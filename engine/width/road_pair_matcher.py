@@ -14,7 +14,7 @@ from typing import Iterable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely import STRtree, make_valid
+from shapely import STRtree, make_valid, union_all
 from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import substring
@@ -292,6 +292,28 @@ def build_corridors(segments: gpd.GeoDataFrame, period: str = "") -> gpd.GeoData
             geometry=[], crs=segments.crs,
         )
     )
+
+
+def build_network_cover(
+    segments: gpd.GeoDataFrame,
+    position_tolerance: float,
+) -> BaseGeometry | None:
+    """Return a loose whole-network cover for presence/absence decisions.
+
+    This deliberately has no direction, topology, segmentation, or reciprocal
+    match requirements.  Those remain part of ``match_road_segments`` for
+    reliable width comparison, not road-existence classification.
+    """
+    geometries = [
+        geometry for geometry in segments.geometry
+        if geometry is not None and not geometry.is_empty
+    ]
+    if not geometries:
+        return None
+    network = union_all(np.asarray(geometries, dtype=object))
+    if network is None or network.is_empty:
+        return None
+    return network.buffer(max(float(position_tolerance), 0.0))
 
 
 def match_road_segments(

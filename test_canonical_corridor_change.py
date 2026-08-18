@@ -120,6 +120,102 @@ class CanonicalCorridorChangeTests(unittest.TestCase):
         self.assertTrue(negative.empty)
         self.assertGreater(summary["matched_centerline_count"], 1)
 
+    def test_presence_case_a_different_segmentation_has_no_added_or_removed(self):
+        before = roads([(LineString([(0, 0), (100, 0)]), 6, "A")])
+        after = roads([
+            (LineString([(0, 0), (49, 0)]), 6, "A"),
+            (LineString([(51, 0), (100, 0)]), 6, "A"),
+        ])
+        positive, negative, _summary = detect_changes(before, after)
+        self.assertNotIn("added", set(positive["change_typ"]))
+        self.assertNotIn("removed", set(negative["change_typ"]))
+
+    def test_presence_case_b_shifted_junction_split_has_no_added_or_removed(self):
+        before = roads([
+            (LineString([(-50, 0), (0, 0)]), 6, "A"),
+            (LineString([(0, 0), (50, 0)]), 6, "A"),
+            (LineString([(0, -50), (0, 50)]), 6, "A"),
+        ])
+        after = roads([
+            (LineString([(-50, 1), (2, 1)]), 6, "A"),
+            (LineString([(2, 1), (50, 1)]), 6, "A"),
+            (LineString([(2, -50), (2, 50)]), 6, "A"),
+        ])
+        positive, negative, _summary = detect_changes(before, after)
+        self.assertNotIn("added", set(positive["change_typ"]))
+        self.assertNotIn("removed", set(negative["change_typ"]))
+
+    def test_presence_case_c_small_centerline_offset_has_no_added_or_removed(self):
+        before = roads([(LineString([(0, 0), (100, 0)]), 6, "A")])
+        after = roads([(LineString([(0, 2.5), (100, 2.5)]), 6, "A")])
+        positive, negative, _summary = detect_changes(before, after)
+        self.assertNotIn("added", set(positive["change_typ"]))
+        self.assertNotIn("removed", set(negative["change_typ"]))
+
+    def test_presence_case_d_true_added_road_has_surface_confirmation(self):
+        existing = LineString([(0, 0), (100, 0)])
+        new_road = LineString([(0, 30), (60, 30)])
+        before = roads([(existing, 6, "A")])
+        after = roads([(existing, 6, "A"), (new_road, 6, "A")])
+        positive, negative, summary = detect_changes(
+            before, after,
+            before_surfaces=surfaces([existing], [6]),
+            after_surfaces=surfaces([existing, new_road], [6, 6]),
+        )
+        added = positive.loc[
+            (positive["change_typ"] == "added") & (positive["qa_state"] == "auto")
+        ]
+        self.assertEqual(len(added), 1)
+        self.assertTrue(negative.empty)
+        self.assertEqual(summary["added_feature_count"], 1)
+
+    def test_presence_case_e_surface_residual_is_review_only(self):
+        existing = LineString([(0, 0), (100, 0)])
+        omitted_centerline = LineString([(0, 30), (60, 30)])
+        before = roads([(existing, 6, "A")])
+        after = roads([(existing, 6, "A"), (omitted_centerline, 6, "A")])
+        both_surfaces = surfaces([existing, omitted_centerline], [6, 6])
+        artifacts = {}
+        positive, negative, unchanged, summary = _detect_changes_internal(
+            before, after, DetectionConfig(), "before", "after",
+            before_surfaces=both_surfaces, after_surfaces=both_surfaces,
+            artifacts=artifacts,
+        )
+        review_added = positive.loc[
+            (positive["change_typ"] == "added") & (positive["qa_state"] == "review")
+        ]
+        self.assertFalse(review_added.empty)
+        self.assertTrue(review_added["audit_reason"].str.contains("centerline_extraction_mismatch").all())
+        self.assertEqual(summary["added_feature_count"], 0)
+        self.assertGreater(summary["review_added_feature_count"], 0)
+
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw)
+            formal = _write_outputs(output, positive, negative, unchanged, after.crs, artifacts)
+            self.assertTrue(formal.empty)
+            self.assertTrue(gpd.read_file(output / "road_changes.shp").empty)
+            self.assertTrue(gpd.read_file(output / "added_roads.shp").empty)
+            review = gpd.read_file(output / "review_changes.shp")
+            self.assertFalse(review.empty)
+            self.assertEqual(set(review["qa_state"]), {"review"})
+
+    def test_presence_case_f_true_removed_road_has_surface_confirmation(self):
+        existing = LineString([(0, 0), (100, 0)])
+        removed_road = LineString([(0, 30), (60, 30)])
+        before = roads([(existing, 6, "A"), (removed_road, 6, "A")])
+        after = roads([(existing, 6, "A")])
+        positive, negative, summary = detect_changes(
+            before, after,
+            before_surfaces=surfaces([existing, removed_road], [6, 6]),
+            after_surfaces=surfaces([existing], [6]),
+        )
+        removed = negative.loc[
+            (negative["change_typ"] == "removed") & (negative["qa_state"] == "auto")
+        ]
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(positive.empty)
+        self.assertEqual(summary["removed_feature_count"], 1)
+
     def test_extension_outputs_only_extended_part(self):
         before = roads([(LineString([(0, 0), (100, 0)]), 6, "A")])
         after = roads([(LineString([(0, 0), (120, 0)]), 6, "A")])

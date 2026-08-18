@@ -918,14 +918,21 @@ def _detect_changes_internal(
         **classification_metadata,
     }
     combined = pd.concat([added, removed], ignore_index=True)
+    qa_state = (
+        combined["qa_state"].fillna("auto")
+        if "qa_state" in combined.columns
+        else pd.Series(["auto"] * len(combined), index=combined.index, dtype="object")
+    )
+    formal = combined.loc[qa_state == "auto"]
     for value in CHANGE_TYPES:
-        selected = combined.loc[combined["change_typ"] == value]
+        selected = formal.loc[formal["change_typ"] == value]
         summary[f"{value}_feature_count"] = len(selected)
         summary[f"{value}_length_m"] = float(selected["length_m"].sum())
         summary[f"{value}_area_m2"] = float(selected["area_m2"].sum())
-    summary["review_feature_count"] = int(
-        (combined.get("qa_state", pd.Series(dtype="object")) == "review").sum()
-    )
+        summary[f"review_{value}_feature_count"] = int(
+            ((combined["change_typ"] == value) & (qa_state == "review")).sum()
+        )
+    summary["review_feature_count"] = int((qa_state == "review").sum())
     return added, removed, unchanged, summary
 
 
@@ -1438,9 +1445,10 @@ def _write_outputs(
         combined["qa_state"] = combined["qa_state"].fillna("auto")
     if "audit_reason" not in combined.columns:
         combined["audit_reason"] = pd.Series([""] * len(combined), dtype="object")
-    combined_output = combined.to_crs(output_crs)
-    added_output = combined.loc[combined["change_typ"] == "added"].to_crs(output_crs)
-    removed_output = combined.loc[combined["change_typ"] == "removed"].to_crs(output_crs)
+    formal = combined.loc[combined["qa_state"] == "auto"]
+    combined_output = formal.to_crs(output_crs)
+    added_output = formal.loc[formal["change_typ"] == "added"].to_crs(output_crs)
+    removed_output = formal.loc[formal["change_typ"] == "removed"].to_crs(output_crs)
     unchanged_output = unchanged.to_crs(output_crs)
     unchanged_is_polygon = not unchanged.empty and _family_from_geometries(unchanged.geometry) == "polygon"
     output_family = (
@@ -1449,8 +1457,8 @@ def _write_outputs(
         or "polygon"
     )
     geometry_type = "Polygon" if output_family == "polygon" else "LineString"
-    widened_output = combined.loc[combined["change_typ"] == "widened"].to_crs(output_crs)
-    narrowed_output = combined.loc[combined["change_typ"] == "narrowed"].to_crs(output_crs)
+    widened_output = formal.loc[formal["change_typ"] == "widened"].to_crs(output_crs)
+    narrowed_output = formal.loc[formal["change_typ"] == "narrowed"].to_crs(output_crs)
     review_output = combined.loc[combined["qa_state"] == "review"].to_crs(output_crs)
 
     def remove_shapefile(path: Path) -> None:
@@ -1511,8 +1519,10 @@ def _write_outputs(
             output_frame, gpkg_path, layer=layer_name, driver="GPKG",
             geometry_type=artifact_types[layer_name], append=True,
         )
-    write_change_preview(output_dir / "change_preview.png", added, removed, unchanged)
-    return combined
+    formal_added = formal.loc[formal["change_typ"].isin(("added", "widened"))]
+    formal_removed = formal.loc[formal["change_typ"].isin(("removed", "narrowed"))]
+    write_change_preview(output_dir / "change_preview.png", formal_added, formal_removed, unchanged)
+    return formal
 
 
 def _preview_parts(geometry: BaseGeometry) -> Iterable[BaseGeometry]:

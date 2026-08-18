@@ -8,7 +8,7 @@ from typing import Iterable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely import STRtree, make_valid, union_all
+from shapely import STRtree, line_merge, make_valid, union_all
 from shapely.geometry import LineString, Point, box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import substring
@@ -16,6 +16,7 @@ from shapely.ops import substring
 from road_pair_matcher import (
     MatchConfig,
     build_corridors,
+    build_network_cover,
     build_width_segments,
     direction_similarity,
     match_road_segments,
@@ -363,11 +364,13 @@ def detect_corridor_changes(
         }
         _append_change(target_rows, geometry, max(config.min_polygon_area, config.width_min_polygon_area), values)
 
+    before_network_cover = build_network_cover(before_segments, config.position_tolerance)
+    after_network_cover = build_network_cover(after_segments, config.position_tolerance)
     presence_confirmed = presence_review = 0
 
-    def append_unmatched(
+    def append_uncovered(
         source_segments: gpd.GeoDataFrame,
-        intervals: dict[int, list[tuple[float, float]]],
+        reference_network_cover: BaseGeometry | None,
         source_surface: BaseGeometry | None,
         reference_surface: BaseGeometry | None,
         change_type: str,
@@ -375,59 +378,94 @@ def detect_corridor_changes(
         target: list[dict],
     ) -> None:
         nonlocal presence_confirmed, presence_review
-        for segment_id, row in source_segments.iterrows():
-            line = row.geometry
-            for part_index, (start, end) in enumerate(_complement(intervals.get(int(segment_id), []), float(line.length))):
-                part = substring(line, start, end)
-                if common_valid is not None:
-                    part = make_valid(part.intersection(common_valid))
-                for line_part in _parts(part, "line"):
-                    if float(line_part.length) < config.min_line_length:
-                        continue
-                    width = float(row.get("width_m", 0.0) or 0.0)
-                    if width <= 0:
-                        width = max(4.0, 2.0 * config.position_tolerance)
-                    corridor = line_part.buffer(width * 0.5, cap_style="flat", join_style="round")
-                    if common_valid is not None:
-                        corridor = make_valid(corridor.intersection(common_valid))
-                    source_coverage = _surface_coverage(line_part, source_surface, config.position_tolerance)
-                    reference_coverage = _surface_coverage(line_part, reference_surface, config.position_tolerance)
-                    has_surface_evidence = source_surface is not None and reference_surface is not None
-                    confirmed = (
-                        str(row.get("qa_state", "review")) == "auto"
-                        and str(row.get("width_quality", "C")) != "C"
-                        and str(row.get("line_source", "samroad")) != "connector"
-                        and (not has_surface_evidence or (source_coverage >= 0.60 and reference_coverage <= 0.20))
-                    )
-                    reasons = []
-                    if has_surface_evidence and source_coverage < 0.60:
-                        reasons.append("source_surface_support_low")
-                    if has_surface_evidence and reference_coverage > 0.20:
-                        reasons.append("reference_surface_residual")
-                    if str(row.get("width_quality", "C")) == "C":
-                        reasons.append("low_width_quality")
-                    if str(row.get("line_source", "samroad")) == "connector":
-                        reasons.append("connector_source")
-                    presence_confirmed += int(confirmed)
-                    presence_review += int(not confirmed)
-                    _append_change(target, corridor, config.min_polygon_area, {
-                        "change_typ": change_type,
-                        "source_fid": f"{row.get('segment_id', segment_id)}:{part_index}",
-                        "src_period": period, "length_m": float(line_part.length),
-                        "axis_len_m": float(line_part.length),
-                        "class_rule": "unmatched_local_width_segment_buffer",
-                        "before_w": width if change_type == "removed" else 0.0,
-                        "after_w": width if change_type == "added" else 0.0,
-                        "width_diff": width if change_type == "added" else -width,
-                        "qa_state": "auto" if confirmed else "review",
-                        "audit_reason": ";".join(reasons) if reasons else "reliable_unmatched_road",
-                        "line_source": row.get("line_source", "samroad"),
-                        "quality_gr": row.get("width_quality", "C"),
-                        "source_cov": source_coverage, "refer_cov": reference_coverage,
-                    })
+        source_lines = [geometry for geometry in source_segments.geometry if not geometry.is_empty]
+        if not source_lines:
+            return
+        source_network = line_merge(union_all(np.asarray(source_lines, dtype=object)))
+        uncovered = (
+            source_network if reference_network_cover is None
+            else source_network.difference(reference_network_cover)
+        )
+        if common_valid is not None:
+            uncovered = make_valid(uncovered.intersection(common_valid))
+        uncovered = line_merge(uncovered)
+        for part_index, line_part in enumerate(_parts(uncovered, "line")):
+            if float(line_part.length) < config.min_line_length:
+                continue
+            contributors = source_segments.loc[
+                source_segments.geometry.map(
+                    lambda geometry: float(geometry.intersection(line_part.buffer(1e-6)).length) > 1e-6
+                )
+            ]
+            if contributors.empty:
+                continue
+            widths = [
+                float(value) for value in contributors.get("width_m", pd.Series(dtype="float64"))
+                if pd.notna(value) and float(value) > 0
+            ]
+            width = float(np.median(widths)) if widths else max(4.0, 2.0 * config.position_tolerance)
+            qa_values = {str(value) for value in contributors.get("qa_state", pd.Series(dtype="object"))}
+            quality_values = {
+                str(value) for value in contributors.get("width_quality", pd.Series(dtype="object"))
+            }
+            source_values = {
+                str(value) for value in contributors.get("line_source", pd.Series(dtype="object"))
+            }
+            corridor = line_part.buffer(width * 0.5, cap_style="flat", join_style="round")
+            if common_valid is not None:
+                corridor = make_valid(corridor.intersection(common_valid))
+            source_coverage = _surface_coverage(line_part, source_surface, config.position_tolerance)
+            reference_coverage = _surface_coverage(line_part, reference_surface, config.position_tolerance)
+            has_surface_evidence = source_surface is not None and reference_surface is not None
+            source_supported = source_coverage >= 0.60
+            reference_supported = reference_coverage > 0.20
+            reliable_source = (
+                "review" not in qa_values
+                and "C" not in quality_values
+                and "connector" not in source_values
+            )
+            confirmed = reliable_source and (
+                not has_surface_evidence or (source_supported and not reference_supported)
+            )
+            reasons = []
+            if has_surface_evidence and source_supported and reference_supported:
+                reasons.append("centerline_extraction_mismatch")
+            else:
+                if has_surface_evidence and not source_supported:
+                    reasons.append("source_surface_support_low")
+                if has_surface_evidence and reference_supported:
+                    reasons.append("reference_surface_residual")
+            if "C" in quality_values:
+                reasons.append("low_width_quality")
+            if "connector" in source_values:
+                reasons.append("connector_source")
+            presence_confirmed += int(confirmed)
+            presence_review += int(not confirmed)
+            source_ids = sorted(str(value) for value in contributors.get("segment_id", contributors.index))
+            _append_change(target, corridor, config.min_polygon_area, {
+                "change_typ": change_type,
+                "source_fid": f"{','.join(source_ids)}:{part_index}",
+                "src_period": period, "length_m": float(line_part.length),
+                "axis_len_m": float(line_part.length),
+                "class_rule": "whole_reference_network_uncovered_segment_buffer",
+                "before_w": width if change_type == "removed" else 0.0,
+                "after_w": width if change_type == "added" else 0.0,
+                "width_diff": width if change_type == "added" else -width,
+                "qa_state": "auto" if confirmed else "review",
+                "audit_reason": ";".join(reasons) if reasons else "reliable_network_uncovered_road",
+                "line_source": "connector" if "connector" in source_values else "samroad",
+                "quality_gr": max(quality_values) if quality_values else "C",
+                "source_cov": source_coverage, "refer_cov": reference_coverage,
+            })
 
-    append_unmatched(after_segments, after_intervals, after_surface, before_surface, "added", after_period, positive_rows)
-    append_unmatched(before_segments, before_intervals, before_surface, after_surface, "removed", before_period, negative_rows)
+    append_uncovered(
+        after_segments, before_network_cover, after_surface, before_surface,
+        "added", after_period, positive_rows,
+    )
+    append_uncovered(
+        before_segments, after_network_cover, before_surface, after_surface,
+        "removed", before_period, negative_rows,
+    )
 
     positive = gpd.GeoDataFrame(positive_rows, geometry="geometry", crs=crs) if positive_rows else _empty_change(crs)
     negative = gpd.GeoDataFrame(negative_rows, geometry="geometry", crs=crs) if negative_rows else _empty_change(crs)
@@ -481,7 +519,7 @@ def detect_corridor_changes(
     ], ignore_index=True), geometry="geometry", crs=crs)
     period_corridors = gpd.GeoDataFrame(pd.concat([before_corridors, after_corridors], ignore_index=True), geometry="geometry", crs=crs)
     summary = {
-        "classification_method": "cross_period_centerline_match_local_width_canonical_axis_standardized_buffer",
+        "classification_method": "whole_network_presence_and_strict_match_canonical_axis_width",
         "matched_centerline_count": len(reliable_pairs),
         "width_changed_centerline_count": width_changed_count,
         "width_change_absolute_m": config.width_change_absolute,
