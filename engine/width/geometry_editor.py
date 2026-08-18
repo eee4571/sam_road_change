@@ -872,7 +872,17 @@ def _global_change_geometry(document: GeometryDocument, edited_lines: list[LineS
     elif edited_geometry is None:
         changed = base_geometry
     else:
-        changed = base_geometry.symmetric_difference(edited_geometry)
+        tolerance = max(float(document.global_overview_scale) * 0.1, 0.01)
+        # The editor round-trips map coordinates through overview pixels.  A
+        # tolerant two-sided difference ignores that numerical jitter while
+        # retaining genuinely added, removed, or moved linework.
+        added = edited_geometry.difference(base_geometry.buffer(tolerance))
+        removed = base_geometry.difference(edited_geometry.buffer(tolerance))
+        centerline_changes = [
+            geometry for geometry in (added, removed)
+            if geometry is not None and not geometry.is_empty
+        ]
+        changed = unary_union(centerline_changes) if centerline_changes else None
     additions = _mask_world_bounds(document.surface_additions, document.global_transform)
     removals = _mask_world_bounds(document.surface_removals, document.global_transform)
     parts = [item for item in (changed, additions, removals) if item is not None and not item.is_empty]

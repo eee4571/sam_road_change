@@ -37,6 +37,113 @@ class GlobalGeometryEditorTests(unittest.TestCase):
         ) as dataset:
             dataset.write(data)
 
+    def _large_coordinate_case(self, root: Path):
+        review = root / "review"
+        edited = root / "edited"
+        review.mkdir()
+        edited.mkdir()
+        origin_x = 523000.0
+        origin_y = 3467000.0
+        pixel_size = 0.3
+        tile_size = 32 * pixel_size
+        tile_lefts = {}
+        lines = []
+        for index, stem in enumerate(("tile_a", "tile_b", "tile_c")):
+            left = origin_x + index * tile_size
+            tile_lefts[stem] = left
+            image = root / f"{stem}.tif"
+            data = np.full((3, 32, 32), 70 + index * 20, dtype=np.uint8)
+            with rasterio.open(
+                image, "w", driver="GTiff", width=32, height=32, count=3,
+                dtype="uint8", crs="EPSG:32650",
+                transform=from_origin(left, origin_y, pixel_size, pixel_size),
+            ) as dataset:
+                dataset.write(data)
+            (review / f"{stem}_summary.json").write_text(
+                json.dumps({"image": str(image)}), encoding="utf-8",
+            )
+            lines.append(LineString([
+                (left + 1.234567, origin_y - 4.123456),
+                (left + 8.123456, origin_y - 4.234567),
+            ]))
+        centerlines = root / "centerlines.gpkg"
+        surfaces = root / "surfaces.gpkg"
+        gpd.GeoDataFrame(
+            {"road_id": list(range(len(lines))), "geometry": lines}, crs="EPSG:32650",
+        ).to_file(centerlines, layer="centerlines", driver="GPKG")
+        gpd.GeoDataFrame(
+            {"road_id": list(range(len(lines))), "geometry": [line.buffer(0.8) for line in lines]},
+            crs="EPSG:32650",
+        ).to_file(surfaces, layer="surfaces", driver="GPKG")
+        document = _final_centerline_documents(
+            review, edited, centerlines, surfaces,
+        )[0]
+        return {
+            "review": review,
+            "edited": edited,
+            "centerlines": centerlines,
+            "surfaces": surfaces,
+            "document": document,
+            "tile_lefts": tile_lefts,
+            "origin_y": origin_y,
+        }
+
+    def test_large_coordinates_without_manual_edits_affect_no_tiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self._large_coordinate_case(Path(temporary))
+            document = case["document"]
+            changed = _global_change_geometry(document, _world_lines_from_document(document))
+            self.assertTrue(changed is None or changed.is_empty)
+
+            manifest = save_global_document(
+                document, case["edited"], case["centerlines"], case["surfaces"],
+            )
+            self.assertEqual(manifest["affected_tiles"], [])
+            self.assertEqual(manifest["affected_tile_count"], 0)
+
+    def test_large_coordinates_local_addition_affects_only_its_tile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self._large_coordinate_case(Path(temporary))
+            document = case["document"]
+            left = case["tile_lefts"]["tile_b"]
+            inverse = ~document.global_transform
+            pixel_points = []
+            for x, y in (
+                (left + 2.0, case["origin_y"] - 7.2),
+                (left + 5.0, case["origin_y"] - 7.8),
+            ):
+                col, row = inverse * (x, y)
+                pixel_points.append((row, col))
+            self.assertTrue(document.add_polyline(pixel_points, snap_tolerance=0.1))
+
+            manifest = save_global_document(
+                document, case["edited"], case["centerlines"], case["surfaces"],
+            )
+            self.assertEqual(manifest["affected_tiles"], ["tile_b"])
+            self.assertEqual(manifest["affected_tile_count"], 1)
+
+    def test_large_coordinates_local_deletion_affects_only_its_tile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            case = self._large_coordinate_case(Path(temporary))
+            document = case["document"]
+            target_left = case["tile_lefts"]["tile_c"]
+            target_edge = None
+            for edge_id, (src, dst) in enumerate(document.edges.tolist()):
+                midpoint = np.mean(document.nodes[[src, dst]], axis=0)
+                x, _y = document.global_transform * (float(midpoint[1]), float(midpoint[0]))
+                if target_left < x < target_left + 9.6:
+                    target_edge = edge_id
+                    break
+            self.assertIsNotNone(target_edge)
+            document.edges = np.delete(document.edges, int(target_edge), axis=0)
+            document.compact()
+
+            manifest = save_global_document(
+                document, case["edited"], case["centerlines"], case["surfaces"],
+            )
+            self.assertEqual(manifest["affected_tiles"], ["tile_c"])
+            self.assertEqual(manifest["affected_tile_count"], 1)
+
     def test_global_save_is_lightweight_and_apply_materializes_only_affected_tiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
