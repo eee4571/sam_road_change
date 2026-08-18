@@ -39,6 +39,7 @@ datasets/
 validation_data/
 private_data/
 local_data/
+/project/
 
 # Local secrets and credentials
 .env

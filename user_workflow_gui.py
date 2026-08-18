@@ -28,6 +28,10 @@ USER_VECTOR_SUFFIX = ".shp"
 USER_IMAGE_LIST_SUFFIX = ".txt"
 PROJECT_CONFIG_NAME = "project_config.json"
 
+_HARMLESS_TIFF_WARNING = re.compile(
+    r"TIFFReadDirectory:\s*Unknown field with tag\s+(?:33550|33922|34735|34737)\b"
+)
+
 PREVIEW_LABELS = {
     "centerline": "中心线提取",
     "surface": "路面提取",
@@ -422,6 +426,118 @@ def format_duration(value: object) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def is_harmless_gui_log(line: str) -> bool:
+    """Filter only known TIFF metadata chatter from the GUI, never from disk logs."""
+    return bool(_HARMLESS_TIFF_WARNING.search(str(line)))
+
+
+def write_and_filter_gui_log(line: str, log_file=None) -> str | None:
+    """Persist the original subprocess line and return its optional GUI form."""
+    if log_file is not None:
+        log_file.write(line)
+        log_file.flush()
+    visible = line.rstrip("\r\n")
+    return None if is_harmless_gui_log(visible) else visible
+
+
+def structured_task_status(payload: dict) -> str | None:
+    """Build the primary period-stage display without parsing plain log text."""
+    if payload.get("kind") != "stage":
+        return None
+    grid = str(payload.get("grid") or "").strip()
+    period = str(payload.get("period") or "").strip()
+    stage = str(payload.get("stage") or "").strip()
+    if not grid or not period or not stage:
+        return None
+    try:
+        index = int(payload.get("stage_index"))
+        total = int(payload.get("stage_total"))
+    except (TypeError, ValueError):
+        return None
+    return (
+        f"验证区：{grid}\n"
+        f"期次：{period}\n"
+        f"当前步骤：{stage}\n"
+        f"步骤进度：{index} / {total}"
+    )
+
+
+def unfinished_task_state(output_root: Path | str, active_task: dict | None) -> dict | None:
+    active = active_task if isinstance(active_task, dict) else {}
+    run_id = str(active.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    state_value = str(active.get("state") or "").strip()
+    state_path = Path(state_value).expanduser() if state_value else Path(output_root).expanduser() / _safe_task_name(run_id) / "job_state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict) or state.get("status") in {"completed", "completed_with_errors"}:
+        return None
+    period_state_value = str(state.get("period_state") or "").strip()
+    if period_state_value and Path(period_state_value).expanduser().is_file():
+        try:
+            period_state = json.loads(Path(period_state_value).expanduser().read_text(encoding="utf-8"))
+            for source_key, target_key in (
+                ("grid", "current_grid"), ("period", "current_period"),
+                ("current_stage", "current_stage"),
+                ("current_stage_label", "current_stage_label"),
+                ("last_completed_stage", "last_completed_stage"),
+                ("last_completed_stage_label", "last_completed_stage_label"),
+            ):
+                if period_state.get(source_key) not in (None, ""):
+                    state[target_key] = period_state[source_key]
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            pass
+    state["state_path"] = str(state_path)
+    return state
+
+
+def unfinished_task_message(state: dict) -> str:
+    grid = str(state.get("current_grid") or "未知验证区")
+    period = str(state.get("current_period") or "未知期次")
+    stage = str(state.get("current_stage_label") or state.get("current_stage") or "尚未记录")
+    return (
+        "检测到未完成任务\n\n"
+        f"上次停止：{grid} · {period} · {stage}\n\n"
+        "继续后将复用已完成结果，从未完成步骤继续。"
+    )
+
+
+def mark_task_cancelled(output_root: Path | str, run_id: str) -> dict | None:
+    """Atomically mark a task cancelled while leaving every produced artifact intact."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return None
+    output = Path(output_root).expanduser()
+    job_root = output / run_id
+    state_path = job_root / "job_state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        manifest = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
+            return None
+        manifest["status"] = "cancelled"
+        manifest["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        for target in (state_path, job_root / "pipeline_result.json", output / "latest_pipeline.json"):
+            atomic_write_json(target, manifest)
+        period_state_value = str(manifest.get("period_state") or "").strip()
+        if period_state_value:
+            period_state_path = Path(period_state_value).expanduser()
+            if period_state_path.is_file():
+                period_state = json.loads(period_state_path.read_text(encoding="utf-8"))
+                period_state["status"] = "cancelled"
+                period_state["cancelled_at"] = manifest["cancelled_at"]
+                atomic_write_json(period_state_path, period_state)
+        return manifest
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return None
 
 
 def format_bytes(value: object) -> str:
@@ -1010,6 +1126,7 @@ class UserApp:
         self.progress_total = 0
         self.progress_eta: float | None = None
         self.last_complete_payload: dict | None = None
+        self.current_stage_payload: dict | None = None
         self.active_log_path: Path | None = None
         self.recent_log_lines: list[str] = []
         self.result_tree_paths: dict[str, Path] = {}
@@ -1513,13 +1630,14 @@ class UserApp:
 
         progress_card = ttk.Frame(run_card, style="Soft.TFrame", padding=(14, 11))
         progress_card.pack(fill=X, pady=(8, 0))
-        ttk.Label(progress_card, text="当前进度", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(progress_card, text="正在处理", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        self.run_status = StringVar(value="等待开始任务。")
+        ttk.Label(progress_card, textvariable=self.run_status, style="PathText.TLabel", wraplength=470).pack(fill=X, pady=(0, 10))
+        ttk.Label(progress_card, text="总体进度", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 6))
         self.progress = ttk.Progressbar(progress_card, mode="determinate", maximum=1, value=0, style="Modern.Horizontal.TProgressbar")
         self.progress.pack(fill=X)
         self.progress_text = StringVar(value="0 / 0 · 已用时 00:00:00 · 剩余 --")
         ttk.Label(progress_card, textvariable=self.progress_text, style="PathText.TLabel").pack(anchor="w", pady=(8, 0))
-        self.run_status = StringVar(value="等待开始任务。")
-        ttk.Label(progress_card, textvariable=self.run_status, style="PathText.TLabel", wraplength=470).pack(fill=X, pady=(5, 0))
 
         summary_card = ttk.Frame(content, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         summary_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0))
@@ -2500,7 +2618,16 @@ class UserApp:
             f"{sum(len(rows) for rows in self.project_area_periods.values())} 个影像期次、"
             f"{len(self.project_area_truths)} 个变化真值、{pending} 个待确认候选。"
         )
-        self.status.set(self.project_scan_summary.get())
+        unfinished = unfinished_task_state(
+            self.vars["output_root"].get(), self.project_config.get("active_task"),
+        )
+        if unfinished is not None:
+            notice = unfinished_task_message(unfinished)
+            self.status.set(notice.replace("\n", " "))
+            self.run_status.set(notice)
+            self.preflight_summary.set("检测到同名未完成任务；点击“运行完整流程”将自动续跑。")
+        else:
+            self.status.set(self.project_scan_summary.get())
         self._save_project_config()
 
     def save_task_config(self) -> None:
@@ -2988,6 +3115,7 @@ class UserApp:
         self.progress_total = 0
         self.progress_eta = None
         self.last_complete_payload = None
+        self.current_stage_payload = None
         self.active_log_path = None
         if args and args[0] == "all" and "--preflight-only" not in args:
             try:
@@ -3061,10 +3189,9 @@ class UserApp:
                         log_file = self.active_log_path.open("a", encoding="utf-8", newline="")
                         log_file.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
                     for line in self.process.stdout:
-                        if log_file is not None:
-                            log_file.write(line)
-                            log_file.flush()
-                        self.queue.put(("log", line.rstrip()))
+                        visible_line = write_and_filter_gui_log(line, log_file)
+                        if visible_line is not None:
+                            self.queue.put(("log", visible_line))
                 finally:
                     if log_file is not None:
                         log_file.close()
@@ -3199,26 +3326,7 @@ class UserApp:
     def _mark_cancelled_state(self) -> None:
         output = Path(self.vars["output_root"].get().strip()).expanduser()
         run_id = self.vars["run_id"].get().strip()
-        if not run_id:
-            return
-        job_root = output / run_id
-        state = job_root / "job_state.json"
-        if not state.is_file():
-            return
-        try:
-            manifest = json.loads(state.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
-                return
-            manifest["status"] = "cancelled"
-            manifest["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            targets = (state, job_root / "pipeline_result.json", output / "latest_pipeline.json")
-            for target in targets:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-                temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-                os.replace(temporary, target)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return
+        mark_task_cancelled(output, run_id)
 
     def _poll(self) -> None:
         try:
@@ -3230,7 +3338,17 @@ class UserApp:
                             payload = json.loads(value[len("__SAMROAD_USER__"):])
                             friendly = self._friendly(payload)
                             self.status.set(friendly)
-                            self.run_status.set(friendly)
+                            primary_status = structured_task_status(payload)
+                            if primary_status is not None:
+                                self.current_stage_payload = payload
+                                self.run_status.set(primary_status)
+                            elif payload.get("kind") == "pipeline" or (
+                                payload.get("kind") == "complete" and payload.get("stage") == "all"
+                            ):
+                                self.current_stage_payload = None
+                                self.run_status.set(friendly)
+                            elif self.current_stage_payload is None:
+                                self.run_status.set(friendly)
                             self._update_progress(payload)
                             if payload.get("kind") == "complete":
                                 self.last_complete_payload = payload
@@ -3247,8 +3365,8 @@ class UserApp:
                             self.status.set("人工编辑增量重建已停止；已有正式结果未被删除，可再次应用编辑。")
                             self.run_status.set("增量重建已停止；查看上方日志后可再次点击“应用编辑并重新生成结果”。")
                         else:
-                            self.status.set("任务已取消；已完成结果已保留，可勾选断点续跑后继续。")
-                            self.run_status.set("任务已取消；使用同一任务名称可断点续跑。")
+                            self.status.set("任务已取消；已完成结果和当前位置已保留。")
+                            self.run_status.set("任务已取消；再次点击“运行完整流程”将自动从未完成步骤继续。")
                     elif value == "0" and self.active_command in {"preflight", "data-check"}:
                         payload = self.last_complete_payload or {"kind": "complete", "stage": self.active_command}
                         self.preflight_passed = True

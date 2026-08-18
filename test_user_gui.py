@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,59 @@ import user_workflow_gui as gui
 
 
 class UserGuiInputCommandTests(unittest.TestCase):
+    def test_harmless_tiff_warning_is_hidden_but_preserved_in_log_file(self) -> None:
+        raw = "cv::TIFF_Warning TIFFReadDirectory: Unknown field with tag 33550\n"
+        log_file = io.StringIO()
+        self.assertIsNone(gui.write_and_filter_gui_log(raw, log_file))
+        self.assertEqual(log_file.getvalue(), raw)
+        important = "RuntimeError: model inference failed\n"
+        self.assertEqual(gui.write_and_filter_gui_log(important), important.rstrip())
+
+    def test_structured_stage_status_contains_area_period_and_step_number(self) -> None:
+        status = gui.structured_task_status({
+            "kind": "stage", "grid": "area_03", "period": "2021",
+            "stage": "道路面提取", "stage_index": 2, "stage_total": 5,
+            "status": "running",
+        })
+        self.assertEqual(
+            status,
+            "验证区：area_03\n期次：2021\n当前步骤：道路面提取\n步骤进度：2 / 5",
+        )
+
+    def test_cancel_marks_state_without_deleting_completed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw); job = output / "run_a"; job.mkdir()
+            product = job / "grids" / "area_03" / "centerline.done"
+            product.parent.mkdir(parents=True); product.write_text("kept", encoding="utf-8")
+            period_state = job / "grids" / "area_03" / "period_state.json"
+            period_state.write_text(json.dumps({"status": "running", "stages": {"centerline": "completed", "width": "running"}}), encoding="utf-8")
+            state = {
+                "run_id": "run_a", "status": "running", "current_grid": "area_03",
+                "current_period": "2021", "current_stage_label": "道路宽度计算",
+                "period_state": str(period_state),
+            }
+            (job / "job_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+            cancelled = gui.mark_task_cancelled(output, "run_a")
+
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertTrue(product.is_file())
+            self.assertEqual(json.loads(period_state.read_text(encoding="utf-8"))["status"], "cancelled")
+            self.assertTrue((output / "latest_pipeline.json").is_file())
+
+    def test_unfinished_task_notice_reports_saved_position(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw); job = output / "run_b"; job.mkdir()
+            state_path = job / "job_state.json"
+            state_path.write_text(json.dumps({
+                "run_id": "run_b", "status": "cancelled", "current_grid": "area_03",
+                "current_period": "2021", "current_stage_label": "道路宽度计算",
+            }, ensure_ascii=False), encoding="utf-8")
+            state = gui.unfinished_task_state(output, {"run_id": "run_b", "state": str(state_path)})
+            message = gui.unfinished_task_message(state)
+            self.assertIn("area_03 · 2021 · 道路宽度计算", message)
+            self.assertIn("从未完成步骤继续", message)
+
     def test_control_metrics_are_limited_to_three_size_tiers(self) -> None:
         self.assertEqual(set(gui.CONTROL_METRICS), {"primary", "regular", "compact"})
         self.assertEqual(len({tuple(value["padding"]) for value in gui.CONTROL_METRICS.values()}), 3)

@@ -41,6 +41,132 @@ class GridDiscoveryTests(unittest.TestCase):
 
 
 class ProjectPeriodExtractionTests(unittest.TestCase):
+    @staticmethod
+    def _checkpoint_workspace(root: Path) -> tuple[Path, argparse.Namespace]:
+        workspace = root / "workspace"
+        images = workspace / "images"; images.mkdir(parents=True)
+        (images / "tile.tif").touch()
+        image_txt = workspace / "tiles.txt"; image_txt.write_text(str(images / "tile.tif"), encoding="utf-8")
+        user_pipeline.write_json(
+            workspace / "input_manifest.json",
+            {"images": str(images), "image_txt": str(image_txt)},
+        )
+        checkpoint = root / "model.ckpt"; checkpoint.touch()
+        config = root / "config.yaml"; config.touch()
+        return workspace, argparse.Namespace(
+            workspace=str(workspace), source="", checkpoint=str(checkpoint), config=str(config),
+            device="cpu", pixel_size="0", rescale="off", run_id="roads",
+            junction_node_mode="sparse", grid="area_03", period="2021",
+            resume=False, pipeline_state="",
+        )
+
+    @staticmethod
+    def _complete_fake_stage(workspace: Path, label: str) -> dict:
+        run = workspace / "runs" / "roads"
+        if label == "道路提取":
+            path = run / "inference" / "road_graphs" / "tiles" / "graph" / "tile.p"
+            path.parent.mkdir(parents=True, exist_ok=True); path.touch()
+        elif label == "道路面提取":
+            path = run / "surfaces" / "masks" / "tiles" / "tile_mask.png"
+            path.parent.mkdir(parents=True, exist_ok=True); path.touch()
+        elif label == "道路宽度计算":
+            root = run / "width_review"; root.mkdir(parents=True, exist_ok=True)
+            (root / "batch_width_summary.json").write_text("{}", encoding="utf-8")
+            (root / "tile_summary.json").write_text("{}", encoding="utf-8")
+        elif label == "结果固化":
+            root = run / "finalized"; root.mkdir(parents=True, exist_ok=True)
+            (root / "batch_optimized_summary.json").write_text("{}", encoding="utf-8")
+            (root / "tile_optimized_summary.json").write_text("{}", encoding="utf-8")
+        elif label == "道路产品导出":
+            root = run / "products"; root.mkdir(parents=True, exist_ok=True)
+            for stem in ("road_centerlines", "road_surfaces"):
+                for suffix in (".shp", ".shx", ".dbf"):
+                    (root / f"{stem}{suffix}").touch()
+            (root / "roads.gpkg").touch()
+        return {"stage": label, "elapsed_seconds": 0.01}
+
+    def test_resume_after_centerline_does_not_run_centerline_again(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            workspace, args = self._checkpoint_workspace(root)
+            pipeline_state = root / "job_state.json"
+            user_pipeline.write_json(pipeline_state, {"run_id": "run_a", "status": "running"})
+            args.pipeline_state = str(pipeline_state)
+            first_calls = []
+
+            def interrupted(_command, _cwd, _env, label, _context=None):
+                first_calls.append(label)
+                if label == "道路面提取":
+                    raise RuntimeError("interrupted")
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=interrupted), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    user_pipeline.extract(args)
+            self.assertEqual(first_calls, ["道路提取", "道路面提取"])
+            state = user_pipeline.read_json(workspace / "period_state.json")
+            self.assertEqual(state["stages"]["centerline"], "completed")
+            job_state = user_pipeline.read_json(pipeline_state)
+            self.assertEqual(
+                (job_state["current_grid"], job_state["current_period"], job_state["current_stage"]),
+                ("area_03", "2021", "surface"),
+            )
+            self.assertEqual(job_state["last_completed_stage"], "centerline")
+
+            resumed_calls = []
+            args.resume = True
+
+            def resumed(_command, _cwd, _env, label, _context=None):
+                resumed_calls.append(label)
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=resumed), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+                result = user_pipeline.extract(args)
+
+            self.assertNotIn("道路提取", resumed_calls)
+            self.assertEqual(resumed_calls[0], "道路面提取")
+            self.assertEqual(user_pipeline.read_json(Path(result["period_state"]))["status"], "completed")
+
+    def test_running_stage_is_reexecuted_from_that_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace, args = self._checkpoint_workspace(Path(raw))
+            self._complete_fake_stage(workspace, "道路提取")
+            state = user_pipeline._period_state_template("area_03", "2021")
+            state.update({"status": "running", "current_stage": "surface", "current_stage_label": "道路面提取"})
+            state["stages"].update({"prepare": "completed", "centerline": "completed", "surface": "running"})
+            user_pipeline.write_json(workspace / "period_state.json", state)
+            args.resume = True
+            calls = []
+
+            def fake_run(_command, _cwd, _env, label, _context=None):
+                calls.append(label)
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+                user_pipeline.extract(args)
+
+            self.assertEqual(calls[0], "道路面提取")
+            self.assertNotIn("道路提取", calls)
+
+    def test_completed_stage_with_missing_output_is_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace, args = self._checkpoint_workspace(Path(raw))
+            state = user_pipeline._period_state_template("area_03", "2021")
+            state["stages"].update({"prepare": "completed", "centerline": "completed"})
+            state.update({"status": "running", "last_completed_stage": "centerline"})
+            user_pipeline.write_json(workspace / "period_state.json", state)
+            args.resume = True
+            calls = []
+
+            def fake_run(_command, _cwd, _env, label, _context=None):
+                calls.append(label)
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+                user_pipeline.extract(args)
+
+            self.assertEqual(calls[0], "道路提取")
+
     def test_single_period_extract_and_resume_reuse_complete_products(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -40,6 +40,14 @@ IMAGE_SUFFIXES = {".tif", ".tiff", ".img", ".jp2", ".vrt", ".png", ".jpg", ".jpe
 DIRECT_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 PIPELINE_VERSION = "2026.08-user-batch-5-canonical-corridor-change"
 
+PERIOD_STAGE_DEFINITIONS = (
+    ("centerline", "道路提取"),
+    ("surface", "道路面提取"),
+    ("width", "道路宽度计算"),
+    ("finalize", "结果固化"),
+    ("export", "道路产品导出"),
+)
+
 
 def project_root() -> Path:
     """The standalone project root. Never resolve paths through its parent."""
@@ -885,15 +893,23 @@ def extract_project_period(args: argparse.Namespace) -> dict:
                 ready = normalize_validation_sources(checked, area["validation_area"], normalized_root)
             else:
                 emit("pipeline", stage="验证区影像规范化", status="skipped", reason="续跑复用已完成的规范化影像", completed=1, total=6)
-            prepare(argparse.Namespace(source=str(ready[args.period]), workspace=str(workspace)))
+            if resume and (workspace / "period_state.json").is_file() and _prepared_workspace_complete(workspace):
+                emit(
+                    "pipeline", stage="输入准备", status="skipped", grid=args.area_id,
+                    period=args.period, stage_key="prepare", stage_index=0,
+                    stage_total=len(PERIOD_STAGE_DEFINITIONS),
+                    reason="续跑复用已完成的输入准备",
+                )
+            else:
+                prepare(argparse.Namespace(source=str(ready[args.period]), workspace=str(workspace)))
             base_run_id = "roads"
-            if (workspace / "runs" / base_run_id).exists():
-                base_run_id = f"roads_retry_{int(time.time())}"
             result = extract(argparse.Namespace(
                 workspace=str(workspace), source="", checkpoint=str(MODELS / "samroad" / "samroad.ckpt"),
                 config=str(ROOT / "config" / "samroad_inference.yaml"), device=args.device,
                 pixel_size=str(args.pixel_size), rescale=args.rescale, run_id=base_run_id,
                 junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
+                grid=args.area_id, period=args.period, resume=resume,
+                pipeline_state=str(state_path),
             ))
         state.update({"status": "completed", "result": str(result_path), "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
         write_json(state_path, state)
@@ -1649,7 +1665,10 @@ def doctor(_args: argparse.Namespace) -> dict:
     return result
 
 
-def run_command(command: list[str], cwd: Path, env: dict[str, str], label: str) -> dict:
+def run_command(
+    command: list[str], cwd: Path, env: dict[str, str], label: str,
+    event_context: dict | None = None,
+) -> dict:
     started = time.monotonic()
     started_at = now_text()
     env = dict(env)
@@ -1667,7 +1686,9 @@ def run_command(command: list[str], cwd: Path, env: dict[str, str], label: str) 
         env["PROJ_DATA"] = str(proj_data)
         env["PROJ_LIB"] = str(proj_data)
     env["PYTHONNOUSERSITE"] = "1"
-    emit("stage", stage=label, status="running", started_at=started_at)
+    context = dict(event_context or {})
+    defer_completion = bool(context.pop("_defer_completion", False))
+    emit("stage", stage=label, status="running", started_at=started_at, **context)
     process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     assert process.stdout is not None
     for line in process.stdout:
@@ -1676,7 +1697,7 @@ def run_command(command: list[str], cwd: Path, env: dict[str, str], label: str) 
     if code != 0:
         emit(
             "stage", stage=label, status="failed", code=code,
-            elapsed_seconds=elapsed_seconds(started),
+            elapsed_seconds=elapsed_seconds(started), **context,
         )
         raise RuntimeError(f"{label} 失败，返回码 {code}")
     timing = {
@@ -1685,8 +1706,133 @@ def run_command(command: list[str], cwd: Path, env: dict[str, str], label: str) 
         "completed_at": now_text(),
         "elapsed_seconds": elapsed_seconds(started),
     }
-    emit("stage", status="complete", **timing)
+    if not defer_completion:
+        emit("stage", status="complete", **timing, **context)
     return timing
+
+
+def _period_state_template(grid: str, period: str) -> dict:
+    return {
+        "grid": grid,
+        "period": period,
+        "status": "pending",
+        "current_stage": "prepare",
+        "current_stage_label": "输入准备",
+        "last_completed_stage": None,
+        "last_completed_stage_label": None,
+        "stages": {
+            "prepare": "pending",
+            **{key: "pending" for key, _label in PERIOD_STAGE_DEFINITIONS},
+        },
+    }
+
+
+def _load_period_state(path: Path, grid: str, period: str, resume: bool) -> dict:
+    if resume and path.is_file():
+        try:
+            state = read_json(path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            state = {}
+        if state.get("grid") == grid and state.get("period") == period:
+            merged = _period_state_template(grid, period)
+            merged.update(state)
+            merged["stages"].update(state.get("stages") or {})
+            return merged
+    return _period_state_template(grid, period)
+
+
+def _write_pipeline_position(
+    pipeline_state_path: Path | None, *, grid: str, period: str,
+    stage_key: str, stage_label: str, last_completed_key: str | None,
+    last_completed_label: str | None, period_state_path: Path,
+) -> None:
+    if pipeline_state_path is None or not pipeline_state_path.is_file():
+        return
+    try:
+        state = read_json(pipeline_state_path)
+        state.update({
+            "current_grid": grid,
+            "current_period": period,
+            "current_stage": stage_key,
+            "current_stage_label": stage_label,
+            "last_completed_stage": last_completed_key,
+            "last_completed_stage_label": last_completed_label,
+            "period_state": str(period_state_path),
+        })
+        write_json(pipeline_state_path, state)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return
+
+
+def _merge_pipeline_position(manifest: dict, pipeline_state_path: Path) -> None:
+    if not pipeline_state_path.is_file():
+        return
+    try:
+        persisted = read_json(pipeline_state_path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    for key in (
+        "current_grid", "current_period", "current_stage", "current_stage_label",
+        "last_completed_stage", "last_completed_stage_label", "period_state",
+    ):
+        if key in persisted:
+            manifest[key] = persisted[key]
+
+
+def _named_outputs_complete(root: Path, names: list[str]) -> bool:
+    if not names:
+        return False
+    available = {path.name for path in root.rglob("*") if path.is_file()} if root.is_dir() else set()
+    return all(name in available for name in names)
+
+
+def _shapefile_complete(path: Path) -> bool:
+    return all(path.with_suffix(suffix).is_file() for suffix in (".shp", ".shx", ".dbf"))
+
+
+def _prepared_workspace_complete(workspace: Path) -> bool:
+    manifest_path = workspace / "input_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = read_json(manifest_path)
+        images = Path(str(manifest.get("images") or "")).expanduser()
+        image_txt = Path(str(manifest.get("image_txt") or "")).expanduser()
+        return images.is_dir() and image_txt.is_file() and bool(listed_rasters(images))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return False
+
+
+def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
+    stems = context["image_stems"]
+    if stage_key == "centerline":
+        return _named_outputs_complete(context["infer_dir"], [f"{stem}.p" for stem in stems])
+    if stage_key == "surface":
+        root = context["surface_mask_dir"]
+        if not root.is_dir() or not stems:
+            return False
+        names = {path.name for path in root.rglob("*") if path.is_file()}
+        return all(
+            f"{stem}_mask.png" in names or f"{stem}_mask.tif" in names
+            for stem in stems
+        )
+    if stage_key == "width":
+        return (
+            (context["width_dir"] / "batch_width_summary.json").is_file()
+            and _named_outputs_complete(context["width_dir"], [f"{stem}_summary.json" for stem in stems])
+        )
+    if stage_key == "finalize":
+        return (
+            (context["final_dir"] / "batch_optimized_summary.json").is_file()
+            and _named_outputs_complete(context["final_dir"], [f"{stem}_optimized_summary.json" for stem in stems])
+        )
+    if stage_key == "export":
+        return (
+            _shapefile_complete(context["centerline"])
+            and _shapefile_complete(context["surface"])
+            and context["gpkg"].is_file()
+        )
+    return False
 
 
 def _write_valid_observation_area(image_dir: Path, output: Path) -> str | None:
@@ -1753,6 +1899,8 @@ def extract(args: argparse.Namespace) -> dict:
     image_txt = Path(manifest["image_txt"])
     if not images.is_dir():
         raise FileNotFoundError(f"找不到已准备的格网目录：{images}")
+    if not image_txt.is_file():
+        raise FileNotFoundError(f"找不到已准备的影像清单：{image_txt}")
     ckpt = Path(args.checkpoint).expanduser().resolve()
     config = Path(args.config).expanduser().resolve()
     if not ckpt.is_file():
@@ -1775,49 +1923,139 @@ def extract(args: argparse.Namespace) -> dict:
     if device == "auto":
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    grid = str(getattr(args, "grid", "") or getattr(args, "area_id", "") or workspace.name)
+    period = str(getattr(args, "period", "") or "")
+    resume = bool(getattr(args, "resume", False))
+    period_state_path = workspace / "period_state.json"
+    period_state = _load_period_state(period_state_path, grid, period, resume)
+    period_state.update({
+        "status": "running",
+        "workspace": str(workspace),
+        "run_root": str(run_root),
+        "attempt": int(period_state.get("attempt", 0) or 0) + 1,
+        "started_at": period_state.get("started_at") or now_text(),
+        "resumed_at": now_text() if resume else None,
+    })
+    period_state["stages"]["prepare"] = "completed"
+    period_state["last_completed_stage"] = "prepare"
+    period_state["last_completed_stage_label"] = "输入准备"
+    write_json(period_state_path, period_state)
+    pipeline_state_value = str(getattr(args, "pipeline_state", "") or "").strip()
+    pipeline_state_path = Path(pipeline_state_value).expanduser() if pipeline_state_value else None
+    image_stems = [path.stem for path in listed_rasters(images)]
+    stage_context = {
+        "image_stems": image_stems,
+        "infer_dir": infer_dir / image_txt.stem,
+        "surface_mask_dir": surface_root / "masks" / image_txt.stem,
+        "width_dir": width_dir,
+        "final_dir": final_dir,
+        "centerline": products / "road_centerlines.shp",
+        "surface": products / "road_surfaces.shp",
+        "gpkg": products / "roads.gpkg",
+    }
     stage_timings = []
-    timing = run_command([
-        str(PYTHON), "inferencer.py", "--config", str(config), "--checkpoint", str(ckpt),
-        "--input_txt_dir", str(image_txt.parent), "--output_root", str(infer_root), "--output_dir", str(infer_dir),
-        "--device", device, "--rescale_to_model_gsd", args.rescale,
-        "--junction_node_mode", str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
-    ], SAMROAD, env, "道路提取")
-    if isinstance(timing, dict):
-        stage_timings.append(timing)
-    timing = run_command([
-        str(PYTHON), "infer_img.py", "--input_txt", str(image_txt), "--input_mode", "txt",
-        "--output_root", str(surface_root), "--output_dir", str(surface_root / "masks"),
-        "--SAM_pretrained_path", str(MODELS / "sam_molra" / "sam_vit_b_01ec64.pth"),
-        "--weight_path", str(MODELS / "sam_molra" / "adapter.th"),
-        "--device", "cuda" if device in {"cuda", "auto"} else "cpu", "--tile", "1024", "--overlap", "256", "--threshold", "0.5",
-    ], MOLRA, env, "道路面提取")
-    if isinstance(timing, dict):
-        stage_timings.append(timing)
-    timing = run_command([
-        str(PYTHON), str(WIDTH / "molra_centerline_width.py"), "--image-dir", str(images),
-        "--graph-dir", str(infer_dir / image_txt.stem / "graph"),
-        "--mask-dir", str(surface_root / "masks" / image_txt.stem),
-        "--output-dir", str(width_dir), "--device", device, "--pixel-size", str(args.pixel_size),
-    ], ROOT, env, "道路宽度计算")
-    if isinstance(timing, dict):
-        stage_timings.append(timing)
-    timing = run_command([
-        str(PYTHON), str(WIDTH / "finalize_review_results.py"), "--output-dir", str(width_dir),
-        "--final-dir", str(final_dir),
-    ], ROOT, env, "结果固化")
-    if isinstance(timing, dict):
-        stage_timings.append(timing)
     centerline = products / "road_centerlines.shp"
     surface = products / "road_surfaces.shp"
     gpkg = products / "roads.gpkg"
-    timing = run_command([
-        str(PYTHON), str(WIDTH / "production_workflow.py"), "export-final",
-        "--final-dir", str(final_dir), "--image-dir", str(images), "--output", str(gpkg),
-        "--centerline-shp", str(centerline), "--surface-shp", str(surface),
-        "--visualization", str(products / "road_overview.png"),
-    ], ROOT, env, "道路产品导出")
-    if isinstance(timing, dict):
-        stage_timings.append(timing)
+    stage_commands = {
+        "centerline": ([
+            str(PYTHON), "inferencer.py", "--config", str(config), "--checkpoint", str(ckpt),
+            "--input_txt_dir", str(image_txt.parent), "--output_root", str(infer_root), "--output_dir", str(infer_dir),
+            "--device", device, "--rescale_to_model_gsd", args.rescale,
+            "--junction_node_mode", str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
+        ], SAMROAD),
+        "surface": ([
+            str(PYTHON), "infer_img.py", "--input_txt", str(image_txt), "--input_mode", "txt",
+            "--output_root", str(surface_root), "--output_dir", str(surface_root / "masks"),
+            "--SAM_pretrained_path", str(MODELS / "sam_molra" / "sam_vit_b_01ec64.pth"),
+            "--weight_path", str(MODELS / "sam_molra" / "adapter.th"),
+            "--device", "cuda" if device in {"cuda", "auto"} else "cpu", "--tile", "1024", "--overlap", "256", "--threshold", "0.5",
+        ], MOLRA),
+        "width": ([
+            str(PYTHON), str(WIDTH / "molra_centerline_width.py"), "--image-dir", str(images),
+            "--graph-dir", str(infer_dir / image_txt.stem / "graph"),
+            "--mask-dir", str(surface_root / "masks" / image_txt.stem),
+            "--output-dir", str(width_dir), "--device", device, "--pixel-size", str(args.pixel_size),
+        ], ROOT),
+        "finalize": ([
+            str(PYTHON), str(WIDTH / "finalize_review_results.py"), "--output-dir", str(width_dir),
+            "--final-dir", str(final_dir),
+        ], ROOT),
+        "export": ([
+            str(PYTHON), str(WIDTH / "production_workflow.py"), "export-final",
+            "--final-dir", str(final_dir), "--image-dir", str(images), "--output", str(gpkg),
+            "--centerline-shp", str(centerline), "--surface-shp", str(surface),
+            "--visualization", str(products / "road_overview.png"),
+        ], ROOT),
+    }
+    try:
+        for stage_index, (stage_key, stage_label) in enumerate(PERIOD_STAGE_DEFINITIONS, start=1):
+            event_context = {
+                "grid": grid, "period": period,
+                "stage_key": stage_key, "stage_index": stage_index,
+                "stage_total": len(PERIOD_STAGE_DEFINITIONS),
+            }
+            if (
+                resume
+                and period_state["stages"].get(stage_key) == "completed"
+                and _period_stage_output_complete(stage_key, stage_context)
+            ):
+                emit("stage", stage=stage_label, status="skipped", reason="续跑复用已完成且完整的阶段成果", **event_context)
+                continue
+            period_state.update({
+                "status": "running", "current_stage": stage_key,
+                "current_stage_label": stage_label, "updated_at": now_text(),
+            })
+            period_state["stages"][stage_key] = "running"
+            write_json(period_state_path, period_state)
+            _write_pipeline_position(
+                pipeline_state_path, grid=grid, period=period,
+                stage_key=stage_key, stage_label=stage_label,
+                last_completed_key=period_state.get("last_completed_stage"),
+                last_completed_label=period_state.get("last_completed_stage_label"),
+                period_state_path=period_state_path,
+            )
+            command, command_cwd = stage_commands[stage_key]
+            timing = run_command(
+                command, command_cwd, env, stage_label,
+                {**event_context, "_defer_completion": True},
+            )
+            if not _period_stage_output_complete(stage_key, stage_context):
+                emit(
+                    "stage", stage=stage_label, status="failed",
+                    error="必要输出不完整", **event_context,
+                )
+                raise RuntimeError(f"{stage_label}命令已结束，但必要输出不完整，不能标记为完成")
+            period_state["stages"][stage_key] = "completed"
+            period_state["last_completed_stage"] = stage_key
+            period_state["last_completed_stage_label"] = stage_label
+            period_state["updated_at"] = now_text()
+            write_json(period_state_path, period_state)
+            _write_pipeline_position(
+                pipeline_state_path, grid=grid, period=period,
+                stage_key=stage_key, stage_label=stage_label,
+                last_completed_key=stage_key, last_completed_label=stage_label,
+                period_state_path=period_state_path,
+            )
+            emit("stage", status="complete", **timing, **event_context)
+            if isinstance(timing, dict):
+                stage_timings.append(timing)
+    except Exception as exc:
+        current_key = str(period_state.get("current_stage") or "")
+        if current_key in period_state["stages"]:
+            period_state["stages"][current_key] = "failed"
+        period_state.update({
+            "status": "failed", "last_error": str(exc),
+            "failed_at": now_text(), "updated_at": now_text(),
+        })
+        write_json(period_state_path, period_state)
+        raise
+    period_state.update({
+        "status": "completed", "current_stage": "export",
+        "current_stage_label": "道路产品导出", "completed_at": now_text(),
+        "updated_at": now_text(),
+    })
+    write_json(period_state_path, period_state)
     valid_observation = _write_valid_observation_area(images, products / "valid_observation.shp")
     result = _ensure_extract_manifest_fields({
         "workspace": str(workspace), "run_id": run_id, "run_root": str(run_root),
@@ -1826,6 +2064,7 @@ def extract(args: argparse.Namespace) -> dict:
         "corridors": str(products / "road_corridors.shp"),
         "valid_observation": valid_observation,
         "width_review": str(width_dir), "final_dir": str(final_dir),
+        "period_state": str(period_state_path),
     })
     result["fusion"] = build_fusion_metadata(final_dir)
     result["stage_timings"] = stage_timings
@@ -3189,16 +3428,26 @@ def run_all(args: argparse.Namespace) -> dict:
                 )
                 analysis_source = analysis_sources.get(f"{grid_name}\0{period}", source)
                 try:
-                    prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
+                    internal_resume = resume and (grid_name, period) not in invalid_periods
+                    if internal_resume and (workspace / "period_state.json").is_file() and _prepared_workspace_complete(workspace):
+                        emit(
+                            "pipeline", stage="输入准备", status="skipped", grid=grid_name,
+                            period=period, stage_key="prepare", stage_index=0,
+                            stage_total=len(PERIOD_STAGE_DEFINITIONS),
+                            reason="续跑复用已完成的输入准备",
+                        )
+                    else:
+                        prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
                     base_run_id = "roads"
-                    if (workspace / "runs" / base_run_id).exists():
-                        base_run_id = f"roads_retry_{int(time.time())}"
                     result = _ensure_extract_manifest_fields(extract(
                         argparse.Namespace(
                             workspace=str(workspace), source="", checkpoint=args.checkpoint,
                             config=args.config, device=args.device, pixel_size=args.pixel_size,
                             rescale=args.rescale, run_id=base_run_id,
                             junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
+                            grid=grid_name, period=period,
+                            resume=internal_resume,
+                            pipeline_state=str(state_path),
                         )
                     ))
                     result_path = workspace / "latest_result.json"
@@ -3221,6 +3470,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     if not continue_on_error:
                         raise
                 finally:
+                    _merge_pipeline_position(manifest, state_path)
                     manifest["processed_work"] += 1
                     manifest["period_count"] = len(manifest["period_results"])
                     update_elapsed()
@@ -3267,6 +3517,14 @@ def run_all(args: argparse.Namespace) -> dict:
                     "变化检测", grid=grid_name,
                     before_period=before_period, after_period=after_period,
                 )
+                manifest.update({
+                    "current_grid": grid_name,
+                    "current_period": f"{before_period} → {after_period}",
+                    "current_stage": "change",
+                    "current_stage_label": "变化检测",
+                    "period_state": None,
+                })
+                _persist_pipeline(manifest, job_root, output_root)
                 try:
                     result = _ensure_change_manifest_fields(change(
                         argparse.Namespace(
@@ -3340,6 +3598,7 @@ def run_all(args: argparse.Namespace) -> dict:
         )
         return manifest
     except Exception as exc:
+        _merge_pipeline_position(manifest, state_path)
         manifest["status"] = "failed"
         manifest["last_error"] = str(exc)
         manifest["failed_at"] = now_text()
