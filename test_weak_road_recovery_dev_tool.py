@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -17,8 +19,83 @@ run_test = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(run_test)
 
+LAUNCHER_PATH = ROOT / "dev_tools" / "weak_road_recovery_test" / "launcher.pyw"
+launcher = types.ModuleType("weak_road_recovery_launcher")
+launcher.__file__ = str(LAUNCHER_PATH)
+SourceFileLoader(launcher.__name__, str(LAUNCHER_PATH)).exec_module(launcher)
+
 
 class WeakRoadRecoveryDevToolTests(unittest.TestCase):
+    def test_launcher_loads_defaults_and_builds_full_command(self):
+        parameters = launcher.load_default_parameters()
+        self.assertAlmostEqual(parameters["road_low_threshold"], 0.20)
+        self.assertAlmostEqual(parameters["max_gap"], 64.0)
+        self.assertAlmostEqual(parameters["auto_score"], 0.62)
+
+        command = launcher.build_command(
+            "same-python.exe",
+            LAUNCHER_PATH.parent / "run_test.py",
+            r"D:\images\test image.tif",
+            r"D:\results\test image",
+            "CUDA",
+            16,
+            parameters,
+            recovery_only=False,
+        )
+        self.assertEqual(command[:2], ["same-python.exe", str(LAUNCHER_PATH.parent / "run_test.py")])
+        self.assertIn(r"D:\images\test image.tif", command)
+        self.assertIn("cuda", command)
+        self.assertIn("--batch-size", command)
+        self.assertIn("--road-low-threshold", command)
+        self.assertNotIn("--recovery-only", command)
+
+    def test_launcher_recovery_command_and_cache_validation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw)
+            self.assertEqual(launcher.missing_cache_files(run_dir), list(launcher.CACHE_FILES))
+            for name in launcher.CACHE_FILES:
+                (run_dir / name).touch()
+            self.assertEqual(launcher.missing_cache_files(run_dir), [])
+
+            command = launcher.build_command(
+                "same-python.exe",
+                LAUNCHER_PATH.parent / "run_test.py",
+                "",
+                str(run_dir),
+                "CPU",
+                8,
+                {"max_gap": 80.0, "road_low_threshold": 0.16},
+                recovery_only=True,
+            )
+            self.assertEqual(command[2:5], ["--recovery-only", "--run-dir", str(run_dir)])
+            self.assertIn("--max-gap", command)
+            self.assertIn("--road-low-threshold", command)
+            self.assertNotIn("--device", command)
+            self.assertNotIn("--batch-size", command)
+
+    def test_launcher_reads_run_summary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = Path(raw)
+            (run_dir / "weak_recovery.json").write_text(
+                json.dumps({
+                    "summary": {
+                        "strong_edge_count": 325,
+                        "weak_candidate_count": 46,
+                        "weak_recovered_edge_count": 12,
+                        "rejected_weak_candidate_count": 34,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (run_dir / "timing.json").write_text(
+                json.dumps({"weak_recovery_seconds": 1.8, "total_seconds": 96.4}),
+                encoding="utf-8",
+            )
+            summary = launcher.read_result_summary(run_dir)
+            self.assertEqual(summary["weak_recovered_edge_count"], 12)
+            self.assertEqual(summary["rejected_weak_candidate_count"], 34)
+            self.assertAlmostEqual(summary["total_seconds"], 96.4)
+
     def test_recovery_only_reuses_immutable_original_cache(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -68,6 +68,10 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
 def _save_png(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     value = image
@@ -316,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
 
     timing = {}
     if arguments.recovery_only:
+        _progress("Loading cached original graph and probability...")
         load_started = time.perf_counter()
         image_rgb = single_image_inference.read_rgb_img(image_path)
         road_probability = _read_probability(run_dir / "road_probability.png")
@@ -329,14 +334,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         timing["load_cache_seconds"] = time.perf_counter() - load_started
     else:
+        _progress("Reading input image...")
         image_started = time.perf_counter()
         image_rgb = single_image_inference.read_rgb_img(image_path)
         timing["image_read_seconds"] = time.perf_counter() - image_started
+        _progress(f"Loading model on {device_name}...")
         model_started = time.perf_counter()
         model = single_image_inference.load_model(config, checkpoint_path, device)
         timing["model_load_seconds"] = time.perf_counter() - model_started
         padded = single_image_inference.pad_image_to_min_size(image_rgb, int(config.PATCH_SIZE))
         inference_timing = {}
+        _progress(
+            f"Processing patches with batch size {int(config.INFER_BATCH_SIZE)}..."
+        )
         (
             original_nodes, original_edges, original_scores,
             intersection_probability, road_probability_u8,
@@ -358,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             run_dir / "original_edge_scores.csv", original_nodes, original_edges, original_scores
         )
 
+    _progress("Weak recovery...")
     recovery_started = time.perf_counter()
     recovered_nodes, recovered_edges, metadata, recovery_summary = (
         graph_extraction.recover_weak_road_edges(
@@ -377,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    _progress("Generating overlays and comparison preview...")
     visualization_started = time.perf_counter()
     write_visualizations(
         run_dir, image_rgb, original_nodes, original_edges, recovered_nodes, recovered_edges
@@ -390,7 +402,15 @@ def main(argv: list[str] | None = None) -> int:
             arguments, config, image_path, config_path, checkpoint_path, device_name
         ),
     )
-    print(json.dumps({"run_dir": str(run_dir), **recovery_summary, "timing": timing}, ensure_ascii=False, indent=2))
+    _progress(
+        "Recovery summary: "
+        f"strong_edge_count={recovery_summary.get('strong_edge_count', 0)}, "
+        f"weak_candidate_count={recovery_summary.get('weak_candidate_count', 0)}, "
+        f"weak_recovered_edge_count={recovery_summary.get('weak_recovered_edge_count', 0)}, "
+        f"rejected_weak_candidate_count={recovery_summary.get('rejected_weak_candidate_count', 0)}"
+    )
+    _progress(f"Done. Total seconds: {timing['total_seconds']:.3f}")
+    print(json.dumps({"run_dir": str(run_dir), **recovery_summary, "timing": timing}, ensure_ascii=False, indent=2), flush=True)
     return 0
 
 
