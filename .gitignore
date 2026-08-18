@@ -1,0 +1,68 @@
+# Local Python/Conda environments
+env/
+.venv/
+venv/
+ENV/
+conda-env/
+
+# Large model weights are kept locally and distributed separately
+models/
+
+# Python caches, test output, and coverage
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated application output and diagnostics
+outputs/
+runs/
+logs/
+_logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.pid
+
+# User-supplied remote-sensing/GIS data (often large or private)
+data/
+input/
+inputs/
+datasets/
+validation_data/
+private_data/
+local_data/
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*.json
+secrets*.json
+*token*.json
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/

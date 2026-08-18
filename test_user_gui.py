@@ -1,0 +1,492 @@
+from __future__ import annotations
+
+import json
+import inspect
+import tempfile
+import unittest
+from pathlib import Path
+
+import user_workflow_gui as gui
+
+
+class UserGuiInputCommandTests(unittest.TestCase):
+    def test_control_metrics_are_limited_to_three_size_tiers(self) -> None:
+        self.assertEqual(set(gui.CONTROL_METRICS), {"primary", "regular", "compact"})
+        self.assertEqual(len({tuple(value["padding"]) for value in gui.CONTROL_METRICS.values()}), 3)
+        self.assertGreater(
+            sum(gui.CONTROL_METRICS["primary"]["padding"]),
+            sum(gui.CONTROL_METRICS["regular"]["padding"]),
+        )
+        self.assertGreater(
+            sum(gui.CONTROL_METRICS["regular"]["padding"]),
+            sum(gui.CONTROL_METRICS["compact"]["padding"]),
+        )
+
+    def test_semantic_button_styles_reuse_shared_size_metrics(self) -> None:
+        source = inspect.getsource(gui.UserApp._style)
+        for style_name, tier in (
+            ("Hero.TButton", "primary"),
+            ("Primary.TButton", "primary"),
+            ("Secondary.TButton", "regular"),
+            ("Compact.TButton", "compact"),
+            ("Quiet.TButton", "compact"),
+            ("Danger.TButton", "compact"),
+        ):
+            self.assertIn(
+                f'style.configure("{style_name}", **CONTROL_METRICS["{tier}"]',
+                source,
+            )
+
+    def test_result_buttons_share_one_visual_height(self) -> None:
+        source = inspect.getsource(gui.UserApp._style)
+        self.assertIn('style.configure("ResultPrimary.TButton", **CONTROL_METRICS["regular"]', source)
+        self.assertIn('style.configure("ResultSecondary.TButton", **CONTROL_METRICS["regular"]', source)
+
+    def test_display_percentage_does_not_change_stored_metrics(self) -> None:
+        self.assertEqual(gui.format_percentage(0.788), "78.8%")
+        self.assertEqual(gui.format_percentage("0.999"), "99.9%")
+        self.assertEqual(gui.format_percentage(None), "--")
+
+    def test_result_copy_is_user_facing_and_keeps_internal_codes_out_of_intro(self) -> None:
+        source = inspect.getsource(gui.UserApp._build_result_page)
+        self.assertIn("根据真值数据中的变化类型", source)
+        self.assertNotIn("BHBM=2", source)
+        self.assertIn('text="待评价结果"', source)
+        self.assertIn('text="变化真值数据"', source)
+        self.assertIn('text="变化类型字段"', source)
+        self.assertIn('text="中心线匹配容差（米）"', source)
+        self.assertIn("self.result_review_count", source)
+
+    def test_layout_metrics_cover_page_card_form_and_wrap_spacing(self) -> None:
+        self.assertEqual(
+            set(gui.LAYOUT_METRICS),
+            {"page_padding", "card_padding", "section_gap", "module_gap", "form_gap", "form_label_width", "content_wrap"},
+        )
+        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["page_padding"]), 16)
+        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["card_padding"]), 15)
+        self.assertGreaterEqual(gui.LAYOUT_METRICS["form_gap"], 5)
+
+    def test_project_path_row_reserves_flexible_space_for_long_paths(self) -> None:
+        source = inspect.getsource(gui.UserApp._build_data_page)
+        self.assertIn("quick_actions.grid_columnconfigure(1, weight=1)", source)
+        self.assertIn('textvariable=self.project_path_display, style="PathText.TLabel", width=1', source)
+        self.assertIn('text="选择目录…"', source)
+
+    def test_result_metrics_keep_four_equal_columns(self) -> None:
+        source = inspect.getsource(gui.UserApp._build_result_page)
+        self.assertIn('(\"可人工复核\", self.result_review_count)', source)
+        self.assertIn('box.pack(side=LEFT, fill=X, expand=True, padx=3)', source)
+
+    def test_unicode_paths_and_config_text_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="SAMRoad_unicode_") as raw:
+            root = Path(raw) / "验证区_𠀀"
+            root.mkdir()
+            area = root / "范围_武汉.shp"
+            area.touch()
+            periods = []
+            for year in ("2021", "2022"):
+                source = root / f"影像 清单_{year}_道路.txt"
+                source.write_text(f"C:/数据/遥感影像_{year}_𠀀.tif\n", encoding="utf-8-sig")
+                periods.append((year, str(source)))
+            config = root / "任务 配置_中文.json"
+            payload = {"项目": "道路变化", "路径": str(root), "字符": "𠀀✓→"}
+            config.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), payload)
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area=str(area), periods=periods,
+                truths=[], evaluate=False, **self.common(root),
+            )
+            self.assertIn(str(area), command)
+            for _period, source in periods:
+                self.assertIn(source, command)
+
+    def test_optional_manual_review_is_a_generation_step_before_results(self) -> None:
+        self.assertEqual(
+            gui.WORKFLOW_STEPS,
+            ("数据准备", "运行任务", "人工复核（可选）", "查看结果"),
+        )
+
+    def test_accuracy_evaluation_is_a_runnable_result_step(self) -> None:
+        data_source = inspect.getsource(gui.UserApp._build_data_page)
+        result_source = inspect.getsource(gui.UserApp._build_result_page)
+        self.assertNotIn('text="精度评价"', data_source)
+        self.assertIn('text="精度评价"', result_source)
+        self.assertIn('command=self.run_result_evaluation', result_source)
+
+    def test_builds_evaluation_command_for_existing_change_result(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            truth = root / "truth.shp"
+            truth.touch()
+            command = gui.build_evaluate_existing_command(
+                {"grid": "validation", "before_period": "2021", "after_period": "2022"},
+                root / "pipeline_result.json", str(truth), truth_type_field="change_typ",
+                validation_area=str(root / "area.shp"), evaluation_tolerance="5.0",
+            )
+            self.assertEqual(command[0], "evaluate-existing")
+            self.assertIn("--pipeline-manifest", command)
+            self.assertIn("--truth-type-field", command)
+
+    def test_entering_run_step_does_not_auto_start_preflight(self) -> None:
+        source = inspect.getsource(gui.UserApp._show_step)
+        self.assertNotIn("preflight_inputs", source)
+
+    def test_shared_log_widget_supports_selection_copy_and_file_opening(self) -> None:
+        source = inspect.getsource(gui.UserApp._build_shared_log_panel)
+        build_source = inspect.getsource(gui.UserApp._build)
+        self.assertIn("Text(", source)
+        self.assertIn("全流程日志", source)
+        self.assertIn("复制全部", source)
+        self.assertIn("打开日志文件", source)
+        self.assertIn("self._build_shared_log_panel()", build_source)
+        self.assertNotIn("self.log = Text(", inspect.getsource(gui.UserApp._build_run_page))
+
+    def test_review_page_uses_shared_log_and_keeps_progress_and_stop_controls(self) -> None:
+        source = inspect.getsource(gui.UserApp._build_review_page)
+        self.assertIn("编辑后增量重建", source)
+        self.assertNotIn("self.review_log", source)
+        self.assertIn("全流程日志", source)
+        self.assertIn("self.review_progress = ttk.Progressbar(", source)
+        self.assertIn('text="停止重建"', source)
+        self.assertIn("command=self.cancel_task", source)
+
+    def test_apply_edits_writes_a_dedicated_log_file(self) -> None:
+        source = inspect.getsource(gui.UserApp._command)
+        self.assertIn('args[0] == "apply-edits"', source)
+        self.assertIn('人工编辑重建_', source)
+
+    @staticmethod
+    def common(root: Path) -> dict[str, str]:
+        return {
+            "output_root": str(root / "out"), "checkpoint": "model.ckpt", "config": "config.yaml",
+            "device": "cpu", "pixel_size": "0", "rescale": "off",
+            "absolute": "1", "ratio": "0.1", "tolerance": "3",
+        }
+
+    def test_default_validation_command_naturally_orders_periods_and_truths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area = root / "area.shp"; area.touch()
+            images = []
+            for name in ("20210", "2022", "2021"):
+                path = root / f"{name}.txt"; path.touch(); images.append((name, str(path)))
+            truth_12 = root / "truth_2021_2022.shp"; truth_12.touch()
+            truth_2_10 = root / "truth_2022_20210.shp"; truth_2_10.touch()
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area=str(area), periods=images,
+                truths=[("2022", "20210", str(truth_2_10)), ("2021", "2022", str(truth_12))],
+                truth_type_field="change_kind", **self.common(root),
+            )
+            period_args = [command[index + 1:index + 3] for index, value in enumerate(command) if value == "--period"]
+            truth_args = [command[index + 1:index + 4] for index, value in enumerate(command) if value == "--truth"]
+            self.assertEqual([entry[0] for entry in period_args], ["2021", "2022", "20210"])
+            self.assertEqual([entry[:2] for entry in truth_args], [["2021", "2022"], ["2022", "20210"]])
+            self.assertIn("--validation-area", command)
+            self.assertIn("--truth-type-field", command)
+
+    def test_validation_command_rejects_missing_adjacent_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area = root / "area.shp"; area.touch()
+            first = root / "one.txt"; first.touch()
+            second = root / "two.txt"; second.touch()
+            with self.assertRaisesRegex(ValueError, "每个相邻期次"):
+                gui.build_pipeline_command(
+                    mode="validation", validation_area=str(area),
+                    periods=[("2021", str(first)), ("2022", str(second))], truths=[],
+                    **self.common(root),
+                )
+
+    def test_production_command_allows_validation_without_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area = root / "area.shp"; area.touch()
+            first = root / "one.txt"; first.touch()
+            second = root / "two.txt"; second.touch()
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area=str(area),
+                periods=[("2021", str(first)), ("2022", str(second))], truths=[],
+                evaluate=False, **self.common(root),
+            )
+            self.assertIn("--no-evaluation", command)
+            self.assertNotIn("--truth", command)
+
+    def test_resume_requires_named_task(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); grid_root = root / "grids"; grid_root.mkdir()
+            with self.assertRaisesRegex(ValueError, "原任务名称"):
+                gui.build_pipeline_command(
+                    mode="grid", source_root=str(grid_root), resume=True,
+                    **self.common(root),
+                )
+
+    def test_documented_project_folder_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area_dir = root / "01_验证区"; area_dir.mkdir()
+            imagery_dir = root / "02_影像"; imagery_dir.mkdir()
+            truth_dir = root / "03_变化真值"; truth_dir.mkdir()
+            (area_dir / "area.shp").touch()
+            for period in ("2021", "2022"):
+                (imagery_dir / f"{period}.txt").touch()
+            (truth_dir / "2021_to_2022.shp").touch()
+            project = gui.discover_validation_project(root)
+            self.assertEqual([period for period, _source in project["periods"]], ["2021", "2022"])
+            self.assertEqual(project["truths"][("2021", "2022")], str(truth_dir / "2021_to_2022.shp"))
+            self.assertEqual(Path(project["output_root"]), root / "04_成果输出")
+
+    def test_nested_area_folders_keep_independent_periods_and_truths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            expected = {"north": ("2021", "2022"), "south": ("2020", "2023", "2025")}
+            for area, periods in expected.items():
+                area_root = root / area
+                boundary = area_root / "01_验证区"; boundary.mkdir(parents=True)
+                imagery = area_root / "02_影像"; imagery.mkdir()
+                truths = area_root / "03_变化真值"; truths.mkdir()
+                (boundary / "boundary.shp").touch()
+                for period in periods:
+                    (imagery / f"{period}.txt").touch()
+                for before, after in zip(periods, periods[1:]):
+                    (truths / f"{before}_to_{after}.shp").touch()
+            project = gui.discover_validation_project(root)
+            self.assertEqual(set(project["area_periods"]), set(expected))
+            self.assertEqual(
+                {area: tuple(period for period, _source in rows) for area, rows in project["area_periods"].items()},
+                expected,
+            )
+            self.assertEqual(len(project["area_truths"]), 3)
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area="", validation_areas=project["validation_areas"],
+                periods=project["periods"], area_periods=project["area_periods"],
+                area_truths=[(*key, value) for key, value in project["area_truths"].items()],
+                evaluate=False, **self.common(root),
+            )
+            self.assertEqual(command.count("--validation-area"), 2)
+            self.assertEqual(command.count("--period"), 5)
+            self.assertEqual(command.count("--truth"), 3)
+
+    def test_multi_area_command_expands_every_area_and_period(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            areas = []
+            for name in ("north", "south"):
+                path = root / f"{name}.shp"; path.touch(); areas.append((name, str(path)))
+            periods = []
+            for period in ("2021", "2022", "2023"):
+                path = root / f"{period}.txt"; path.touch(); periods.append((period, str(path)))
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area="", validation_areas=areas,
+                periods=periods, evaluate=False, **self.common(root),
+            )
+            self.assertEqual(command.count("--validation-area"), 2)
+            self.assertEqual(command.count("--period"), 6)
+            self.assertIn(["--validation-area", "north", str(root / "north.shp")], [command[i:i + 3] for i in range(len(command) - 2)])
+
+    def test_production_command_keeps_multi_area_truths_for_result_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area = root / "north.shp"; area.touch()
+            truth = root / "truth.shp"; truth.touch()
+            periods = []
+            for period in ("2021", "2022"):
+                source = root / f"{period}.txt"; source.touch(); periods.append((period, str(source)))
+            command = gui.build_pipeline_command(
+                mode="validation", validation_area="", validation_areas=[("north", str(area))],
+                periods=periods, area_truths=[("north", "2021", "2022", str(truth))],
+                evaluate=False, truth_type_field="BHBM", **self.common(root),
+            )
+            self.assertIn("--no-evaluation", command)
+            self.assertIn(["--truth", "north", "2021", "2022", str(truth)], [command[i:i + 5] for i in range(len(command) - 4)])
+
+    def test_result_page_contains_no_image_preview_decoder(self) -> None:
+        source = inspect.getsource(gui.UserApp)
+        self.assertNotIn("open_preview_window", source)
+        self.assertNotIn("_refresh_result_thumbnails", source)
+        self.assertNotIn("PILImage.open", source)
+
+    def test_validation_command_rejects_non_shp_or_non_txt_user_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            area = root / "area.geojson"; area.touch()
+            first = root / "one.tif"; first.touch()
+            second = root / "two.txt"; second.touch()
+            with self.assertRaisesRegex(ValueError, "验证区必须使用 SHP"):
+                gui.build_pipeline_command(
+                    mode="validation", validation_area=str(area),
+                    periods=[("2021", str(first)), ("2022", str(second))],
+                    evaluate=False, **self.common(root),
+                )
+            area = root / "area.shp"; area.touch()
+            with self.assertRaisesRegex(ValueError, "影像必须使用内含影像路径的 TXT"):
+                gui.build_pipeline_command(
+                    mode="validation", validation_area=str(area),
+                    periods=[("2021", str(first)), ("2022", str(second))],
+                    evaluate=False, **self.common(root),
+                )
+
+    def test_grid_mode_is_an_explicit_backup_command(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); grid_root = root / "grids"; grid_root.mkdir()
+            command = gui.build_pipeline_command(mode="grid", source_root=str(grid_root), **self.common(root))
+            self.assertEqual(command[:5], ["all", "--mode", "grid", "--source-root", str(grid_root)])
+            self.assertNotIn("--validation-area", command)
+
+    def test_apply_edits_command_keeps_manifest_and_reports_change_reruns(self) -> None:
+        command = gui.build_apply_edits_command(
+            {"result": "period.json", "edited_directory": "edited"}, "latest_pipeline.json",
+        )
+        self.assertEqual(command[-2:], ["--pipeline-manifest", "latest_pipeline.json"])
+        message = gui.UserApp._friendly({
+            "kind": "complete", "stage": "apply-edits", "change_rerun_count": 2,
+        })
+        self.assertIn("重跑 2 个", message)
+
+
+class UserGuiArtifactTests(unittest.TestCase):
+    def test_collects_fusion_counts_and_centerline_edit_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            preview = root / "fusion.png"
+            preview.touch()
+            review = root / "review"
+            review.mkdir()
+            edited = root / "edited"
+            result = root / "latest_result.json"
+            result.touch()
+            final_centerlines = root / "road_centerlines.shp"
+            final_centerlines.touch()
+            manifest = {
+                "period_results": [{
+                    "grid": "g", "period": "2026", "result": str(result),
+                    "centerlines": str(final_centerlines),
+                    "previews": {"fusion": str(preview)},
+                    "fusion": {
+                        "original_edge_count": 10, "optimized_edge_count": 13,
+                        "auto_gap_count": 1, "auto_surface_count": 2,
+                        "geometry_edited_tile_count": 0,
+                    },
+                    "review": {
+                        "available": True, "directory": str(review),
+                        "edited_directory": str(edited), "manual_item_count": 3,
+                    },
+                }],
+                "change_results": [],
+            }
+            previews = gui.collect_preview_items(manifest, root)
+            reviews = gui.collect_review_items(manifest, root)
+            self.assertEqual(len(previews), 1)
+            self.assertIn("道路面骨架新增 2 条", previews[0]["detail"])
+            self.assertEqual(reviews[0]["edited_directory"], str(edited.resolve()))
+            self.assertEqual(reviews[0]["result"], str(result.resolve()))
+            self.assertEqual(reviews[0]["final_centerlines"], str(final_centerlines.resolve()))
+
+    def test_result_preview_omits_intermediate_extraction_images(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            paths = {}
+            for key in ("centerline", "surface", "fusion", "width"):
+                paths[key] = root / f"{key}.png"
+                paths[key].touch()
+            items = gui.collect_preview_items({
+                "period_results": [{"grid": "g", "period": "2026", "previews": {key: str(value) for key, value in paths.items()}}],
+                "change_results": [],
+            }, root)
+            self.assertEqual([item["category"] for item in items], ["融合", "重新测宽"])
+
+    def test_collects_temporal_life_shp_for_attribute_table(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            life = root / "road_life.shp"
+            life.touch()
+            items = gui.collect_temporal_items({"temporal_results": [{
+                "grid": "g", "life_shp": str(life), "period_count": 8, "road_count": 12,
+            }]}, root)
+            self.assertEqual(items[0]["path"], str(life.resolve()))
+            self.assertEqual(items[0]["period_count"], "8")
+
+    def test_validation_manifest_uses_user_facing_scope_label(self) -> None:
+        self.assertEqual(gui._display_scope({"grid": "validation", "period": "2026"}), ("验证区项目", "2026"))
+
+    def test_root_geometry_editor_is_available_as_packaged_fallback(self) -> None:
+        app = object.__new__(gui.UserApp)
+        script = app._geometry_editor_script()
+        self.assertIsNotNone(script)
+        self.assertEqual(script.name, "geometry_editor.py")
+
+    def test_packaged_geometry_editor_is_self_contained(self) -> None:
+        app = object.__new__(gui.UserApp)
+        script = app._geometry_editor_script()
+        self.assertIsNotNone(script)
+        source = script.read_text(encoding="utf-8")
+        self.assertNotIn("runpy", source)
+        self.assertNotIn("sam_width_experiment", source)
+        self.assertIn("class GeometryEditorApp", source)
+
+    def test_geometry_editor_preflight_and_command_are_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            review = root / "review"
+            review.mkdir()
+            image = root / "2022.tif"
+            graph = root / "2022_prepared_graph.p"
+            image.touch()
+            graph.touch()
+            (review / "2022_summary.json").write_text(
+                json.dumps({"image": str(image), "prepared_graph": str(graph)}),
+                encoding="utf-8",
+            )
+            item = {
+                "directory": str(review),
+                "edited_directory": str(root / "centerline_edit"),
+                "final_centerlines": str(root / "road_centerlines.shp"),
+            }
+            Path(item["final_centerlines"]).touch()
+            inputs = gui.collect_geometry_editor_inputs(review)
+            self.assertEqual(len(inputs), 1)
+            self.assertTrue(inputs[0]["image_exists"])
+            self.assertTrue(inputs[0]["prepared_graph_exists"])
+            self.assertEqual(gui.geometry_editor_diagnostics(review), [])
+            command = gui.build_geometry_editor_command(root / "geometry_editor.py", item)
+            self.assertEqual(Path(command[command.index("--review-dir") + 1]), review.resolve())
+            self.assertEqual(
+                Path(command[command.index("--edited-dir") + 1]),
+                (root / "centerline_edit").resolve(),
+            )
+            self.assertEqual(
+                Path(command[command.index("--final-centerlines") + 1]),
+                Path(item["final_centerlines"]).resolve(),
+            )
+
+    def test_actual_run_2022_geometry_editor_paths_are_resolved(self) -> None:
+        manifest_path = Path(__file__).resolve().parent / "outputs" / "latest_pipeline.json"
+        if not manifest_path.is_file():
+            self.skipTest(f"actual run manifest is unavailable: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        items = gui.collect_review_items(manifest, manifest_path.parent)
+        target = next((item for item in items if item.get("scope") == "2022"), None)
+        if target is None:
+            self.skipTest("actual run has no available 2022 review item")
+        review = Path(target["directory"])
+        inputs = gui.collect_geometry_editor_inputs(review)
+        tile = next(
+            (
+                entry for entry in inputs
+                if entry.get("image_exists") and entry.get("prepared_graph_exists")
+            ),
+            None,
+        )
+        self.assertIsNotNone(tile)
+        self.assertTrue(tile["image_exists"], tile)
+        self.assertTrue(tile["prepared_graph_exists"], tile)
+        self.assertTrue(Path(target["result"]).is_file())
+        command = gui.build_geometry_editor_command(gui.ROOT.parent / "sam_width_experiment" / "geometry_editor.py", target)
+        self.assertEqual(Path(command[command.index("--review-dir") + 1]), review.resolve())
+        self.assertEqual(
+            Path(command[command.index("--edited-dir") + 1]),
+            Path(target["edited_directory"]).resolve(),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
