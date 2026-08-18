@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import geopandas as gpd
+import cv2
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
@@ -24,6 +25,7 @@ from geometry_editor import (  # noqa: E402
     save_global_document,
 )
 from finalize_review_results import load_graph  # noqa: E402
+from production_workflow import apply_global_edit_directory  # noqa: E402
 
 
 class GlobalGeometryEditorTests(unittest.TestCase):
@@ -35,7 +37,7 @@ class GlobalGeometryEditorTests(unittest.TestCase):
         ) as dataset:
             dataset.write(data)
 
-    def test_final_products_open_as_one_global_document_and_save_back_to_tiles(self) -> None:
+    def test_global_save_is_lightweight_and_apply_materializes_only_affected_tiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             review = root / "review"
@@ -83,22 +85,42 @@ class GlobalGeometryEditorTests(unittest.TestCase):
                 "width_px": abs(end_row - start_row),
             })
 
+            untouched_graph = edited / "tile_b_edited_graph.p"
+            untouched_graph.write_bytes(b"existing-unaffected-result")
+            untouched_mtime = untouched_graph.stat().st_mtime_ns
             manifest = save_global_document(document, edited, centerlines, surfaces)
             self.assertEqual(manifest["editing_scope"], "period_final_fused_centerlines_global_once")
             self.assertIn("tile_a", manifest["affected_tiles"])
             self.assertNotIn("tile_b", manifest["affected_tiles"])
             self.assertTrue((edited / "global_edited_centerlines.gpkg").is_file())
+            self.assertFalse((edited / "tile_a_edited_graph.p").exists())
+            self.assertFalse((edited / "tile_a_manual_widths.json").exists())
+            self.assertFalse((edited / "tile_a_manual_surface_add.png").exists())
+            self.assertEqual(untouched_graph.read_bytes(), b"existing-unaffected-result")
+            self.assertEqual(untouched_graph.stat().st_mtime_ns, untouched_mtime)
+
+            (edited / "edited_manifest.json").write_text(
+                json.dumps(manifest, indent=2), encoding="utf-8",
+            )
             for stem in ("tile_a", "tile_b"):
-                graph = edited / f"{stem}_edited_graph.p"
-                self.assertTrue(graph.is_file())
-                nodes, edges = load_graph(graph)
-                self.assertGreater(len(nodes), 0)
-                self.assertGreater(len(edges), 0)
+                cv2.imencode(".png", np.full((32, 32), 255, dtype=np.uint8))[1].tofile(
+                    review / f"{stem}_road_probability.png"
+                )
+                cv2.imencode(".png", np.full((32, 32), 255, dtype=np.uint8))[1].tofile(
+                    review / f"{stem}_molra_clean_mask.png"
+                )
+            result = apply_global_edit_directory(review, edited, {"tile_a"})
+            self.assertEqual(result["materialized_tiles"], ["tile_a"])
+            nodes, edges = load_graph(edited / "tile_a_edited_graph.p")
+            self.assertGreater(len(nodes), 0)
+            self.assertGreater(len(edges), 0)
+            self.assertTrue((edited / "tile_a_reconstructed_road_surface.png").is_file())
+            self.assertEqual(untouched_graph.read_bytes(), b"existing-unaffected-result")
+            self.assertEqual(untouched_graph.stat().st_mtime_ns, untouched_mtime)
             widths_a = json.loads((edited / "tile_a_manual_widths.json").read_text(encoding="utf-8"))
-            widths_b = json.loads((edited / "tile_b_manual_widths.json").read_text(encoding="utf-8"))
             self.assertEqual(len(widths_a), 1)
             self.assertEqual(widths_a[0]["source"], "global_manual_boundary_measurement")
-            self.assertEqual(widths_b, [])
+            self.assertFalse((edited / "tile_b_manual_widths.json").exists())
 
 
 if __name__ == "__main__":

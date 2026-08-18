@@ -964,6 +964,53 @@ class ManifestMetadataTests(unittest.TestCase):
 
 
 class ApplyCenterlineEditsTests(unittest.TestCase):
+    def test_global_edit_uses_authoritative_gpkg_without_stitching(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            workspace = root / "workspace"
+            run_root = workspace / "runs" / "roads"
+            width_dir = run_root / "width_review"
+            final_dir = run_root / "finalized"
+            products = run_root / "products"
+            images = workspace / "images"
+            edited_dir = run_root / "centerline_edit"
+            for directory in (width_dir, final_dir, products, images, edited_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            global_centerlines = edited_dir / "global_edited_centerlines.gpkg"
+            global_centerlines.touch()
+            user_pipeline.write_json(edited_dir / "edited_manifest.json", {
+                "editing_scope": "period_final_fused_centerlines_global_once",
+                "global_centerlines": str(global_centerlines),
+                "affected_tiles": ["tile_a"],
+            })
+            user_pipeline.write_json(workspace / "input_manifest.json", {"images": str(images)})
+            result_path = workspace / "latest_result.json"
+            result = {
+                "workspace": str(workspace), "run_root": str(run_root),
+                "width_review": str(width_dir), "final_dir": str(final_dir),
+                "gpkg": str(products / "roads.gpkg"),
+                "centerlines": str(products / "road_centerlines.shp"),
+                "surfaces": str(products / "road_surfaces.shp"),
+                "review": {"edited_directory": str(edited_dir)},
+            }
+            user_pipeline.write_json(result_path, result)
+            args = argparse.Namespace(result=str(result_path), edited_dir="", pipeline_manifest="")
+
+            with patch.object(user_pipeline, "run_command") as run_mock:
+                updated = user_pipeline.apply_centerline_edits(args)
+
+            self.assertEqual(run_mock.call_count, 3)
+            commands = [call.args[0] for call in run_mock.call_args_list]
+            self.assertIn("apply-global-edit", commands[0])
+            self.assertNotIn("stitch-edited", commands[0])
+            self.assertIn("--only-stem", commands[0])
+            self.assertIn("tile_a", commands[0])
+            self.assertIn("--only-stem", commands[1])
+            stitched_index = commands[2].index("--stitched-centerlines") + 1
+            self.assertEqual(commands[2][stitched_index], str(global_centerlines.resolve()))
+            self.assertEqual(updated["manual_edit"]["canonical_centerlines"], str(global_centerlines.resolve()))
+            self.assertTrue(updated["manual_edit"]["canonical_centerlines_authoritative"])
+
     def test_applies_saved_graph_then_remeasures_and_exports(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

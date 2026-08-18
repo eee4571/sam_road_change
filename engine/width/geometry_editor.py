@@ -22,7 +22,7 @@ import rasterio
 from rasterio.features import rasterize
 from rasterio.merge import merge
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import Resampling, reproject, transform as transform_coordinates, transform_bounds
+from rasterio.warp import transform_bounds
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
@@ -32,6 +32,7 @@ if str(TOOL_DIR) not in sys.path:
 
 from finalize_review_results import load_graph, save_graph  # noqa: E402
 from chain_width_calculator import build_road_chains  # noqa: E402
+from global_edit_utils import _graph_from_world_lines, _project_manual_widths  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
 
 
@@ -684,50 +685,6 @@ def _build_global_overview(
     return _to_display_uint8(values, valid), transform
 
 
-def _graph_from_world_lines(
-    frame: gpd.GeoDataFrame, transform: rasterio.Affine,
-    clip_geometry=None,
-) -> tuple[np.ndarray, np.ndarray]:
-    inverse = ~transform
-    nodes: list[tuple[float, float]] = []
-    edges: list[tuple[int, int]] = []
-    tolerance = 0.05
-    node_bins: dict[tuple[int, int], list[int]] = {}
-
-    def node_id(point: tuple[float, float]) -> int:
-        key = (int(math.floor(point[0] / tolerance)), int(math.floor(point[1] / tolerance)))
-        for row_offset in (-1, 0, 1):
-            for col_offset in (-1, 0, 1):
-                for match in node_bins.get((key[0] + row_offset, key[1] + col_offset), []):
-                    existing = nodes[match]
-                    if math.hypot(existing[0] - point[0], existing[1] - point[1]) <= tolerance:
-                        return match
-        nodes.append(point)
-        node_bins.setdefault(key, []).append(len(nodes) - 1)
-        return len(nodes) - 1
-
-    for geometry in frame.geometry:
-        if geometry is None or geometry.is_empty:
-            continue
-        if clip_geometry is not None:
-            if not geometry.intersects(clip_geometry):
-                continue
-            geometry = geometry.intersection(clip_geometry)
-        for part in _line_parts(geometry):
-            previous = None
-            for x, y in part.coords:
-                col, row = inverse * (x, y)
-                current = node_id((float(row), float(col)))
-                if previous is not None and previous != current:
-                    edges.append((previous, current))
-                previous = current
-    unique_edges = sorted({tuple(sorted(edge)) for edge in edges})
-    return (
-        np.asarray(nodes, dtype=np.float32).reshape(-1, 2),
-        np.asarray(unique_edges, dtype=np.int32).reshape(-1, 2),
-    )
-
-
 def _world_lines_from_document(document: GeometryDocument) -> list[LineString]:
     transform = getattr(document, "global_transform", None)
     if transform is None:
@@ -932,56 +889,16 @@ def _global_change_geometry(document: GeometryDocument, edited_lines: list[LineS
     return unary_union(parts).buffer(max(document.global_overview_scale * 2.0, 0.01))
 
 
-def _project_manual_widths(
-    measurements: list[dict], source_transform: rasterio.Affine, source_crs,
-    destination_transform: rasterio.Affine, destination_crs, destination_bounds,
-) -> list[dict]:
-    projected = []
-    inverse = ~destination_transform
-    for measurement in measurements:
-        try:
-            pixels = [
-                (float(measurement[f"{name}_col"]), float(measurement[f"{name}_row"]))
-                for name in ("start", "end", "target")
-            ]
-        except (KeyError, TypeError, ValueError):
-            continue
-        world = [source_transform * point for point in pixels]
-        xs, ys = transform_coordinates(
-            source_crs, destination_crs,
-            [point[0] for point in world], [point[1] for point in world],
-        )
-        target = Point(xs[2], ys[2])
-        if not box(
-            destination_bounds.left, destination_bounds.bottom,
-            destination_bounds.right, destination_bounds.top,
-        ).covers(target):
-            continue
-        tile_pixels = [inverse * (x, y) for x, y in zip(xs, ys)]
-        row_col = [(float(row), float(col)) for col, row in tile_pixels]
-        start, end, target_pixel = row_col
-        row = dict(measurement)
-        row.update({
-            "start_row": start[0], "start_col": start[1],
-            "end_row": end[0], "end_col": end[1],
-            "target_row": target_pixel[0], "target_col": target_pixel[1],
-            "width_px": float(math.hypot(end[0] - start[0], end[1] - start[1])),
-            "source": "global_manual_boundary_measurement",
-        })
-        projected.append(row)
-    return projected
-
-
 def save_global_document(
     document: GeometryDocument, edited_dir: Path,
     final_centerlines: Path, final_surfaces: Path,
 ) -> dict:
-    """Persist one global edit and generate the tile-local reconstruction inputs."""
+    """Persist the authoritative global edit without materializing tile inputs."""
     document.compact()
     edited_lines = _world_lines_from_document(document)
     if not edited_lines:
         raise ValueError("全局最终中心线已为空；请至少保留一条道路后再保存")
-    global_path = edited_dir / "global_edited_centerlines.gpkg"
+    global_path = (edited_dir / "global_edited_centerlines.gpkg").resolve()
     if global_path.exists():
         global_path.unlink()
     edited_frame = gpd.GeoDataFrame(
@@ -989,12 +906,12 @@ def save_global_document(
         geometry="geometry", crs=document.global_crs,
     )
     edited_frame.to_file(global_path, layer="edited_centerlines", driver="GPKG")
-    global_width_path = edited_dir / "global_manual_widths.json"
+    global_width_path = (edited_dir / "global_manual_widths.json").resolve()
     global_width_path.write_text(
         json.dumps(document.manual_widths, indent=2, ensure_ascii=False), encoding="utf-8",
     )
-    global_add_path = edited_dir / "global_manual_surface_add.png"
-    global_remove_path = edited_dir / "global_manual_surface_remove.png"
+    global_add_path = (edited_dir / "global_manual_surface_add.png").resolve()
+    global_remove_path = (edited_dir / "global_manual_surface_remove.png").resolve()
     cv2.imencode(".png", document.surface_additions.astype(np.uint8) * 255)[1].tofile(global_add_path)
     cv2.imencode(".png", document.surface_removals.astype(np.uint8) * 255)[1].tofile(global_remove_path)
 
@@ -1007,39 +924,7 @@ def save_global_document(
             if dataset.crs is None:
                 raise ValueError(f"影像缺少 CRS：{image_path}")
             raster_crs = dataset.crs
-            raster_transform = dataset.transform
             raster_bounds = dataset.bounds
-            raster_shape = (dataset.height, dataset.width)
-        frame = edited_frame if edited_frame.crs == raster_crs else edited_frame.to_crs(raster_crs)
-        footprint = box(raster_bounds.left, raster_bounds.bottom, raster_bounds.right, raster_bounds.top)
-        nodes, edges = _graph_from_world_lines(frame, raster_transform, footprint)
-        graph_path = edited_dir / f"{stem}_edited_graph.p"
-        save_graph(
-            graph_path,
-            [tuple(float(value) for value in point) for point in nodes.tolist()],
-            edges.tolist(),
-        )
-        tile_widths = _project_manual_widths(
-            document.manual_widths, document.global_transform, document.global_crs,
-            raster_transform, raster_crs, raster_bounds,
-        )
-        width_path = edited_dir / f"{stem}_manual_widths.json"
-        width_path.write_text(json.dumps(tile_widths, indent=2, ensure_ascii=False), encoding="utf-8")
-        additions = np.zeros(raster_shape, dtype=np.uint8)
-        removals = np.zeros(raster_shape, dtype=np.uint8)
-        for source, destination in (
-            (document.surface_additions, additions), (document.surface_removals, removals),
-        ):
-            reproject(
-                source=source, destination=destination,
-                src_transform=document.global_transform, src_crs=document.global_crs,
-                dst_transform=raster_transform, dst_crs=raster_crs,
-                src_nodata=0, dst_nodata=0, resampling=Resampling.nearest,
-            )
-        add_path = edited_dir / f"{stem}_manual_surface_add.png"
-        remove_path = edited_dir / f"{stem}_manual_surface_remove.png"
-        cv2.imencode(".png", additions * 255)[1].tofile(add_path)
-        cv2.imencode(".png", removals * 255)[1].tofile(remove_path)
         affected = False
         if changed is not None and not changed.is_empty:
             left, bottom, right, top = transform_bounds(
@@ -1051,11 +936,9 @@ def save_global_document(
         if affected:
             affected_tiles.append(stem)
         tile_manifest[stem] = {
-            "graph": str(graph_path), "line_count": int(len(edges)), "affected": bool(affected),
-            "manual_widths": str(width_path), "manual_width_count": len(tile_widths),
-            "manual_surface_add": str(add_path), "manual_surface_remove": str(remove_path),
-            "manual_surface_added_px": int(np.count_nonzero(additions)),
-            "manual_surface_removed_px": int(np.count_nonzero(removals)),
+            "image": str(image_path),
+            "affected": bool(affected),
+            "tile_inputs_materialized": False,
         }
     report = {
         "editing_scope": "period_final_fused_centerlines_global_once",
@@ -1065,6 +948,9 @@ def save_global_document(
         "affected_tile_count": len(affected_tiles),
         "tile_count": len(tile_manifest),
         "overview_pixel_size": float(document.global_overview_scale),
+        "global_transform": list(document.global_transform)[:6],
+        "global_crs": document.global_crs.to_wkt(),
+        "global_raster_shape": list(document.surface_additions.shape),
     }
     (edited_dir / "global_edit_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8",
@@ -1627,7 +1513,7 @@ class GeometryEditorApp:
                     f"最终中心线已作为一个全局网络保存到：\n{self.edited_dir}\n\n"
                     f"受影响切片：{manifest['affected_tile_count']} / {manifest['tile_count']}。\n"
                     "返回主程序点击“应用编辑并重新生成结果”后，只会重新测算受影响窗口，"
-                    "再统一融合最终中心线、道路面和相邻期次变化。",
+                    "最终中心线直接采用当前全局编辑成果，并更新道路面和相邻期次变化。",
                 )
             return
         manifest = {"editor": "builtin_geometry_editor_v2_final_fused", "tiles": {}}

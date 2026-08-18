@@ -2406,12 +2406,21 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
         getattr(args, "edited_dir", "") or result.get("review", {}).get("edited_directory", "")
         or run_root / "centerline_edit"
     ).expanduser().resolve()
-    edited_graphs = sorted(edited_dir.glob("*_edited_graph.p")) if edited_dir.is_dir() else []
-    if not edited_graphs:
-        raise FileNotFoundError(f"尚未保存人工编辑中心线：{edited_dir}")
     edit_manifest_path = edited_dir / "edited_manifest.json"
     edit_manifest = read_json(edit_manifest_path) if edit_manifest_path.is_file() else {}
     global_edit = str(edit_manifest.get("editing_scope", "")).startswith("period_final_fused_centerlines_global")
+    edited_graphs = sorted(edited_dir.glob("*_edited_graph.p")) if edited_dir.is_dir() else []
+    if not global_edit and not edited_graphs:
+        raise FileNotFoundError(f"尚未保存人工编辑中心线：{edited_dir}")
+    global_centerlines = None
+    if global_edit:
+        global_value = str(edit_manifest.get("global_centerlines", "") or "").strip()
+        global_centerlines = Path(global_value).expanduser() if global_value else edited_dir / "global_edited_centerlines.gpkg"
+        if not global_centerlines.is_absolute():
+            global_centerlines = edited_dir / global_centerlines
+        global_centerlines = global_centerlines.resolve()
+        if not global_centerlines.is_file():
+            raise FileNotFoundError(f"尚未保存权威全局中心线：{global_centerlines}")
     affected_stems = [
         str(value) for value in edit_manifest.get("affected_tiles", []) if str(value).strip()
     ] if global_edit else []
@@ -2450,19 +2459,25 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
 
     products = Path(result["gpkg"]).resolve().parent
     products.mkdir(parents=True, exist_ok=True)
-    stitched = products / "edited_centerlines_stitched.gpkg"
+    canonical_centerlines = global_centerlines if global_edit else products / "edited_centerlines_stitched.gpkg"
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(WIDTH), str(SAMROAD), env.get("PYTHONPATH", "")))
-    report_progress("人工中心线全局拼接与受影响路面重建")
-    stitch_command = [
-        str(PYTHON), str(WIDTH / "production_workflow.py"), "stitch-edited",
-        "--review-dir", str(width_dir), "--edited-dir", str(edited_dir),
-        "--output", str(stitched), "--snap-tolerance", "1.5",
-    ]
-    if global_edit and affected_stems:
+    if global_edit:
+        report_progress("从权威全局中心线生成受影响切片并重建路面")
+        prepare_command = [
+            str(PYTHON), str(WIDTH / "production_workflow.py"), "apply-global-edit",
+            "--review-dir", str(width_dir), "--edited-dir", str(edited_dir),
+        ]
         for stem in affected_stems:
-            stitch_command.extend(("--only-stem", stem))
-    run_command(stitch_command, ROOT, env, "人工中心线全局拼接与受影响路面重建")
+            prepare_command.extend(("--only-stem", stem))
+        run_command(prepare_command, ROOT, env, "受影响切片中心线、测宽与道路面增量重建")
+    else:
+        report_progress("人工中心线全局拼接与受影响路面重建")
+        run_command([
+            str(PYTHON), str(WIDTH / "production_workflow.py"), "stitch-edited",
+            "--review-dir", str(width_dir), "--edited-dir", str(edited_dir),
+            "--output", str(canonical_centerlines), "--snap-tolerance", "1.5",
+        ], ROOT, env, "人工中心线全局拼接与受影响路面重建")
     progress_completed += 1
     report_progress("编辑后受影响窗口重新测宽")
     finalize_command = [
@@ -2482,7 +2497,7 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
         "--output", result["gpkg"], "--centerline-shp", result["centerlines"],
         "--surface-shp", result["surfaces"],
         "--visualization", str(products / "road_overview.png"),
-        "--stitched-centerlines", str(stitched),
+        "--stitched-centerlines", str(canonical_centerlines),
     ], ROOT, env, "人工编辑成果重新导出")
     progress_completed += 1
 
@@ -2491,7 +2506,9 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
     result["manual_edit"] = {
         "applied": True,
         "edited_directory": str(edited_dir),
-        "stitched_centerlines": str(stitched),
+        "stitched_centerlines": str(canonical_centerlines),
+        "canonical_centerlines": str(canonical_centerlines),
+        "canonical_centerlines_authoritative": bool(global_edit),
         "editing_scope": edit_manifest.get("editing_scope", "tile_local"),
         "affected_tiles": affected_stems,
         "affected_tile_count": len(affected_stems),

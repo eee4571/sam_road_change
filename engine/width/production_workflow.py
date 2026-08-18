@@ -29,6 +29,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 from finalize_review_results import load_graph, save_graph  # noqa: E402
+from global_edit_utils import _graph_from_world_lines, _project_manual_widths  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
 from surface_reconstruction import SurfaceReconstructionConfig, reconstruct_surface  # noqa: E402
 from road_pair_matcher import build_corridors, build_width_segments  # noqa: E402
@@ -1375,6 +1376,7 @@ def export_final_products(
             width_segments.append({"tile_stem": stem, **row, "geometry": _world_line(points, transform)})
 
     canonical_network = None
+    canonical_is_authoritative = False
     if stitched_centerlines is not None and stitched_centerlines.is_file():
         stitched_layers = set(gpd.list_layers(stitched_centerlines)["name"].tolist())
         stitched_layer = "stitched_centerlines" if "stitched_centerlines" in stitched_layers else next(iter(stitched_layers), "")
@@ -1384,6 +1386,7 @@ def export_final_products(
                 if stitched_frame.crs != crs:
                     stitched_frame = stitched_frame.to_crs(crs)
                 canonical_network = unary_union([geometry for geometry in stitched_frame.geometry if geometry is not None and not geometry.is_empty])
+                canonical_is_authoritative = stitched_layer == "edited_centerlines"
     pixel_sizes = [context["feather_distance"] / 256.0 for context in source_contexts.values()]
     match_tolerance = max(1.5 * float(np.median(pixel_sizes)), 1e-6) if pixel_sizes else 1.5
     fused_centerlines = _fuse_centerline_records(centerlines, source_contexts, canonical_network, match_tolerance)
@@ -1408,13 +1411,16 @@ def export_final_products(
     if fused_surface_geometry is not None:
         pixel_area = float(np.median(pixel_sizes)) ** 2 if pixel_sizes else 1.0
         fused_surface_geometry = _clean_surface(fused_surface_geometry, 50.0 * pixel_area, 25.0 * pixel_area)
-    fused_centerlines, global_gap_count = _connect_surface_supported_global_gaps(
-        fused_centerlines,
-        fused_surface_geometry,
-        float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
-        centerline_probability=fused_centerline_probability,
-        centerline_transform=fused_centerline_transform,
-    )
+    if canonical_is_authoritative:
+        global_gap_count = 0
+    else:
+        fused_centerlines, global_gap_count = _connect_surface_supported_global_gaps(
+            fused_centerlines,
+            fused_surface_geometry,
+            float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
+            centerline_probability=fused_centerline_probability,
+            centerline_transform=fused_centerline_transform,
+        )
     fused_surface_geometry, global_gap_surface_count, global_gap_surface_added_area = _merge_global_gap_surfaces(
         fused_surface_geometry,
         fused_centerlines,
@@ -1515,6 +1521,7 @@ def export_final_products(
         "visualization": visualization_report,
         "fusion": {
             "canonical_network": str(stitched_centerlines) if stitched_centerlines is not None else "",
+            "canonical_network_authoritative": canonical_is_authoritative,
             "match_tolerance": match_tolerance,
             "global_endpoint_snapping": False,
             "global_surface_gap_count": global_gap_count,
@@ -1648,6 +1655,219 @@ def stitch_edit_package(input_gpkg: Path, review_dir: Path, edited_dir: Path, ou
     manifest.update({"stitched_network": str(output), "global_source_count": len(geometries), "stitched_tile_edge_count": total_edges})
     (edited_dir / "edited_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
+
+
+def _manifest_file(value: object, edited_dir: Path) -> Path:
+    path = Path(str(value or "")).expanduser()
+    return path if path.is_absolute() else edited_dir / path
+
+
+def apply_global_edit_directory(
+    review_dir: Path,
+    edited_dir: Path,
+    only_stems: set[str] | None = None,
+    surface_low_probability: float = 0.30,
+    surface_high_probability: float = 0.55,
+    surface_max_corridor_px: float = 60.0,
+) -> dict:
+    """Materialize and rebuild only affected tiles from an authoritative global edit."""
+    manifest_path = edited_dir / "edited_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing global edit manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not str(manifest.get("editing_scope", "")).startswith("period_final_fused_centerlines_global"):
+        raise ValueError("apply-global-edit only accepts the global final-centerline editing workflow")
+
+    affected_stems = {
+        str(value) for value in manifest.get("affected_tiles", []) if str(value).strip()
+    }
+    requested_stems = set(only_stems) if only_stems is not None else set(affected_stems)
+    unexpected = requested_stems - affected_stems
+    if unexpected:
+        raise ValueError(f"Requested tiles are not marked affected: {sorted(unexpected)}")
+    if not requested_stems:
+        return {
+            "editing_scope": manifest.get("editing_scope"),
+            "authoritative_centerlines": manifest.get("global_centerlines", ""),
+            "materialized_tiles": [],
+            "materialized_tile_count": 0,
+            "surface_reconstruction": {},
+        }
+
+    global_path = _manifest_file(manifest.get("global_centerlines"), edited_dir)
+    if not global_path.is_file():
+        raise FileNotFoundError(f"Missing authoritative global centerlines: {global_path}")
+    layers = list(gpd.list_layers(global_path)["name"])
+    layer = "edited_centerlines" if "edited_centerlines" in layers else next(iter(layers), "")
+    if not layer:
+        raise ValueError(f"No centerline layer in {global_path}")
+    global_lines = gpd.read_file(global_path, layer=layer)
+    if global_lines.empty or global_lines.crs is None:
+        raise ValueError(f"Authoritative global centerlines are empty or lack CRS: {global_path}")
+
+    transform_values = manifest.get("global_transform", [])
+    if not isinstance(transform_values, list) or len(transform_values) < 6:
+        raise ValueError("Global edit manifest lacks global_transform; reopen and save the global edit")
+    global_transform = rasterio.Affine(*[float(value) for value in transform_values[:6]])
+    global_crs = manifest.get("global_crs") or global_lines.crs
+    global_width_path = _manifest_file(manifest.get("global_manual_widths"), edited_dir)
+    global_widths = (
+        json.loads(global_width_path.read_text(encoding="utf-8"))
+        if global_width_path.is_file() else []
+    )
+    global_shape = tuple(int(value) for value in manifest.get("global_raster_shape", []))
+    if len(global_shape) != 2:
+        raise ValueError("Global edit manifest lacks global_raster_shape; reopen and save the global edit")
+    global_add = _read_image(_manifest_file(manifest.get("global_manual_surface_add"), edited_dir))
+    global_remove = _read_image(_manifest_file(manifest.get("global_manual_surface_remove"), edited_dir))
+    if global_add is None:
+        global_add = np.zeros(global_shape, dtype=np.uint8)
+    if global_remove is None:
+        global_remove = np.zeros(global_shape, dtype=np.uint8)
+
+    summary_by_stem = {
+        stem_from_summary(path): json.loads(path.read_text(encoding="utf-8"))
+        for path in summaries(review_dir)
+    }
+    missing = requested_stems - set(summary_by_stem)
+    if missing:
+        raise FileNotFoundError(f"No review summaries for affected tiles: {sorted(missing)}")
+
+    reconstruction_totals = {
+        "added_surface_px": 0, "removed_surface_px": 0, "uncertain_surface_px": 0,
+    }
+    materialized = []
+    for stem in sorted(requested_stems):
+        summary = summary_by_stem[stem]
+        image_path = Path(summary["image"]).expanduser().resolve()
+        with rasterio.open(image_path) as dataset:
+            if dataset.crs is None:
+                raise ValueError(f"Raster lacks CRS: {image_path}")
+            raster_transform = dataset.transform
+            raster_crs = dataset.crs
+            raster_bounds = dataset.bounds
+            raster_shape = (dataset.height, dataset.width)
+
+        frame = global_lines if global_lines.crs == raster_crs else global_lines.to_crs(raster_crs)
+        footprint = box(raster_bounds.left, raster_bounds.bottom, raster_bounds.right, raster_bounds.top)
+        nodes, edges = _graph_from_world_lines(frame, raster_transform, footprint)
+        graph_path = edited_dir / f"{stem}_edited_graph.p"
+        save_graph(
+            graph_path,
+            [tuple(float(value) for value in point) for point in nodes.tolist()],
+            edges.tolist(),
+        )
+
+        tile_widths = _project_manual_widths(
+            global_widths, global_transform, global_crs,
+            raster_transform, raster_crs, raster_bounds,
+        )
+        width_path = edited_dir / f"{stem}_manual_widths.json"
+        width_path.write_text(json.dumps(tile_widths, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        additions = np.zeros(raster_shape, dtype=np.uint8)
+        removals = np.zeros(raster_shape, dtype=np.uint8)
+        for source, destination in ((global_add, additions), (global_remove, removals)):
+            reproject(
+                source=(source > 0).astype(np.uint8), destination=destination,
+                src_transform=global_transform, src_crs=global_crs,
+                dst_transform=raster_transform, dst_crs=raster_crs,
+                src_nodata=0, dst_nodata=0, resampling=Resampling.nearest,
+            )
+        add_path = edited_dir / f"{stem}_manual_surface_add.png"
+        remove_path = edited_dir / f"{stem}_manual_surface_remove.png"
+        cv2.imencode(".png", additions * 255)[1].tofile(add_path)
+        cv2.imencode(".png", removals * 255)[1].tofile(remove_path)
+
+        probability = _read_image(review_dir / f"{stem}_road_probability.png")
+        original_surface = _read_image(review_dir / f"{stem}_molra_clean_mask.png")
+        if probability is None or original_surface is None:
+            raise FileNotFoundError(f"Missing road probability or original surface for {stem}")
+        reconstruction = reconstruct_surface(
+            probability,
+            original_surface,
+            nodes,
+            edges,
+            SurfaceReconstructionConfig(
+                low_probability=surface_low_probability,
+                high_probability=surface_high_probability,
+                max_corridor_px=surface_max_corridor_px,
+            ),
+        )
+        final_surface = reconstruction.surface.copy()
+        final_surface[additions > 0] = 1
+        final_surface[removals > 0] = 0
+        reconstruction.surface = final_surface.astype(np.uint8)
+        reconstruction.added = (reconstruction.surface > (original_surface > 0)).astype(np.uint8)
+        reconstruction.removed = ((original_surface > 0) > reconstruction.surface).astype(np.uint8)
+        reconstruction.metadata.update({
+            "manual_surface_add_px": int(np.count_nonzero(additions)),
+            "manual_surface_remove_px": int(np.count_nonzero(removals)),
+            "manual_surface_override_applied": bool(np.any(additions) or np.any(removals)),
+        })
+        reconstructed_path = edited_dir / f"{stem}_reconstructed_road_surface.png"
+        added_path = edited_dir / f"{stem}_surface_added.png"
+        removed_path = edited_dir / f"{stem}_surface_removed.png"
+        uncertain_path = edited_dir / f"{stem}_surface_uncertain.png"
+        for path, mask in (
+            (reconstructed_path, reconstruction.surface),
+            (added_path, reconstruction.added),
+            (removed_path, reconstruction.removed),
+            (uncertain_path, reconstruction.uncertain),
+        ):
+            cv2.imencode(".png", mask.astype(np.uint8) * 255)[1].tofile(path)
+        viz_path = edited_dir / f"{stem}_surface_reconstruction_viz.png"
+        image = _read_image(image_path, cv2.IMREAD_COLOR)
+        if image is not None:
+            overlay = image.copy()
+            overlay[reconstruction.surface > 0] = (40, 190, 40)
+            overlay[reconstruction.added > 0] = (255, 120, 0)
+            overlay[reconstruction.removed > 0] = (0, 0, 255)
+            overlay[reconstruction.uncertain > 0] = (0, 220, 255)
+            viz = cv2.addWeighted(overlay, 0.38, image, 0.62, 0)
+            cv2.imencode(".png", viz)[1].tofile(viz_path)
+        report_path = edited_dir / f"{stem}_surface_reconstruction.json"
+        report_path.write_text(json.dumps(reconstruction.metadata, indent=2), encoding="utf-8")
+        for key in reconstruction_totals:
+            reconstruction_totals[key] += int(reconstruction.metadata.get(key, 0))
+
+        tile = manifest.setdefault("tiles", {}).setdefault(stem, {})
+        tile.update({
+            "affected": True,
+            "tile_inputs_materialized": True,
+            "graph": str(graph_path),
+            "line_count": int(len(edges)),
+            "manual_widths": str(width_path),
+            "manual_width_count": len(tile_widths),
+            "manual_surface_add": str(add_path),
+            "manual_surface_remove": str(remove_path),
+            "manual_surface_added_px": int(np.count_nonzero(additions)),
+            "manual_surface_removed_px": int(np.count_nonzero(removals)),
+            "road_surface": str(reconstructed_path),
+            "reconstructed_road_surface": str(reconstructed_path),
+            "surface_added": str(added_path),
+            "surface_removed": str(removed_path),
+            "surface_uncertain": str(uncertain_path),
+            "surface_reconstruction_viz": str(viz_path),
+            "surface_reconstruction_report": str(report_path),
+        })
+        materialized.append(stem)
+
+    manifest.update({
+        "canonical_network": str(global_path),
+        "tile_materialization_source": "authoritative_global_centerlines",
+        "materialized_tiles": materialized,
+        "materialized_tile_count": len(materialized),
+        "surface_reconstruction": reconstruction_totals,
+    })
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "editing_scope": manifest.get("editing_scope"),
+        "authoritative_centerlines": str(global_path),
+        "materialized_tiles": materialized,
+        "materialized_tile_count": len(materialized),
+        "surface_reconstruction": reconstruction_totals,
+    }
 
 
 def stitch_edited_directory(
@@ -1852,6 +2072,16 @@ def main() -> int:
         "--only-stem", action="append", default=[],
         help="只为指定切片重建道路面；全局中心线仍会统一拼接并回写所有切片。",
     )
+    apply_global = sub.add_parser("apply-global-edit")
+    apply_global.add_argument("--review-dir", required=True)
+    apply_global.add_argument("--edited-dir", required=True)
+    apply_global.add_argument("--surface-low-probability", type=float, default=0.30)
+    apply_global.add_argument("--surface-high-probability", type=float, default=0.55)
+    apply_global.add_argument("--surface-max-corridor-px", type=float, default=60.0)
+    apply_global.add_argument(
+        "--only-stem", action="append", default=[],
+        help="只物化并重建 manifest 中列出的受影响切片。",
+    )
     args = parser.parse_args()
     if args.command == "review-status":
         result = review_status(Path(args.review_dir))
@@ -1872,6 +2102,11 @@ def main() -> int:
         Path(args.review_dir), Path(args.edited_dir), Path(args.output), args.snap_tolerance,
         args.surface_low_probability, args.surface_high_probability, args.surface_max_corridor_px,
         set(args.only_stem) if args.only_stem else None,
+    )
+    elif args.command == "apply-global-edit": result = apply_global_edit_directory(
+        Path(args.review_dir), Path(args.edited_dir),
+        set(args.only_stem) if args.only_stem else None,
+        args.surface_low_probability, args.surface_high_probability, args.surface_max_corridor_px,
     )
     else: result = stitch_final_products(Path(args.input_gpkg), Path(args.output), args.snap_tolerance)
     print(json.dumps(result, indent=2, ensure_ascii=False))
