@@ -335,6 +335,28 @@ def _read_validation_area(path: Path):
     return area
 
 
+def _require_shapefile_components(path: Path, label: str) -> None:
+    """Reject incomplete user Shapefiles before a long task starts."""
+    source = Path(path).expanduser().resolve()
+    missing = [str(source.with_suffix(suffix)) for suffix in (".shp", ".shx", ".dbf", ".prj") if not source.with_suffix(suffix).is_file()]
+    if missing:
+        raise FileNotFoundError(f"{label} Shapefile 附件不完整：\n" + "\n".join(missing))
+
+
+def _validate_truth_shapefile(path: Path) -> None:
+    _require_shapefile_components(path, "变化真值")
+    import geopandas as gpd
+    frame = gpd.read_file(path)
+    if frame.crs is None:
+        raise ValueError(f"变化真值缺少 CRS：{path}")
+    usable = frame.loc[frame.geometry.notna() & ~frame.geometry.is_empty]
+    if usable.empty:
+        raise ValueError(f"变化真值没有有效几何：{path}")
+    invalid = sorted({geometry.geom_type for geometry in usable.geometry if geometry.geom_type not in {"LineString", "MultiLineString", "Polygon", "MultiPolygon"}})
+    if invalid:
+        raise ValueError(f"变化真值必须是线或面：{path}（发现 {', '.join(invalid)}）")
+
+
 def _valid_raster_footprint(path: Path, target_crs=None):
     """Return raster bounds after a minimal readability/CRS check.
 
@@ -2239,6 +2261,8 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
 
 def _period_result_ready(entry: dict) -> bool:
     """Return whether a prior period result is complete enough to resume from."""
+    if str(entry.get("status") or "").casefold() in {"stale", "failed", "running"}:
+        return False
     try:
         result_path = Path(str(entry.get("result") or "")).expanduser()
         if not result_path.is_file():
@@ -2254,6 +2278,8 @@ def _period_result_ready(entry: dict) -> bool:
 
 def _change_result_ready(entry: dict) -> bool:
     """A no-change run may omit a GPKG, so the summary is the stable marker."""
+    if str(entry.get("status") or "").casefold() in {"stale", "failed", "running"}:
+        return False
     try:
         return Path(str(entry.get("summary") or "")).expanduser().is_file()
     except (OSError, ValueError, TypeError):
@@ -2353,12 +2379,85 @@ def _task_input_spec(
     }
 
 
+def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
+    """Describe the minimum stages invalidated by a changed frozen input spec."""
+    current_grids = current.get("grids") or {}
+    all_periods = {
+        (str(grid), str(period))
+        for grid, periods in current_grids.items()
+        for period in (periods or {})
+    }
+    extraction_keys = (
+        "pipeline_version", "mode", "validation_area", "checkpoint", "config",
+        "device", "pixel_size", "rescale", "junction_node_mode",
+    )
+    invalidate_all_extraction = any(prior.get(key) != current.get(key) for key in extraction_keys)
+    changed_periods = set(all_periods if invalidate_all_extraction else ())
+    if not invalidate_all_extraction:
+        prior_grids = prior.get("grids") or {}
+        for grid, periods in current_grids.items():
+            previous = prior_grids.get(grid) or {}
+            for period, fingerprint in (periods or {}).items():
+                if previous.get(period) != fingerprint:
+                    changed_periods.add((str(grid), str(period)))
+        for grid, periods in prior_grids.items():
+            for period in (periods or {}):
+                if period not in (current_grids.get(grid) or {}):
+                    changed_periods.add((str(grid), str(period)))
+    threshold_changed = any(prior.get(key) != current.get(key) for key in ("absolute", "ratio", "tolerance"))
+    truth_changed = any(
+        prior.get(key) != current.get(key)
+        for key in ("truths", "truth_type_field", "evaluation_enabled")
+    )
+    changed_pairs = set()
+    for grid, periods in current_grids.items():
+        names = sorted((periods or {}).keys(), key=period_sort_key)
+        for before, after in zip(names, names[1:]):
+            if threshold_changed or truth_changed or (str(grid), str(before)) in changed_periods or (str(grid), str(after)) in changed_periods:
+                changed_pairs.add((str(grid), str(before), str(after)))
+    return {
+        "periods": sorted(changed_periods),
+        "changes": sorted(changed_pairs),
+        "threshold_changed": threshold_changed,
+        "truth_changed": truth_changed,
+        "reuse_all": not changed_periods and not changed_pairs and prior == current,
+    }
+
+
+def check_runtime_environment(args: argparse.Namespace, output_root: Path) -> dict:
+    """Check run-only concerns separately from project data validation."""
+    checkpoint = Path(str(args.checkpoint)).expanduser().resolve()
+    config = Path(str(args.config)).expanduser().resolve()
+    missing = [str(path) for path in (checkpoint, config) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("运行所需模型或配置不存在：\n" + "\n".join(missing))
+    required = (SAMROAD / "inferencer.py", MOLRA / "infer_img.py", WIDTH / "road_change_detection.py")
+    engine_missing = [str(path) for path in required if not path.is_file()]
+    if engine_missing:
+        raise FileNotFoundError("运行引擎文件不完整：\n" + "\n".join(engine_missing))
+    import torch
+    requested = str(getattr(args, "device", "auto") or "auto").casefold()
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("已选择 CUDA，但当前运行环境没有可用 CUDA 设备。")
+    existing = output_root
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if not existing.exists():
+        raise FileNotFoundError(f"无法定位成果输出目录所在磁盘：{output_root}")
+    return {
+        "checkpoint": str(checkpoint), "config": str(config),
+        "device": requested, "cuda_available": bool(torch.cuda.is_available()),
+        "output_root": str(output_root), "output_free_bytes": shutil.disk_usage(existing).free,
+    }
+
+
 def build_preflight_report(
     mode: str,
     grids: dict[str, dict[str, Path]],
     validation_area: str | dict[str, str],
     truth_by_pair: dict[tuple, Path],
     output_root: Path,
+    *, include_runtime_checks: bool = True,
 ) -> dict:
     """Inspect the complete task without creating outputs or starting models."""
     try:
@@ -2367,6 +2466,12 @@ def build_preflight_report(
         from rasterio.warp import transform_bounds
     except ImportError as exc:
         raise RuntimeError("输入预检需要本项目内的 rasterio/numpy 环境") from exc
+
+    area_paths = validation_area.values() if isinstance(validation_area, dict) else ([validation_area] if validation_area else [])
+    for area_path in area_paths:
+        _require_shapefile_components(Path(area_path), "验证区")
+    for truth_path in truth_by_pair.values():
+        _validate_truth_shapefile(Path(truth_path))
 
     image_count = 0
     input_bytes = 0
@@ -2417,6 +2522,27 @@ def build_preflight_report(
                 "dtypes": sorted(dtype_values),
                 "resolutions": resolutions[:10],
             })
+
+    if mode == "validation":
+        from shapely.geometry import box
+        from shapely.ops import unary_union
+        area_map = validation_area if isinstance(validation_area, dict) else {next(iter(grids)): validation_area}
+        for area_id, area_path in area_map.items():
+            area = _read_validation_area(Path(area_path))
+            area_geometry = area.geometry.unary_union
+            for period in grids.get(area_id, {}):
+                footprints = []
+                for item in all_metadata:
+                    if item["grid"] != area_id or Path(item["path"]) not in listed_rasters(grids[area_id][period]):
+                        continue
+                    bounds = transform_bounds(item["crs"], area.crs, *item["bounds"], densify_pts=21)
+                    footprints.append(box(*bounds))
+                covered = unary_union(footprints) if footprints else None
+                if covered is None or not covered.intersects(area_geometry):
+                    raise ValueError(f"{area_id} / {period} 期影像与验证区没有空间交集。")
+                missing_area = max(0.0, float(area_geometry.area - covered.intersection(area_geometry).area))
+                if area_geometry.area > 0 and missing_area / float(area_geometry.area) > 0.01:
+                    warnings.append(f"{area_id}/{period} 的影像边界未覆盖约 {missing_area / float(area_geometry.area):.1%} 验证区；请确认 NoData 和实际覆盖。")
 
     estimated_grid = None
     estimated_grids = []
@@ -2470,12 +2596,14 @@ def build_preflight_report(
                 )
         estimated_grid = estimated_grids[0] if estimated_grids else None
 
-    existing = output_root
-    while not existing.exists() and existing != existing.parent:
-        existing = existing.parent
-    free_bytes = shutil.disk_usage(existing).free if existing.exists() else None
-    if estimated_normalized_bytes and free_bytes is not None and free_bytes < estimated_normalized_bytes * 2:
-        warnings.append("输出盘剩余空间低于规范化影像估算量的 2 倍，建议更换磁盘或拆分任务")
+    free_bytes = None
+    if include_runtime_checks:
+        existing = output_root
+        while not existing.exists() and existing != existing.parent:
+            existing = existing.parent
+        free_bytes = shutil.disk_usage(existing).free if existing.exists() else None
+        if estimated_normalized_bytes and free_bytes is not None and free_bytes < estimated_normalized_bytes * 2:
+            warnings.append("输出盘剩余空间低于规范化影像估算量的 2 倍，建议更换磁盘或拆分任务")
     report = {
         "mode": mode,
         "grid_count": len(grids),
@@ -2504,6 +2632,180 @@ def _persist_pipeline(manifest: dict, job_root: Path, output_root: Path) -> None
     write_json(job_root / "job_state.json", manifest)
     write_json(job_root / "pipeline_result.json", manifest)
     write_json(output_root / "latest_pipeline.json", manifest)
+
+
+def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
+    job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
+    _write_task_report(manifest, job_root)
+    _persist_pipeline(manifest, job_root, job_root.parent)
+    if manifest_path.resolve() not in {
+        (job_root / "job_state.json").resolve(),
+        (job_root / "pipeline_result.json").resolve(),
+        (job_root.parent / "latest_pipeline.json").resolve(),
+    }:
+        write_json(manifest_path, manifest)
+
+
+def _manifest_period_index(manifest: dict, grid: str, period: str) -> int:
+    for index, entry in enumerate(manifest.get("period_results", []) or []):
+        if isinstance(entry, dict) and str(entry.get("grid")) == grid and str(entry.get("period")) == period:
+            return index
+    raise ValueError(f"任务索引中不存在期次：{grid} / {period}")
+
+
+def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
+    index = _manifest_period_index(manifest, grid, period)
+    old = manifest["period_results"][index]
+    result_path = Path(str(old.get("result") or "")).expanduser().resolve()
+    if not result_path.parent.is_dir():
+        raise FileNotFoundError(f"期次工作目录不存在：{result_path.parent}")
+    workspace = result_path.parent
+    analysis_source = Path(str(old.get("analysis_source") or old.get("source") or "")).expanduser()
+    if not analysis_source.exists():
+        raise FileNotFoundError(f"期次输入不存在：{analysis_source}")
+    input_spec = manifest.get("input_spec") or {}
+    checkpoint = str((input_spec.get("checkpoint") or {}).get("path") or "")
+    config = str((input_spec.get("config") or {}).get("path") or "")
+    if not checkpoint or not config:
+        raise ValueError("旧任务索引缺少模型或推理配置路径，无法局部重跑。")
+    started = time.monotonic()
+    prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
+    result = _ensure_extract_manifest_fields(extract(argparse.Namespace(
+        workspace=str(workspace), source="", checkpoint=checkpoint, config=config,
+        device=str(input_spec.get("device") or "auto"),
+        pixel_size=str(input_spec.get("pixel_size") or "0.0"),
+        rescale=str(input_spec.get("rescale") or "off"),
+        run_id=f"roads_rerun_{int(time.time())}",
+        junction_node_mode=str(input_spec.get("junction_node_mode") or "sparse"),
+    )))
+    updated = {
+        **old, **result, "result": str(result_path), "status": "completed",
+        "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
+    }
+    manifest["period_results"][index] = updated
+    return updated
+
+
+def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
+    periods = {
+        (str(entry.get("grid")), str(entry.get("period"))): entry
+        for entry in (manifest.get("period_results", []) or []) if isinstance(entry, dict)
+    }
+    before_entry, after_entry = periods.get((grid, before)), periods.get((grid, after))
+    if before_entry is None or after_entry is None:
+        raise ValueError(f"变化对缺少道路提取结果：{grid} / {before} → {after}")
+    entries = manifest.get("change_results", []) or []
+    index = next((
+        number for number, entry in enumerate(entries)
+        if isinstance(entry, dict) and str(entry.get("grid")) == grid
+        and str(entry.get("before_period")) == before and str(entry.get("after_period")) == after
+    ), None)
+    old = entries[index] if index is not None else {}
+    job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
+    output = Path(str(old.get("output") or job_root / "grids" / clean_name(grid) / "changes" / f"{clean_name(before)}_to_{clean_name(after)}"))
+    spec = manifest.get("input_spec") or {}
+    started = time.monotonic()
+    result = _ensure_change_manifest_fields(change(argparse.Namespace(
+        before_result=str(before_entry["result"]), after_result=str(after_entry["result"]),
+        output=str(output), before_period=before, after_period=after,
+        absolute=str(spec.get("absolute") or old.get("absolute") or "2.0"),
+        ratio=str(spec.get("ratio") or old.get("ratio") or "0.2"),
+        tolerance=str(spec.get("tolerance") or old.get("tolerance") or "3.0"),
+        truth=str(old.get("truth") or ""), validation_area=str(old.get("validation_area") or ""),
+        truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or ""),
+    )), output)
+    updated = {
+        **old, **result, "grid": grid, "before_period": before, "after_period": after,
+        "status": "completed", "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
+    }
+    updated.pop("stale_reason", None)
+    if index is None:
+        entries.append(updated)
+    else:
+        entries[index] = updated
+    manifest["change_results"] = entries
+    return updated
+
+
+def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tuple[str, str]]:
+    names = sorted({
+        str(entry.get("period")) for entry in (manifest.get("period_results", []) or [])
+        if isinstance(entry, dict) and str(entry.get("grid")) == grid
+    }, key=period_sort_key)
+    return [(before, after) for before, after in zip(names, names[1:]) if period in {before, after}]
+
+
+def _refresh_manifest_downstream(manifest: dict) -> None:
+    job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
+    manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+    aggregate_change_evaluations(manifest, job_root)
+    manifest["downstream_updated_at"] = now_text()
+
+
+def rerun_pipeline_period(args: argparse.Namespace) -> dict:
+    manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
+    manifest = read_json(manifest_path)
+    grid, period = str(args.grid), str(args.period)
+    pairs = _affected_manifest_pairs(manifest, grid, period)
+    emit("pipeline", stage="道路提取局部重跑", status="running", completed=0, total=1 + (len(pairs) if args.update_related else 0))
+    updated = _rerun_period_entry(manifest, grid, period)
+    if args.update_related:
+        for index, (before, after) in enumerate(pairs, start=1):
+            _rerun_change_entry(manifest, grid, before, after)
+            emit("pipeline", stage="相关变化对更新", status="running", completed=index, total=len(pairs))
+        _refresh_manifest_downstream(manifest)
+    else:
+        for entry in manifest.get("change_results", []) or []:
+            key = (str(entry.get("before_period")), str(entry.get("after_period")))
+            if str(entry.get("grid")) == grid and key in pairs:
+                entry["status"] = "stale"
+                entry["stale_reason"] = f"{period} 期道路成果已重跑"
+        manifest["temporal_status"] = "stale"
+    manifest["status"] = "completed"
+    manifest["updated_at"] = now_text()
+    _persist_existing_pipeline(manifest, manifest_path)
+    result = {"grid": grid, "period": period, "affected_pairs": pairs, "updated_related": bool(args.update_related), "result": updated.get("result")}
+    emit("complete", stage="rerun-period", **result)
+    return result
+
+
+def rerun_pipeline_change(args: argparse.Namespace) -> dict:
+    manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
+    manifest = read_json(manifest_path)
+    updated = _rerun_change_entry(manifest, str(args.grid), str(args.before_period), str(args.after_period))
+    if args.update_temporal:
+        _refresh_manifest_downstream(manifest)
+    else:
+        manifest["temporal_status"] = "stale"
+    manifest["status"] = "completed"
+    _persist_existing_pipeline(manifest, manifest_path)
+    result = {"grid": args.grid, "before_period": args.before_period, "after_period": args.after_period, "updated_temporal": bool(args.update_temporal), "output": updated.get("output")}
+    emit("complete", stage="rerun-change", **result)
+    return result
+
+
+def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
+    manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
+    manifest = read_json(manifest_path)
+    period_keys = [
+        (str(entry.get("grid")), str(entry.get("period")))
+        for entry in (manifest.get("period_results", []) or []) if isinstance(entry, dict)
+    ]
+    for index, (grid, period) in enumerate(period_keys, start=1):
+        _rerun_period_entry(manifest, grid, period)
+        emit("pipeline", stage="批量道路提取重跑", status="running", completed=index, total=len(period_keys))
+    change_keys = [
+        (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))
+        for entry in (manifest.get("change_results", []) or []) if isinstance(entry, dict)
+    ]
+    for grid, before, after in change_keys:
+        _rerun_change_entry(manifest, grid, before, after)
+    _refresh_manifest_downstream(manifest)
+    manifest["status"] = "completed"
+    _persist_existing_pipeline(manifest, manifest_path)
+    result = {"period_count": len(period_keys), "change_count": len(change_keys)}
+    emit("complete", stage="rerun-all-periods", **result)
+    return result
 
 
 def build_temporal_outputs(manifest: dict, job_root: Path | None = None) -> list[dict]:
@@ -2609,15 +2911,30 @@ def run_all(args: argparse.Namespace) -> dict:
         for grid, periods in grids.items()
     }
     output_root = Path(args.output_root).expanduser().resolve()
-    if bool(getattr(args, "preflight_only", False)):
+    data_check_only = bool(getattr(args, "data_check_only", False))
+    if bool(getattr(args, "preflight_only", False)) or data_check_only:
         report = build_preflight_report(
             mode, grids, validation_area, truth_by_pair, output_root,
+            include_runtime_checks=not data_check_only,
         )
         report["elapsed_seconds"] = elapsed_seconds(current_started)
         report["completed"] = 1
         report["total"] = 1
-        emit("complete", stage="preflight", **report)
+        emit("complete", stage="data-check" if data_check_only else "preflight", **report)
         return report
+    if bool(getattr(args, "runtime_preflight", False)):
+        emit("pipeline", stage="运行前检查", status="running", completed=0, total=1)
+        data_report = build_preflight_report(
+            mode, grids, validation_area, truth_by_pair, output_root,
+            include_runtime_checks=True,
+        )
+        runtime_report = check_runtime_environment(args, output_root)
+        emit(
+            "pipeline", stage="运行前检查", status="complete", completed=1, total=1,
+            warning_count=len(data_report.get("warnings") or []),
+            cuda_available=runtime_report["cuda_available"],
+            output_free_bytes=runtime_report["output_free_bytes"],
+        )
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = clean_name(args.run_id.strip() or time.strftime("run_%Y%m%d_%H%M%S"))
     job_root = output_root / run_id
@@ -2630,12 +2947,15 @@ def run_all(args: argparse.Namespace) -> dict:
     input_spec = _task_input_spec(mode, grids, validation_area, truth_by_pair, args)
     prior = {}
     state_path = job_root / "job_state.json"
+    invalidation = {"periods": [], "changes": [], "threshold_changed": False, "truth_changed": False, "reuse_all": False}
     if resume:
         if not state_path.is_file():
             raise FileNotFoundError(f"找不到可续跑的任务状态：{state_path}")
         prior = read_json(state_path)
-        if prior.get("input_spec") != input_spec:
-            raise ValueError("续跑输入或参数与原任务不一致；请恢复原设置或使用新的任务名称。")
+        invalidation = dependency_invalidation_plan(prior.get("input_spec") or {}, input_spec)
+
+    invalid_periods = {tuple(value) for value in invalidation["periods"]}
+    invalid_changes = {tuple(value) for value in invalidation["changes"]}
 
     planned_period_count = sum(len(periods) for periods in grids.values())
     planned_change_count = sum(max(0, len(periods) - 1) for periods in grids.values())
@@ -2644,11 +2964,30 @@ def run_all(args: argparse.Namespace) -> dict:
     prior_periods = {
         (entry.get("grid"), entry.get("period")): entry
         for entry in prior.get("period_results", []) if isinstance(entry, dict)
+        and (str(entry.get("grid")), str(entry.get("period"))) not in invalid_periods
     }
     prior_changes = {
         (entry.get("grid"), entry.get("before_period"), entry.get("after_period")): entry
         for entry in prior.get("change_results", []) if isinstance(entry, dict)
+        and (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period"))) not in invalid_changes
     }
+    if resume and invalidation["reuse_all"] and prior.get("status") in {"completed", "completed_with_errors"}:
+        periods_ready = all(_period_result_ready(entry) for entry in prior_periods.values())
+        changes_ready = all(_change_result_ready(entry) for entry in prior_changes.values())
+        if periods_ready and changes_ready:
+            prior["attempt"] = int(prior.get("attempt", 0) or 0) + 1
+            prior["resumed_at"] = now_text()
+            prior["last_reused_at"] = now_text()
+            prior["reuse_count"] = int(prior.get("reuse_count", 0) or 0) + 1
+            _persist_pipeline(prior, job_root, output_root)
+            emit(
+                "complete", stage="all", manifest=str(job_root / "pipeline_result.json"),
+                job_root=str(job_root), grid_count=len(grids),
+                period_count=len(prior_periods), change_count=len(prior_changes),
+                failure_count=len(prior.get("failures", [])), status=prior.get("status"),
+                reused=True, completed=1, total=1,
+            )
+            return prior
     manifest = {
         "pipeline_version": PIPELINE_VERSION,
         "run_id": run_id,
@@ -2663,6 +3002,7 @@ def run_all(args: argparse.Namespace) -> dict:
         "evaluation_enabled": not bool(getattr(args, "no_evaluation", False)),
         "job_root": str(job_root),
         "input_spec": input_spec,
+        "invalidation_plan": invalidation,
         "status": "running",
         "attempt": int(prior.get("attempt", 0) or 0) + 1,
         "started_at": prior.get("started_at") or now_text(),
@@ -2716,7 +3056,8 @@ def run_all(args: argparse.Namespace) -> dict:
         if mode == "validation":
             for area_id, area_periods in grids.items():
                 normalized_root = job_root / "validation_inputs" / clean_name(area_id)
-                ready = _normalized_sources_ready(area_periods, normalized_root) if resume else None
+                area_invalidated = any((str(area_id), str(period)) in invalid_periods for period in area_periods)
+                ready = _normalized_sources_ready(area_periods, normalized_root) if resume and not area_invalidated else None
                 if ready is None:
                     ready = normalize_validation_sources(
                         area_periods, validation_area[area_id], normalized_root,
@@ -2967,6 +3308,15 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--result", required=True, help="期次 latest_result.json")
     a.add_argument("--edited-dir", default="")
     a.add_argument("--pipeline-manifest", default="")
+    a = sub.add_parser("rerun-period", help="主动重跑任务索引中的一个道路提取期次")
+    a.add_argument("--pipeline-manifest", required=True); a.add_argument("--grid", required=True); a.add_argument("--period", required=True)
+    a.add_argument("--update-related", action="store_true")
+    a = sub.add_parser("rerun-change", help="主动重跑任务索引中的一个相邻变化对")
+    a.add_argument("--pipeline-manifest", required=True); a.add_argument("--grid", required=True)
+    a.add_argument("--before-period", required=True); a.add_argument("--after-period", required=True)
+    a.add_argument("--update-temporal", action="store_true")
+    a = sub.add_parser("rerun-all-periods", help="批量重跑全部道路提取并按依赖更新下游成果")
+    a.add_argument("--pipeline-manifest", required=True)
     a = sub.add_parser("evaluate-existing", help="使用真值评价已有变化检测结果，不重跑提取和检测")
     a.add_argument("--pipeline-manifest", required=True)
     a.add_argument("--grid", required=True)
@@ -3007,6 +3357,8 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--resume", action="store_true", help="继续同名未完成任务并跳过完整成果")
     a.add_argument("--continue-on-error", action="store_true", help="单个格网/期次失败后继续处理其他任务")
     a.add_argument("--preflight-only", action="store_true", help="只检查输入规模、空间参考和磁盘风险，不创建任务")
+    a.add_argument("--data-check-only", action="store_true", help="只检查项目数据，不检查模型、设备、输出空间")
+    a.add_argument("--runtime-preflight", action="store_true", help="完整流程开始前同时检查运行环境和输出空间")
     a.add_argument("--absolute", default="2.0"); a.add_argument("--ratio", default="0.2"); a.add_argument("--tolerance", default="3.0")
     return p
 
@@ -3023,6 +3375,9 @@ def main() -> int:
     elif args.command == "extract": extract(args)
     elif args.command == "change": change(args)
     elif args.command == "apply-edits": apply_centerline_edits(args)
+    elif args.command == "rerun-period": rerun_pipeline_period(args)
+    elif args.command == "rerun-change": rerun_pipeline_change(args)
+    elif args.command == "rerun-all-periods": rerun_all_pipeline_periods(args)
     elif args.command == "evaluate-existing": evaluate_existing_changes(args)
     elif args.command == "evaluate-all-existing": evaluate_all_existing_changes(args)
     else: run_all(args)

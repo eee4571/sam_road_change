@@ -52,7 +52,7 @@ class UserGuiInputCommandTests(unittest.TestCase):
         self.assertIn("根据真值数据中的变化类型", source)
         self.assertNotIn("BHBM=2", source)
         self.assertIn('text="待评价结果"', source)
-        self.assertIn('text="变化真值数据"', source)
+        self.assertIn('text="项目真值"', source)
         self.assertIn('text="变化类型字段"', source)
         self.assertIn('text="中心线匹配容差（米）"', source)
         self.assertIn("self.result_review_count", source)
@@ -70,11 +70,12 @@ class UserGuiInputCommandTests(unittest.TestCase):
         source = inspect.getsource(gui.UserApp._build_data_page)
         self.assertIn("quick_actions.grid_columnconfigure(1, weight=1)", source)
         self.assertIn('textvariable=self.project_path_display, style="PathText.TLabel", width=1', source)
-        self.assertIn('text="选择目录…"', source)
+        self.assertIn('text="连接数据源"', source)
+        self.assertEqual(source.count('text="扫描数据"'), 1)
 
     def test_result_metrics_keep_four_equal_columns(self) -> None:
         source = inspect.getsource(gui.UserApp._build_result_page)
-        self.assertIn('(\"可人工复核\", self.result_review_count)', source)
+        self.assertIn('(\"可人工编辑\", self.result_review_count)', source)
         self.assertIn('box.pack(side=LEFT, fill=X, expand=True, padx=3)', source)
 
     def test_unicode_paths_and_config_text_round_trip(self) -> None:
@@ -103,8 +104,59 @@ class UserGuiInputCommandTests(unittest.TestCase):
     def test_optional_manual_review_is_a_generation_step_before_results(self) -> None:
         self.assertEqual(
             gui.WORKFLOW_STEPS,
-            ("数据准备", "运行任务", "人工复核（可选）", "查看结果"),
+            ("数据准备", "自动处理", "人工编辑（可选）", "成果与评价"),
         )
+
+    def test_project_config_is_atomic_and_separate_from_external_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            source = Path(raw) / "external-source"
+            project.mkdir(); source.mkdir()
+            payload = {"project_root": str(project), "external_data_sources": [str(source)]}
+            path = gui.atomic_write_json(gui.project_config_path(project), payload)
+            self.assertEqual(path.name, "project_config.json")
+            self.assertEqual(gui.read_project_config(project), payload)
+            self.assertNotEqual(path.parent, source)
+            self.assertEqual(list(project.glob(".*.tmp")), [])
+
+    def test_selected_period_reports_both_adjacent_dependencies(self) -> None:
+        self.assertEqual(
+            gui.affected_change_pairs(["2024", "2021", "2022"], "2022"),
+            [("2021", "2022"), ("2022", "2024")],
+        )
+
+    def test_cancelled_active_task_is_automatically_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw); state = output / "run_cancelled" / "job_state.json"
+            state.parent.mkdir(); state.write_text('{"status":"cancelled"}', encoding="utf-8")
+            run_id, resume, resolved = gui.resolve_automatic_run(
+                output, active_task={"run_id": "run_cancelled"}, generated_run_id="new_run",
+            )
+            self.assertEqual(run_id, "run_cancelled")
+            self.assertTrue(resume)
+            self.assertEqual(resolved, state)
+
+    def test_data_check_and_runtime_preflight_are_separate_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); area = root / "area.shp"; area.touch()
+            periods = []
+            for year in ("2021", "2022"):
+                source = root / f"{year}.txt"; source.touch(); periods.append((year, str(source)))
+            common = dict(mode="validation", validation_area=str(area), periods=periods, truths=[], evaluate=False, **self.common(root))
+            data_check = gui.build_pipeline_command(data_check_only=True, **common)
+            full = gui.build_pipeline_command(**common)
+            self.assertIn("--data-check-only", data_check)
+            self.assertNotIn("--runtime-preflight", data_check)
+            self.assertIn("--runtime-preflight", full)
+
+    def test_result_browser_represents_missing_products_without_opening_them(self) -> None:
+        items = gui.collect_result_tree_items({
+            "period_results": [{"grid": "north", "period": "2022", "centerlines": "missing.shp"}],
+            "change_results": [],
+        })
+        centerline = next(item for item in items if item["label"] == "道路中心线")
+        self.assertEqual(centerline["status"], "未生成")
+        self.assertIn("长时序道路成果", {item["label"] for item in items})
 
     def test_accuracy_evaluation_is_a_runnable_result_step(self) -> None:
         data_source = inspect.getsource(gui.UserApp._build_data_page)

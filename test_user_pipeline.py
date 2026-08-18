@@ -690,6 +690,16 @@ class OneClickPipelineTests(unittest.TestCase):
             self.assertEqual(resumed["period_count"], 2)
             self.assertEqual(resumed["change_count"], 1)
 
+            changed_args = argparse.Namespace(**{**common, "absolute": "2"}, resume=True)
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout), \
+                    patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract") as extract_mock, \
+                    patch.object(user_pipeline, "change", side_effect=fake_change) as change_mock:
+                changed = user_pipeline.run_all(changed_args)
+            prepare_mock.assert_not_called(); extract_mock.assert_not_called()
+            self.assertEqual(change_mock.call_count, 1)
+            self.assertTrue(changed["invalidation_plan"]["threshold_changed"])
+
     def test_continue_on_error_records_failure_and_dependency_skip(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw); source = root / "source"; source.mkdir(); output = root / "output"
@@ -860,7 +870,8 @@ class ApplyCenterlineEditsTests(unittest.TestCase):
                 result=str(result_path), edited_dir="", pipeline_manifest=str(pipeline_path)
             )
 
-            with patch.object(user_pipeline, "run_command") as run_mock:
+            with patch.object(user_pipeline, "run_command") as run_mock, \
+                    patch.object(user_pipeline, "extract") as extract_mock:
                 updated = user_pipeline.apply_centerline_edits(args)
 
             self.assertEqual(run_mock.call_count, 3)
@@ -869,6 +880,7 @@ class ApplyCenterlineEditsTests(unittest.TestCase):
             self.assertIn("--edited-dir", commands[1])
             self.assertIn("--stitched-centerlines", commands[2])
             self.assertTrue(updated["manual_edit"]["applied"])
+            extract_mock.assert_not_called()
             pipeline = user_pipeline.read_json(pipeline_path)
             self.assertTrue(pipeline["period_results"][0]["manual_edit"]["applied"])
 
@@ -928,6 +940,87 @@ class ApplyCenterlineEditsTests(unittest.TestCase):
                 [(call.args[0].before_period, call.args[0].after_period) for call in end_mock.call_args_list],
                 [("2023", "2024")],
             )
+
+
+class DependencyInvalidationTests(unittest.TestCase):
+    @staticmethod
+    def spec() -> dict:
+        return {
+            "pipeline_version": user_pipeline.PIPELINE_VERSION,
+            "mode": "validation", "validation_area": {"north": {"path": "area.shp"}},
+            "grids": {"north": {
+                "2021": {"path": "2021.txt", "size": 1},
+                "2022": {"path": "2022.txt", "size": 2},
+                "2024": {"path": "2024.txt", "size": 4},
+            }},
+            "checkpoint": {"path": "model.ckpt"}, "config": {"path": "config.yaml"},
+            "device": "cpu", "pixel_size": "0", "rescale": "off", "junction_node_mode": "sparse",
+            "absolute": "2", "ratio": "0.2", "tolerance": "3",
+            "truths": {}, "truth_type_field": "", "evaluation_enabled": False,
+        }
+
+    def test_threshold_change_invalidates_changes_but_not_extraction(self) -> None:
+        prior = self.spec(); current = json.loads(json.dumps(prior)); current["absolute"] = "3"
+        plan = user_pipeline.dependency_invalidation_plan(prior, current)
+        self.assertEqual(plan["periods"], [])
+        self.assertEqual(plan["changes"], [
+            ("north", "2021", "2022"), ("north", "2022", "2024"),
+        ])
+        self.assertTrue(plan["threshold_changed"])
+
+    def test_one_period_input_invalidates_only_it_and_adjacent_changes(self) -> None:
+        prior = self.spec(); current = json.loads(json.dumps(prior)); current["grids"]["north"]["2022"]["size"] = 99
+        plan = user_pipeline.dependency_invalidation_plan(prior, current)
+        self.assertEqual(plan["periods"], [("north", "2022")])
+        self.assertEqual(plan["changes"], [
+            ("north", "2021", "2022"), ("north", "2022", "2024"),
+        ])
+
+    def test_period_rerun_without_cascade_marks_pairs_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); job = root / "run"; job.mkdir()
+            manifest_path = root / "latest_pipeline.json"
+            manifest = {
+                "job_root": str(job),
+                "period_results": [
+                    {"grid": "north", "period": year, "result": str(job / year / "latest_result.json")}
+                    for year in ("2021", "2022", "2024")
+                ],
+                "change_results": [
+                    {"grid": "north", "before_period": "2021", "after_period": "2022"},
+                    {"grid": "north", "before_period": "2022", "after_period": "2024"},
+                ],
+            }
+            user_pipeline.write_json(manifest_path, manifest)
+            with patch.object(user_pipeline, "_rerun_period_entry", return_value={"result": "updated"}), \
+                    patch.object(user_pipeline, "_rerun_change_entry") as change_mock, \
+                    patch.object(user_pipeline, "_write_task_report"):
+                result = user_pipeline.rerun_pipeline_period(argparse.Namespace(
+                    pipeline_manifest=str(manifest_path), grid="north", period="2022", update_related=False,
+                ))
+            updated = user_pipeline.read_json(manifest_path)
+            self.assertFalse(result["updated_related"])
+            change_mock.assert_not_called()
+            self.assertEqual([entry["status"] for entry in updated["change_results"]], ["stale", "stale"])
+            self.assertEqual(updated["temporal_status"], "stale")
+
+    def test_period_rerun_with_cascade_is_serial_and_refreshes_downstream_last(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); job = root / "run"; job.mkdir(); manifest_path = root / "latest_pipeline.json"
+            user_pipeline.write_json(manifest_path, {
+                "job_root": str(job),
+                "period_results": [{"grid": "north", "period": year} for year in ("2021", "2022", "2024")],
+                "change_results": [],
+            })
+            order = []
+            with patch.object(user_pipeline, "_rerun_period_entry", side_effect=lambda *_args: order.append("period") or {}), \
+                    patch.object(user_pipeline, "_rerun_change_entry", side_effect=lambda _m, _g, b, a: order.append(f"change:{b}:{a}") or {}), \
+                    patch.object(user_pipeline, "_refresh_manifest_downstream", side_effect=lambda _m: order.append("downstream")), \
+                    patch.object(user_pipeline, "_write_task_report"):
+                user_pipeline.rerun_pipeline_period(argparse.Namespace(
+                    pipeline_manifest=str(manifest_path), grid="north", period="2022", update_related=True,
+                ))
+            self.assertEqual(order, ["period", "change:2021:2022", "change:2022:2024", "downstream"])
 
 
 if __name__ == "__main__":

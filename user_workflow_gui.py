@@ -12,7 +12,7 @@ import time
 import zipfile
 import ctypes
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Canvas, StringVar, TclError, Text, Tk, Toplevel, filedialog, font as tkfont, messagebox, simpledialog
+from tkinter import BOTH, END, LEFT, RIGHT, X, Canvas, Menu, StringVar, TclError, Text, Tk, Toplevel, filedialog, font as tkfont, messagebox, simpledialog
 from tkinter import ttk
 
 from input_catalog import period_order_manifest, period_sort_key
@@ -26,6 +26,7 @@ DEFAULT_CKPT = ROOT / "models" / "samroad" / "samroad.ckpt"
 DEFAULT_TEST_DATA = ROOT / "功能测试数据"
 USER_VECTOR_SUFFIX = ".shp"
 USER_IMAGE_LIST_SUFFIX = ".txt"
+PROJECT_CONFIG_NAME = "project_config.json"
 
 PREVIEW_LABELS = {
     "centerline": "中心线提取",
@@ -37,9 +38,9 @@ PREVIEW_LABELS = {
 
 WORKFLOW_STEPS = (
     "数据准备",
-    "运行任务",
-    "人工复核（可选）",
-    "查看结果",
+    "自动处理",
+    "人工编辑（可选）",
+    "成果与评价",
 )
 
 UI = {
@@ -392,7 +393,7 @@ def build_geometry_editor_command(script: Path | str, item: dict[str, str]) -> l
     final_centerlines = str(item.get("final_centerlines") or "").strip()
     final_surfaces = str(item.get("final_surfaces") or "").strip()
     if not final_centerlines:
-        raise ValueError("该期次缺少最终融合中心线 SHP，无法按正式成果进行人工复核。")
+        raise ValueError("该期次缺少最终融合中心线 SHP，无法按正式成果进行人工编辑。")
     if not final_surfaces:
         final_surfaces = str(Path(final_centerlines).with_name("road_surfaces.shp"))
     return [
@@ -442,6 +443,120 @@ def format_percentage(value: object, digits: int = 1) -> str:
     except (TypeError, ValueError):
         return "--"
     return f"{number * 100:.{digits}f}%"
+
+
+def atomic_write_json(path: Path | str, value: dict) -> Path:
+    """Write a project-side JSON file without exposing a partial document."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def project_config_path(project_root: Path | str) -> Path:
+    return Path(project_root).expanduser().resolve() / PROJECT_CONFIG_NAME
+
+
+def read_project_config(project_root: Path | str) -> dict:
+    """Read the new project config while accepting an absent legacy config."""
+    path = project_config_path(project_root)
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"项目配置根节点必须是 JSON 对象：{path}")
+    return value
+
+
+def affected_change_pairs(periods: list[str] | tuple[str, ...], selected: str) -> list[tuple[str, str]]:
+    """Return the adjacent changes invalidated by replacing one period result."""
+    ordered = sorted({str(value).strip() for value in periods if str(value).strip()}, key=period_sort_key)
+    return [
+        (before, after)
+        for before, after in zip(ordered, ordered[1:])
+        if selected in {before, after}
+    ]
+
+
+def scan_external_data_source(source_dir: Path | str) -> dict:
+    """Scan an external source without moving or rewriting any source file."""
+    root = Path(source_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"外部数据源不存在：{root}")
+    try:
+        discovered = discover_validation_project(root)
+    except ValueError:
+        discovered = None
+    candidates = {
+        "shp": [str(path.resolve()) for path in sorted(root.rglob("*.shp"), key=lambda item: natural_key(str(item)))],
+        "txt": [str(path.resolve()) for path in sorted(root.rglob("*.txt"), key=lambda item: natural_key(str(item)))],
+    }
+    return {"root": str(root), "discovered": discovered, "candidates": candidates}
+
+
+def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
+    """Build one stable result-browser model for new and historical manifests."""
+    items: list[dict[str, str]] = []
+    area_nodes: set[str] = set()
+
+    def add(node_id: str, parent: str, label: str, path_value: object = "") -> None:
+        path = _manifest_path(path_value, base_dir)
+        exists = bool(path and path.exists())
+        items.append({
+            "id": node_id, "parent": parent, "label": label,
+            "path": str(path) if path is not None else "",
+            "status": "已生成" if exists else "未生成",
+        })
+
+    def ensure_area(area: str) -> str:
+        node = f"area:{area}"
+        if node not in area_nodes:
+            area_nodes.add(node)
+            items.append({"id": node, "parent": "", "label": area, "path": "", "status": ""})
+        return node
+
+    for index, entry in enumerate(manifest.get("period_results", []) or []):
+        if not isinstance(entry, dict):
+            continue
+        area = str(entry.get("grid") or "validation")
+        parent = ensure_area(area)
+        period = str(entry.get("period") or f"期次 {index + 1}")
+        period_id = f"{parent}:period:{period}"
+        items.append({"id": period_id, "parent": parent, "label": period, "path": "", "status": str(entry.get("status") or "")})
+        add(f"{period_id}:centerline", period_id, "道路中心线", entry.get("centerlines"))
+        add(f"{period_id}:surface", period_id, "道路面", entry.get("surfaces"))
+        add(f"{period_id}:width", period_id, "道路宽度", entry.get("gpkg"))
+    for index, entry in enumerate(manifest.get("change_results", []) or []):
+        if not isinstance(entry, dict):
+            continue
+        area = str(entry.get("grid") or "validation")
+        parent = ensure_area(area)
+        before, after = str(entry.get("before_period") or "前期"), str(entry.get("after_period") or "后期")
+        pair_id = f"{parent}:change:{before}:{after}:{index}"
+        items.append({"id": pair_id, "parent": parent, "label": f"{before} → {after}", "path": "", "status": str(entry.get("status") or "")})
+        add(f"{pair_id}:result", pair_id, "变化检测结果", entry.get("gpkg") or entry.get("summary") or entry.get("output"))
+    temporal_by_area = {
+        str(entry.get("grid") or "validation"): entry
+        for entry in (manifest.get("temporal_results", []) or []) if isinstance(entry, dict)
+    }
+    for area_node in sorted(area_nodes):
+        area = area_node.removeprefix("area:")
+        temporal = temporal_by_area.get(area, {})
+        add(f"{area_node}:temporal", area_node, "长时序道路成果", temporal.get("life_shp"))
+    job_root = _manifest_path(manifest.get("job_root"), base_dir)
+    report = job_root / "task_report.csv" if job_root is not None else None
+    items.append({
+        "id": "task-report", "parent": "", "label": "任务报告",
+        "path": str(report) if report is not None else "",
+        "status": "已生成" if report is not None and report.is_file() else "未生成",
+    })
+    return items
 
 
 def discover_validation_project(project_dir: Path | str) -> dict:
@@ -570,6 +685,7 @@ def build_pipeline_command(
     truths: list[tuple[str, str, str]] | None = None, truth_type_field: str = "",
     source_root: str = "", evaluate: bool = True, resume: bool = False,
     continue_on_error: bool = True, preflight_only: bool = False,
+    data_check_only: bool = False, runtime_preflight: bool = True,
     junction_node_mode: str = "sparse",
     validation_areas: list[tuple[str, str]] | None = None,
     area_truths: list[tuple[str, str, str, str]] | None = None,
@@ -675,6 +791,10 @@ def build_pipeline_command(
         args.append("--continue-on-error")
     if preflight_only:
         args.append("--preflight-only")
+    if data_check_only:
+        args.append("--data-check-only")
+    elif runtime_preflight and not preflight_only:
+        args.append("--runtime-preflight")
     return args
 
 
@@ -692,6 +812,17 @@ def _safe_task_name(value: str) -> str:
     """Return the path component used by the existing project-stage backend."""
     normalized = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value).strip())
     return normalized.strip("._-") or "workspace"
+
+
+def resolve_automatic_run(
+    output_root: Path | str, requested_run_id: str = "", active_task: dict | None = None,
+    *, generated_run_id: str | None = None,
+) -> tuple[str, bool, Path]:
+    """Choose a new or resumable task without exposing resume as a task type."""
+    active = active_task if isinstance(active_task, dict) else {}
+    run_id = str(requested_run_id or active.get("run_id") or generated_run_id or time.strftime("run_%Y%m%d_%H%M%S")).strip()
+    state = Path(output_root).expanduser() / _safe_task_name(run_id) / "job_state.json"
+    return run_id, state.is_file(), state
 
 
 def find_period_result(item: dict[str, str]) -> Path | None:
@@ -832,7 +963,7 @@ def build_evaluate_all_command(
 class UserApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.root.title("道路实体变化智能检测与人工核验")
+        self.root.title("道路实体变化智能检测与人工编辑")
         self.display_scale = configure_window_geometry(
             self.root, base_width=1280, base_height=820, min_width=1000, min_height=680,
         )
@@ -848,17 +979,24 @@ class UserApp:
         self.project_validation_areas: list[tuple[str, str]] = []
         self.project_area_truths: list[tuple[str, str, str, str]] = []
         self.project_area_periods: dict[str, list[tuple[str, str]]] = {}
+        self.project_data_sources: list[str] = []
+        self.project_candidates: dict[str, list[str]] = {"shp": [], "txt": []}
+        self.project_config: dict = {}
         self.project_root_path = ""
         self.project_region = StringVar(value="")
         self.project_period = StringVar(value="")
         self.project_change_pair = StringVar(value="")
         self.project_scan_summary = StringVar(value="尚未扫描数据源。")
+        self.data_status = StringVar(value="未连接数据源")
+        self.data_source_display = StringVar(value="尚未连接外部数据源")
         self.project_validation_path = StringVar(value="尚未选择验证区。")
         self.review_edit_directory = StringVar(value="")
         self.grid_options_visible = False
         self.manual_inputs_visible = False
         self.run_settings_visible = False
         self.advanced_visible = False
+        self.review_advanced_visible = False
+        self.evaluation_advanced_visible = False
         self.log_visible = False
         self.current_step = 0
         self.preflight_passed = False
@@ -874,6 +1012,7 @@ class UserApp:
         self.last_complete_payload: dict | None = None
         self.active_log_path: Path | None = None
         self.recent_log_lines: list[str] = []
+        self.result_tree_paths: dict[str, Path] = {}
         self.vars = {
             key: StringVar(value=value)
             for key, value in {
@@ -992,19 +1131,31 @@ class UserApp:
         self.status = StringVar(value="请选择 SAMRoad 项目目录。")
         self.current_project = StringVar(value="当前项目：未选择")
         self.header_state = StringVar(value="等待选择数据")
+        menu = Menu(self.root)
+        project_menu = Menu(menu, tearoff=False)
+        project_menu.add_command(label="新建项目", command=self.create_project_folder)
+        project_menu.add_command(label="打开项目", command=self.import_project_folder)
+        project_menu.add_command(label="载入已有任务结果", command=self.load_existing_results)
+        project_menu.add_separator()
+        project_menu.add_command(label="打开项目文件夹", command=self.open_project_folder)
+        menu.add_cascade(label="项目", menu=project_menu)
+        tools_menu = Menu(menu, tearoff=False)
+        tools_menu.add_command(label="运行诊断 / 导出诊断包", command=self.export_diagnostics)
+        menu.add_cascade(label="工具", menu=tools_menu)
+        self.root.configure(menu=menu)
 
         header = ttk.Frame(self.root, padding=(22, 14, 22, 14), style="Header.TFrame")
         header.pack(fill=X)
         ttk.Label(header, text="ROAD CHANGE", style="Brand.TLabel").pack(side=LEFT, padx=(0, 22))
         title_area = ttk.Frame(header, style="Header.TFrame")
         title_area.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(title_area, text="道路实体变化智能检测与人工核验", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(title_area, text="道路实体变化智能检测与人工编辑", style="HeaderTitle.TLabel").pack(anchor="w")
         project_area = ttk.Frame(header, style="Header.TFrame")
         project_area.pack(side=RIGHT)
         ttk.Label(project_area, textvariable=self.current_project, style="HeaderProject.TLabel").pack(side=LEFT, padx=(0, 20))
         self.header_state_label = ttk.Label(project_area, textvariable=self.header_state, style="HeaderIdle.TLabel")
         self.header_state_label.pack(side=LEFT, padx=(0, 20))
-        ttk.Label(project_area, text="道路提取  ·  变化检测  ·  人工复核  ·  成果交付", style="HeaderMeta.TLabel").pack(side=LEFT)
+        ttk.Label(project_area, text="道路提取  ·  变化检测  ·  人工编辑  ·  成果交付", style="HeaderMeta.TLabel").pack(side=LEFT)
 
         self.stepper_canvas = Canvas(
             self.root, height=56, background=UI["page"], highlightthickness=0, borderwidth=0,
@@ -1097,7 +1248,7 @@ class UserApp:
         log_body.grid_columnconfigure(0, weight=1)
         self.log.bind("<Control-a>", self._select_all_logs)
         self.log.bind("<Control-A>", self._select_all_logs)
-        self.log.insert("1.0", "这里统一显示数据检查、处理、人工复核和精度评价日志。\n")
+        self.log.insert("1.0", "这里统一显示数据检查、自动处理、人工编辑和精度评价日志。\n")
 
     def _resize_content_canvas(self, event=None) -> None:
         if not hasattr(self, "content_canvas"):
@@ -1241,23 +1392,23 @@ class UserApp:
 
         quick = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         quick.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(quick, text="▤  原始数据源", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(quick, text="连接规范项目文件夹后，自动扫描一个或多个地区的数据。", style="CardMuted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["module_gap"]))
+        ttk.Label(quick, text="▤  外部原始数据源", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(quick, text="只保存外部路径和映射；不会移动、复制或重命名原始数据。", style="CardMuted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["module_gap"]))
         quick_actions = ttk.Frame(quick, style="Soft.TFrame", padding=(14, 12))
         quick_actions.pack(fill=X)
         ttk.Label(quick_actions, text="01", foreground=UI["blue"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 9, "bold"), padding=(9, 7)).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
         path_area = ttk.Frame(quick_actions, style="Soft.TFrame")
         path_area.grid(row=0, column=1, rowspan=2, sticky="ew")
         quick_actions.grid_columnconfigure(1, weight=1)
-        ttk.Label(path_area, text="数据文件夹", style="PathTitle.TLabel").pack(anchor="w")
-        ttk.Label(path_area, textvariable=self.project_path_display, style="PathText.TLabel", width=1).pack(anchor="w", fill=X, pady=(3, 0))
+        ttk.Label(path_area, text="已连接数据源", style="PathTitle.TLabel").pack(anchor="w")
+        ttk.Label(path_area, textvariable=self.data_source_display, style="PathText.TLabel", width=1).pack(anchor="w", fill=X, pady=(3, 0))
         ttk.Button(
-            quick_actions, text="选择目录…", style="Secondary.TButton",
-            command=self.import_project_folder,
+            quick_actions, text="连接数据源", style="Primary.TButton",
+            command=self.connect_data_source,
         ).grid(row=0, column=3, rowspan=2, sticky="e")
         ttk.Button(
-            quick_actions, text="重新扫描", style="Secondary.TButton",
-            command=self.rescan_project_folder,
+            quick_actions, text="扫描数据", style="Secondary.TButton",
+            command=self.scan_data_sources,
         ).grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 8))
         self.input_summary = StringVar(value="请选择项目目录；如需手工指定数据，可展开高级设置。")
         summary_row = ttk.Frame(quick)
@@ -1266,6 +1417,8 @@ class UserApp:
         self.input_summary_dot.pack(side=LEFT, padx=(0, 7))
         self.input_summary_label = ttk.Label(summary_row, textvariable=self.input_summary, style="CardMuted.TLabel", wraplength=1050)
         self.input_summary_label.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(quick, textvariable=self.data_status, style="Success.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(quick, textvariable=self.project_scan_summary, style="CardMuted.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(3, 0))
 
         config_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         config_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
@@ -1283,15 +1436,14 @@ class UserApp:
         ttk.Label(area_row, text="验证区", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         ttk.Label(area_row, textvariable=self.project_validation_path, style="CardMuted.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
         ttk.Button(area_row, text="选择…", style="Compact.TButton", command=self.replace_project_validation_area).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(area_row, text="移除区域", style="Compact.TButton", command=self.remove_project_region).pack(side=LEFT, padx=(4, 0))
         self.project_config_container = ttk.Frame(config_card, style="Soft.TFrame", padding=(14, 10))
         self.project_config_container.pack(fill=X, pady=(8, 8))
         config_actions = ttk.Frame(config_card)
         config_actions.pack(fill=X)
         self.add_project_period_button = ttk.Button(config_actions, text="＋ 添加期次", style="Compact.TButton", command=self.add_project_period)
         self.add_project_period_button.pack(side=LEFT)
-        ttk.Button(config_actions, text="自动识别数据", style="Secondary.TButton", command=self.rescan_project_folder).pack(side=RIGHT)
-        ttk.Button(config_actions, text="检查数据", style="Secondary.TButton", command=self.preflight_inputs).pack(side=RIGHT, padx=(0, 8))
-        ttk.Button(config_actions, text="保存到项目配置…", style="Primary.TButton", command=self.save_task_config).pack(side=RIGHT, padx=(0, 8))
+        ttk.Button(config_actions, text="检查数据", style="Primary.TButton", command=self.preflight_inputs).pack(side=RIGHT)
         self._refresh_project_config_panel()
 
         self.manual_toggle = ttk.Button(
@@ -1327,11 +1479,11 @@ class UserApp:
         config_actions = ttk.Frame(self.manual_frame, style="Card.TFrame")
         config_actions.pack(fill=X, pady=(12, 0))
         ttk.Button(config_actions, text="加载配置…", style="Compact.TButton", command=self.load_task_config).pack(side=LEFT)
-        ttk.Button(config_actions, text="保存当前配置…", style="Compact.TButton", command=self.save_task_config).pack(side=LEFT, padx=8)
+        ttk.Button(config_actions, text="导出配置…", style="Compact.TButton", command=self.save_task_config).pack(side=LEFT, padx=8)
 
     def _build_run_page(self, page: ttk.Frame) -> None:
         self.run_body = page
-        ttk.Label(page, text="运行任务", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(page, text="自动处理", style="Section.TLabel").pack(anchor="w")
         ttk.Label(page, text="系统将在开始处理前检查项目数据和运行环境。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
         content = ttk.Frame(page, style="Page.TFrame")
         content.pack(fill=BOTH, expand=True)
@@ -1350,12 +1502,9 @@ class UserApp:
             ttk.Label(row, text="开始前检查", foreground=UI["subtle"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 8)).pack(side=RIGHT)
         actions = ttk.Frame(run_card)
         actions.pack(fill=X, pady=(2, 12))
-        self.preflight_button = ttk.Button(
-            actions, text="检查项目", style="Secondary.TButton", command=self.preflight_inputs,
-        )
-        self.preflight_button.pack(side=LEFT)
+        self.preflight_button = ttk.Button(actions, text="检查数据", command=self.preflight_inputs)
         self.run_button = ttk.Button(
-            actions, text="开始处理", style="Hero.TButton", command=self.run_all,
+            actions, text="运行完整流程", style="Hero.TButton", command=self.run_all,
         )
         self.run_button.pack(side=RIGHT)
         self.cancel_button = ttk.Button(actions, text="取消任务", style="Danger.TButton", command=self.cancel_task)
@@ -1383,20 +1532,17 @@ class UserApp:
         ttk.Label(summary_body, text="成果位置", style="PathTitle.TLabel").pack(anchor="w")
         ttk.Label(summary_body, textvariable=self.run_destination_summary, style="PathText.TLabel", wraplength=480).pack(anchor="w", fill=X, pady=(3, 0))
         self.run_settings_toggle = ttk.Button(
-            summary_card, text="›  输出位置、续跑和参数", style="Quiet.TButton", command=self._toggle_run_settings,
+            summary_card, text="›  输出位置与高级设置", style="Quiet.TButton", command=self._toggle_run_settings,
         )
         self.run_settings_toggle.pack(anchor="w")
         self.run_settings_frame = ttk.Frame(summary_card, style="Card.TFrame")
         self._field(self.run_settings_frame, "成果输出目录", "output_root", "dir")
-        self._field(self.run_settings_frame, "任务名称", "run_id")
+        self._field(self.run_settings_frame, "手工任务名称", "run_id")
         run_options = ttk.Frame(self.run_settings_frame)
         run_options.pack(fill=X, pady=(3, 0))
         ttk.Checkbutton(
-            run_options, text="继续同名任务", variable=self.vars["resume"], onvalue="1", offvalue="0",
-        ).pack(side=LEFT)
-        ttk.Checkbutton(
             run_options, text="单项失败后继续", variable=self.vars["continue_on_error"], onvalue="1", offvalue="0",
-        ).pack(side=LEFT, padx=(18, 0))
+        ).pack(side=LEFT)
         ttk.Button(
             run_options, text="检查软件环境", style="Compact.TButton", command=lambda: self._command(["doctor"]),
         ).pack(side=RIGHT)
@@ -1407,7 +1553,6 @@ class UserApp:
         self.advanced_frame = ttk.Frame(self.run_settings_frame)
         self._field(self.advanced_frame, "道路模型", "checkpoint", "file")
         self._field(self.advanced_frame, "推理配置", "config", "file")
-        self._field(self.advanced_frame, "真值类型字段", "truth_type_field")
         advanced_row = ttk.Frame(self.advanced_frame)
         advanced_row.pack(fill=X, pady=(4, 2))
         ttk.Label(advanced_row, text="计算设备", width=18).pack(side=LEFT)
@@ -1439,10 +1584,10 @@ class UserApp:
 
         stage_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         stage_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(stage_card, text="分步重跑与续跑", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(stage_card, text="局部重跑", style="CardTitle.TLabel").pack(anchor="w")
         ttk.Label(
             stage_card,
-            text="已完成的完整成果会在续跑时复用。改了原始数据或参数时，请使用新的任务名称，避免与原任务状态混用。",
+            text="重跑会主动废弃所选阶段的旧结果；选择更新相关结果时，系统按依赖顺序串行更新变化、评价、长时序成果和报告。",
             style="Hint.TLabel", wraplength=1040,
         ).pack(anchor="w", pady=(4, 10))
         selectors = ttk.Frame(stage_card, style="Soft.TFrame", padding=(14, 10))
@@ -1454,33 +1599,42 @@ class UserApp:
         ttk.Label(selectors, text="期次", style="PathTitle.TLabel").grid(row=0, column=2, sticky="w")
         self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=22)
         self.stage_period_combo.grid(row=0, column=3, sticky="ew", padx=(8, 18))
+        self.stage_period_combo.bind("<<ComboboxSelected>>", self._stage_period_changed)
         ttk.Label(selectors, text="相邻变化对", style="PathTitle.TLabel").grid(row=0, column=4, sticky="w")
         self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=25)
         self.stage_pair_combo.grid(row=0, column=5, sticky="ew", padx=(8, 0))
         for column in (1, 3, 5):
             selectors.grid_columnconfigure(column, weight=1)
+        self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
+        ttk.Label(stage_card, textvariable=self.affected_pairs_summary, style="WarningNote.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(0, 10))
         stage_actions = ttk.Frame(stage_card)
         stage_actions.pack(fill=X)
         self.stage_buttons = []
         for text, command, style in (
-            ("续跑完整任务", self.resume_all, "Primary.TButton"),
-            ("仅提取全部期次", self.run_extract_all, "Secondary.TButton"),
-            ("提取/续跑所选期次", self.run_extract_selected, "Secondary.TButton"),
-            ("检测/续跑所选变化对", self.run_change_selected, "Secondary.TButton"),
+            ("重跑所选期次", lambda: self.rerun_selected_period(False), "Secondary.TButton"),
+            ("重跑并更新相关结果", lambda: self.rerun_selected_period(True), "Primary.TButton"),
+            ("重跑所选变化对", lambda: self.rerun_selected_change(False), "Secondary.TButton"),
+            ("重跑并更新长时序成果", lambda: self.rerun_selected_change(True), "Secondary.TButton"),
         ):
             button = ttk.Button(stage_actions, text=text, style=style, command=command)
             button.pack(side=LEFT, padx=(0, 8))
             self.stage_buttons.append(button)
+        advanced_stage = ttk.Frame(stage_card)
+        advanced_stage.pack(fill=X, pady=(10, 0))
+        ttk.Label(advanced_stage, text="高级操作", style="CardMuted.TLabel").pack(side=LEFT)
+        batch_button = ttk.Button(advanced_stage, text="批量重跑全部道路提取", style="Compact.TButton", command=self.run_extract_all)
+        batch_button.pack(side=LEFT, padx=(10, 0))
+        self.stage_buttons.append(batch_button)
         self._refresh_stage_selectors()
 
     def _build_review_page(self, page: ttk.Frame) -> None:
         self.review_body = page
-        ttk.Label(page, text="人工复核（可选）", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(page, text="人工编辑（可选）", style="Section.TLabel").pack(anchor="w")
         ttk.Label(page, text="如需提高成果质量，可修正中心线并重新生成受影响的结果。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
         review_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         review_card.pack(fill=X)
-        ttk.Label(review_card, text="复核与重新生成", style="CardTitle.TLabel").pack(anchor="w")
-        self.review_status = StringVar(value="完成自动处理后，可在此选择需要复核的期次。")
+        ttk.Label(review_card, text="编辑与自动更新", style="CardTitle.TLabel").pack(anchor="w")
+        self.review_status = StringVar(value="完成自动处理后，可在此选择需要编辑的期次。")
         ttk.Label(review_card, textvariable=self.review_status, style="Hint.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(4, 0))
         selector = ttk.Frame(review_card, style="Soft.TFrame", padding=(14, 11))
         selector.pack(fill=X, pady=(16, 10))
@@ -1493,16 +1647,19 @@ class UserApp:
         ttk.Label(review_card, textvariable=self.review_detail, style="Hint.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(0, 14))
         edit_row = ttk.Frame(review_card, style="Soft.TFrame", padding=(14, 9))
         edit_row.pack(fill=X, pady=(0, 12))
-        ttk.Label(edit_row, text="已保存编辑目录", style="PathTitle.TLabel").pack(side=LEFT)
+        ttk.Label(edit_row, text="项目编辑目录", style="PathTitle.TLabel").pack(side=LEFT)
         ttk.Label(edit_row, textvariable=self.review_edit_directory, style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True, padx=(12, 8))
-        ttk.Button(edit_row, text="选择内网编辑成果…", style="Compact.TButton", command=self.select_review_edit_directory).pack(side=RIGHT)
         actions = ttk.Frame(review_card)
         actions.pack(fill=X)
-        self.launch_review_button = ttk.Button(actions, text="打开人工编辑工作台", style="Hero.TButton", command=self.launch_selected_review_editor)
+        self.launch_review_button = ttk.Button(actions, text="打开编辑工作台", style="Hero.TButton", command=self.launch_selected_review_editor)
         self.launch_review_button.pack(side=LEFT)
-        self.apply_review_button = ttk.Button(actions, text="重新测宽并生成道路面", style="Primary.TButton", command=self.apply_selected_review)
+        self.apply_review_button = ttk.Button(actions, text="应用编辑并更新相关结果", style="Primary.TButton", command=self.apply_selected_review)
         self.apply_review_button.pack(side=LEFT, padx=10)
-        ttk.Button(actions, text="打开复核资料目录", style="Secondary.TButton", command=self.open_selected_review_folder).pack(side=LEFT)
+        self.review_advanced_toggle = ttk.Button(review_card, text="›  高级操作", style="Quiet.TButton", command=self._toggle_review_advanced)
+        self.review_advanced_toggle.pack(anchor="w", pady=(10, 0))
+        self.review_advanced_frame = ttk.Frame(review_card)
+        ttk.Button(self.review_advanced_frame, text="导入外部编辑成果", style="Compact.TButton", command=self.select_review_edit_directory).pack(side=LEFT)
+        ttk.Button(self.review_advanced_frame, text="打开编辑资料目录", style="Compact.TButton", command=self.open_selected_review_folder).pack(side=LEFT, padx=(8, 0))
 
         self.review_task_frame = ttk.Frame(page, style="Card.TFrame", padding=(18, 15))
         self.review_task_frame.pack(fill=BOTH, expand=True, pady=(12, 0))
@@ -1529,11 +1686,11 @@ class UserApp:
             self.review_task_frame, text="详细输出统一显示在窗口底部的“全流程日志”。",
             style="CardMuted.TLabel",
         ).pack(anchor="w")
-        ttk.Label(page, text="人工复核不是必需步骤；跳过时将直接采用自动处理结果。", style="Muted.TLabel").pack(anchor="w", pady=(12, 0))
+        ttk.Label(page, text="人工编辑不是必需步骤；跳过时将直接采用自动处理结果。", style="Muted.TLabel").pack(anchor="w", pady=(12, 0))
 
     def _build_result_page(self, page: ttk.Frame) -> None:
         self.result_body = page
-        ttk.Label(page, text="查看结果", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(page, text="成果与评价", style="Section.TLabel").pack(anchor="w")
         ttk.Label(page, text="查看、评价并导出本次任务的正式成果。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
         result_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
         result_card.pack(fill=X)
@@ -1548,22 +1705,29 @@ class UserApp:
         self.result_review_count = StringVar(value="0 处")
         for label, variable in (
             ("影像期次", self.result_period_count), ("变化检测任务", self.result_change_count),
-            ("验证区", self.result_area_count), ("可人工复核", self.result_review_count),
+            ("验证区", self.result_area_count), ("可人工编辑", self.result_review_count),
         ):
             box = ttk.Frame(metrics, style="Soft.TFrame", padding=(16, 12))
             box.pack(side=LEFT, fill=X, expand=True, padx=3)
             ttk.Label(box, text=label, style="MetricName.TLabel").pack()
             ttk.Label(box, textvariable=variable, style="MetricValue.TLabel").pack(pady=(4, 0))
-        primary_results = ttk.Frame(result_card)
-        primary_results.pack(fill=X, pady=(14, 7))
-        ttk.Button(primary_results, text="打开成果目录", style="ResultPrimary.TButton", command=self.open_latest).pack(side=LEFT)
-        ttk.Button(primary_results, text="打开长时序道路成果", style="ResultSecondary.TButton", command=self.open_temporal_roads).pack(side=LEFT, padx=(10, 0))
-        ttk.Button(primary_results, text="查看长时序属性表", style="ResultSecondary.TButton", command=self.open_temporal_attribute_table).pack(side=LEFT, padx=(10, 0))
-        ttk.Button(primary_results, text="打开任务报告", style="ResultSecondary.TButton", command=self.open_task_report).pack(side=LEFT, padx=(10, 0))
-        secondary_results = ttk.Frame(result_card)
-        secondary_results.pack(fill=X)
-        ttk.Button(secondary_results, text="载入已有任务结果", style="Compact.TButton", command=self.load_existing_results).pack(side=LEFT)
-        ttk.Button(secondary_results, text="导出诊断包", style="Compact.TButton", command=self.export_diagnostics).pack(side=LEFT, padx=(8, 0))
+        browser = ttk.Frame(result_card, style="Soft.TFrame", padding=(10, 8))
+        browser.pack(fill=BOTH, expand=True, pady=(14, 7))
+        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=11, style="Data.Treeview")
+        self.result_tree.heading("#0", text="成果")
+        self.result_tree.heading("status", text="状态")
+        self.result_tree.column("#0", width=620, minwidth=320, stretch=True)
+        self.result_tree.column("status", width=140, minwidth=100, stretch=False)
+        tree_scroll = ttk.Scrollbar(browser, orient="vertical", command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=tree_scroll.set)
+        self.result_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        tree_scroll.pack(side=RIGHT, fill="y")
+        self.result_tree.bind("<Double-1>", lambda _event: self.open_selected_result())
+        result_actions = ttk.Frame(result_card)
+        result_actions.pack(fill=X)
+        ttk.Button(result_actions, text="打开所选成果", style="ResultPrimary.TButton", command=self.open_selected_result).pack(side=LEFT)
+        ttk.Button(result_actions, text="打开所在目录", style="ResultSecondary.TButton", command=self.open_selected_result_folder).pack(side=LEFT, padx=(10, 0))
+        ttk.Button(result_actions, text="查看长时序属性表", style="ResultSecondary.TButton", command=self.open_temporal_attribute_table).pack(side=LEFT, padx=(10, 0))
         ttk.Label(
             page,
             text="成果目录中包含道路中心线、道路面、道路宽度、变化检测结果、长时序道路成果、精度评价结果及任务报告。",
@@ -1587,23 +1751,21 @@ class UserApp:
         self.evaluation_pair_combo.bind("<<ComboboxSelected>>", self._evaluation_pair_changed)
         truth_row = ttk.Frame(evaluation_card)
         truth_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
-        ttk.Label(truth_row, text="变化真值数据", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
+        ttk.Label(truth_row, text="项目真值", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_truth = StringVar(value="")
-        ttk.Entry(truth_row, textvariable=self.evaluation_truth).pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(truth_row, textvariable=self.evaluation_truth, style="CardMuted.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
         ttk.Button(
-            truth_row, text="选择…", style="Compact.TButton",
-            command=lambda: self._browse_variable(self.evaluation_truth, "shp"),
+            truth_row, text="补充真值", style="Compact.TButton",
+            command=self.supplement_evaluation_truth,
         ).pack(side=LEFT, padx=(8, 0))
-        ttk.Button(
-            truth_row, text="重新读取项目全部真值", style="Compact.TButton",
-            command=self.reload_project_truths,
-        ).pack(side=LEFT, padx=(6, 0))
         self.evaluation_truth_summary = StringVar(value="总体评价会按区域和相邻期次分别匹配真值，不使用上方单个路径代替全部真值。")
         ttk.Label(
             evaluation_card, textvariable=self.evaluation_truth_summary, style="CardMuted.TLabel", wraplength=980,
         ).pack(anchor="w", fill=X, pady=(0, 5))
+        self.evaluation_advanced_toggle = ttk.Button(evaluation_card, text="›  评价高级设置", style="Quiet.TButton", command=self._toggle_evaluation_advanced)
+        self.evaluation_advanced_toggle.pack(anchor="w", pady=(4, 4))
         options_row = ttk.Frame(evaluation_card)
-        options_row.pack(fill=X, pady=(LAYOUT_METRICS["form_gap"], 10))
+        self.evaluation_advanced_frame = options_row
         ttk.Label(options_row, text="变化类型字段", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_type_field = StringVar(value="BHBM")
         ttk.Entry(options_row, textvariable=self.evaluation_type_field, width=18).pack(side=LEFT)
@@ -1639,12 +1801,12 @@ class UserApp:
         if not self.step_pages:
             return
         index = max(0, min(int(index), len(self.step_pages) - 1))
-        if self.process is not None and index != self.current_step and not force:
-            self.status.set("任务正在运行，请等待完成或先取消任务。")
+        if self.process is not None and index != self.current_step and index in {0, 2} and not force:
+            self.status.set("任务运行期间不能修改数据配置或人工编辑；仍可查看日志和已有成果。")
             return
         has_results = self.results_available
         if index >= 2 and not has_results and not force:
-            self.status.set("请先完成自动处理，再进入人工复核或结果步骤。")
+            self.status.set("请先完成自动处理，再进入人工编辑或成果步骤。")
             return
         for page in self.step_pages:
             page.pack_forget()
@@ -1662,9 +1824,9 @@ class UserApp:
         self.root.after_idle(self._draw_stepper)
         self.footer_back.state(["disabled"] if index == 0 else ["!disabled"])
         labels = (
-            "下一步：运行任务  →",
-            "下一步：人工复核（可选）  →",
-            "跳过人工复核，查看结果  →",
+            "下一步：自动处理  →",
+            "下一步：人工编辑（可选）  →",
+            "跳过人工编辑，查看成果  →",
             "已到最后一步",
         )
         self.footer_next.configure(text=labels[index])
@@ -1695,12 +1857,12 @@ class UserApp:
             return
         if self.current_step == 1:
             if not self.results_available:
-                self.status.set("请先完成自动处理，再进入人工复核步骤。")
+                self.status.set("请先完成自动处理，再进入人工编辑步骤。")
                 return
             self._show_step(2)
             return
         if self.current_step == 2:
-            self.status.set("已跳过人工复核，采用自动处理结果。")
+            self.status.set("已跳过人工编辑，采用自动处理结果。")
             self._show_step(3)
 
     def _toggle_manual_inputs(self) -> None:
@@ -1727,14 +1889,34 @@ class UserApp:
             self.advanced_toggle.configure(text="▶ 高级参数（通常不需要修改）")
         self._schedule_content_layout()
 
+    def _toggle_review_advanced(self) -> None:
+        self.review_advanced_visible = not self.review_advanced_visible
+        if self.review_advanced_visible:
+            self.review_advanced_frame.pack(fill=X, pady=(4, 0), after=self.review_advanced_toggle)
+            self.review_advanced_toggle.configure(text="⌄  收起高级操作")
+        else:
+            self.review_advanced_frame.pack_forget()
+            self.review_advanced_toggle.configure(text="›  高级操作")
+        self._schedule_content_layout()
+
+    def _toggle_evaluation_advanced(self) -> None:
+        self.evaluation_advanced_visible = not self.evaluation_advanced_visible
+        if self.evaluation_advanced_visible:
+            self.evaluation_advanced_frame.pack(fill=X, pady=(2, 10), after=self.evaluation_advanced_toggle)
+            self.evaluation_advanced_toggle.configure(text="⌄  收起评价高级设置")
+        else:
+            self.evaluation_advanced_frame.pack_forget()
+            self.evaluation_advanced_toggle.configure(text="›  评价高级设置")
+        self._schedule_content_layout()
+
     def _toggle_run_settings(self) -> None:
         self.run_settings_visible = not self.run_settings_visible
         if self.run_settings_visible:
             self.run_settings_frame.pack(fill=X, pady=(4, 2), after=self.run_settings_toggle)
-            self.run_settings_toggle.configure(text="⌄  收起输出位置、续跑和参数")
+            self.run_settings_toggle.configure(text="⌄  收起输出位置与高级设置")
         else:
             self.run_settings_frame.pack_forget()
-            self.run_settings_toggle.configure(text="›  输出位置、续跑和参数")
+            self.run_settings_toggle.configure(text="›  输出位置与高级设置")
         self._schedule_content_layout()
 
     def _toggle_log(self) -> None:
@@ -1843,6 +2025,18 @@ class UserApp:
     def _refresh_project_config_panel(self) -> None:
         if not hasattr(self, "project_config_container"):
             return
+        def render_candidates() -> None:
+            pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
+            if not pending:
+                return
+            ttk.Label(self.project_config_container, text="待确认候选", style="PathTitle.TLabel").pack(anchor="w", pady=(10, 5))
+            for kind, path in pending[:10]:
+                row = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+                row.pack(fill=X, pady=1)
+                ttk.Label(row, text=kind, width=6, style="PathText.TLabel").pack(side=LEFT)
+                ttk.Label(row, text=path, style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
+            if len(pending) > 10:
+                ttk.Label(self.project_config_container, text=f"另有 {len(pending) - 10} 项候选保存在项目配置中。", style="PathText.TLabel").pack(anchor="w")
         names = [name for name, _path in self.project_validation_areas]
         self.project_region_combo.configure(values=names)
         if self.project_region.get() not in names:
@@ -1860,6 +2054,7 @@ class UserApp:
             ).pack(anchor="w")
             if hasattr(self, "add_project_period_button"):
                 self.add_project_period_button.state(["disabled"])
+            render_candidates()
             self._refresh_stage_selectors()
             return
         if hasattr(self, "add_project_period_button"):
@@ -1890,6 +2085,9 @@ class UserApp:
             truth = truth_map.get((region, before, after), "")
             ttk.Label(row, text=truth or "未设置", style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
             ttk.Button(row, text="选择", style="Compact.TButton", command=lambda b=before, a=after: self.set_project_truth(b, a)).pack(side=LEFT, padx=(6, 0))
+            if truth:
+                ttk.Button(row, text="移除", style="Compact.TButton", command=lambda b=before, a=after: self.remove_project_truth(b, a)).pack(side=LEFT, padx=(4, 0))
+        render_candidates()
         self._refresh_stage_selectors()
         self._schedule_content_layout()
 
@@ -1910,9 +2108,152 @@ class UserApp:
             self.project_period.set(periods[0] if periods else "")
         if self.project_change_pair.get() not in pairs:
             self.project_change_pair.set(pairs[0] if pairs else "")
+        self._stage_period_changed()
 
     def _project_region_changed(self, _event=None) -> None:
         self._refresh_project_config_panel()
+
+    def _project_payload(self) -> dict:
+        payload = dict(self.project_config)
+        payload.update({
+            "version": 3,
+            "project_root": self.project_root_path,
+            "external_data_sources": list(dict.fromkeys(self.project_data_sources)),
+            "validation_areas": [list(row) for row in self.project_validation_areas],
+            "area_periods": {
+                area: [list(row) for row in rows]
+                for area, rows in self.project_area_periods.items()
+            },
+            "area_truths": [list(row) for row in self.project_area_truths],
+            "unmapped_candidates": self.project_candidates,
+            "output_root": self.vars["output_root"].get().strip(),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        return payload
+
+    def _save_project_config(self, *, notify: bool = False) -> bool:
+        if not self.project_root_path:
+            return False
+        try:
+            path = atomic_write_json(project_config_path(self.project_root_path), self._project_payload())
+            self.project_config = read_project_config(self.project_root_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("项目配置保存失败", str(exc), parent=self.root)
+            return False
+        if notify:
+            self.status.set(f"项目配置已保存：{path}")
+        return True
+
+    def _consume_candidate(self, path: str) -> None:
+        resolved = str(Path(path).expanduser().resolve())
+        for kind in self.project_candidates:
+            self.project_candidates[kind] = [value for value in self.project_candidates[kind] if str(Path(value).expanduser().resolve()) != resolved]
+
+    def _apply_discovered_project(self, project: dict, *, merge: bool = False) -> None:
+        discovered_areas = list(project.get("validation_areas") or [])
+        discovered_truths = [
+            (area, before, after, path)
+            for (area, before, after), path in (project.get("area_truths") or {}).items()
+        ]
+        discovered_periods = {
+            str(area): [(str(period), str(source)) for period, source in rows]
+            for area, rows in (project.get("area_periods") or {}).items()
+        }
+        if not merge:
+            self.project_validation_areas = discovered_areas
+            self.project_area_truths = discovered_truths
+            self.project_area_periods = discovered_periods
+            return
+        areas = {name: path for name, path in self.project_validation_areas}
+        areas.update({str(name): str(path) for name, path in discovered_areas})
+        self.project_validation_areas = sorted(areas.items(), key=lambda row: natural_key(row[0]))
+        self.project_area_periods.update(discovered_periods)
+        truths = {(area, before, after): path for area, before, after, path in self.project_area_truths}
+        truths.update({(area, before, after): path for area, before, after, path in discovered_truths})
+        self.project_area_truths = [(*key, path) for key, path in truths.items()]
+
+    def _apply_project_config(self, payload: dict) -> None:
+        self.project_config = dict(payload)
+        self.project_data_sources = [str(Path(value).expanduser().resolve()) for value in payload.get("external_data_sources", []) if str(value).strip()]
+        self.project_validation_areas = [
+            (str(name), str(path)) for name, path in payload.get("validation_areas", [])
+        ]
+        self.project_area_periods = {
+            str(area): [(str(period), str(source)) for period, source in rows]
+            for area, rows in (payload.get("area_periods") or {}).items()
+        }
+        self.project_area_truths = [
+            (str(area), str(before), str(after), str(path))
+            for area, before, after, path in payload.get("area_truths", [])
+        ]
+        candidates = payload.get("unmapped_candidates") or {}
+        self.project_candidates = {
+            "shp": [str(value) for value in candidates.get("shp", [])],
+            "txt": [str(value) for value in candidates.get("txt", [])],
+        }
+        output_root = str(payload.get("output_root") or "").strip()
+        if output_root:
+            self.vars["output_root"].set(output_root)
+        active = payload.get("active_task") or {}
+        if isinstance(active, dict) and str(active.get("run_id") or "").strip():
+            self.vars["run_id"].set(str(active["run_id"]))
+        self.data_source_display.set("；".join(self.project_data_sources) if self.project_data_sources else "尚未连接外部数据源")
+
+    def connect_data_source(self) -> None:
+        if not self.project_root_path:
+            messagebox.showinfo("请先打开项目", "请先新建或打开项目文件夹，再连接外部原始数据源。", parent=self.root)
+            return
+        directory = filedialog.askdirectory(parent=self.root, title="连接外部原始数据源")
+        if not directory:
+            return
+        resolved = str(Path(directory).resolve())
+        if resolved not in self.project_data_sources:
+            self.project_data_sources.append(resolved)
+        self.data_source_display.set("；".join(self.project_data_sources))
+        self.data_status.set("已连接，尚未扫描")
+        self._save_project_config()
+        self.scan_data_sources()
+
+    def scan_data_sources(self) -> None:
+        if not self.project_data_sources:
+            self.data_status.set("未连接数据源")
+            messagebox.showinfo("未连接数据源", "请先连接一个或多个外部原始数据目录。", parent=self.root)
+            return
+        discovered_count = 0
+        candidates = {"shp": [], "txt": []}
+        for source in self.project_data_sources:
+            try:
+                scan = scan_external_data_source(source)
+            except ValueError as exc:
+                messagebox.showerror("数据源不可用", str(exc), parent=self.root)
+                self.data_status.set("数据检查失败")
+                return
+            for kind in candidates:
+                candidates[kind].extend(scan["candidates"][kind])
+            if scan["discovered"]:
+                self._apply_discovered_project(scan["discovered"], merge=True)
+                discovered_count += 1
+        mapped = {
+            path for _area, path in self.project_validation_areas
+        } | {
+            path for rows in self.project_area_periods.values() for _period, path in rows
+        } | {
+            path for _area, _before, _after, path in self.project_area_truths
+        }
+        self.project_candidates = {
+            kind: sorted({path for path in paths if path not in mapped}, key=natural_key)
+            for kind, paths in candidates.items()
+        }
+        pending = sum(len(values) for values in self.project_candidates.values())
+        self.data_status.set("已扫描，存在待确认项" if pending else "已扫描，等待数据检查")
+        self.project_scan_summary.set(
+            f"已扫描 {len(self.project_data_sources)} 个外部目录；自动识别 {len(self.project_validation_areas)} 个区域、"
+            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个期次；待确认候选 {pending} 项。"
+        )
+        self._refresh_project_config_panel()
+        self._refresh_input_summary()
+        self._save_project_config()
+        self.status.set(self.project_scan_summary.get())
 
     def add_project_region(self) -> None:
         path = self._select_path("shp")
@@ -1930,11 +2271,13 @@ class UserApp:
             messagebox.showerror("区域名称重复", f"区域“{name}”已经存在。", parent=self.root)
             return
         self.project_validation_areas.append((name, str(Path(path).resolve())))
+        self._consume_candidate(path)
         self.project_area_periods[name] = []
         self.project_region.set(name)
         self.vars["mode"].set("validation")
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
 
     def replace_project_validation_area(self) -> None:
         region = self._selected_project_region()
@@ -1948,8 +2291,24 @@ class UserApp:
             (name, str(Path(path).resolve()) if name == region else value)
             for name, value in self.project_validation_areas
         ]
+        self._consume_candidate(path)
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
+
+    def remove_project_region(self) -> None:
+        region = self._selected_project_region()
+        if not region:
+            return
+        if not messagebox.askyesno("移除区域映射", f"仅从项目配置移除区域“{region}”；不会删除任何原始文件。是否继续？", parent=self.root):
+            return
+        self.project_validation_areas = [row for row in self.project_validation_areas if row[0] != region]
+        self.project_area_periods.pop(region, None)
+        self.project_area_truths = [row for row in self.project_area_truths if row[0] != region]
+        self.project_region.set("")
+        self._refresh_project_config_panel()
+        self._refresh_input_summary()
+        self._save_project_config()
 
     def add_project_period(self) -> None:
         region = self._selected_project_region()
@@ -1968,9 +2327,11 @@ class UserApp:
             messagebox.showerror("期次不可用", "期次名称不能为空或与现有期次重复。", parent=self.root)
             return
         rows.append((period, str(Path(source).resolve())))
+        self._consume_candidate(source)
         self.project_area_periods[region] = rows
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
 
     def replace_project_period_source(self, period: str) -> None:
         region = self._selected_project_region()
@@ -1981,8 +2342,10 @@ class UserApp:
             (name, str(Path(source).resolve()) if name == period else value)
             for name, value in self.project_area_periods.get(region, [])
         ]
+        self._consume_candidate(source)
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
 
     def remove_project_period(self, period: str) -> None:
         region = self._selected_project_region()
@@ -1995,6 +2358,7 @@ class UserApp:
         ]
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
 
     def set_project_truth(self, before: str, after: str) -> None:
         region = self._selected_project_region()
@@ -2006,8 +2370,20 @@ class UserApp:
             if (row[0], row[1], row[2]) != (region, before, after)
         ]
         self.project_area_truths.append((region, before, after, str(Path(path).resolve())))
+        self._consume_candidate(path)
         self._refresh_project_config_panel()
         self._refresh_input_summary()
+        self._save_project_config()
+
+    def remove_project_truth(self, before: str, after: str) -> None:
+        region = self._selected_project_region()
+        self.project_area_truths = [
+            row for row in self.project_area_truths
+            if (row[0], row[1], row[2]) != (region, before, after)
+        ]
+        self._refresh_project_config_panel()
+        self._refresh_input_summary()
+        self._save_project_config()
 
     def create_project_folder(self) -> None:
         parent = filedialog.askdirectory(parent=self.root, title="选择新项目保存位置")
@@ -2025,7 +2401,7 @@ class UserApp:
             messagebox.showerror("项目已存在", f"目标文件夹不是空文件夹：\n{root}", parent=self.root)
             return
         try:
-            for child in ("01_验证区", "02_影像", "03_变化真值", "04_成果输出"):
+            for child in ("04_成果输出", "_logs"):
                 (root / child).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("无法新建项目", str(exc), parent=self.root)
@@ -2034,7 +2410,16 @@ class UserApp:
         self.project_path_display.set(self.project_root_path)
         self.project_name_display.set(safe_name)
         self.current_project.set(f"当前项目：{safe_name}")
-        self.project_scan_summary.set("项目目录已创建；请放入验证区和影像 TXT 后点击“重新扫描”。")
+        self.project_validation_areas = []
+        self.project_area_periods = {}
+        self.project_area_truths = []
+        self.project_data_sources = []
+        self.project_candidates = {"shp": [], "txt": []}
+        self.vars["output_root"].set(str((root / "04_成果输出").resolve()))
+        self.data_source_display.set("尚未连接外部数据源")
+        self.data_status.set("未连接数据源")
+        self.project_scan_summary.set("项目已创建；请连接外部原始数据源。")
+        self._save_project_config()
         self.status.set(self.project_scan_summary.get())
 
     def open_project_folder(self) -> None:
@@ -2045,10 +2430,7 @@ class UserApp:
         self._open(root)
 
     def rescan_project_folder(self) -> None:
-        if not self.project_root_path:
-            self.import_project_folder()
-            return
-        self._load_project_directory(self.project_root_path)
+        self.scan_data_sources()
 
     def import_project_folder(self) -> None:
         directory = filedialog.askdirectory(parent=self.root, title="选择规范项目文件夹")
@@ -2057,56 +2439,73 @@ class UserApp:
         self._load_project_directory(directory)
 
     def _load_project_directory(self, directory: str) -> None:
-        try:
-            project = discover_validation_project(directory)
-        except ValueError as exc:
-            messagebox.showerror("无法识别项目", str(exc), parent=self.root)
-            self._show_manual_inputs()
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
+            messagebox.showerror("无法打开项目", f"项目文件夹不存在：{root}", parent=self.root)
             return
+        try:
+            payload = read_project_config(root)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("项目配置不可用", str(exc), parent=self.root)
+            return
+        legacy_project = None
+        if not payload:
+            try:
+                legacy_project = discover_validation_project(root)
+            except ValueError:
+                legacy_project = None
         for state in self.period_rows:
             state["frame"].destroy()
         self.period_rows = []
         self.vars["mode"].set("validation")
-        self.vars["validation_area"].set(project["validation_area"])
-        self.project_validation_areas = list(project.get("validation_areas") or [])
-        self.project_area_truths = [
-            (area, before, after, path)
-            for (area, before, after), path in (project.get("area_truths") or {}).items()
-        ]
-        self.project_area_periods = {
-            str(area): [(str(period), str(source)) for period, source in rows]
-            for area, rows in (project.get("area_periods") or {}).items()
-        }
-        self.vars["output_root"].set(project["output_root"])
-        for period, source in project["periods"]:
+        self.project_root_path = str(root)
+        if payload:
+            self._apply_project_config(payload)
+        elif legacy_project:
+            self.project_data_sources = [str(root)]
+            self._apply_discovered_project(legacy_project)
+            self.vars["output_root"].set(str(legacy_project["output_root"]))
+            self.data_source_display.set(str(root))
+        else:
+            self.project_config = {}
+            self.project_data_sources = []
+            self.project_validation_areas = []
+            self.project_area_truths = []
+            self.project_area_periods = {}
+            self.project_candidates = {"shp": [], "txt": []}
+            output = root / "04_成果输出"
+            self.vars["output_root"].set(str(output))
+            self.data_source_display.set("尚未连接外部数据源")
+        flat_periods = next(iter(self.project_area_periods.values()), [])
+        for period, source in flat_periods:
             self._add_period_row(period, source)
-        truths = project.get("truths", {})
+        if not self.period_rows:
+            self._add_period_row("2021")
+            self._add_period_row("2022")
         self.vars["evaluate"].set("0")
-        if hasattr(self, "evaluation_truth") and truths:
-            first_pair = sorted(truths, key=lambda pair: (natural_key(pair[0]), natural_key(pair[1])))[0]
-            self.evaluation_truth.set(str(truths[first_pair]))
-        self.project_path_display.set(str(project["project_root"]))
-        self.project_root_path = str(project["project_root"])
-        self.project_name_display.set(Path(project["project_root"]).name)
-        self.current_project.set(f"当前项目：{Path(project['project_root']).name}")
+        self.project_path_display.set(str(root))
+        self.project_name_display.set(root.name)
+        self.current_project.set(f"当前项目：{root.name}")
         self.preflight_passed = False
         self.run_button.state(["!disabled"])
         self._refresh_input_summary()
         self._refresh_project_config_panel()
+        pending = sum(len(values) for values in self.project_candidates.values())
+        self.data_status.set(
+            "未连接数据源" if not self.project_data_sources else
+            ("已扫描，存在待确认项" if pending else "已扫描，等待数据检查")
+        )
         self.project_scan_summary.set(
-            f"已扫描：{len(self.project_validation_areas)} 个验证区、"
+            f"项目已打开：{len(self.project_validation_areas)} 个验证区、"
             f"{sum(len(rows) for rows in self.project_area_periods.values())} 个影像期次、"
-            f"{len(self.project_area_truths)} 个变化真值。"
+            f"{len(self.project_area_truths)} 个变化真值、{pending} 个待确认候选。"
         )
-        self.status.set(
-            f"已导入项目：{len(self.project_validation_areas)} 个验证区、"
-            f"共 {sum(len(rows) for rows in self.project_area_periods.values())} 个验证区期次任务；生产检测可直接运行。"
-            + (f" 已发现 {len(self.project_area_truths)} 个真值，可在结果页用于精度评价。" if self.project_area_truths else "")
-        )
+        self.status.set(self.project_scan_summary.get())
+        self._save_project_config()
 
     def save_task_config(self) -> None:
         path = filedialog.asksaveasfilename(
-            parent=self.root, title="保存任务配置", defaultextension=".json",
+            parent=self.root, title="导出兼容任务配置", defaultextension=".json",
             filetypes=(("JSON 配置", "*.json"),),
         )
         if not path:
@@ -2122,11 +2521,11 @@ class UserApp:
             "area_periods": self.project_area_periods,
         }
         try:
-            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(path, payload)
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.root)
             return
-        self.status.set(f"任务配置已保存：{path}")
+        self.status.set(f"兼容任务配置已导出：{path}")
 
     def load_task_config(self) -> None:
         path = filedialog.askopenfilename(
@@ -2181,6 +2580,7 @@ class UserApp:
         self._refresh_input_summary()
         self.preflight_passed = False
         self.run_button.state(["!disabled"])
+        self._save_project_config()
         self.status.set(f"任务配置已加载：{path}")
 
     def _add_period_row(self, period: str = "", source: str = "") -> None:
@@ -2290,7 +2690,7 @@ class UserApp:
         self._refresh_input_summary()
         self._schedule_content_layout()
 
-    def _build_current_command(self, *, preflight_only: bool = False) -> list[str]:
+    def _build_current_command(self, *, preflight_only: bool = False, data_check_only: bool = False) -> list[str]:
         return build_pipeline_command(
             mode=self.vars["mode"].get(), output_root=self.vars["output_root"].get(),
             checkpoint=self.vars["checkpoint"].get(), config=self.vars["config"].get(),
@@ -2305,6 +2705,7 @@ class UserApp:
             resume=(self.vars["resume"].get() == "1" and not preflight_only),
             continue_on_error=self.vars["continue_on_error"].get() == "1",
             preflight_only=preflight_only,
+            data_check_only=data_check_only,
             junction_node_mode=self.vars["junction_node_mode"].get(),
             validation_areas=(self.project_validation_areas or None),
             area_truths=(self.project_area_truths or None),
@@ -2313,7 +2714,7 @@ class UserApp:
 
     def preflight_inputs(self) -> None:
         try:
-            args = self._build_current_command(preflight_only=True)
+            args = self._build_current_command(data_check_only=True)
         except ValueError as exc:
             messagebox.showerror("输入不完整", str(exc), parent=self.root)
             if not self.vars["output_root"].get().strip() or (
@@ -2326,13 +2727,21 @@ class UserApp:
                 self._show_manual_inputs()
                 self._scroll_to_module(self.data_body)
             return
-        self.preflight_summary.set("正在检查项目目录、影像覆盖、模型、输出目录和运行环境…")
-        self._show_step(1, force=True)
+        self.preflight_summary.set("正在检查验证区、影像清单、期次顺序、CRS、波段、数据类型、覆盖和真值映射…")
+        self.data_status.set("正在检查数据")
         self._command(args)
 
     def run_all(self) -> None:
-        if not self.vars["run_id"].get().strip():
-            self.vars["run_id"].set(time.strftime("run_%Y%m%d_%H%M%S"))
+        output = Path(self.vars["output_root"].get().strip()).expanduser()
+        run_id, should_resume, state_path = resolve_automatic_run(
+            output, self.vars["run_id"].get(), self.project_config.get("active_task"),
+        )
+        self.vars["run_id"].set(run_id)
+        self.vars["resume"].set("1" if should_resume else "0")
+        self.project_config["active_task"] = {
+            "run_id": run_id, "state": str(state_path), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._save_project_config()
         try:
             args = self._build_current_command()
         except ValueError as exc:
@@ -2358,17 +2767,7 @@ class UserApp:
         self._command(args)
 
     def resume_all(self) -> None:
-        """Resume the named integrated task and reuse every complete stage."""
-        if not self.vars["run_id"].get().strip():
-            messagebox.showerror(
-                "缺少原任务名称",
-                "续跑必须填写原任务名称。请在“输出位置、续跑和参数”中填写后再试。",
-                parent=self.root,
-            )
-            if not self.run_settings_visible:
-                self._toggle_run_settings()
-            return
-        self.vars["resume"].set("1")
+        """Compatibility alias; normal users always get automatic continuation."""
         self.run_all()
 
     def _project_stage_context(self) -> tuple[Path, str, str]:
@@ -2394,7 +2793,70 @@ class UserApp:
             "--junction-node-mode", self.vars["junction_node_mode"].get(),
         ]
 
+    def _stage_period_changed(self, _event=None) -> None:
+        region = self._selected_project_region()
+        periods = [period for period, _source in self.project_area_periods.get(region, [])]
+        pairs = affected_change_pairs(periods, self.project_period.get().strip())
+        if pairs:
+            self.affected_pairs_summary.set(
+                "该操作会影响：" + "；".join(f"{before} → {after}" for before, after in pairs)
+            )
+        else:
+            self.affected_pairs_summary.set("所选期次没有可识别的相邻变化对。")
+
+    def _current_pipeline_manifest_path(self) -> Path:
+        manifest, latest = self._latest_manifest()
+        if manifest is None or latest is None or not latest.is_file():
+            raise ValueError("请先完成或载入一个完整任务，局部重跑需要已有 pipeline_result.json。")
+        return latest.resolve()
+
+    def rerun_selected_period(self, update_related: bool) -> None:
+        try:
+            manifest = self._current_pipeline_manifest_path()
+            region = self._selected_project_region()
+            period = self.project_period.get().strip()
+            if not region or not period:
+                raise ValueError("请选择需要重跑的区域和影像期次。")
+            args = ["rerun-period", "--pipeline-manifest", str(manifest), "--grid", region, "--period", period]
+            if update_related:
+                args.append("--update-related")
+        except ValueError as exc:
+            messagebox.showerror("无法局部重跑", str(exc), parent=self.root)
+            return
+        self._show_step(1, force=True)
+        self._command(args)
+
+    def rerun_selected_change(self, update_temporal: bool) -> None:
+        try:
+            manifest = self._current_pipeline_manifest_path()
+            region = self._selected_project_region()
+            pair = self.project_change_pair.get().strip()
+            if not region or "→" not in pair:
+                raise ValueError("请选择需要重跑的区域和相邻变化对。")
+            before, after = (value.strip() for value in pair.split("→", 1))
+            args = [
+                "rerun-change", "--pipeline-manifest", str(manifest), "--grid", region,
+                "--before-period", before, "--after-period", after,
+            ]
+            if update_temporal:
+                args.append("--update-temporal")
+        except ValueError as exc:
+            messagebox.showerror("无法重跑变化对", str(exc), parent=self.root)
+            return
+        self._show_step(1, force=True)
+        self._command(args)
+
     def run_extract_all(self) -> None:
+        try:
+            manifest = self._current_pipeline_manifest_path()
+        except ValueError as exc:
+            messagebox.showerror("无法批量重跑", str(exc), parent=self.root)
+            return
+        self._show_step(1, force=True)
+        self._command(["rerun-all-periods", "--pipeline-manifest", str(manifest)])
+
+    def run_extract_all_legacy(self) -> None:
+        """Retained for callers of the historical standalone stage commands."""
         try:
             root, _region, run_id = self._project_stage_context()
             args = [
@@ -2480,7 +2942,7 @@ class UserApp:
             before_state = base / _safe_task_name(before) / _safe_task_name(run_id) / "period_task.json"
             after_state = base / _safe_task_name(after) / _safe_task_name(run_id) / "period_task.json"
             if not before_state.is_file() or not after_state.is_file():
-                raise ValueError("所选前后期尚无分步提取状态。请先点击“提取/续跑所选期次”完成两个期次。")
+                raise ValueError("所选前后期尚无分步提取状态。请先重跑并完成两个期次。")
             args = [
                 "change-project-periods", "--project-root", str(root), "--area-id", region,
                 "--before-period", before, "--after-period", after,
@@ -2514,7 +2976,8 @@ class UserApp:
         self._set_stage_buttons_enabled(False)
         self._set_cancel_enabled(True)
         self.active_command = (
-            "preflight" if "--preflight-only" in args else (args[0] if args else "")
+            "data-check" if "--data-check-only" in args else
+            ("preflight" if "--preflight-only" in args else (args[0] if args else ""))
         )
         if self.active_command == "apply-edits" and hasattr(self, "apply_review_button"):
             self.apply_review_button.state(["disabled"])
@@ -2786,9 +3249,11 @@ class UserApp:
                         else:
                             self.status.set("任务已取消；已完成结果已保留，可勾选断点续跑后继续。")
                             self.run_status.set("任务已取消；使用同一任务名称可断点续跑。")
-                    elif value == "0" and self.active_command == "preflight":
-                        payload = self.last_complete_payload or {"kind": "complete", "stage": "preflight"}
+                    elif value == "0" and self.active_command in {"preflight", "data-check"}:
+                        payload = self.last_complete_payload or {"kind": "complete", "stage": self.active_command}
                         self.preflight_passed = True
+                        pending_candidates = sum(len(values) for values in self.project_candidates.values())
+                        self.data_status.set("已扫描，存在待确认项" if pending_candidates else "数据已就绪")
                         self.run_button.state(["!disabled"])
                         self.status.set(self._friendly(payload))
                         self.run_status.set(self._friendly(payload))
@@ -2797,9 +3262,9 @@ class UserApp:
                         detail = self._friendly(payload)
                         if warnings:
                             detail += "\n\n风险提示：\n" + "\n".join(f"• {item}" for item in warnings[:20])
-                            messagebox.showwarning("运行前检查完成", detail, parent=self.root)
+                            messagebox.showwarning("数据检查完成", detail, parent=self.root)
                         else:
-                            messagebox.showinfo("运行前检查完成", detail + "\n\n未发现阻断性问题。", parent=self.root)
+                            messagebox.showinfo("数据检查完成", detail + "\n\n数据已就绪；自动处理开始时仍会独立检查模型、设备、输出目录和磁盘空间。", parent=self.root)
                     elif value == "0" and self.active_command == "apply-edits":
                         self.status.set("人工编辑已应用：道路面和宽度已重建，受影响的相邻期变化检测已重新运行。")
                         self.run_status.set("人工编辑成果已重新生成。")
@@ -2813,12 +3278,16 @@ class UserApp:
                         self._show_step(3, force=True)
                     elif value == "0" and self.active_command in {
                         "extract-project-period", "extract-project-all", "change-project-periods", "change",
+                        "rerun-period", "rerun-change", "rerun-all-periods",
                     }:
                         labels = {
-                            "extract-project-period": "所选期次提取/续跑已完成。",
-                            "extract-project-all": "全部期次分步提取/续跑已完成。",
-                            "change-project-periods": "所选变化对检测/续跑已完成。",
+                            "extract-project-period": "所选期次道路提取已完成。",
+                            "extract-project-all": "全部期次道路提取已完成。",
+                            "change-project-periods": "所选变化对检测已完成。",
                             "change": "所选已有变化对已重新检测完成。",
+                            "rerun-period": "所选期次已按指定范围重跑完成。",
+                            "rerun-change": "所选变化对已重跑完成。",
+                            "rerun-all-periods": "全部道路提取已按依赖顺序批量重跑完成。",
                         }
                         self.status.set(labels[self.active_command])
                         self.run_status.set(labels[self.active_command])
@@ -2830,11 +3299,13 @@ class UserApp:
                             self.run_status.set(f"任务结束，但有 {failure_count} 项失败或跳过。请查看详细日志和任务报告。")
                             self._show_log()
                         else:
-                            self.status.set("自动处理已完成；可进行人工复核，或跳过并直接查看结果。")
-                            self.run_status.set("自动处理完成，可进入“人工复核（可选）”。")
+                            self.status.set("自动处理已完成；可进行人工编辑，或跳过并直接查看成果。")
+                            self.run_status.set("自动处理完成，可进入“人工编辑（可选）”。")
                             self._show_step(2, force=True)
                     else:
                         summary = self._last_error_summary()
+                        if self.active_command == "data-check":
+                            self.data_status.set("数据检查失败")
                         self.status.set(f"任务失败：{summary}")
                         self.run_status.set(f"任务失败：{summary}")
                         self._show_log()
@@ -2982,6 +3453,7 @@ class UserApp:
                 self.evaluation_pair.set("")
                 self.evaluation_status.set("请先载入或生成包含变化检测的任务结果。")
                 self.run_evaluation_button.state(["disabled"])
+            self._populate_result_tree([], None)
             return
         base_dir = latest.parent
         self.review_items = collect_review_items(manifest, base_dir)
@@ -3018,8 +3490,65 @@ class UserApp:
             if str(item.get("manual_item_count", 0) or 0).isdigit()
         )
         self.result_review_count.set(f"{review_count} 处")
+        self._populate_result_tree(collect_result_tree_items(manifest, base_dir), base_dir)
         self._refresh_evaluation_results(manifest)
         self._populate_review_step()
+
+    def _populate_result_tree(self, items: list[dict[str, str]], _base_dir: Path | None) -> None:
+        if not hasattr(self, "result_tree"):
+            return
+        self.result_tree.delete(*self.result_tree.get_children())
+        self.result_tree_paths = {}
+        pending = list(items)
+        inserted = set()
+        while pending:
+            next_pending = []
+            for item in pending:
+                parent = item.get("parent", "")
+                if parent and parent not in inserted:
+                    next_pending.append(item)
+                    continue
+                node = self.result_tree.insert(
+                    parent, END, iid=item["id"], text=item["label"], values=(item.get("status", ""),),
+                    open=not bool(parent),
+                )
+                inserted.add(node)
+                path_text = item.get("path", "")
+                if path_text:
+                    self.result_tree_paths[node] = Path(path_text)
+            if len(next_pending) == len(pending):
+                break
+            pending = next_pending
+
+    def open_selected_result(self) -> None:
+        if not hasattr(self, "result_tree"):
+            return
+        selected = self.result_tree.selection()
+        if not selected:
+            messagebox.showinfo("请选择成果", "请先在成果树中选择一个已生成成果。", parent=self.root)
+            return
+        path = self.result_tree_paths.get(selected[0])
+        if path is None or not path.exists():
+            messagebox.showinfo("未生成", "所选成果尚未生成，不能打开。", parent=self.root)
+            return
+        self._open(path)
+
+    def open_selected_result_folder(self) -> None:
+        if not hasattr(self, "result_tree"):
+            return
+        selected = self.result_tree.selection()
+        path = self.result_tree_paths.get(selected[0]) if selected else None
+        if path is None:
+            manifest, latest = self._latest_manifest()
+            if manifest is None or latest is None:
+                messagebox.showinfo("暂无目录", "尚未载入任务成果。", parent=self.root)
+                return
+            path = Path(str(manifest.get("job_root") or latest.parent))
+        target = path if path.is_dir() else path.parent
+        if not target.exists():
+            messagebox.showinfo("目录不存在", f"成果目录尚不存在：\n{target}", parent=self.root)
+            return
+        self._open(target)
 
     def _refresh_evaluation_results(self, manifest: dict) -> None:
         if not hasattr(self, "evaluation_pair_combo"):
@@ -3075,13 +3604,13 @@ class UserApp:
                 + (f"，新增/灭失道路中心线平均偏差 {float(offset):.2f} 米。" if offset not in {None, ""} else "；中心线偏差暂无可用值。")
             )
         self.evaluation_status.set(status)
-        self._evaluation_pair_changed()
         configured = len(self.project_area_truths)
         embedded = sum(bool(str(entry.get("truth") or "").strip()) for entry in self.result_change_items)
         self.evaluation_truth_summary.set(
             f"总体评价将自动匹配 {max(configured, embedded)} 个区域/相邻期次真值；"
             "上方路径只用于“评价当前结果”。"
         )
+        self._evaluation_pair_changed()
         self.run_evaluation_button.state(["!disabled"])
         self.run_total_evaluation_button.state(["!disabled"])
 
@@ -3100,6 +3629,30 @@ class UserApp:
         )
         if truth:
             self.evaluation_truth.set(truth)
+            self.evaluation_truth_summary.set(f"已匹配项目真值：{truth}")
+        else:
+            self.evaluation_truth.set("缺少真值")
+            self.evaluation_truth_summary.set("缺少真值；点击“补充真值”后会自动保存到项目配置。")
+
+    def supplement_evaluation_truth(self) -> None:
+        if not self.result_change_items or not hasattr(self, "evaluation_pair_combo"):
+            return
+        try:
+            index = list(self.evaluation_pair_combo["values"]).index(self.evaluation_pair.get())
+            item = self.result_change_items[index]
+        except (ValueError, IndexError):
+            return
+        path = self._select_path("shp")
+        if not path:
+            return
+        key = (str(item.get("grid")), str(item.get("before_period")), str(item.get("after_period")))
+        self.project_area_truths = [
+            row for row in self.project_area_truths if (row[0], row[1], row[2]) != key
+        ]
+        self.project_area_truths.append((*key, str(Path(path).resolve())))
+        self._save_project_config()
+        self._evaluation_pair_changed()
+        self.status.set("真值映射已补充并自动保存到项目配置。")
 
     def reload_project_truths(self) -> None:
         if not self.project_root_path:
@@ -3124,6 +3677,9 @@ class UserApp:
         manifest, latest = self._latest_manifest()
         if manifest is None or latest is None:
             messagebox.showinfo("暂无成果", "请先载入或生成任务结果。", parent=self.root)
+            return
+        if self.evaluation_truth.get().strip() in {"", "缺少真值"}:
+            messagebox.showinfo("缺少真值", "请先为所选变化对补充真值。", parent=self.root)
             return
         try:
             index = list(self.evaluation_pair_combo["values"]).index(self.evaluation_pair.get())
@@ -3192,7 +3748,7 @@ class UserApp:
         self.preflight_passed = True
         self._refresh_result_availability()
         self._show_step(3, force=True)
-        self.status.set("已载入已有成果；可直接查看结果或进入人工复核，不会运行推理。")
+        self.status.set("已载入已有成果；可直接查看成果或进入人工编辑，不会运行推理。")
 
     def open_task_report(self) -> None:
         manifest, latest = self._latest_manifest()
@@ -3376,7 +3932,7 @@ class UserApp:
         if not self.review_items:
             messagebox.showinfo(
                 "暂无可选复核资料",
-                "最新任务没有可用的人工复核目录。自动流程不会因人工复核暂停；如需复核，请重新运行支持复核资料输出的任务。",
+                "最新任务没有可用的人工编辑目录。自动流程不会因人工编辑暂停；如需编辑，请重新运行支持编辑资料输出的任务。",
                 parent=self.root,
             )
             return
@@ -3392,7 +3948,7 @@ class UserApp:
         detail = f"已打开：\n{directory}\n\n这里只提供第 3 步人工编辑所需资料，不存在另一套逐项人工处理流程。"
         if decisions:
             detail += f"\n复核决定文件：\n{decisions}"
-        messagebox.showinfo("可选人工复核", detail, parent=self.root)
+        messagebox.showinfo("可选人工编辑", detail, parent=self.root)
 
     def _geometry_editor_script(self) -> Path | None:
         # The user-facing package must remain independently distributable.
@@ -3415,7 +3971,7 @@ class UserApp:
             self.review_combo.configure(state="disabled")
             self.review_detail.set("自动处理结果没有可编辑的中心线复核资料，可直接跳过本步骤。")
             self.review_edit_directory.set("暂无可用编辑目录")
-            self.review_status.set("人工复核是可选步骤；当前任务可直接进入结果页。")
+            self.review_status.set("人工编辑是可选步骤；当前任务可直接进入成果页。")
             self.launch_review_button.state(["disabled"])
             self.apply_review_button.state(["disabled"])
             return
@@ -3430,7 +3986,7 @@ class UserApp:
                 pass
         pending_text = f"，共有 {pending} 处结果可供核查" if pending else ""
         self.review_status.set(
-            f"本次任务有 {len(self.review_items)} 个影像期次可进行人工复核{pending_text}。"
+            f"本次任务有 {len(self.review_items)} 个影像期次可进行人工编辑{pending_text}。"
             "如有修改，请保存后重新生成相关结果。"
         )
         self.launch_review_button.state(["!disabled"])
@@ -3448,11 +4004,23 @@ class UserApp:
         if item is None:
             self.review_detail.set("暂无可复核数据。")
             return
-        self.review_detail.set(
-            f"复核内容：该期道路中心线成果    ·    "
-            f"编辑成果位置：{item.get('edited_directory') or '未设置'}"
-        )
         saved, _checked = find_saved_edit_directory(item)
+        state = "已人工编辑，待更新" if saved else "可编辑"
+        result_path = find_period_result(item)
+        if result_path is not None:
+            try:
+                period_result = json.loads(result_path.read_text(encoding="utf-8"))
+                if (period_result.get("manual_edit") or {}).get("applied"):
+                    state = "已更新"
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        region = item.get("grid", "")
+        periods = [period for period, _source in self.project_area_periods.get(region, [])]
+        pairs = affected_change_pairs(periods, item.get("scope", ""))
+        pair_text = "；".join(f"{before} → {after}：需要重新计算" for before, after in pairs) or "无相邻变化对"
+        self.review_detail.set(
+            f"期次状态：{state}    ·    受影响变化对：{pair_text}"
+        )
         self.review_edit_directory.set(str(saved or item.get("edited_directory") or "尚未保存编辑成果"))
 
     def select_review_edit_directory(self) -> None:
@@ -3516,25 +4084,13 @@ class UserApp:
         edited_dir, checked = find_saved_edit_directory(item, self.review_edit_directory.get())
         if edited_dir is None:
             checked_text = "\n".join(f"• {path}" for path in checked[:8]) or "• 未提供编辑目录"
-            if not messagebox.askyesno(
+            messagebox.showerror(
                 "尚未找到已保存的编辑成果",
-                "重新测宽需要编辑器保存出的 edited_manifest.json 和 *_edited_graph.p。\n\n"
-                "已检查：\n" + checked_text + "\n\n是否手工选择编辑成果目录？",
+                "请先在编辑工作台执行“保存全部”。系统已自动检查当前项目与期次的编辑目录：\n"
+                + checked_text + "\n\n如需兼容外部编辑成果，可展开“高级操作”后导入。",
                 parent=self.root,
-            ):
-                return
-            selected = filedialog.askdirectory(parent=self.root, title="选择已保存的人工编辑成果目录")
-            if not selected:
-                return
-            edited_dir, checked = find_saved_edit_directory(item, selected)
-            if edited_dir is None:
-                messagebox.showerror(
-                    "编辑成果不完整",
-                    "所选目录中没有完整的 edited_manifest.json 与 *_edited_graph.p。"
-                    "请回到人工编辑工作台执行“保存全部”后再试。",
-                    parent=self.root,
-                )
-                return
+            )
+            return
         self.review_edit_directory.set(str(edited_dir))
         item = {**item, "result": str(result_path), "edited_directory": str(edited_dir)}
         _manifest, latest = self._latest_manifest()
