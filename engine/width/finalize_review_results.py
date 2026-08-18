@@ -866,8 +866,14 @@ def finalize_one(
         record = {
             **width_row,
             "final_edge_id": len(edge_records),
-            "source": "manual_edited" if geometry_edited else "samroad",
-            "line_feature_id": f"edited:{edge_id}" if geometry_edited else f"samroad:{edge_id}",
+            "source": (
+                "manual_edited" if geometry_edited
+                else str(width_row.get("line_source", "samroad") or "samroad")
+            ),
+            "line_feature_id": (
+                f"edited:{edge_id}" if geometry_edited
+                else f"{str(width_row.get('line_source', 'samroad') or 'samroad')}:{edge_id}"
+            ),
             "original_edge_id": edge_id,
             "candidate_id": "",
             "src_idx": int(src_idx),
@@ -1241,6 +1247,13 @@ def finalize_one(
         "mean_road_probability",
         "mean_centerline_probability",
         "auto_retained",
+        "line_source",
+        "recovery_score",
+        "center_conf",
+        "surface_conf",
+        "recovery_reason",
+        "qa_state",
+        "recovery_id",
     ]
     write_csv(final_dir / f"{stem}_optimized_edges.csv", edge_records, edge_fields)
 
@@ -1306,7 +1319,7 @@ def finalize_one(
             color_mode="source",
         )
 
-    base_sources = {"samroad", "manual_edited"}
+    base_sources = {"samroad", "weak_recovered", "manual_edited"}
     removed_original_count = sum(1 for row in edge_records if row["source"] in base_sources and row["final_status"] == "removed_by_review")
     kept_original_count = sum(1 for row in edge_records if row["source"] in base_sources and row["final_status"] != "removed_by_review")
     unresolved_added_count = sum(

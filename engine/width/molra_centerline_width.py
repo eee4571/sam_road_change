@@ -1005,6 +1005,58 @@ def load_edge_topology_probabilities(
     return probabilities, f"{score_path} ({matched}/{edges.shape[0]} matched)"
 
 
+def load_edge_provenance(
+    graph_path: Path,
+    nodes_rc: np.ndarray,
+    edges: np.ndarray,
+    match_tolerance_px: float = 3.0,
+) -> list[dict]:
+    """Match SAMRoad edge provenance to the current (possibly recentered) graph."""
+    score_path = graph_path.with_name(f"{graph_path.stem}_edge_scores.csv")
+    defaults = [
+        {
+            "line_source": "samroad", "recovery_score": 0.0,
+            "center_conf": 0.0, "surface_conf": 0.0,
+            "recovery_reason": "", "qa_state": "auto", "recovery_id": "",
+        }
+        for _ in range(edges.shape[0])
+    ]
+    if not score_path.is_file():
+        return defaults
+    records = []
+    with open(score_path, "r", encoding="utf-8-sig", newline="") as file:
+        for row in csv.DictReader(file):
+            try:
+                src = np.asarray([float(row["src_row"]), float(row["src_col"])], dtype=np.float32)
+                dst = np.asarray([float(row["dst_row"]), float(row["dst_col"])], dtype=np.float32)
+            except (KeyError, TypeError, ValueError):
+                continue
+            records.append((src, dst, row))
+    for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+        src = nodes_rc[int(src_idx)]
+        dst = nodes_rc[int(dst_idx)]
+        best_distance = float("inf")
+        best_row = None
+        for record_src, record_dst, row in records:
+            direct = max(float(np.linalg.norm(src - record_src)), float(np.linalg.norm(dst - record_dst)))
+            reverse = max(float(np.linalg.norm(src - record_dst)), float(np.linalg.norm(dst - record_src)))
+            distance = min(direct, reverse)
+            if distance < best_distance:
+                best_distance, best_row = distance, row
+        if best_row is None or best_distance > match_tolerance_px:
+            continue
+        defaults[edge_id] = {
+            "line_source": str(best_row.get("line_source", "samroad") or "samroad"),
+            "recovery_score": float(best_row.get("recovery_score", 0.0) or 0.0),
+            "center_conf": float(best_row.get("center_conf", 0.0) or 0.0),
+            "surface_conf": float(best_row.get("surface_conf", 0.0) or 0.0),
+            "recovery_reason": str(best_row.get("recovery_reason", "") or ""),
+            "qa_state": str(best_row.get("qa_state", "auto") or "auto"),
+            "recovery_id": str(best_row.get("recovery_id", "") or ""),
+        }
+    return defaults
+
+
 def resolve_pixel_size(image_path: Path, requested: float) -> tuple[float, str]:
     if requested > 0:
         return float(requested), "argument"
@@ -3839,6 +3891,9 @@ def process_one(
         binary = binary & graph_buffer_mask(binary.shape, nodes_rc, edges, args.centerline_buffer_px)
 
     edge_rows = build_edge_surface_evidence(nodes_rc, edges, binary)
+    edge_provenance = load_edge_provenance(graph_path, nodes_rc, edges)
+    for row, provenance in zip(edge_rows, edge_provenance):
+        row.update(provenance)
     prepared_topology_probabilities, prepared_topology_probability_source = load_edge_topology_probabilities(
         graph_path, nodes_rc, edges
     )
@@ -4007,6 +4062,13 @@ def process_one(
         "mean_centerline_probability",
         "topology_probability",
         "auto_retained",
+        "line_source",
+        "recovery_score",
+        "center_conf",
+        "surface_conf",
+        "recovery_reason",
+        "qa_state",
+        "recovery_id",
     ]
     surface_only_fields = [
         "region_id",
@@ -4232,6 +4294,11 @@ def process_one(
         "manual_review_item_count": int(sum(bool(row["requires_manual_review"]) for row in conflict_rows)),
         "auto_handled_conflict_count": int(sum(not bool(row["requires_manual_review"]) for row in conflict_rows)),
         "auto_retained_line_without_surface_count": int(sum(bool(row.get("auto_retained")) for row in edge_rows)),
+        "strong_edge_count": int(sum(row.get("line_source", "samroad") == "samroad" for row in edge_rows)),
+        "weak_recovered_edge_count": int(sum(row.get("line_source") == "weak_recovered" for row in edge_rows)),
+        "surface_supported_recovery_count": int(sum(
+            row.get("recovery_reason") == "weak_probability_surface_supported" for row in edge_rows
+        )),
         "width_segment_count": 0,
         "road_chain_count": len(road_chains),
         "original_topology": graph_topology_metrics(original_nodes_rc, original_edges),

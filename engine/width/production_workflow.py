@@ -1272,6 +1272,8 @@ def export_final_products(
                 line_source = "connector"
             elif any(value == "auto_added_surface" for value in source_values):
                 line_source = "surface_skeleton"
+            elif any(value == "weak_recovered" for value in source_values):
+                line_source = "weak_recovered"
             else:
                 line_source = "samroad"
             center_values = [
@@ -1282,8 +1284,21 @@ def export_final_products(
                 float(edge_by_id.get(edge_id, {}).get("mean_road_probability", 0) or 0)
                 for edge_id in chain.edge_ids
             ]
-            qa_state = "review" if quality_grade == "C" or line_source == "connector" else "auto"
-            qa_reason = "low_width_quality" if quality_grade == "C" else "automatic_gap_connector" if line_source == "connector" else ""
+            edge_qa_values = [
+                str(edge_by_id.get(edge_id, {}).get("qa_state", "auto") or "auto")
+                for edge_id in chain.edge_ids
+            ]
+            qa_state = (
+                "review"
+                if quality_grade == "C" or line_source == "connector" or "review" in edge_qa_values
+                else "auto"
+            )
+            qa_reason = (
+                "low_width_quality" if quality_grade == "C"
+                else "automatic_gap_connector" if line_source == "connector"
+                else "weak_recovery_review" if "review" in edge_qa_values
+                else ""
+            )
             tile_centerline_geometries.append(line_geometry)
             centerlines.append({
                 "tile_stem": stem, "road_id": f"{stem}:{chain.chain_id}", "width_px": width_px,

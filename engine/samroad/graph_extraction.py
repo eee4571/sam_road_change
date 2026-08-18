@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 import cv2
 import math
 import tcod
+from collections import Counter
 from sklearn.neighbors import KDTree
 from skimage.draw import line
 from skimage.morphology import skeletonize
@@ -114,18 +115,468 @@ def create_cost_field(sample_pts, road_mask):
     cost_field = np.maximum(cost_field, 255 - road_mask)
     return cost_field
 
-def create_cost_field_astar(sample_pts, road_mask, block_threshold=200):
-    # road mask shall be uint8 normalized to 0-255
-    # for tcod, 0 is blocked
-    cost_field = np.zeros(road_mask.shape, dtype=np.uint8)
+def _probability01(mask):
+    probability = np.asarray(mask, dtype=np.float32)
+    if probability.size and float(np.nanmax(probability)) > 1.0:
+        probability = probability / 255.0
+    return np.nan_to_num(probability, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+
+
+def _config_value(config, name, default):
+    getter = getattr(config, "get", None)
+    return getter(name, default) if getter is not None else getattr(config, name, default)
+
+
+def resolve_road_thresholds(config):
+    """Resolve configurable high/low thresholds, including sensor profiles."""
+    profile_name = str(_config_value(config, "ROAD_THRESHOLD_PROFILE", "default"))
+    profiles = _config_value(config, "ROAD_THRESHOLD_PROFILES", {}) or {}
+    profile = profiles.get(profile_name, {}) if hasattr(profiles, "get") else {}
+
+    def profile_value(name, fallback):
+        if hasattr(profile, "get"):
+            return profile.get(name, profile.get(name.lower(), fallback))
+        return fallback
+
+    legacy_high = float(_config_value(config, "ROAD_THRESHOLD", 0.364))
+    high = float(profile_value(
+        "ROAD_HIGH_THRESHOLD",
+        _config_value(config, "ROAD_HIGH_THRESHOLD", legacy_high),
+    ))
+    low = float(profile_value(
+        "ROAD_LOW_THRESHOLD",
+        _config_value(config, "ROAD_LOW_THRESHOLD", min(0.20, high * 0.65)),
+    ))
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError(
+            f"Road thresholds must satisfy 0 <= low < high <= 1; got low={low}, high={high}"
+        )
+    return high, low, profile_name
+
+
+def create_cost_field_astar(
+    sample_pts,
+    road_mask,
+    block_threshold=200,
+    *,
+    low_threshold=None,
+    surface_probability=None,
+    surface_threshold=0.60,
+):
+    """Build a weighted A* field where weak evidence is costly but traversable."""
+    probability = _probability01(road_mask)
+    low_threshold = (
+        max(0.0, min(1.0, (255.0 - float(block_threshold)) / 255.0))
+        if low_threshold is None
+        else float(low_threshold)
+    )
+    allowed = probability >= low_threshold
+    effective = probability.copy()
+    if surface_probability is not None:
+        surface = _probability01(surface_probability)
+        if surface.shape != probability.shape:
+            raise ValueError(
+                f"Road/surface probability shape mismatch: {probability.shape} != {surface.shape}"
+            )
+        surface_allowed = surface >= float(surface_threshold)
+        allowed |= surface_allowed
+        # Surface evidence permits travel but never makes a weak centerline as
+        # cheap as a genuinely high SAMRoad response.
+        effective = np.maximum(effective, np.where(surface_allowed, 0.45 * surface, 0.0))
+    cost_field = np.clip(np.rint(1.0 + (1.0 - effective) * 199.0), 1, 255).astype(np.uint8)
+    cost_field[~allowed] = 0
     kp_block_radius = 6
     for point in sample_pts:
         cv2.circle(cost_field, point, kp_block_radius, 255, -1)
-    cost_field = np.maximum(cost_field, 255 - road_mask)
-    cost_field[cost_field == 0] = 1
-    cost_field[cost_field > block_threshold] = 0
-
     return cost_field
+
+
+def _endpoint_vectors(nodes_rc, edges):
+    adjacency = [[] for _ in range(len(nodes_rc))]
+    for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
+        adjacency[src_idx].append(dst_idx)
+        adjacency[dst_idx].append(src_idx)
+    vectors = {}
+    for node_idx, neighbors in enumerate(adjacency):
+        if len(neighbors) != 1:
+            continue
+        vector = nodes_rc[node_idx] - nodes_rc[neighbors[0]]
+        norm = float(np.linalg.norm(vector))
+        if norm > 1e-6:
+            vectors[node_idx] = vector / norm
+    return vectors
+
+
+def _astar_probability_path(
+    start_rc,
+    end_rc,
+    road_probability,
+    low_threshold,
+    *,
+    surface_probability=None,
+    surface_threshold=0.60,
+    margin=12,
+):
+    height, width = road_probability.shape
+    y0 = max(0, int(math.floor(min(start_rc[0], end_rc[0]) - margin)))
+    y1 = min(height, int(math.ceil(max(start_rc[0], end_rc[0]) + margin + 1)))
+    x0 = max(0, int(math.floor(min(start_rc[1], end_rc[1]) - margin)))
+    x1 = min(width, int(math.ceil(max(start_rc[1], end_rc[1]) + margin + 1)))
+    local_surface = None if surface_probability is None else surface_probability[y0:y1, x0:x1]
+    cost = create_cost_field_astar(
+        [],
+        road_probability[y0:y1, x0:x1],
+        low_threshold=low_threshold,
+        surface_probability=local_surface,
+        surface_threshold=surface_threshold,
+    )
+    start = np.rint(start_rc - np.asarray([y0, x0])).astype(np.int32)
+    end = np.rint(end_rc - np.asarray([y0, x0])).astype(np.int32)
+    cost[start[0], start[1]] = max(1, int(cost[start[0], start[1]]))
+    cost[end[0], end[1]] = max(1, int(cost[end[0], end[1]]))
+    path = np.asarray(
+        tcod.path.AStar(cost).get_path(int(start[0]), int(start[1]), int(end[0]), int(end[1])),
+        dtype=np.int32,
+    ).reshape(-1, 2)
+    if path.size == 0:
+        return np.empty((0, 2), dtype=np.int32)
+    path = path + np.asarray([y0, x0], dtype=np.int32)
+    if not np.array_equal(path[0], np.rint(start_rc).astype(np.int32)):
+        path = np.vstack([np.rint(start_rc).astype(np.int32), path])
+    if not np.array_equal(path[-1], np.rint(end_rc).astype(np.int32)):
+        path = np.vstack([path, np.rint(end_rc).astype(np.int32)])
+    return path
+
+
+def _path_background_mean(probability, path, offset=3.0):
+    if len(path) < 2:
+        return 0.0
+    samples = []
+    for position in range(len(path)):
+        before = path[max(0, position - 1)].astype(np.float32)
+        after = path[min(len(path) - 1, position + 1)].astype(np.float32)
+        tangent = after - before
+        norm = float(np.linalg.norm(tangent))
+        if norm <= 1e-6:
+            continue
+        normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32) / norm
+        for sign in (-1.0, 1.0):
+            point = np.rint(path[position] + sign * offset * normal).astype(np.int32)
+            point[0] = np.clip(point[0], 0, probability.shape[0] - 1)
+            point[1] = np.clip(point[1], 0, probability.shape[1] - 1)
+            samples.append(float(probability[point[0], point[1]]))
+    return float(np.mean(samples)) if samples else 0.0
+
+
+def _recovery_path_evidence(
+    path,
+    road_probability,
+    low_threshold,
+    surface_probability,
+    parameters,
+):
+    rows = np.clip(path[:, 0], 0, road_probability.shape[0] - 1)
+    cols = np.clip(path[:, 1], 0, road_probability.shape[1] - 1)
+    values = road_probability[rows, cols]
+    center_mean = float(np.mean(values))
+    center_q25 = float(np.quantile(values, 0.25))
+    weak_fraction = float(np.mean(values >= low_threshold))
+    background_mean = _path_background_mean(
+        road_probability, path, parameters["background_offset"]
+    )
+    contrast = center_mean - background_mean
+    surface_mean = surface_fraction = 0.0
+    if surface_probability is not None:
+        surface_values = surface_probability[rows, cols]
+        surface_mean = float(np.mean(surface_values))
+        surface_fraction = float(np.mean(surface_values >= parameters["surface_threshold"]))
+    road_supported = (
+        center_mean >= parameters["min_mean"]
+        and center_q25 >= parameters["min_q25"]
+        and weak_fraction >= parameters["min_weak_fraction"]
+        and contrast >= parameters["min_contrast"]
+    )
+    surface_supported = (
+        surface_probability is not None
+        and center_mean >= parameters["surface_min_center"]
+        and surface_mean >= parameters["surface_min_mean"]
+        and surface_fraction >= parameters["surface_min_fraction"]
+    )
+    return {
+        "center_conf": center_mean,
+        "center_q25": center_q25,
+        "weak_fraction": weak_fraction,
+        "background_conf": background_mean,
+        "probability_contrast": contrast,
+        "surface_conf": surface_mean,
+        "surface_fraction": surface_fraction,
+        "road_supported": road_supported,
+        "surface_supported": surface_supported,
+    }
+
+
+def recover_weak_road_edges(
+    nodes_rc,
+    edges,
+    road_probability,
+    config,
+    *,
+    surface_probability=None,
+    edge_scores=None,
+    distance_scale=1.0,
+):
+    """Conservatively bridge or extend dangling endpoints through weak evidence."""
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    road = _probability01(road_probability)
+    surface = None if surface_probability is None else _probability01(surface_probability)
+    if surface is not None and surface.shape != road.shape:
+        raise ValueError(f"Road/surface probability shape mismatch: {road.shape} != {surface.shape}")
+    high_threshold, low_threshold, profile_name = resolve_road_thresholds(config)
+    enabled = bool(_config_value(config, "WEAK_RECOVERY_ENABLED", True))
+    scores = np.asarray(
+        edge_scores if edge_scores is not None else np.full(len(original_edges), np.nan),
+        dtype=np.float32,
+    )
+    if len(scores) != len(original_edges):
+        raise ValueError("edge_scores must align with edges")
+    metadata = []
+    for edge_id, (src_idx, dst_idx) in enumerate(original_edges.tolist()):
+        rr, cc = line(
+            int(round(nodes[src_idx, 0])), int(round(nodes[src_idx, 1])),
+            int(round(nodes[dst_idx, 0])), int(round(nodes[dst_idx, 1])),
+        )
+        rr = np.clip(rr, 0, road.shape[0] - 1)
+        cc = np.clip(cc, 0, road.shape[1] - 1)
+        center_conf = float(np.mean(road[rr, cc])) if len(rr) else 0.0
+        topology_probability = float(scores[edge_id]) if np.isfinite(scores[edge_id]) else center_conf
+        metadata.append({
+            "line_source": "samroad", "topology_probability": topology_probability,
+            "recovery_score": 0.0, "center_conf": center_conf, "surface_conf": 0.0,
+            "recovery_reason": "strong_threshold", "qa_state": "auto", "recovery_id": "",
+        })
+    summary = {
+        "threshold_profile": profile_name,
+        "road_high_threshold": high_threshold,
+        "road_low_threshold": low_threshold,
+        "strong_edge_count": int(len(original_edges)),
+        "weak_candidate_count": 0,
+        "weak_recovered_candidate_count": 0,
+        "weak_recovered_edge_count": 0,
+        "surface_supported_recovery_count": 0,
+        "rejected_weak_candidate_count": 0,
+        "recovery_reason_counts": {},
+    }
+    if not enabled or len(original_edges) == 0 or len(nodes) == 0:
+        return nodes, original_edges, metadata, summary
+
+    scale = max(float(distance_scale), 1e-6)
+    parameters = {
+        "max_gap": float(_config_value(config, "WEAK_RECOVERY_MAX_GAP_PX", 64.0)) * scale,
+        "max_extension": float(_config_value(config, "WEAK_RECOVERY_MAX_EXTENSION_PX", 48.0)) * scale,
+        "min_extension": float(_config_value(config, "WEAK_RECOVERY_MIN_EXTENSION_PX", 10.0)) * scale,
+        "min_alignment": float(_config_value(config, "WEAK_RECOVERY_MIN_DIRECTION_COSINE", 0.65)),
+        "max_path_ratio": float(_config_value(config, "WEAK_RECOVERY_MAX_PATH_RATIO", 1.35)),
+        "min_mean": float(_config_value(config, "WEAK_RECOVERY_MIN_MEAN_PROBABILITY", max(low_threshold, 0.20))),
+        "min_q25": float(_config_value(config, "WEAK_RECOVERY_MIN_Q25_PROBABILITY", max(0.15, low_threshold * 0.85))),
+        "min_weak_fraction": float(_config_value(config, "WEAK_RECOVERY_MIN_WEAK_FRACTION", 0.80)),
+        "min_contrast": float(_config_value(config, "WEAK_RECOVERY_MIN_BACKGROUND_CONTRAST", 0.08)),
+        "background_offset": float(_config_value(config, "WEAK_RECOVERY_BACKGROUND_OFFSET_PX", 4.0)) * scale,
+        "surface_threshold": float(_config_value(config, "WEAK_RECOVERY_SURFACE_THRESHOLD", 0.60)),
+        "surface_min_center": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_CENTER_PROBABILITY", 0.10)),
+        "surface_min_mean": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_MEAN", 0.70)),
+        "surface_min_fraction": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_FRACTION", 0.80)),
+        "path_margin": max(1.0, float(_config_value(config, "WEAK_RECOVERY_PATH_MARGIN_PX", 16.0)) * scale),
+        "sample_step": max(1.0, float(_config_value(config, "WEAK_RECOVERY_SAMPLE_STEP_PX", 12.0)) * scale),
+        "auto_score": float(_config_value(config, "WEAK_RECOVERY_AUTO_SCORE", 0.62)),
+    }
+    endpoint_vectors = _endpoint_vectors(nodes, original_edges)
+    endpoint_ids = sorted(endpoint_vectors)
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(nodes)))
+    graph.add_edges_from(original_edges.tolist())
+    component = {}
+    for component_id, members in enumerate(nx.connected_components(graph)):
+        for node_idx in members:
+            component[node_idx] = component_id
+
+    proposals = []
+
+    def evaluate(start_idx, end_point, kind, end_idx=None):
+        start_point = nodes[start_idx]
+        delta = np.asarray(end_point, dtype=np.float32) - start_point
+        distance = float(np.linalg.norm(delta))
+        limit = parameters["max_gap"] if kind == "bridge" else parameters["max_extension"]
+        if distance <= 1e-6 or distance > limit:
+            return
+        direction = delta / distance
+        first_alignment = float(np.dot(endpoint_vectors[start_idx], direction))
+        if first_alignment < parameters["min_alignment"]:
+            return
+        second_alignment = 1.0
+        if kind == "bridge":
+            if end_idx is None or component[start_idx] == component[end_idx]:
+                return
+            second_alignment = float(np.dot(endpoint_vectors[end_idx], -direction))
+            if second_alignment < parameters["min_alignment"]:
+                return
+        elif distance < parameters["min_extension"]:
+            return
+        summary["weak_candidate_count"] += 1
+        path = _astar_probability_path(
+            start_point, end_point, road, low_threshold,
+            surface_probability=surface,
+            surface_threshold=parameters["surface_threshold"],
+            margin=parameters["path_margin"],
+        )
+        if len(path) < 2:
+            summary["rejected_weak_candidate_count"] += 1
+            return
+        path_length = float(np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1).sum())
+        path_ratio = path_length / max(distance, 1e-6)
+        evidence = _recovery_path_evidence(path, road, low_threshold, surface, parameters)
+        if path_ratio > parameters["max_path_ratio"] or not (
+            evidence["road_supported"] or evidence["surface_supported"]
+        ):
+            summary["rejected_weak_candidate_count"] += 1
+            return
+        alignment = min(first_alignment, second_alignment)
+        directness = min(1.0, 1.0 / max(path_ratio, 1.0))
+        recovery_score = (
+            0.32 * min(1.0, evidence["center_conf"] / max(high_threshold, 1e-6))
+            + 0.18 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
+            + 0.20 * alignment
+            + 0.15 * directness
+            + 0.15 * evidence["surface_conf"]
+        )
+        reason = (
+            "weak_probability_surface_supported"
+            if evidence["surface_supported"]
+            else "weak_probability_endpoint_bridge" if kind == "bridge"
+            else "weak_probability_endpoint_extension"
+        )
+        proposals.append({
+            "score": recovery_score, "start_idx": start_idx, "end_idx": end_idx,
+            "end_point": np.asarray(end_point, dtype=np.float32), "kind": kind,
+            "path": path, "path_ratio": path_ratio, "alignment": alignment,
+            "reason": reason, **evidence,
+        })
+
+    if len(endpoint_ids) > 1:
+        endpoint_points = nodes[endpoint_ids]
+        endpoint_tree = KDTree(endpoint_points)
+        for local_idx, start_idx in enumerate(endpoint_ids):
+            neighbor_local_ids = endpoint_tree.query_radius(
+                endpoint_points[local_idx][np.newaxis, :], r=parameters["max_gap"]
+            )[0]
+            for neighbor_local_idx in neighbor_local_ids.tolist():
+                end_idx = endpoint_ids[neighbor_local_idx]
+                if end_idx <= start_idx:
+                    continue
+                evaluate(start_idx, nodes[end_idx], "bridge", end_idx=end_idx)
+
+    traversable = road >= low_threshold
+    if surface is not None:
+        traversable |= surface >= parameters["surface_threshold"]
+    weak_skeleton = skeletonize(traversable)
+    neighbor_kernel = np.ones((3, 3), dtype=np.uint8)
+    neighbor_count = cv2.filter2D(weak_skeleton.astype(np.uint8), -1, neighbor_kernel) - weak_skeleton
+    terminal_rc = np.column_stack(np.where(weak_skeleton & (neighbor_count == 1))).astype(np.float32)
+    if len(terminal_rc):
+        terminal_tree = KDTree(terminal_rc)
+        node_tree = KDTree(nodes)
+        for start_idx in endpoint_ids:
+            candidates = terminal_tree.query_radius(
+                nodes[start_idx][np.newaxis, :], r=parameters["max_extension"]
+            )[0]
+            for terminal_idx in candidates.tolist():
+                target = terminal_rc[terminal_idx]
+                nearest_distance, _ = node_tree.query(target[np.newaxis, :], k=1)
+                if float(nearest_distance[0, 0]) < max(2.0, parameters["min_extension"] * 0.25):
+                    continue
+                evaluate(start_idx, target, "extension")
+
+    used_endpoints = set()
+    combined_nodes = nodes.tolist()
+    combined_edges = original_edges.tolist()
+    existing_edges = {tuple(sorted(edge)) for edge in combined_edges}
+    reason_counts = Counter()
+    recovery_id = 0
+    for proposal in sorted(proposals, key=lambda row: row["score"], reverse=True):
+        endpoint_members = {proposal["start_idx"]}
+        if proposal["end_idx"] is not None:
+            endpoint_members.add(proposal["end_idx"])
+        if endpoint_members & used_endpoints:
+            continue
+        path = proposal["path"]
+        path_steps = np.concatenate([
+            np.asarray([0.0], dtype=np.float32),
+            np.cumsum(np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1)),
+        ])
+        sample_distances = np.arange(parameters["sample_step"], path_steps[-1], parameters["sample_step"])
+        chain = [proposal["start_idx"]]
+        for sample_distance in sample_distances.tolist():
+            path_idx = min(int(np.searchsorted(path_steps, sample_distance)), len(path) - 1)
+            sampled_point = path[path_idx].astype(np.float32)
+            if np.array_equal(np.rint(combined_nodes[chain[-1]]), np.rint(sampled_point)):
+                continue
+            combined_nodes.append(sampled_point.tolist())
+            chain.append(len(combined_nodes) - 1)
+        if proposal["end_idx"] is None:
+            if not np.array_equal(
+                np.rint(combined_nodes[chain[-1]]), np.rint(proposal["end_point"])
+            ):
+                combined_nodes.append(proposal["end_point"].tolist())
+                chain.append(len(combined_nodes) - 1)
+        else:
+            if (
+                chain[-1] >= len(nodes)
+                and chain[-1] == len(combined_nodes) - 1
+                and np.array_equal(
+                    np.rint(combined_nodes[chain[-1]]), np.rint(nodes[proposal["end_idx"]])
+                )
+            ):
+                chain.pop()
+                combined_nodes.pop()
+            chain.append(proposal["end_idx"])
+        added_count = 0
+        qa_state = "auto" if proposal["score"] >= parameters["auto_score"] else "review"
+        for src_idx, dst_idx in zip(chain[:-1], chain[1:]):
+            key = tuple(sorted((int(src_idx), int(dst_idx))))
+            if src_idx == dst_idx or key in existing_edges:
+                continue
+            existing_edges.add(key)
+            combined_edges.append((int(src_idx), int(dst_idx)))
+            metadata.append({
+                "line_source": "weak_recovered",
+                "topology_probability": float(proposal["score"]),
+                "recovery_score": float(proposal["score"]),
+                "center_conf": float(proposal["center_conf"]),
+                "surface_conf": float(proposal["surface_conf"]),
+                "recovery_reason": proposal["reason"],
+                "qa_state": qa_state,
+                "recovery_id": f"weak:{recovery_id}",
+            })
+            added_count += 1
+        if added_count:
+            used_endpoints.update(endpoint_members)
+            recovery_id += 1
+            summary["weak_recovered_candidate_count"] += 1
+            reason_counts[proposal["reason"]] += added_count
+            summary["weak_recovered_edge_count"] += added_count
+            if proposal["surface_supported"]:
+                summary["surface_supported_recovery_count"] += added_count
+    summary["rejected_weak_candidate_count"] = max(
+        0,
+        summary["weak_candidate_count"] - summary["weak_recovered_candidate_count"],
+    )
+    summary["recovery_reason_counts"] = dict(sorted(reason_counts.items()))
+    return (
+        np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
+        np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
+        metadata,
+        summary,
+    )
 
 
 def skeletonize_road_mask(road_mask, threshold, close_kernel_size=3):
@@ -212,13 +663,14 @@ def branch_aware_nms_points(
 
 
 def extract_graph_points(keypoint_mask, road_mask, config):
+    high_threshold, _low_threshold, _profile_name = resolve_road_thresholds(config)
     kp_candidates, kp_scores = get_points_and_scores_from_mask(keypoint_mask, config.ITSC_THRESHOLD * 255)
     kps_0 = nms_points(kp_candidates, kp_scores, config.ITSC_NMS_RADIUS)
     # The keypoint heatmap contains broad blobs. Keep its historical coarse
     # spacing; divided-road preservation is applied only to the road skeleton.
     if kps_0.shape[0]:
         kps_0 = nms_points(kps_0, np.ones(kps_0.shape[0]), config.ROAD_NMS_RADIUS)
-    road_skel_mask = skeletonize_road_mask(road_mask, config.ROAD_THRESHOLD * 255)
+    road_skel_mask = skeletonize_road_mask(road_mask, high_threshold * 255)
     kp_candidates, kp_scores = get_points_and_scores_from_mask(road_skel_mask, 0)
     road_scores = road_mask[kp_candidates[:, 1], kp_candidates[:, 0]] if kp_candidates.shape[0] else kp_scores
     kps_1 = branch_aware_nms_points(
@@ -253,7 +705,8 @@ def extract_graph_astar(keypoint_mask, road_mask, config):
     kps = extract_graph_points(keypoint_mask, road_mask, config)
 
     # cost_field = create_cost_field(kps, road_mask)
-    cost_field = create_cost_field_astar(kps, road_mask)
+    _high_threshold, low_threshold, _profile_name = resolve_road_thresholds(config)
+    cost_field = create_cost_field_astar(kps, road_mask, low_threshold=low_threshold)
     viz_cost_field = np.array(cost_field)
     viz_cost_field[viz_cost_field == 0] = 255
     # cv2.imwrite('astar_cost_dbg.png', viz_cost_field)

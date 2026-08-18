@@ -162,6 +162,7 @@ def gather_inference_inputs(input_dir="", input_txt_dir=""):
 
 def run_inference_on_images(net, config, input_img_paths, output_dir, input_label):
     total_inference_seconds = 0.0
+    recovery_summaries = []
     print(f'Found {len(input_img_paths)} image(s) under {input_label}.')
     print(f'Inference patch size: {config.PATCH_SIZE}x{config.PATCH_SIZE}')
     print(f'Inference device: {resolved_device_name}')
@@ -232,6 +233,20 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 pred_nodes, pred_edges, original_height, original_width, edge_confidences
             )
 
+        pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.recover_weak_road_edges(
+            pred_nodes,
+            pred_edges,
+            road_mask,
+            config,
+            edge_scores=edge_confidences,
+            distance_scale=1.0 / max(float(resize_factor), 1e-6),
+        )
+        edge_confidences = np.asarray(
+            [row["topology_probability"] for row in edge_metadata], dtype=np.float32
+        )
+        recovery_summary = {"tile": img_id, **recovery_summary}
+        recovery_summaries.append(recovery_summary)
+
         viz_img = np.copy(img)
         mask_save_dir = os.path.join(output_dir, 'mask')
         os.makedirs(mask_save_dir, exist_ok=True)
@@ -252,9 +267,15 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             pickle.dump(large_map_sat2graph_format, file)
         score_path = os.path.join(graph_save_dir, f'{img_id}_edge_scores.csv')
         with open(score_path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=['edge_id', 'src_row', 'src_col', 'dst_row', 'dst_col', 'topology_probability'])
+            writer = csv.DictWriter(file, fieldnames=[
+                'edge_id', 'src_row', 'src_col', 'dst_row', 'dst_col',
+                'topology_probability', 'line_source', 'recovery_score',
+                'center_conf', 'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
+            ])
             writer.writeheader()
-            for edge_id, ((src_idx, dst_idx), score) in enumerate(zip(pred_edges.tolist(), edge_confidences.tolist())):
+            for edge_id, ((src_idx, dst_idx), score, metadata) in enumerate(
+                zip(pred_edges.tolist(), edge_confidences.tolist(), edge_metadata)
+            ):
                 src_row, src_col = pred_nodes[src_idx]
                 dst_row, dst_col = pred_nodes[dst_idx]
                 writer.writerow({
@@ -262,7 +283,16 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                     'src_row': float(src_row), 'src_col': float(src_col),
                     'dst_row': float(dst_row), 'dst_col': float(dst_col),
                     'topology_probability': float(score),
+                    'line_source': metadata['line_source'],
+                    'recovery_score': metadata['recovery_score'],
+                    'center_conf': metadata['center_conf'],
+                    'surface_conf': metadata['surface_conf'],
+                    'recovery_reason': metadata['recovery_reason'],
+                    'qa_state': metadata['qa_state'],
+                    'recovery_id': metadata['recovery_id'],
                 })
+        with open(os.path.join(graph_save_dir, f'{img_id}_weak_recovery.json'), 'w', encoding='utf-8') as file:
+            json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
         candidate_path = os.path.join(graph_save_dir, f'{img_id}_edge_candidates.csv')
         with open(candidate_path, 'w', newline='', encoding='utf-8') as file:
             writer = csv.DictWriter(
@@ -292,6 +322,28 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     print(time_txt)
     with open(os.path.join(output_dir, 'inference_time.txt'), 'w', encoding='utf-8') as f:
         f.write(time_txt)
+    total_fields = (
+        'strong_edge_count', 'weak_candidate_count', 'weak_recovered_edge_count',
+        'surface_supported_recovery_count', 'rejected_weak_candidate_count',
+    )
+    recovery_report = {
+        'tile_count': len(recovery_summaries),
+        **{name: int(sum(row.get(name, 0) for row in recovery_summaries)) for name in total_fields},
+        'recovery_reason_counts': {
+            reason: int(sum(
+                row.get('recovery_reason_counts', {}).get(reason, 0)
+                for row in recovery_summaries
+            ))
+            for reason in sorted({
+                reason
+                for row in recovery_summaries
+                for reason in row.get('recovery_reason_counts', {})
+            })
+        },
+        'tiles': recovery_summaries,
+    }
+    with open(os.path.join(output_dir, 'weak_recovery_summary.json'), 'w', encoding='utf-8') as file:
+        json.dump(recovery_report, file, ensure_ascii=False, indent=2)
     return total_inference_seconds
 
 
@@ -639,6 +691,7 @@ if __name__ == "__main__":
     else:
         base_output_dir = create_output_dir_and_save_config(output_dir_prefix, config)
 
+    road_high_threshold, road_low_threshold, road_threshold_profile = graph_extraction.resolve_road_thresholds(config)
     with open(os.path.join(base_output_dir, 'inference_metadata.json'), 'w', encoding='utf-8') as file:
         json.dump(
             {
@@ -647,6 +700,10 @@ if __name__ == "__main__":
                 'device': resolved_device_name,
                 'topology_threshold': float(config.TOPO_THRESHOLD),
                 'topology_candidate_threshold': float(config.get('TOPO_CANDIDATE_THRESHOLD', 0.20)),
+                'road_threshold_profile': road_threshold_profile,
+                'road_high_threshold': road_high_threshold,
+                'road_low_threshold': road_low_threshold,
+                'weak_recovery_enabled': bool(config.get('WEAK_RECOVERY_ENABLED', True)),
                 'branch_aware_road_nms': True,
             },
             file,
