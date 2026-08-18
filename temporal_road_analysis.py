@@ -30,7 +30,7 @@ CONF_FIELDS = ("confidence", "conf", "center_p", "gap_score")
 STATUS_CODES = {"present": "P", "absent": "A", "uncertain": "U", "no_data": "N"}
 EVENT_CODES = {
     "added": "A", "removed": "R", "widened": "W", "narrowed": "N",
-    "rerouted": "D", "uncertain": "U",
+    "uncertain": "U",
 }
 
 

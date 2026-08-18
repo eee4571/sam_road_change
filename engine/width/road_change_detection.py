@@ -22,6 +22,8 @@ from skimage.measure import label
 from skimage.morphology import skeletonize
 from PIL import Image, ImageDraw, ImageFont
 
+from road_corridor_change import detect_corridor_changes
+
 
 LINE_TYPES = {"LineString", "MultiLineString"}
 POLYGON_TYPES = {"Polygon", "MultiPolygon"}
@@ -64,6 +66,8 @@ class DetectionConfig:
     width_min_polygon_area: float = 20.0
     width_require_reciprocal_match: bool = True
     width_exclude_low_quality: bool = True
+    width_min_valid_ratio: float = 0.60
+    width_same_direction_ratio: float = 0.70
 
 
 def _clean_geometries(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -821,6 +825,11 @@ def _detect_changes_internal(
     after_period: str,
     before_surfaces: gpd.GeoDataFrame | None = None,
     after_surfaces: gpd.GeoDataFrame | None = None,
+    before_width_segments: gpd.GeoDataFrame | None = None,
+    after_width_segments: gpd.GeoDataFrame | None = None,
+    before_valid_area: gpd.GeoDataFrame | None = None,
+    after_valid_area: gpd.GeoDataFrame | None = None,
+    artifacts: dict[str, gpd.GeoDataFrame] | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
     before = _clean_geometries(before)
     after = _clean_geometries(after)
@@ -836,41 +845,40 @@ def _detect_changes_internal(
     before_width_field = _width_field(before_analysis) if family == "line" else None
     after_width_field = _width_field(after_analysis) if family == "line" else None
     classification_metadata = {}
-    if family == "line" and before_surfaces is not None and after_surfaces is not None:
+    if family == "line":
         before_width_field = before_width_field or _width_field_or_zero(before_analysis)
         after_width_field = after_width_field or _width_field_or_zero(after_analysis)
-        before_surfaces = _to_crs_if_needed(_clean_geometries(before_surfaces), analysis_crs)
-        after_surfaces = _to_crs_if_needed(_clean_geometries(after_surfaces), analysis_crs)
-        if _family_from_geometries(before_surfaces.geometry) != "polygon" or _family_from_geometries(after_surfaces.geometry) != "polygon":
-            raise ValueError("The actual before/after road surface layers must contain polygons.")
-        before_surface_union = union_all(np.asarray(before_surfaces.geometry.values, dtype=object))
-        after_surface_union = union_all(np.asarray(after_surfaces.geometry.values, dtype=object))
-        positive_guides, negative_guides, classification_metadata = _detect_centerline_width_changes(
-            before_analysis, after_analysis, before_width_field, after_width_field,
-            before_period, after_period, config, before_surface_union, after_surface_union,
+        if before_surfaces is not None:
+            before_surfaces = _to_crs_if_needed(_clean_geometries(before_surfaces), analysis_crs)
+            if not before_surfaces.empty and _family_from_geometries(before_surfaces.geometry) != "polygon":
+                raise ValueError("The actual before road surface layer must contain polygons.")
+        if after_surfaces is not None:
+            after_surfaces = _to_crs_if_needed(_clean_geometries(after_surfaces), analysis_crs)
+            if not after_surfaces.empty and _family_from_geometries(after_surfaces.geometry) != "polygon":
+                raise ValueError("The actual after road surface layer must contain polygons.")
+        if before_width_segments is not None:
+            before_width_segments = _to_crs_if_needed(_clean_geometries(before_width_segments), analysis_crs)
+        if after_width_segments is not None:
+            after_width_segments = _to_crs_if_needed(_clean_geometries(after_width_segments), analysis_crs)
+
+        def valid_union(frame: gpd.GeoDataFrame | None):
+            if frame is None:
+                return None
+            frame = _to_crs_if_needed(_clean_geometries(frame), analysis_crs)
+            if frame.empty:
+                return box(0, 0, 0, 0)
+            if _family_from_geometries(frame.geometry) != "polygon":
+                raise ValueError("Valid-observation layers must contain polygons.")
+            return union_all(np.asarray(frame.geometry.values, dtype=object))
+
+        added, removed, unchanged, classification_metadata, corridor_artifacts = detect_corridor_changes(
+            before_analysis, after_analysis, config, before_period, after_period,
+            before_surfaces=before_surfaces, after_surfaces=after_surfaces,
+            before_width_segments=before_width_segments, after_width_segments=after_width_segments,
+            before_valid=valid_union(before_valid_area), after_valid=valid_union(after_valid_area),
         )
-        unchanged = _unchanged_features(before_surface_union, after_surface_union, "polygon", analysis_crs)
-        added = _classify_actual_surface_difference(
-            after_surface_union.difference(before_surface_union), positive_guides,
-            after_period, analysis_crs, config,
-        )
-        removed = _classify_actual_surface_difference(
-            before_surface_union.difference(after_surface_union), negative_guides,
-            before_period, analysis_crs, config,
-        )
-        added = _retain_presence_fallbacks(added, positive_guides, "added", config)
-        removed = _retain_presence_fallbacks(removed, negative_guides, "removed", config)
-        classification_metadata.update(
-            {
-                "positive_guide_feature_count": len(positive_guides),
-                "negative_guide_feature_count": len(negative_guides),
-                "actual_surface_source": True,
-            }
-        )
-    elif family == "line" and (before_width_field or after_width_field):
-        raise ValueError(
-            "Road centerlines with width attributes require both actual before/after road surface layers."
-        )
+        if artifacts is not None:
+            artifacts.update(corridor_artifacts)
     else:
         before_union = union_all(np.asarray(before_analysis.geometry.values, dtype=object))
         after_union = union_all(np.asarray(after_analysis.geometry.values, dtype=object))
@@ -929,9 +937,14 @@ def detect_changes(
     after_period: str = "after",
     before_surfaces: gpd.GeoDataFrame | None = None,
     after_surfaces: gpd.GeoDataFrame | None = None,
+    before_width_segments: gpd.GeoDataFrame | None = None,
+    after_width_segments: gpd.GeoDataFrame | None = None,
+    before_valid_area: gpd.GeoDataFrame | None = None,
+    after_valid_area: gpd.GeoDataFrame | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
     added, removed, _unchanged, summary = _detect_changes_internal(
         before, after, config, before_period, after_period, before_surfaces, after_surfaces,
+        before_width_segments, after_width_segments, before_valid_area, after_valid_area,
     )
     return added, removed, summary
 
@@ -1411,6 +1424,7 @@ def _write_outputs(
     removed: gpd.GeoDataFrame,
     unchanged: gpd.GeoDataFrame,
     output_crs,
+    artifacts: dict[str, gpd.GeoDataFrame] | None = None,
 ) -> gpd.GeoDataFrame:
     output_dir.mkdir(parents=True, exist_ok=True)
     combined = gpd.GeoDataFrame(
@@ -1465,16 +1479,37 @@ def _write_outputs(
     write_shapefile("review_changes.shp", review_output)
     write_shapefile("unchanged_road_surfaces.shp", unchanged_output, "Polygon" if unchanged_is_polygon else geometry_type)
 
+    artifact_outputs: dict[str, gpd.GeoDataFrame] = {}
+    artifact_types = {
+        "road_width_segments": "LineString",
+        "road_corridors": "Polygon",
+        "road_matches": "LineString",
+        "canonical_roads": "LineString",
+    }
+    for layer_name, layer_type in artifact_types.items():
+        frame = (artifacts or {}).get(layer_name)
+        if frame is None:
+            frame = gpd.GeoDataFrame({"feature_id": pd.Series(dtype="object")}, geometry=[], crs=added.crs)
+        output_frame = frame.to_crs(output_crs)
+        artifact_outputs[layer_name] = output_frame
+        write_shapefile(f"{layer_name}.shp", output_frame, layer_type)
+
     gpkg_path = output_dir / "road_changes.gpkg"
     if gpkg_path.is_file():
         gpkg_path.unlink()
-    if not combined_output.empty:
-        combined_output.to_file(output_dir / "road_changes.gpkg", layer="road_changes", driver="GPKG")
+    pyogrio.write_dataframe(
+        combined_output, gpkg_path, layer="road_changes", driver="GPKG", geometry_type=geometry_type,
+    )
     if not review_output.empty:
         review_output.to_file(output_dir / "road_changes.gpkg", layer="review_changes", driver="GPKG")
     if unchanged_is_polygon:
         unchanged_output.to_file(
             output_dir / "road_changes.gpkg", layer="unchanged_road_surfaces", driver="GPKG",
+        )
+    for layer_name, output_frame in artifact_outputs.items():
+        pyogrio.write_dataframe(
+            output_frame, gpkg_path, layer=layer_name, driver="GPKG",
+            geometry_type=artifact_types[layer_name], append=True,
         )
     write_change_preview(output_dir / "change_preview.png", added, removed, unchanged)
     return combined
@@ -1558,6 +1593,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--after", required=True, help="Road centerline or surface vector after the change.")
     parser.add_argument("--before-surfaces", default="", help="Actual before-period road surface polygons.")
     parser.add_argument("--after-surfaces", default="", help="Actual after-period road surface polygons.")
+    parser.add_argument("--before-width-segments", default="", help="Optional measured local-width line segments.")
+    parser.add_argument("--after-width-segments", default="", help="Optional measured local-width line segments.")
+    parser.add_argument("--before-valid-area", default="", help="Polygon extent of valid before-period observations.")
+    parser.add_argument("--after-valid-area", default="", help="Polygon extent of valid after-period observations.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--before-period", default="before")
     parser.add_argument("--after-period", default="after")
@@ -1574,6 +1613,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width-line-match-ratio", type=float, default=0.7)
     parser.add_argument("--width-min-overlap-length", type=float, default=20.0)
     parser.add_argument("--width-min-polygon-area", type=float, default=20.0)
+    parser.add_argument("--width-min-valid-ratio", type=float, default=0.60)
+    parser.add_argument("--width-same-direction-ratio", type=float, default=0.70)
     parser.add_argument("--truth", default="", help="Optional vector truth of road changes.")
     parser.add_argument("--validation-area", default="", help="Optional polygon boundary for evaluation.")
     parser.add_argument("--truth-type-field", default="")
@@ -1594,6 +1635,8 @@ def main(argv: list[str] | None = None) -> int:
         or not args.width_change_ratio <= args.width_change_max_ratio <= 1
         or not 0 < args.line_match_ratio <= 1
         or not 0 < args.width_line_match_ratio <= 1
+        or not 0 <= args.width_min_valid_ratio <= 1
+        or not 0 <= args.width_same_direction_ratio <= 1
     ):
         raise ValueError("Width change ratio must be 0..1 and line match ratios must be >0..1.")
     if args.evaluation_tolerance <= 0:
@@ -1606,7 +1649,12 @@ def main(argv: list[str] | None = None) -> int:
     after = gpd.read_file(args.after)
     before_surfaces = gpd.read_file(args.before_surfaces) if args.before_surfaces else None
     after_surfaces = gpd.read_file(args.after_surfaces) if args.after_surfaces else None
+    before_width_segments = gpd.read_file(args.before_width_segments) if args.before_width_segments else None
+    after_width_segments = gpd.read_file(args.after_width_segments) if args.after_width_segments else None
+    before_valid_area = gpd.read_file(args.before_valid_area) if args.before_valid_area else None
+    after_valid_area = gpd.read_file(args.after_valid_area) if args.after_valid_area else None
     output_crs = after.crs
+    artifacts: dict[str, gpd.GeoDataFrame] = {}
     added, removed, unchanged, summary = _detect_changes_internal(
         before,
         after,
@@ -1621,14 +1669,21 @@ def main(argv: list[str] | None = None) -> int:
             width_line_match_ratio=args.width_line_match_ratio,
             width_min_overlap_length=args.width_min_overlap_length,
             width_min_polygon_area=args.width_min_polygon_area,
+            width_min_valid_ratio=args.width_min_valid_ratio,
+            width_same_direction_ratio=args.width_same_direction_ratio,
         ),
         args.before_period,
         args.after_period,
         before_surfaces,
         after_surfaces,
+        before_width_segments,
+        after_width_segments,
+        before_valid_area,
+        after_valid_area,
+        artifacts,
     )
     # detect_changes keeps metric geometries in its selected projected CRS.
-    combined = _write_outputs(output_dir, added, removed, unchanged, output_crs)
+    combined = _write_outputs(output_dir, added, removed, unchanged, output_crs, artifacts)
 
     if args.truth:
         print(f"Evaluating against truth: {args.truth}", flush=True)
@@ -1654,11 +1709,22 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    summary["outputs"] = {
+        "road_changes": str(output_dir / "road_changes.shp"),
+        "review_changes": str(output_dir / "review_changes.shp"),
+        "geopackage": str(output_dir / "road_changes.gpkg"),
+        "road_width_segments": str(output_dir / "road_width_segments.shp"),
+        "road_corridors": str(output_dir / "road_corridors.shp"),
+        "road_matches": str(output_dir / "road_matches.shp"),
+        "canonical_roads": str(output_dir / "canonical_roads.shp"),
+    }
     with (output_dir / "change_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
     audit_keys = [
         key for key in summary
         if key.startswith("width_rejected_") or key.startswith("presence_")
+        or key.startswith("rejected_") or key.startswith("unmatched_")
+        or key in {"spatial_candidate_count", "valid_candidate_count"}
     ]
     with (output_dir / "change_audit.csv").open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=["rule", "count"])

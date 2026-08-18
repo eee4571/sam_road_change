@@ -31,6 +31,7 @@ if str(TOOL_DIR) not in sys.path:
 from finalize_review_results import load_graph, save_graph  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
 from surface_reconstruction import SurfaceReconstructionConfig, reconstruct_surface  # noqa: E402
+from road_pair_matcher import build_corridors, build_width_segments  # noqa: E402
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -799,6 +800,11 @@ def _connect_surface_supported_global_gaps(
             "src_count": 0,
             "src_tiles": "",
             "quality_gr": "C",
+            "line_source": "connector",
+            "center_conf": evidence.get("center_probability_mean", 0.0),
+            "surface_conf": evidence.get("surface_support_ratio", evidence.get("straight_surface_support_ratio", 0.0)),
+            "qa_state": "review",
+            "qa_reason": "automatic_gap_connector",
             "fusion_sta": "global_gap_repair",
             "conflict": 0,
             "gap_length": distance,
@@ -917,6 +923,7 @@ def _fuse_centerline_records(
         midpoint = part.interpolate(0.5, normalized=True)
         part_direction = _line_direction(part)
         observations = []
+        provenance = []
         for row in source_parts:
             geometry = row["geometry"]
             if geometry.distance(part) > tolerance:
@@ -927,6 +934,14 @@ def _fuse_centerline_records(
             support_ratio = min(1.0, support_length / max(float(part.length), tolerance))
             if support_ratio <= 0.01:
                 continue
+            source_name = str(row.get("line_source", "samroad") or "samroad")
+            provenance.append((
+                source_name, support_ratio,
+                float(row.get("center_conf", 0.0) or 0.0),
+                float(row.get("surface_conf", 0.0) or 0.0),
+                str(row.get("qa_state", "auto") or "auto"),
+                str(row.get("qa_reason", "") or ""),
+            ))
             try:
                 width_map = float(row.get("width_map", 0.0) or 0.0)
             except (TypeError, ValueError):
@@ -984,13 +999,31 @@ def _fuse_centerline_records(
             conflict = 1
             source_tiles = []
             width_source = "unresolved"
+        if provenance:
+            source_support: dict[str, float] = {}
+            for source_name, support_ratio, *_rest in provenance:
+                source_support[source_name] = source_support.get(source_name, 0.0) + support_ratio
+            line_source = max(source_support, key=source_support.get)
+            center_conf = float(np.median([item[2] for item in provenance]))
+            surface_conf = float(np.median([item[3] for item in provenance]))
+            qa_state = "review" if quality_grade == "C" or any(item[4] == "review" for item in provenance) else "auto"
+            qa_reasons = sorted({item[5] for item in provenance if item[5]})
+            qa_reason = ";".join(qa_reasons) or ("low_width_quality" if quality_grade == "C" else "")
+        else:
+            line_source, center_conf, surface_conf = "samroad", 0.0, 0.0
+            qa_state, qa_reason = "review", "missing_source_provenance"
         fused.append({
             "global_id": global_id,
             "width_map": width_map,
             "width_std": width_std,
             "src_count": len(source_tiles),
             "src_tiles": ",".join(source_tiles),
-            "quality_gr": quality_grade,
+            "quality_grade": quality_grade,
+            "line_source": line_source,
+            "center_conf": center_conf,
+            "surface_conf": surface_conf,
+            "qa_state": qa_state,
+            "qa_reason": qa_reason,
             "fusion_sta": "conflict" if conflict else "fused",
             "conflict": conflict,
             "width_src": width_source,
@@ -1231,11 +1264,35 @@ def export_final_products(
             else:
                 quality_grade = "C"
             line_geometry = _world_line(points, transform)
+            source_values = [str(edge_by_id.get(edge_id, {}).get("source", "samroad") or "samroad") for edge_id in chain.edge_ids]
+            if any(value in {"manual_edited", "review_added_candidate"} for value in source_values):
+                line_source = "manual"
+            elif any(value == "auto_added_gap" for value in source_values):
+                line_source = "connector"
+            elif any(value == "auto_added_surface" for value in source_values):
+                line_source = "surface_skeleton"
+            else:
+                line_source = "samroad"
+            center_values = [
+                float(edge_by_id.get(edge_id, {}).get("mean_centerline_probability", edge_by_id.get(edge_id, {}).get("confidence", 0)) or 0)
+                for edge_id in chain.edge_ids
+            ]
+            surface_values = [
+                float(edge_by_id.get(edge_id, {}).get("mean_road_probability", 0) or 0)
+                for edge_id in chain.edge_ids
+            ]
+            qa_state = "review" if quality_grade == "C" or line_source == "connector" else "auto"
+            qa_reason = "low_width_quality" if quality_grade == "C" else "automatic_gap_connector" if line_source == "connector" else ""
             tile_centerline_geometries.append(line_geometry)
             centerlines.append({
                 "tile_stem": stem, "road_id": f"{stem}:{chain.chain_id}", "width_px": width_px,
                 "width_map": width_px * float(summary.get("pixel_size", 1.0)),
                 "edge_count": len(chain.edge_ids), "quality_grade": quality_grade,
+                "line_source": line_source,
+                "center_conf": float(np.median(center_values)) if center_values else 0.0,
+                "surface_conf": float(np.median(surface_values)) if surface_values else 0.0,
+                "qa_state": qa_state,
+                "qa_reason": qa_reason,
                 "direct_measurement_ratio": direct_ratio, "automatic_estimate_ratio": automatic_ratio,
                 "quality": {"A": "direct_measurement", "B": "chain_interpolation", "C": "automatic_estimate"}.get(quality_grade, "automatic_estimate"),
                 "width_source": (
@@ -1366,10 +1423,46 @@ def export_final_products(
     fused_surfaces = ([{"source": "sammolra_feathered_surface_fusion_with_global_gap_buffers", "geometry": fused_surface_geometry}]
                       if fused_surface_geometry is not None and not fused_surface_geometry.is_empty else [])
 
+    exported_centerlines = []
+    for row in fused_centerlines:
+        exported = dict(row)
+        exported["quality_grade"] = str(exported.get("quality_grade", exported.get("quality_gr", "C")) or "C")
+        exported.pop("quality_gr", None)
+        exported_centerlines.append(exported)
+    fused_centerline_frame = (
+        gpd.GeoDataFrame(exported_centerlines, geometry="geometry", crs=crs)
+        if exported_centerlines else gpd.GeoDataFrame(
+            {
+                "global_id": np.asarray([], dtype=np.int64),
+                "width_map": np.asarray([], dtype=np.float64),
+                "quality_grade": np.asarray([], dtype=object),
+                "line_source": np.asarray([], dtype=object),
+                "qa_state": np.asarray([], dtype=object),
+            },
+            geometry=[], crs=crs,
+        )
+    )
+    measured_segment_frame = (
+        gpd.GeoDataFrame(width_segments, geometry="geometry", crs=crs)
+        if width_segments else None
+    )
+    standardized_width_segments = build_width_segments(
+        fused_centerline_frame,
+        measured_segment_frame,
+        target_length=15.0,
+        source_tolerance=max(match_tolerance, 0.5),
+    )
+    standardized_corridors = build_corridors(standardized_width_segments)
+    standardized_width_rows = standardized_width_segments.to_dict("records")
+    standardized_corridor_rows = standardized_corridors.to_dict("records")
+
     layers = {
-        "final_centerlines": fused_centerlines, "final_road_surfaces": fused_surfaces,
+        "final_centerlines": exported_centerlines, "final_road_surfaces": fused_surfaces,
         "tile_centerlines": centerlines, "tile_road_surfaces": road_surfaces,
-        "final_width_samples": width_samples, "final_width_segments": width_segments,
+        "final_width_samples": width_samples,
+        "final_width_segments": standardized_width_rows,
+        "final_road_corridors": standardized_corridor_rows,
+        "tile_width_segments": width_segments,
         "final_review_issues": issues,
         "surface_added": surface_added, "surface_removed": surface_removed,
         "surface_uncertain": surface_uncertain,
@@ -1385,10 +1478,18 @@ def export_final_products(
 
     if centerline_shp is not None:
         centerline_shp.parent.mkdir(parents=True, exist_ok=True)
-        gpd.GeoDataFrame(fused_centerlines, geometry="geometry", crs=crs).to_file(centerline_shp, driver="ESRI Shapefile")
+        fused_centerline_frame.to_file(centerline_shp, driver="ESRI Shapefile")
     if surface_shp is not None:
         surface_shp.parent.mkdir(parents=True, exist_ok=True)
         gpd.GeoDataFrame(fused_surfaces, geometry="geometry", crs=crs).to_file(surface_shp, driver="ESRI Shapefile")
+    width_segment_shp = (
+        centerline_shp.parent / "road_width_segments.shp" if centerline_shp is not None
+        else surface_shp.parent / "road_width_segments.shp" if surface_shp is not None
+        else output.parent / "road_width_segments.shp"
+    )
+    corridor_shp = width_segment_shp.parent / "road_corridors.shp"
+    standardized_width_segments.to_file(width_segment_shp, driver="ESRI Shapefile", encoding="UTF-8")
+    standardized_corridors.to_file(corridor_shp, driver="ESRI Shapefile", encoding="UTF-8")
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1409,6 +1510,8 @@ def export_final_products(
         "geopackage": str(output) if output is not None else "",
         "centerline_shp": str(centerline_shp) if centerline_shp is not None else "",
         "surface_shp": str(surface_shp) if surface_shp is not None else "",
+        "width_segments_shp": str(width_segment_shp),
+        "corridors_shp": str(corridor_shp),
         "visualization": visualization_report,
         "fusion": {
             "canonical_network": str(stitched_centerlines) if stitched_centerlines is not None else "",

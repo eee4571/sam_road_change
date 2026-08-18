@@ -38,7 +38,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".img", ".jp2", ".vrt", ".png", ".jpg", ".jpeg", ".bmp"}
 DIRECT_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-PIPELINE_VERSION = "2026.08-user-batch-4-production-change-qa"
+PIPELINE_VERSION = "2026.08-user-batch-5-canonical-corridor-change"
 
 
 def project_root() -> Path:
@@ -236,6 +236,14 @@ def _ensure_extract_manifest_fields(result: dict | None) -> dict:
         payload["review"] = review
     else:
         payload["review"] = build_review_metadata(run_root) if run_root is not None else _empty_review_metadata()
+    products = run_root / "products" if run_root is not None else None
+    for key, name in (
+        ("width_segments", "road_width_segments.shp"),
+        ("corridors", "road_corridors.shp"),
+        ("valid_observation", "valid_observation.shp"),
+    ):
+        if not payload.get(key) and products is not None and (products / name).is_file():
+            payload[key] = str((products / name).resolve())
     return payload
 
 
@@ -250,6 +258,19 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
         else:
             previews.pop("change", None)
     payload["previews"] = previews
+    if target is not None:
+        layers = dict(payload.get("layers")) if isinstance(payload.get("layers"), dict) else {}
+        for key, name in (
+            ("changes", "road_changes.shp"), ("review", "review_changes.shp"),
+            ("added", "added_roads.shp"), ("removed", "removed_roads.shp"),
+            ("widened", "widened_road_parts.shp"), ("narrowed", "narrowed_road_parts.shp"),
+            ("width_segments", "road_width_segments.shp"), ("corridors", "road_corridors.shp"),
+            ("matches", "road_matches.shp"), ("canonical_roads", "canonical_roads.shp"),
+        ):
+            path = target / name
+            if path.is_file():
+                layers[key] = str(path.resolve())
+        payload["layers"] = layers
     return payload
 
 
@@ -1668,6 +1689,57 @@ def run_command(command: list[str], cwd: Path, env: dict[str, str], label: str) 
     return timing
 
 
+def _write_valid_observation_area(image_dir: Path, output: Path) -> str | None:
+    """Vectorize the true per-pixel observation mask without loading a mosaic."""
+    import geopandas as gpd
+    import numpy as np
+    import rasterio
+    from rasterio.features import shapes
+    from shapely import make_valid, union_all
+    from shapely.geometry import shape
+
+    geometries = []
+    target_crs = None
+    for image_path in listed_rasters(image_dir):
+        try:
+            with rasterio.open(image_path) as dataset:
+                if dataset.crs is None:
+                    continue
+                source_geometries = []
+                for _block_id, window in dataset.block_windows(1):
+                    mask = dataset.dataset_mask(window=window)
+                    valid = mask > 0
+                    if not bool(valid.any()):
+                        continue
+                    transform = dataset.window_transform(window)
+                    source_geometries.extend(
+                        shape(mapping)
+                        for mapping, value in shapes(valid.astype(np.uint8), mask=valid, transform=transform)
+                        if value == 1
+                    )
+                if not source_geometries:
+                    continue
+                source_frame = gpd.GeoDataFrame(geometry=source_geometries, crs=dataset.crs)
+                if target_crs is None:
+                    target_crs = dataset.crs
+                elif not source_frame.crs.equals(target_crs):
+                    source_frame = source_frame.to_crs(target_crs)
+                geometries.extend(source_frame.geometry.tolist())
+        except (OSError, ValueError, rasterio.errors.RasterioError):
+            continue
+    if not geometries or target_crs is None:
+        return None
+    merged = make_valid(union_all(np.asarray(geometries, dtype=object)))
+    rows = [part for part in getattr(merged, "geoms", [merged]) if part.geom_type == "Polygon" and not part.is_empty]
+    if not rows:
+        return None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    gpd.GeoDataFrame({"valid_px": [1] * len(rows)}, geometry=rows, crs=target_crs).to_file(
+        output, driver="ESRI Shapefile", encoding="UTF-8",
+    )
+    return str(output.resolve())
+
+
 def extract(args: argparse.Namespace) -> dict:
     started = time.monotonic()
     workspace = Path(args.workspace).expanduser().resolve()
@@ -1746,9 +1818,13 @@ def extract(args: argparse.Namespace) -> dict:
     ], ROOT, env, "道路产品导出")
     if isinstance(timing, dict):
         stage_timings.append(timing)
+    valid_observation = _write_valid_observation_area(images, products / "valid_observation.shp")
     result = _ensure_extract_manifest_fields({
         "workspace": str(workspace), "run_id": run_id, "run_root": str(run_root),
         "centerlines": str(centerline), "surfaces": str(surface), "gpkg": str(gpkg),
+        "width_segments": str(products / "road_width_segments.shp"),
+        "corridors": str(products / "road_corridors.shp"),
+        "valid_observation": valid_observation,
         "width_review": str(width_dir), "final_dir": str(final_dir),
     })
     result["fusion"] = build_fusion_metadata(final_dir)
@@ -1775,6 +1851,15 @@ def change(args: argparse.Namespace) -> dict:
         "--width-change-absolute", str(args.absolute), "--width-change-ratio", str(args.ratio),
         "--position-tolerance", str(args.tolerance),
     ]
+    for option, key, payload in (
+        ("--before-width-segments", "width_segments", before),
+        ("--after-width-segments", "width_segments", after),
+        ("--before-valid-area", "valid_observation", before),
+        ("--after-valid-area", "valid_observation", after),
+    ):
+        value = str(payload.get(key, "") or "").strip()
+        if value and Path(value).expanduser().is_file():
+            command.extend([option, value])
     truth = str(getattr(args, "truth", "") or "").strip()
     validation_area = str(getattr(args, "validation_area", "") or "").strip()
     truth_type_field = str(getattr(args, "truth_type_field", "") or "").strip()
@@ -1788,6 +1873,10 @@ def change(args: argparse.Namespace) -> dict:
     summary = output / "change_summary.json"
     result = _ensure_change_manifest_fields({
         "output": str(output), "summary": str(summary), "gpkg": str(output / "road_changes.gpkg"),
+        "width_segments": str(output / "road_width_segments.shp"),
+        "corridors": str(output / "road_corridors.shp"),
+        "matches": str(output / "road_matches.shp"),
+        "canonical_roads": str(output / "canonical_roads.shp"),
         "evaluation_metrics": str(output / "evaluation_metrics.csv") if (output / "evaluation_metrics.csv").is_file() else None,
     }, output)
     result["stage_timings"] = [timing] if isinstance(timing, dict) else []
