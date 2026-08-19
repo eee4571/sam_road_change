@@ -141,15 +141,39 @@ def read_result_summary(run_dir: Path) -> dict:
         "weak_recovered_edge_count": int(summary.get("weak_recovered_edge_count", 0)),
         "rejected_weak_candidate_count": int(summary.get("rejected_weak_candidate_count", 0)),
         "bootstrap_candidate_count": int(summary.get("bootstrap_candidate_count", 0)),
+        "bootstrap_accepted_candidate_count": int(
+            summary.get(
+                "bootstrap_accepted_candidate_count",
+                int(summary.get("bootstrap_auto_count", 0))
+                + int(summary.get("bootstrap_review_count", 0)),
+            )
+        ),
         "bootstrap_recovered_edge_count": int(summary.get("bootstrap_recovered_edge_count", 0)),
         "bootstrap_auto_count": int(summary.get("bootstrap_auto_count", 0)),
         "bootstrap_review_count": int(summary.get("bootstrap_review_count", 0)),
         "bootstrap_rejected_count": int(summary.get("bootstrap_rejected_count", 0)),
         "scene_confidence_state": str(summary.get("scene_confidence_state", "unknown")),
         "recommended_profile": str(summary.get("recommended_profile", "default")),
+        "active_profile": str(
+            summary.get("active_profile", summary.get("threshold_profile", "default"))
+        ),
+        "diagnostic_reference_profile": str(
+            summary.get("diagnostic_reference_profile", "default")
+        ),
+        "weak_recovery_reject_reason_counts": dict(
+            summary.get("weak_recovery_reject_reason_counts", {})
+        ),
+        "bootstrap_reject_reason_counts": dict(
+            summary.get("bootstrap_reject_reason_counts", {})
+        ),
         "weak_recovery_seconds": float(timing.get("weak_recovery_seconds", 0.0)),
         "total_seconds": float(timing.get("total_seconds", 0.0)),
     }
+
+
+def format_top_reject_reasons(reason_counts: dict, limit: int = 3) -> str:
+    rows = sorted(reason_counts.items(), key=lambda row: (-int(row[1]), str(row[0])))[:limit]
+    return ", ".join(f"{reason}: {int(count)}" for reason, count in rows) or "none"
 
 
 def cuda_available() -> bool:
@@ -481,15 +505,26 @@ class WeakRecoveryLauncher:
             return
         try:
             summary = read_result_summary(run_dir)
+            summary["weak_top_rejects"] = format_top_reject_reasons(
+                summary["weak_recovery_reject_reason_counts"]
+            )
+            summary["bootstrap_top_rejects"] = format_top_reject_reasons(
+                summary["bootstrap_reject_reason_counts"]
+            )
             self.summary_var.set(
-                "原始边数：{strong_edge_count}    弱候选：{weak_candidate_count}    "
-                "成功恢复边：{weak_recovered_edge_count}    拒绝候选：{rejected_weak_candidate_count}    "
-                "Bootstrap：{bootstrap_recovered_edge_count}（auto {bootstrap_auto_count} / review {bootstrap_review_count}）    "
+                "Strong edges：{strong_edge_count}\n"
+                "Weak recovery：Candidates {weak_candidate_count} / Accepted {weak_recovered_candidate_count}\n"
+                "Top reject reasons：{weak_top_rejects}\n"
+                "Bootstrap：Candidates {bootstrap_candidate_count} / Accepted {bootstrap_accepted_candidate_count} "
+                "（edges {bootstrap_recovered_edge_count}；auto {bootstrap_auto_count} / review {bootstrap_review_count}）\n"
+                "Top reject reasons：{bootstrap_top_rejects}\n"
                 "Weak Recovery：{weak_recovery_seconds:.2f}s    总耗时：{total_seconds:.2f}s".format(**summary)
             )
             self.scene_var.set(
-                f"Scene Confidence：{summary['scene_confidence_state']}    "
-                f"Recommended Profile：{summary['recommended_profile']}"
+                f"Scene：{summary['scene_confidence_state']}    "
+                f"Profile：{summary['active_profile']}    "
+                f"Reference：{summary['diagnostic_reference_profile']}    "
+                f"Recommended：{summary['recommended_profile']}"
             )
         except Exception as exc:
             self.summary_var.set(f"结果已生成，但摘要读取失败：{exc}")

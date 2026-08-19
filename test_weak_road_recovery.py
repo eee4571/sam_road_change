@@ -118,6 +118,23 @@ class WeakRoadRecoveryTests(unittest.TestCase):
             {"weak_probability_endpoint_bridge"},
         )
 
+    def test_reciprocal_edges_do_not_hide_true_endpoints(self):
+        nodes, _edges = split_graph()
+        reciprocal_edges = np.asarray(
+            [[0, 1], [1, 0], [2, 3], [3, 2]], dtype=np.int32
+        )
+        probability = draw_probability(weak_value=0.22)
+
+        result_nodes, result_edges, _metadata, summary = (
+            graph_extraction.recover_weak_road_edges(
+                nodes, reciprocal_edges, probability, recovery_config()
+            )
+        )
+
+        self.assertEqual(component_count(len(result_nodes), result_edges), 1)
+        self.assertGreater(summary["weak_candidate_count"], 0)
+        self.assertGreater(summary["weak_recovered_edge_count"], 0)
+
     def test_case_c_isolated_weak_noise_is_not_recovered(self):
         nodes = np.asarray([[16, 8], [16, 32]], dtype=np.float32)
         edges = np.asarray([[0, 1]], dtype=np.int32)
@@ -136,14 +153,21 @@ class WeakRoadRecoveryTests(unittest.TestCase):
     def test_case_d_near_endpoints_without_evidence_are_not_connected(self):
         nodes, edges = split_graph()
         probability = draw_probability(weak_value=0.0)
+        candidate_audit = []
 
         result_nodes, result_edges, _metadata, summary = graph_extraction.recover_weak_road_edges(
-            nodes, edges, probability, recovery_config()
+            nodes, edges, probability, recovery_config(), candidate_audit=candidate_audit
         )
 
         self.assertEqual(component_count(len(result_nodes), result_edges), 2)
         self.assertEqual(summary["weak_recovered_edge_count"], 0)
         self.assertGreater(summary["rejected_weak_candidate_count"], 0)
+        self.assertEqual(
+            summary["rejected_weak_candidate_count"],
+            sum(summary["weak_recovery_reject_reason_counts"].values()),
+        )
+        self.assertIn("no_astar_path", summary["weak_recovery_reject_reason_counts"])
+        self.assertEqual(len(candidate_audit), summary["weak_candidate_count"])
 
     def test_case_e_weak_centerline_with_strong_surface_is_recovered(self):
         nodes, edges = split_graph()
@@ -193,6 +217,74 @@ class WeakRoadRecoveryTests(unittest.TestCase):
         }
         high, low, profile = graph_extraction.resolve_road_thresholds(config)
         self.assertEqual((high, low, profile), (0.42, 0.16, "sensor_b"))
+
+    def test_scene_diagnosis_uses_fixed_reference_profile(self):
+        config = recovery_config()
+        config["ROAD_THRESHOLD_PROFILES"] = {
+            "default": {"ROAD_HIGH_THRESHOLD": 0.50, "ROAD_LOW_THRESHOLD": 0.18},
+            "weak_sensor": {"ROAD_HIGH_THRESHOLD": 0.24, "ROAD_LOW_THRESHOLD": 0.10},
+        }
+        config["SCENE_DIAGNOSTIC_REFERENCE_PROFILE"] = "default"
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:121] = 0.22
+
+        config["ROAD_THRESHOLD_PROFILE"] = "default"
+        default_diagnosis = graph_extraction.diagnose_scene_confidence(
+            probability,
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            config,
+        )
+        config["ROAD_THRESHOLD_PROFILE"] = "weak_sensor"
+        weak_diagnosis = graph_extraction.diagnose_scene_confidence(
+            probability,
+            np.asarray([[48, 8], [48, 120]], dtype=np.float32),
+            np.asarray([[0, 1]], dtype=np.int32),
+            config,
+        )
+
+        self.assertEqual(
+            default_diagnosis["scene_confidence_state"],
+            weak_diagnosis["scene_confidence_state"],
+        )
+        self.assertEqual(
+            default_diagnosis["recommended_profile"],
+            weak_diagnosis["recommended_profile"],
+        )
+        self.assertEqual(weak_diagnosis["scene_confidence_state"], "low_confidence")
+        self.assertEqual(weak_diagnosis["recommended_profile"], "weak_sensor")
+        self.assertEqual(weak_diagnosis["active_profile"], "weak_sensor")
+        self.assertEqual(weak_diagnosis["diagnostic_reference_profile"], "default")
+        self.assertNotEqual(
+            default_diagnosis["active_low_threshold"],
+            weak_diagnosis["active_low_threshold"],
+        )
+        self.assertNotEqual(
+            default_diagnosis["strong_graph_edge_count"],
+            weak_diagnosis["strong_graph_edge_count"],
+        )
+
+    def test_weak_sensor_bootstrap_gate_uses_reference_diagnosis(self):
+        config = recovery_config()
+        config["ROAD_THRESHOLD_PROFILES"] = {
+            "default": {"ROAD_HIGH_THRESHOLD": 0.50, "ROAD_LOW_THRESHOLD": 0.18},
+            "weak_sensor": {"ROAD_HIGH_THRESHOLD": 0.24, "ROAD_LOW_THRESHOLD": 0.10},
+        }
+        config["SCENE_DIAGNOSTIC_REFERENCE_PROFILE"] = "default"
+        config["ROAD_THRESHOLD_PROFILE"] = "weak_sensor"
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:121] = 0.22
+
+        _nodes, _edges, _metadata, summary = graph_extraction.postprocess_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            config,
+        )
+
+        self.assertEqual(summary["scene_confidence_state"], "low_confidence")
+        self.assertEqual(summary["recommended_profile"], "weak_sensor")
+        self.assertTrue(summary["bootstrap_ran"])
 
     def test_bootstrap_case_a_normal_strong_scene_is_not_changed(self):
         nodes = np.asarray([[48, 8], [48, 112]], dtype=np.float32)
@@ -253,12 +345,14 @@ class WeakRoadRecoveryTests(unittest.TestCase):
     def test_bootstrap_case_d_short_isolated_weak_line_is_rejected(self):
         probability = np.full((96, 128), 0.03, dtype=np.float32)
         probability[47:50, 8:28] = 0.24
+        candidate_audit = []
 
         _nodes, edges, _metadata, summary = graph_extraction.bootstrap_weak_road_network(
             np.empty((0, 2), dtype=np.float32),
             np.empty((0, 2), dtype=np.int32),
             probability,
             recovery_config(),
+            candidate_audit=candidate_audit,
         )
 
         self.assertEqual(len(edges), 0)
@@ -266,6 +360,12 @@ class WeakRoadRecoveryTests(unittest.TestCase):
         self.assertEqual(
             summary["bootstrap_rejected_count"], summary["bootstrap_candidate_count"]
         )
+        self.assertEqual(
+            summary["bootstrap_rejected_count"],
+            sum(summary["bootstrap_reject_reason_counts"].values()),
+        )
+        self.assertIn("too_short", summary["bootstrap_reject_reason_counts"])
+        self.assertEqual(len(candidate_audit), summary["bootstrap_candidate_count"])
 
     def test_bootstrap_case_e_long_relative_response_is_accepted(self):
         config = recovery_config()

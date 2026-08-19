@@ -26,6 +26,25 @@ SourceFileLoader(launcher.__name__, str(LAUNCHER_PATH)).exec_module(launcher)
 
 
 class WeakRoadRecoveryDevToolTests(unittest.TestCase):
+    def test_cached_reload_preserves_exact_directed_edges(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            nodes = np.asarray([[20, 8], [20, 32], [20, 64]], dtype=np.float32)
+            edges = np.asarray([[0, 1], [1, 0], [1, 2]], dtype=np.int32)
+            scores = np.asarray([0.91, 0.92, 0.93], dtype=np.float32)
+            graph_path = root / "original_graph.p"
+            score_path = root / "original_edge_scores.csv"
+            run_test.save_graph(graph_path, nodes, edges)
+            run_test.write_original_scores(score_path, nodes, edges, scores)
+
+            loaded_nodes, loaded_edges, loaded_scores = run_test.load_original_scored_graph(
+                graph_path, score_path
+            )
+
+            np.testing.assert_array_equal(loaded_nodes, nodes)
+            np.testing.assert_array_equal(loaded_edges, edges)
+            np.testing.assert_allclose(loaded_scores, scores)
+
     def test_launcher_loads_defaults_and_builds_full_command(self):
         parameters = launcher.load_default_parameters()
         self.assertAlmostEqual(parameters["road_low_threshold"], 0.20)
@@ -165,8 +184,19 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             for name in (
                 "scene_probability_diagnostic.png", "bootstrap_overlay.png",
                 "recovery_compare.png", "recovered_graph.p",
+                "weak_recovery_candidates.csv", "bootstrap_candidates.csv",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
+            self.assertEqual(
+                (run_dir / "weak_recovery_candidates.csv")
+                .read_text(encoding="utf-8-sig").splitlines()[0].split(","),
+                list(run_test.WEAK_CANDIDATE_FIELDS),
+            )
+            self.assertEqual(
+                (run_dir / "bootstrap_candidates.csv")
+                .read_text(encoding="utf-8-sig").splitlines()[0].split(","),
+                list(run_test.BOOTSTRAP_CANDIDATE_FIELDS),
+            )
 
     def test_recovery_only_reuses_immutable_original_cache(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -228,6 +258,7 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "original_overlay.png", "recovered_overlay.png", "recovery_compare.png",
                 "bootstrap_overlay.png", "scene_probability_diagnostic.png",
                 "recovered_graph.p", "test_config.json",
+                "weak_recovery_candidates.csv", "bootstrap_candidates.csv",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
 

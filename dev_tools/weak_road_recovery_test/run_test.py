@@ -28,6 +28,19 @@ DEFAULT_CONFIG = REPO_ROOT / "config" / "samroad_inference.yaml"
 DEFAULT_CHECKPOINT = REPO_ROOT / "models" / "samroad" / "samroad.ckpt"
 DEFAULT_OUTPUTS = Path(__file__).resolve().parent / "outputs"
 
+WEAK_CANDIDATE_FIELDS = (
+    "candidate_type", "start", "end", "distance", "direction_cosine",
+    "path_length", "path_ratio", "mean_probability", "q25_probability",
+    "weak_fraction", "background_probability", "background_contrast",
+    "surface_probability", "accepted", "reject_reason",
+)
+BOOTSTRAP_CANDIDATE_FIELDS = (
+    "path_length", "direct_distance", "tortuosity", "mean_probability",
+    "q25_probability", "weak_fraction", "background_probability",
+    "background_contrast", "connection_count", "accepted", "qa_state",
+    "reject_reason",
+)
+
 OVERRIDES = {
     "road_high_threshold": "ROAD_HIGH_THRESHOLD",
     "road_low_threshold": "ROAD_LOW_THRESHOLD",
@@ -83,6 +96,18 @@ def parser() -> argparse.ArgumentParser:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_candidate_csv(path: Path, fieldnames, rows: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            payload = dict(row)
+            for name in ("start", "end"):
+                if isinstance(payload.get(name), (list, tuple)):
+                    payload[name] = json.dumps(payload[name], ensure_ascii=False)
+            writer.writerow(payload)
 
 
 def _progress(message: str) -> None:
@@ -153,6 +178,35 @@ def read_original_scores(path: Path, nodes_rc: np.ndarray, edges: np.ndarray) ->
         dst = tuple(int(round(value)) for value in nodes_rc[int(dst_idx)])
         scores.append(by_coordinates.get(tuple(sorted((src, dst))), float("nan")))
     return np.asarray(scores, dtype=np.float32)
+
+
+def load_original_scored_graph(
+    graph_path: Path,
+    score_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reload the exact directed edge list saved by a full test run."""
+    nodes, _unique_edges = load_graph(graph_path)
+    node_by_coordinate = {
+        tuple(int(round(value)) for value in point): node_idx
+        for node_idx, point in enumerate(nodes)
+    }
+    edges = []
+    scores = []
+    with score_path.open("r", encoding="utf-8-sig", newline="") as file:
+        for row in csv.DictReader(file):
+            src = (int(round(float(row["src_row"]))), int(round(float(row["src_col"]))))
+            dst = (int(round(float(row["dst_row"]))), int(round(float(row["dst_col"]))))
+            if src not in node_by_coordinate or dst not in node_by_coordinate:
+                raise ValueError(
+                    f"Cached score edge references a missing graph node: {src} -> {dst}"
+                )
+            edges.append((node_by_coordinate[src], node_by_coordinate[dst]))
+            scores.append(float(row["topology_probability"]))
+    return (
+        nodes,
+        np.asarray(edges, dtype=np.int32).reshape(-1, 2),
+        np.asarray(scores, dtype=np.float32),
+    )
 
 
 def _apply_overrides(config, arguments: argparse.Namespace) -> None:
@@ -327,6 +381,9 @@ def _actual_test_config(
     device_name: str,
 ) -> dict:
     high, low, profile = graph_extraction.resolve_road_thresholds(config)
+    reference_high, reference_low, reference_profile = (
+        graph_extraction.resolve_scene_diagnostic_thresholds(config)
+    )
     config_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
     weak_parameters = {
         key: value for key, value in config_dict.items()
@@ -341,6 +398,9 @@ def _actual_test_config(
         "ROAD_THRESHOLD_PROFILE": profile,
         "ROAD_HIGH_THRESHOLD": high,
         "ROAD_LOW_THRESHOLD": low,
+        "SCENE_DIAGNOSTIC_REFERENCE_PROFILE": reference_profile,
+        "SCENE_DIAGNOSTIC_REFERENCE_HIGH_THRESHOLD": reference_high,
+        "SCENE_DIAGNOSTIC_REFERENCE_LOW_THRESHOLD": reference_low,
         **weak_parameters,
     }
 
@@ -409,9 +469,9 @@ def main(argv: list[str] | None = None) -> int:
         load_started = time.perf_counter()
         image_rgb = single_image_inference.read_rgb_img(image_path)
         road_probability = _read_probability(run_dir / "road_probability.png")
-        original_nodes, original_edges = load_graph(run_dir / "original_graph.p")
-        original_scores = read_original_scores(
-            run_dir / "original_edge_scores.csv", original_nodes, original_edges
+        original_nodes, original_edges, original_scores = load_original_scored_graph(
+            run_dir / "original_graph.p",
+            run_dir / "original_edge_scores.csv",
         )
         if road_probability.shape != image_rgb.shape[:2]:
             raise ValueError(
@@ -455,6 +515,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _progress("Scene diagnosis, weak-network bootstrap, and weak recovery...")
     recovery_started = time.perf_counter()
+    weak_candidate_audit = []
+    bootstrap_candidate_audit = []
     recovered_nodes, recovered_edges, metadata, recovery_summary = (
         graph_extraction.postprocess_weak_road_network(
             original_nodes,
@@ -462,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
             road_probability,
             config,
             edge_scores=original_scores,
+            weak_candidate_audit=weak_candidate_audit,
+            bootstrap_candidate_audit=bootstrap_candidate_audit,
         )
     )
     timing["weak_recovery_seconds"] = time.perf_counter() - recovery_started
@@ -471,6 +535,16 @@ def main(argv: list[str] | None = None) -> int:
         _recovery_payload(
             recovery_summary, recovered_nodes, recovered_edges, metadata, len(original_edges)
         ),
+    )
+    _write_candidate_csv(
+        run_dir / "weak_recovery_candidates.csv",
+        WEAK_CANDIDATE_FIELDS,
+        weak_candidate_audit,
+    )
+    _write_candidate_csv(
+        run_dir / "bootstrap_candidates.csv",
+        BOOTSTRAP_CANDIDATE_FIELDS,
+        bootstrap_candidate_audit,
     )
 
     _progress("Generating overlays and comparison preview...")

@@ -127,9 +127,13 @@ def _config_value(config, name, default):
     return getter(name, default) if getter is not None else getattr(config, name, default)
 
 
-def resolve_road_thresholds(config):
+def resolve_road_thresholds(config, profile_name=None):
     """Resolve configurable high/low thresholds, including sensor profiles."""
-    profile_name = str(_config_value(config, "ROAD_THRESHOLD_PROFILE", "default"))
+    profile_name = str(
+        profile_name
+        if profile_name is not None
+        else _config_value(config, "ROAD_THRESHOLD_PROFILE", "default")
+    )
     profiles = _config_value(config, "ROAD_THRESHOLD_PROFILES", {}) or {}
     profile = profiles.get(profile_name, {}) if hasattr(profiles, "get") else {}
 
@@ -152,6 +156,14 @@ def resolve_road_thresholds(config):
             f"Road thresholds must satisfy 0 <= low < high <= 1; got low={low}, high={high}"
         )
     return high, low, profile_name
+
+
+def resolve_scene_diagnostic_thresholds(config):
+    """Resolve fixed thresholds used only to diagnose probability calibration."""
+    reference_profile = str(
+        _config_value(config, "SCENE_DIAGNOSTIC_REFERENCE_PROFILE", "default")
+    )
+    return resolve_road_thresholds(config, profile_name=reference_profile)
 
 
 def create_cost_field_astar(
@@ -192,15 +204,19 @@ def create_cost_field_astar(
 
 
 def _endpoint_vectors(nodes_rc, edges):
-    adjacency = [[] for _ in range(len(nodes_rc))]
+    # SAMRoad can emit reciprocal directed edges. Endpoint degree must be based
+    # on unique neighboring nodes, otherwise a true degree-one endpoint appears
+    # to have degree two and is silently excluded from recovery proposals.
+    adjacency = [set() for _ in range(len(nodes_rc))]
     for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
-        adjacency[src_idx].append(dst_idx)
-        adjacency[dst_idx].append(src_idx)
+        adjacency[src_idx].add(dst_idx)
+        adjacency[dst_idx].add(src_idx)
     vectors = {}
     for node_idx, neighbors in enumerate(adjacency):
         if len(neighbors) != 1:
             continue
-        vector = nodes_rc[node_idx] - nodes_rc[neighbors[0]]
+        neighbor_idx = next(iter(neighbors))
+        vector = nodes_rc[node_idx] - nodes_rc[neighbor_idx]
         norm = float(np.linalg.norm(vector))
         if norm > 1e-6:
             vectors[node_idx] = vector / norm
@@ -315,6 +331,19 @@ def _recovery_path_evidence(
     }
 
 
+def _road_evidence_reject_reason(evidence, parameters):
+    """Return the first failed road-evidence rule for candidate auditing."""
+    if evidence["center_conf"] < parameters["min_mean"]:
+        return "mean_probability_low"
+    if evidence["center_q25"] < parameters["min_q25"]:
+        return "q25_probability_low"
+    if evidence["weak_fraction"] < parameters["min_weak_fraction"]:
+        return "weak_fraction_low"
+    if evidence["probability_contrast"] < parameters["min_contrast"]:
+        return "background_contrast_low"
+    return "insufficient_independent_support"
+
+
 def _graph_raster_mask(nodes_rc, edges, shape):
     mask = np.zeros(shape, dtype=np.uint8)
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
@@ -404,24 +433,29 @@ def diagnose_scene_confidence(
 ):
     """Describe low-response scenes without changing the selected profile."""
     road = _probability01(road_probability)
-    high_threshold, low_threshold, profile_name = resolve_road_thresholds(config)
+    active_high, active_low, active_profile = resolve_road_thresholds(config)
+    reference_high, reference_low, reference_profile = resolve_scene_diagnostic_thresholds(config)
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
-    low_mask = (road >= low_threshold).astype(np.uint8)
+    low_mask = (road >= reference_low).astype(np.uint8)
+    high_mask = (road >= reference_high).astype(np.uint8)
     if close_size > 1:
         kernel = np.ones((close_size, close_size), dtype=np.uint8)
         low_mask = cv2.morphologyEx(low_mask, cv2.MORPH_CLOSE, kernel)
+        high_mask = cv2.morphologyEx(high_mask, cv2.MORPH_CLOSE, kernel)
     weak_skeleton = skeletonize(low_mask.astype(bool))
+    reference_strong_skeleton = skeletonize(high_mask.astype(bool))
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
     graph_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
-    strong_length = float(sum(
+    active_graph_length = float(sum(
         np.linalg.norm(nodes[int(dst_idx)] - nodes[int(src_idx)])
         for src_idx, dst_idx in graph_edges.tolist()
     ))
     weak_length = float(np.count_nonzero(weak_skeleton))
-    high_ratio = float(np.mean(road >= high_threshold)) if road.size else 0.0
-    low_ratio = float(np.mean(road >= low_threshold)) if road.size else 0.0
+    reference_strong_length = float(np.count_nonzero(reference_strong_skeleton))
+    high_ratio = float(np.mean(road >= reference_high)) if road.size else 0.0
+    low_ratio = float(np.mean(road >= reference_low)) if road.size else 0.0
     relative_high = high_ratio / max(low_ratio, 1e-9)
-    relative_strong = strong_length / max(weak_length, 1e-9)
+    relative_strong = reference_strong_length / max(weak_length, 1e-9)
     minimum_structure = float(
         _config_value(config, "WEAK_BOOTSTRAP_MIN_LENGTH_PX", 48.0)
     ) * max(float(distance_scale), 1e-6)
@@ -431,14 +465,20 @@ def diagnose_scene_confidence(
         state = "low_confidence"
     elif has_low_structure and relative_high < 0.30 and relative_strong < 0.35:
         state = "low_confidence"
-    elif not len(graph_edges) and high_ratio <= 1e-6 and low_ratio <= 1e-6:
+    elif reference_strong_length <= 0.0 and high_ratio <= 1e-6 and low_ratio <= 1e-6:
         state = "very_low_confidence"
     else:
         state = "normal"
     return {
         "scene_confidence_state": state,
         "recommended_profile": "weak_sensor" if state != "normal" else "default",
-        "threshold_profile": profile_name,
+        "threshold_profile": active_profile,
+        "active_profile": active_profile,
+        "diagnostic_reference_profile": reference_profile,
+        "active_high_threshold": active_high,
+        "active_low_threshold": active_low,
+        "reference_high_threshold": reference_high,
+        "reference_low_threshold": reference_low,
         "probability_p50": float(percentiles[0]),
         "probability_p90": float(percentiles[1]),
         "probability_p95": float(percentiles[2]),
@@ -446,7 +486,8 @@ def diagnose_scene_confidence(
         "high_pixel_ratio": high_ratio,
         "low_pixel_ratio": low_ratio,
         "strong_graph_edge_count": int(len(graph_edges)),
-        "strong_graph_total_length": strong_length,
+        "strong_graph_total_length": active_graph_length,
+        "reference_strong_skeleton_total_length": reference_strong_length,
         "weak_skeleton_total_length": weak_length,
     }
 
@@ -460,6 +501,7 @@ def bootstrap_weak_road_network(
     surface_probability=None,
     edge_scores=None,
     distance_scale=1.0,
+    candidate_audit=None,
 ):
     """Conservatively add continuous weak chains that do not need strong seeds."""
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
@@ -514,10 +556,12 @@ def bootstrap_weak_road_network(
     summary = {
         "threshold_profile": profile_name,
         "bootstrap_candidate_count": 0,
+        "bootstrap_accepted_candidate_count": 0,
         "bootstrap_recovered_edge_count": 0,
         "bootstrap_auto_count": 0,
         "bootstrap_review_count": 0,
         "bootstrap_rejected_count": 0,
+        "bootstrap_reject_reason_counts": {},
     }
     if not bool(_config_value(config, "WEAK_BOOTSTRAP_ENABLED", True)):
         return nodes, original_edges, metadata, summary
@@ -548,15 +592,40 @@ def bootstrap_weak_road_network(
     }
     node_tree = KDTree(nodes) if len(nodes) else None
     recovery_id = 0
+    reject_counts = Counter()
+
+    def reject_candidate(row, reason):
+        row["accepted"] = False
+        row["qa_state"] = "rejected"
+        row["reject_reason"] = reason
+        summary["bootstrap_rejected_count"] += 1
+        reject_counts[reason] += 1
+        if candidate_audit is not None:
+            candidate_audit.append(row)
+
     for path in chains:
         summary["bootstrap_candidate_count"] += 1
         path_float = path.astype(np.float32)
         path_length = float(np.linalg.norm(np.diff(path_float, axis=0), axis=1).sum())
-        if path_length < parameters["min_length"]:
-            summary["bootstrap_rejected_count"] += 1
-            continue
         direct_distance = float(np.linalg.norm(path_float[-1] - path_float[0]))
         tortuosity = path_length / max(direct_distance, 1e-6)
+        audit_row = {
+            "path_length": path_length,
+            "direct_distance": direct_distance,
+            "tortuosity": tortuosity,
+            "mean_probability": None,
+            "q25_probability": None,
+            "weak_fraction": None,
+            "background_probability": None,
+            "background_contrast": None,
+            "connection_count": 0,
+            "accepted": False,
+            "qa_state": "rejected",
+            "reject_reason": "",
+        }
+        if path_length < parameters["min_length"]:
+            reject_candidate(audit_row, "too_short")
+            continue
         evidence = _recovery_path_evidence(
             path, road, low_threshold, surface, parameters
         )
@@ -566,6 +635,14 @@ def bootstrap_weak_road_network(
         connection_count = sum(
             distance <= parameters["connection_radius"] for distance in endpoint_distances
         )
+        audit_row.update({
+            "mean_probability": evidence["center_conf"],
+            "q25_probability": evidence["center_q25"],
+            "weak_fraction": evidence["weak_fraction"],
+            "background_probability": evidence["background_conf"],
+            "background_contrast": evidence["probability_contrast"],
+            "connection_count": connection_count,
+        })
         recovery_gap_limit = float(_config_value(config, "WEAK_RECOVERY_MAX_GAP_PX", 64.0)) * scale
         delegated_gap = connection_count == 2 and path_length <= recovery_gap_limit
         geometry_supported = tortuosity <= parameters["max_tortuosity"]
@@ -579,8 +656,20 @@ def bootstrap_weak_road_network(
             )
         )
         evidence_supported = evidence["road_supported"] or evidence["surface_supported"]
-        if delegated_gap or not geometry_supported or not evidence_supported or not independent_supported:
-            summary["bootstrap_rejected_count"] += 1
+        if delegated_gap:
+            reject_candidate(audit_row, "delegated_to_weak_recovery")
+            continue
+        if not geometry_supported:
+            reject_candidate(audit_row, "high_tortuosity")
+            continue
+        if not evidence_supported:
+            reject_candidate(
+                audit_row,
+                _road_evidence_reject_reason(evidence, parameters),
+            )
+            continue
+        if not independent_supported:
+            reject_candidate(audit_row, "insufficient_independent_support")
             continue
         directness = min(1.0, 1.0 / max(tortuosity, 1.0))
         proximity = (0.5, 0.8, 1.0)[connection_count]
@@ -639,10 +728,17 @@ def bootstrap_weak_road_network(
             added_count += 1
         if added_count:
             recovery_id += 1
+            summary["bootstrap_accepted_candidate_count"] += 1
             summary["bootstrap_recovered_edge_count"] += added_count
             summary[f"bootstrap_{qa_state}_count"] += 1
+            audit_row["accepted"] = True
+            audit_row["qa_state"] = qa_state
+            audit_row["reject_reason"] = ""
+            if candidate_audit is not None:
+                candidate_audit.append(audit_row)
         else:
-            summary["bootstrap_rejected_count"] += 1
+            reject_candidate(audit_row, "duplicate_or_suppressed")
+    summary["bootstrap_reject_reason_counts"] = dict(sorted(reject_counts.items()))
     return (
         np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
         np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
@@ -660,6 +756,7 @@ def recover_weak_road_edges(
     surface_probability=None,
     edge_scores=None,
     distance_scale=1.0,
+    candidate_audit=None,
 ):
     """Conservatively bridge or extend dangling endpoints through weak evidence."""
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
@@ -701,6 +798,7 @@ def recover_weak_road_edges(
         "weak_recovered_edge_count": 0,
         "surface_supported_recovery_count": 0,
         "rejected_weak_candidate_count": 0,
+        "weak_recovery_reject_reason_counts": {},
         "recovery_reason_counts": {},
     }
     if not enabled or len(original_edges) == 0 or len(nodes) == 0:
@@ -737,28 +835,61 @@ def recover_weak_road_edges(
             component[node_idx] = component_id
 
     proposals = []
+    reject_counts = Counter()
+
+    def reject_candidate(row, reason):
+        row["accepted"] = False
+        row["reject_reason"] = reason
+        summary["rejected_weak_candidate_count"] += 1
+        reject_counts[reason] += 1
+        if candidate_audit is not None:
+            candidate_audit.append(row)
 
     def evaluate(start_idx, end_point, kind, end_idx=None):
         start_point = nodes[start_idx]
         delta = np.asarray(end_point, dtype=np.float32) - start_point
         distance = float(np.linalg.norm(delta))
         limit = parameters["max_gap"] if kind == "bridge" else parameters["max_extension"]
+        summary["weak_candidate_count"] += 1
+        audit_row = {
+            "candidate_type": kind,
+            "start": start_point.astype(float).tolist(),
+            "end": np.asarray(end_point, dtype=np.float32).astype(float).tolist(),
+            "distance": distance,
+            "direction_cosine": None,
+            "path_length": None,
+            "path_ratio": None,
+            "mean_probability": None,
+            "q25_probability": None,
+            "weak_fraction": None,
+            "background_probability": None,
+            "background_contrast": None,
+            "surface_probability": None,
+            "accepted": False,
+            "reject_reason": "",
+        }
         if distance <= 1e-6 or distance > limit:
+            reject_candidate(audit_row, "distance_too_large")
             return
         direction = delta / distance
         first_alignment = float(np.dot(endpoint_vectors[start_idx], direction))
+        audit_row["direction_cosine"] = first_alignment
         if first_alignment < parameters["min_alignment"]:
+            reject_candidate(audit_row, "direction_mismatch")
             return
         second_alignment = 1.0
         if kind == "bridge":
             if end_idx is None or component[start_idx] == component[end_idx]:
+                reject_candidate(audit_row, "same_component")
                 return
             second_alignment = float(np.dot(endpoint_vectors[end_idx], -direction))
+            audit_row["direction_cosine"] = min(first_alignment, second_alignment)
             if second_alignment < parameters["min_alignment"]:
+                reject_candidate(audit_row, "direction_mismatch")
                 return
         elif distance < parameters["min_extension"]:
+            reject_candidate(audit_row, "distance_too_large")
             return
-        summary["weak_candidate_count"] += 1
         path = _astar_probability_path(
             start_point, end_point, road, low_threshold,
             surface_probability=surface,
@@ -766,15 +897,29 @@ def recover_weak_road_edges(
             margin=parameters["path_margin"],
         )
         if len(path) < 2:
-            summary["rejected_weak_candidate_count"] += 1
+            reject_candidate(audit_row, "no_astar_path")
             return
         path_length = float(np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1).sum())
         path_ratio = path_length / max(distance, 1e-6)
+        audit_row["path_length"] = path_length
+        audit_row["path_ratio"] = path_ratio
         evidence = _recovery_path_evidence(path, road, low_threshold, surface, parameters)
-        if path_ratio > parameters["max_path_ratio"] or not (
-            evidence["road_supported"] or evidence["surface_supported"]
-        ):
-            summary["rejected_weak_candidate_count"] += 1
+        audit_row.update({
+            "mean_probability": evidence["center_conf"],
+            "q25_probability": evidence["center_q25"],
+            "weak_fraction": evidence["weak_fraction"],
+            "background_probability": evidence["background_conf"],
+            "background_contrast": evidence["probability_contrast"],
+            "surface_probability": evidence["surface_conf"],
+        })
+        if path_ratio > parameters["max_path_ratio"]:
+            reject_candidate(audit_row, "path_ratio_too_large")
+            return
+        if not (evidence["road_supported"] or evidence["surface_supported"]):
+            reject_candidate(
+                audit_row,
+                _road_evidence_reject_reason(evidence, parameters),
+            )
             return
         alignment = min(first_alignment, second_alignment)
         directness = min(1.0, 1.0 / max(path_ratio, 1.0))
@@ -795,7 +940,7 @@ def recover_weak_road_edges(
             "score": recovery_score, "start_idx": start_idx, "end_idx": end_idx,
             "end_point": np.asarray(end_point, dtype=np.float32), "kind": kind,
             "path": path, "path_ratio": path_ratio, "alignment": alignment,
-            "reason": reason, **evidence,
+            "reason": reason, "audit_row": audit_row, **evidence,
         })
 
     if len(endpoint_ids) > 1:
@@ -829,6 +974,24 @@ def recover_weak_road_edges(
                 target = terminal_rc[terminal_idx]
                 nearest_distance, _ = node_tree.query(target[np.newaxis, :], k=1)
                 if float(nearest_distance[0, 0]) < max(2.0, parameters["min_extension"] * 0.25):
+                    summary["weak_candidate_count"] += 1
+                    reject_candidate({
+                        "candidate_type": "extension",
+                        "start": nodes[start_idx].astype(float).tolist(),
+                        "end": target.astype(float).tolist(),
+                        "distance": float(np.linalg.norm(target - nodes[start_idx])),
+                        "direction_cosine": None,
+                        "path_length": None,
+                        "path_ratio": None,
+                        "mean_probability": None,
+                        "q25_probability": None,
+                        "weak_fraction": None,
+                        "background_probability": None,
+                        "background_contrast": None,
+                        "surface_probability": None,
+                        "accepted": False,
+                        "reject_reason": "",
+                    }, "duplicate_or_suppressed")
                     continue
                 evaluate(start_idx, target, "extension")
 
@@ -843,6 +1006,7 @@ def recover_weak_road_edges(
         if proposal["end_idx"] is not None:
             endpoint_members.add(proposal["end_idx"])
         if endpoint_members & used_endpoints:
+            reject_candidate(proposal["audit_row"], "endpoint_already_used")
             continue
         path = proposal["path"]
         path_steps = np.concatenate([
@@ -902,10 +1066,13 @@ def recover_weak_road_edges(
             summary["weak_recovered_edge_count"] += added_count
             if proposal["surface_supported"]:
                 summary["surface_supported_recovery_count"] += added_count
-    summary["rejected_weak_candidate_count"] = max(
-        0,
-        summary["weak_candidate_count"] - summary["weak_recovered_candidate_count"],
-    )
+            proposal["audit_row"]["accepted"] = True
+            proposal["audit_row"]["reject_reason"] = ""
+            if candidate_audit is not None:
+                candidate_audit.append(proposal["audit_row"])
+        else:
+            reject_candidate(proposal["audit_row"], "duplicate_or_suppressed")
+    summary["weak_recovery_reject_reason_counts"] = dict(sorted(reject_counts.items()))
     summary["recovery_reason_counts"] = dict(sorted(reason_counts.items()))
     return (
         np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
@@ -924,6 +1091,8 @@ def postprocess_weak_road_network(
     surface_probability=None,
     edge_scores=None,
     distance_scale=1.0,
+    weak_candidate_audit=None,
+    bootstrap_candidate_audit=None,
 ):
     """Diagnose, optionally bootstrap, then run the existing endpoint recovery."""
     original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
@@ -949,6 +1118,7 @@ def postprocess_weak_road_network(
                 surface_probability=surface_probability,
                 edge_scores=edge_scores,
                 distance_scale=distance_scale,
+                candidate_audit=bootstrap_candidate_audit,
             )
         )
     else:
@@ -957,10 +1127,12 @@ def postprocess_weak_road_network(
         bootstrap_metadata = []
         bootstrap_summary = {
             "bootstrap_candidate_count": 0,
+            "bootstrap_accepted_candidate_count": 0,
             "bootstrap_recovered_edge_count": 0,
             "bootstrap_auto_count": 0,
             "bootstrap_review_count": 0,
             "bootstrap_rejected_count": 0,
+            "bootstrap_reject_reason_counts": {},
         }
     if bootstrap_metadata:
         combined_scores = np.asarray(
@@ -977,6 +1149,7 @@ def postprocess_weak_road_network(
         surface_probability=surface_probability,
         edge_scores=combined_scores,
         distance_scale=distance_scale,
+        candidate_audit=weak_candidate_audit,
     )
     if bootstrap_metadata:
         final_metadata[:len(bootstrap_metadata)] = bootstrap_metadata

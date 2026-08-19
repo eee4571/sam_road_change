@@ -328,7 +328,8 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     total_fields = (
         'strong_edge_count', 'weak_candidate_count', 'weak_recovered_edge_count',
         'surface_supported_recovery_count', 'rejected_weak_candidate_count',
-        'bootstrap_candidate_count', 'bootstrap_recovered_edge_count',
+        'bootstrap_candidate_count', 'bootstrap_accepted_candidate_count',
+        'bootstrap_recovered_edge_count',
         'bootstrap_auto_count', 'bootstrap_review_count', 'bootstrap_rejected_count',
     )
     recovery_report = {
@@ -343,6 +344,28 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 reason
                 for row in recovery_summaries
                 for reason in row.get('recovery_reason_counts', {})
+            })
+        },
+        'weak_recovery_reject_reason_counts': {
+            reason: int(sum(
+                row.get('weak_recovery_reject_reason_counts', {}).get(reason, 0)
+                for row in recovery_summaries
+            ))
+            for reason in sorted({
+                reason
+                for row in recovery_summaries
+                for reason in row.get('weak_recovery_reject_reason_counts', {})
+            })
+        },
+        'bootstrap_reject_reason_counts': {
+            reason: int(sum(
+                row.get('bootstrap_reject_reason_counts', {}).get(reason, 0)
+                for row in recovery_summaries
+            ))
+            for reason in sorted({
+                reason
+                for row in recovery_summaries
+                for reason in row.get('bootstrap_reject_reason_counts', {})
             })
         },
         'tiles': recovery_summaries,
