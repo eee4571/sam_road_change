@@ -68,7 +68,12 @@ BOOTSTRAP_PARAMETER_SPECS = (
     ("bootstrap_max_tortuosity", "Max Tortuosity", "WEAK_BOOTSTRAP_MAX_TORTUOSITY", "--bootstrap-max-tortuosity", 1.35),
     ("bootstrap_min_weak_fraction", "Min Weak Fraction", "WEAK_BOOTSTRAP_MIN_WEAK_FRACTION", "--bootstrap-min-weak-fraction", 0.80),
 )
-PARAMETER_SPECS = RECOVERY_PARAMETER_SPECS + BOOTSTRAP_PARAMETER_SPECS
+SEGMENT_PARAMETER_SPECS = (
+    ("max_segment_distance", "Max Segment Distance", "WEAK_SEGMENT_RECOVERY_MAX_DISTANCE_PX", "--max-segment-distance", 64.0),
+    ("min_segment_direction_cosine", "Min Direction Cosine", "WEAK_SEGMENT_RECOVERY_MIN_DIRECTION_COSINE", "--min-segment-direction-cosine", 0.50),
+    ("direction_lookback", "Direction Lookback", "WEAK_ENDPOINT_DIRECTION_LOOKBACK_PX", "--direction-lookback", 32.0),
+)
+PARAMETER_SPECS = RECOVERY_PARAMETER_SPECS + BOOTSTRAP_PARAMETER_SPECS + SEGMENT_PARAMETER_SPECS
 
 
 def load_threshold_profiles(config_path: Path = DEFAULT_CONFIG) -> tuple[str, ...]:
@@ -110,6 +115,7 @@ def build_command(
     *,
     profile_name: str = "default",
     bootstrap_enabled: bool = True,
+    segment_recovery_enabled: bool = False,
     recovery_only: bool,
 ) -> list[str]:
     command = [python_executable, str(run_test_path)]
@@ -124,6 +130,10 @@ def build_command(
         ])
     command.extend(["--threshold-profile", profile_name])
     command.append("--enable-bootstrap" if bootstrap_enabled else "--disable-bootstrap")
+    command.append(
+        "--enable-segment-recovery"
+        if segment_recovery_enabled else "--disable-segment-recovery"
+    )
     cli_by_name = {name: cli for name, _label, _key, cli, _fallback in PARAMETER_SPECS}
     for name, value in parameters.items():
         if name in cli_by_name:
@@ -138,6 +148,9 @@ def read_result_summary(run_dir: Path) -> dict:
     return {
         "strong_edge_count": int(summary.get("strong_edge_count", 0)),
         "weak_candidate_count": int(summary.get("weak_candidate_count", 0)),
+        "weak_recovered_candidate_count": int(
+            summary.get("weak_recovered_candidate_count", 0)
+        ),
         "weak_recovered_edge_count": int(summary.get("weak_recovered_edge_count", 0)),
         "rejected_weak_candidate_count": int(summary.get("rejected_weak_candidate_count", 0)),
         "bootstrap_candidate_count": int(summary.get("bootstrap_candidate_count", 0)),
@@ -152,6 +165,26 @@ def read_result_summary(run_dir: Path) -> dict:
         "bootstrap_auto_count": int(summary.get("bootstrap_auto_count", 0)),
         "bootstrap_review_count": int(summary.get("bootstrap_review_count", 0)),
         "bootstrap_rejected_count": int(summary.get("bootstrap_rejected_count", 0)),
+        "component_count_before": int(summary.get("component_count_before", 0)),
+        "component_count_after": int(summary.get("component_count_after", 0)),
+        "endpoint_count_before": int(summary.get("endpoint_count_before", 0)),
+        "endpoint_count_after": int(summary.get("endpoint_count_after", 0)),
+        "connectivity_gain_total": int(summary.get("connectivity_gain_total", 0)),
+        "endpoint_segment_candidate_count": int(
+            summary.get("endpoint_segment_candidate_count", 0)
+        ),
+        "endpoint_segment_accepted_count": int(
+            summary.get("endpoint_segment_accepted_count", 0)
+        ),
+        "endpoint_segment_rejected_count": int(
+            summary.get("endpoint_segment_rejected_count", 0)
+        ),
+        "endpoint_segment_connectivity_gain": int(
+            summary.get("endpoint_segment_connectivity_gain", 0)
+        ),
+        "endpoint_segment_reject_reason_counts": dict(
+            summary.get("endpoint_segment_reject_reason_counts", {})
+        ),
         "scene_confidence_state": str(summary.get("scene_confidence_state", "unknown")),
         "recommended_profile": str(summary.get("recommended_profile", "default")),
         "active_profile": str(
@@ -198,6 +231,9 @@ class WeakRecoveryLauncher:
             saved_profile = self.profile_names[0]
         self.profile_var = tk.StringVar(value=saved_profile)
         self.bootstrap_var = tk.BooleanVar(value=bool(self.settings.get("bootstrap_enabled", True)))
+        self.segment_recovery_var = tk.BooleanVar(
+            value=bool(self.settings.get("segment_recovery_enabled", False))
+        )
         self.defaults = load_default_parameters(profile_name=saved_profile)
 
         self.image_var = tk.StringVar(value=str(self.settings.get("image", "")))
@@ -222,8 +258,8 @@ class WeakRecoveryLauncher:
 
     def _build_ui(self) -> None:
         self.root.title("Weak Road Recovery Test")
-        self.root.geometry("1000x780")
-        self.root.minsize(820, 620)
+        self.root.geometry("1240x780")
+        self.root.minsize(980, 620)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
@@ -280,6 +316,10 @@ class WeakRecoveryLauncher:
         recovery_frame.grid(row=0, column=0, sticky="nw", padx=(0, 12))
         bootstrap_frame = ttk.LabelFrame(self.advanced_frame, text="Weak Network Bootstrap", padding=8)
         bootstrap_frame.grid(row=0, column=1, sticky="nw")
+        segment_frame = ttk.LabelFrame(
+            self.advanced_frame, text="Endpoint → Segment Recovery", padding=8
+        )
+        segment_frame.grid(row=0, column=2, sticky="nw", padx=(12, 0))
         for row, (name, label, _key, _cli, _fallback) in enumerate(RECOVERY_PARAMETER_SPECS):
             ttk.Label(recovery_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Entry(recovery_frame, textvariable=self.parameter_vars[name], width=14).grid(
@@ -293,9 +333,21 @@ class WeakRecoveryLauncher:
             ttk.Entry(bootstrap_frame, textvariable=self.parameter_vars[name], width=14).grid(
                 row=row, column=1, sticky="w", padx=8, pady=2
             )
+        ttk.Checkbutton(
+            segment_frame,
+            text="Endpoint → Segment Recovery",
+            variable=self.segment_recovery_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        for row, (name, label, _key, _cli, _fallback) in enumerate(
+            SEGMENT_PARAMETER_SPECS, 1
+        ):
+            ttk.Label(segment_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(segment_frame, textvariable=self.parameter_vars[name], width=14).grid(
+                row=row, column=1, sticky="w", padx=8, pady=2
+            )
         ttk.Button(
             self.advanced_frame, text="恢复默认值", command=self._restore_defaults
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.advanced_frame.grid_remove()
 
         status = ttk.Frame(main)
@@ -327,6 +379,7 @@ class WeakRecoveryLauncher:
             "batch_size": self.batch_var.get().strip(),
             "threshold_profile": self.profile_var.get(),
             "bootstrap_enabled": bool(self.bootstrap_var.get()),
+            "segment_recovery_enabled": bool(self.segment_recovery_var.get()),
             "parameters": {name: variable.get().strip() for name, variable in self.parameter_vars.items()},
         }
         SETTINGS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -383,6 +436,7 @@ class WeakRecoveryLauncher:
             "min_q25_probability", "min_weak_fraction", "min_background_contrast", "auto_score",
             "bootstrap_min_mean_probability", "bootstrap_min_q25_probability",
             "bootstrap_min_background_contrast", "bootstrap_min_weak_fraction",
+            "min_segment_direction_cosine",
         }
         for name, variable in self.parameter_vars.items():
             try:
@@ -391,7 +445,9 @@ class WeakRecoveryLauncher:
                 raise ValueError(f"{name} 必须是数字") from exc
             if name in probability_names and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} 必须在 0 到 1 之间")
-            if name in {"max_gap", "max_extension"} and value <= 0:
+            if name in {
+                "max_gap", "max_extension", "max_segment_distance", "direction_lookback"
+            } and value <= 0:
                 raise ValueError(f"{name} 必须大于 0")
             if name in {"bootstrap_min_length", "bootstrap_max_tortuosity"} and value <= 0:
                 raise ValueError(f"{name} 必须大于 0")
@@ -430,7 +486,9 @@ class WeakRecoveryLauncher:
         command = build_command(
             sys.executable, RUN_TEST, image, str(run_dir), self.device_var.get(), batch_size,
             parameters, profile_name=self.profile_var.get(),
-            bootstrap_enabled=bool(self.bootstrap_var.get()), recovery_only=recovery_only,
+            bootstrap_enabled=bool(self.bootstrap_var.get()),
+            segment_recovery_enabled=bool(self.segment_recovery_var.get()),
+            recovery_only=recovery_only,
         )
         self._save_settings()
         self._set_running(True)
@@ -446,6 +504,9 @@ class WeakRecoveryLauncher:
             self._append_log(f"Batch size: {batch_size}")
         self._append_log(f"Threshold profile: {self.profile_var.get()}")
         self._append_log(f"Weak network bootstrap: {bool(self.bootstrap_var.get())}")
+        self._append_log(
+            f"Endpoint-to-segment recovery: {bool(self.segment_recovery_var.get())}"
+        )
         threading.Thread(
             target=self._run_process, args=(command, run_dir), daemon=True
         ).start()
@@ -511,10 +572,19 @@ class WeakRecoveryLauncher:
             summary["bootstrap_top_rejects"] = format_top_reject_reasons(
                 summary["bootstrap_reject_reason_counts"]
             )
+            summary["segment_top_rejects"] = format_top_reject_reasons(
+                summary["endpoint_segment_reject_reason_counts"]
+            )
             self.summary_var.set(
                 "Strong edges：{strong_edge_count}\n"
+                "Connectivity：Components {component_count_before} → {component_count_after} "
+                "（gain {connectivity_gain_total}）；Endpoints {endpoint_count_before} → {endpoint_count_after}\n"
                 "Weak recovery：Candidates {weak_candidate_count} / Accepted {weak_recovered_candidate_count}\n"
                 "Top reject reasons：{weak_top_rejects}\n"
+                "Endpoint→Segment：Candidates {endpoint_segment_candidate_count} / "
+                "Accepted {endpoint_segment_accepted_count} / Rejected {endpoint_segment_rejected_count} "
+                "（gain {endpoint_segment_connectivity_gain}）\n"
+                "Top reject reasons：{segment_top_rejects}\n"
                 "Bootstrap：Candidates {bootstrap_candidate_count} / Accepted {bootstrap_accepted_candidate_count} "
                 "（edges {bootstrap_recovered_edge_count}；auto {bootstrap_auto_count} / review {bootstrap_review_count}）\n"
                 "Top reject reasons：{bootstrap_top_rejects}\n"

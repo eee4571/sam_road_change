@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import pickle
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,16 @@ WEAK_CANDIDATE_FIELDS = (
     "path_length", "path_ratio", "mean_probability", "q25_probability",
     "weak_fraction", "background_probability", "background_contrast",
     "surface_probability", "accepted", "reject_reason",
+    "component_before_start", "component_before_target", "merges_components",
+    "component_count_before", "component_count_after", "connectivity_gain",
+)
+ENDPOINT_SEGMENT_CANDIDATE_FIELDS = (
+    "candidate_id", "endpoint_node", "target_segment", "target_projection",
+    "distance", "direction_cosine", "path_length", "path_ratio",
+    "mean_probability", "q25_probability", "weak_fraction",
+    "background_probability", "background_contrast",
+    "start_component", "target_component", "connectivity_gain",
+    "accepted", "reject_reason", "recovery_score",
 )
 BOOTSTRAP_CANDIDATE_FIELDS = (
     "path_length", "direct_distance", "tortuosity", "mean_probability",
@@ -52,6 +63,9 @@ OVERRIDES = {
     "min_weak_fraction": "WEAK_RECOVERY_MIN_WEAK_FRACTION",
     "min_background_contrast": "WEAK_RECOVERY_MIN_BACKGROUND_CONTRAST",
     "auto_score": "WEAK_RECOVERY_AUTO_SCORE",
+    "max_segment_distance": "WEAK_SEGMENT_RECOVERY_MAX_DISTANCE_PX",
+    "min_segment_direction_cosine": "WEAK_SEGMENT_RECOVERY_MIN_DIRECTION_COSINE",
+    "direction_lookback": "WEAK_ENDPOINT_DIRECTION_LOOKBACK_PX",
     "bootstrap_min_length": "WEAK_BOOTSTRAP_MIN_LENGTH_PX",
     "bootstrap_min_mean_probability": "WEAK_BOOTSTRAP_MIN_MEAN_PROBABILITY",
     "bootstrap_min_q25_probability": "WEAK_BOOTSTRAP_MIN_Q25_PROBABILITY",
@@ -75,6 +89,14 @@ def parser() -> argparse.ArgumentParser:
     bootstrap_group.add_argument("--enable-bootstrap", dest="bootstrap_enabled", action="store_true")
     bootstrap_group.add_argument("--disable-bootstrap", dest="bootstrap_enabled", action="store_false")
     result.set_defaults(bootstrap_enabled=None)
+    segment_group = result.add_mutually_exclusive_group()
+    segment_group.add_argument(
+        "--enable-segment-recovery", dest="segment_recovery_enabled", action="store_true"
+    )
+    segment_group.add_argument(
+        "--disable-segment-recovery", dest="segment_recovery_enabled", action="store_false"
+    )
+    result.set_defaults(segment_recovery_enabled=None)
     result.add_argument("--road-high-threshold", type=float)
     result.add_argument("--road-low-threshold", type=float)
     result.add_argument("--max-gap", type=float)
@@ -85,6 +107,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-weak-fraction", type=float)
     result.add_argument("--min-background-contrast", type=float)
     result.add_argument("--auto-score", type=float)
+    result.add_argument("--max-segment-distance", type=float)
+    result.add_argument("--min-segment-direction-cosine", type=float)
+    result.add_argument("--direction-lookback", type=float)
     result.add_argument("--bootstrap-min-length", type=float)
     result.add_argument("--bootstrap-min-mean-probability", type=float)
     result.add_argument("--bootstrap-min-q25-probability", type=float)
@@ -104,7 +129,7 @@ def _write_candidate_csv(path: Path, fieldnames, rows: list[dict]) -> None:
         writer.writeheader()
         for row in rows:
             payload = dict(row)
-            for name in ("start", "end"):
+            for name in ("start", "end", "target_projection", "endpoint_node", "target_segment"):
                 if isinstance(payload.get(name), (list, tuple)):
                     payload[name] = json.dumps(payload[name], ensure_ascii=False)
             writer.writerow(payload)
@@ -242,6 +267,8 @@ def _apply_overrides(config, arguments: argparse.Namespace) -> None:
         config.INFER_BATCH_SIZE = int(arguments.batch_size)
     if arguments.bootstrap_enabled is not None:
         config.WEAK_BOOTSTRAP_ENABLED = bool(arguments.bootstrap_enabled)
+    if arguments.segment_recovery_enabled is not None:
+        config.WEAK_SEGMENT_RECOVERY_ENABLED = bool(arguments.segment_recovery_enabled)
 
 
 def _read_probability(path: Path) -> np.ndarray:
@@ -303,6 +330,7 @@ def write_visualizations(
         "samroad": ((255, 220, 0), 3),
         "weak_recovered": ((0, 255, 255), 5),
         "weak_bootstrap": ((255, 0, 255), 5),
+        "weak_segment_connector": ((255, 128, 0), 6),
     }
     for source, (color, thickness) in source_styles.items():
         edge_ids = [
@@ -323,7 +351,7 @@ def write_visualizations(
     left = _labeled_preview(original_overlay, "Original SAMRoad (yellow)")
     right = _labeled_preview(
         recovered_overlay,
-        "Final: strong yellow / recovered cyan / bootstrap magenta",
+        "Final: strong yellow / recovered cyan / segment orange",
     )
     target_height = min(left.shape[0], right.shape[0])
     if left.shape[0] != target_height:
@@ -331,6 +359,160 @@ def write_visualizations(
     if right.shape[0] != target_height:
         right = cv2.resize(right, (int(right.shape[1] * target_height / right.shape[0]), target_height))
     _save_png(run_dir / "recovery_compare.png", np.concatenate([left, right], axis=1))
+
+
+def _candidate_crop_bounds(points, image_shape, margin=100, minimum_size=256):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    y0 = int(np.floor(points[:, 0].min())) - margin
+    y1 = int(np.ceil(points[:, 0].max())) + margin + 1
+    x0 = int(np.floor(points[:, 1].min())) - margin
+    x1 = int(np.ceil(points[:, 1].max())) + margin + 1
+    height, width = image_shape[:2]
+
+    def expand(low, high, limit):
+        if high - low < minimum_size:
+            extra = minimum_size - (high - low)
+            low -= extra // 2
+            high += extra - extra // 2
+        if low < 0:
+            high -= low
+            low = 0
+        if high > limit:
+            low -= high - limit
+            high = limit
+        return max(0, low), min(limit, high)
+
+    y0, y1 = expand(y0, y1, height)
+    x0, x1 = expand(x0, x1, width)
+    return x0, y0, x1, y1
+
+
+def _write_candidate_montage(path: Path, image_paths: list[Path]) -> None:
+    if not image_paths:
+        montage = np.full((300, 760, 3), 25, dtype=np.uint8)
+        cv2.putText(
+            montage, "No accepted endpoint-to-segment candidates", (75, 160),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (235, 235, 235), 2, cv2.LINE_AA,
+        )
+        _save_png(path, montage)
+        return
+    panels = []
+    tile_width, tile_height = 760, 420
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        scale = min(tile_width / image.shape[1], tile_height / image.shape[0])
+        resized = cv2.resize(
+            image,
+            (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        panel = np.zeros((tile_height, tile_width, 3), dtype=np.uint8)
+        x0 = (tile_width - resized.shape[1]) // 2
+        y0 = (tile_height - resized.shape[0]) // 2
+        panel[y0:y0 + resized.shape[0], x0:x0 + resized.shape[1]] = resized
+        panels.append(panel)
+    columns = min(3, len(panels))
+    while len(panels) % columns:
+        panels.append(np.zeros_like(panels[0]))
+    montage = np.vstack([
+        np.hstack(panels[index:index + columns])
+        for index in range(0, len(panels), columns)
+    ])
+    _save_png(path, montage)
+
+
+def write_endpoint_segment_candidate_visualizations(
+    run_dir: Path,
+    image_rgb: np.ndarray,
+    recovered_nodes: np.ndarray,
+    recovered_edges: np.ndarray,
+    metadata: list[dict],
+    candidate_audit: list[dict],
+) -> None:
+    output_dir = (run_dir / "endpoint_segment_candidates").resolve()
+    if output_dir.parent != run_dir.resolve():
+        raise ValueError(f"Unsafe endpoint segment output directory: {output_dir}")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True)
+    accepted = [row for row in candidate_audit if row.get("accepted")]
+    image_paths = []
+    for row in accepted:
+        path_points = np.asarray(row.get("_path") or [], dtype=np.float32).reshape(-1, 2)
+        target_nodes = np.asarray(row.get("_target_nodes") or [], dtype=np.float32).reshape(-1, 2)
+        points = np.vstack([path_points, target_nodes])
+        x0, y0, x1, y1 = _candidate_crop_bounds(points, image_rgb.shape)
+        crop = image_rgb[y0:y1, x0:x1].copy()
+
+        def xy(point):
+            return int(round(float(point[1]) - x0)), int(round(float(point[0]) - y0))
+
+        source_styles = {
+            "samroad": ((255, 220, 0), 2),
+            "weak_recovered": ((0, 255, 255), 3),
+            "weak_bootstrap": ((255, 0, 255), 3),
+        }
+        for edge_id, (src_idx, dst_idx) in enumerate(recovered_edges.tolist()):
+            source = metadata[edge_id].get("line_source")
+            if source not in source_styles:
+                continue
+            src, dst = recovered_nodes[int(src_idx)], recovered_nodes[int(dst_idx)]
+            if (
+                max(src[1], dst[1]) < x0 or min(src[1], dst[1]) >= x1
+                or max(src[0], dst[0]) < y0 or min(src[0], dst[0]) >= y1
+            ):
+                continue
+            color, thickness = source_styles[source]
+            cv2.line(crop, xy(src), xy(dst), color, thickness, cv2.LINE_AA)
+        if len(target_nodes) == 2:
+            cv2.line(crop, xy(target_nodes[0]), xy(target_nodes[1]), (255, 255, 0), 6, cv2.LINE_AA)
+        if len(path_points) >= 2:
+            cv2.polylines(
+                crop, [np.asarray([xy(point) for point in path_points], dtype=np.int32)],
+                False, (255, 128, 0), 5, cv2.LINE_AA,
+            )
+        endpoint = recovered_nodes[int(row["endpoint_node"])]
+        projection = np.asarray(row["target_projection"], dtype=np.float32)
+        cv2.circle(crop, xy(endpoint), 8, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(crop, xy(projection), 8, (255, 0, 0), -1, cv2.LINE_AA)
+
+        canvas_width = max(760, crop.shape[1])
+        if crop.shape[1] < canvas_width:
+            canvas = np.zeros((crop.shape[0], canvas_width, 3), dtype=np.uint8)
+            offset = (canvas_width - crop.shape[1]) // 2
+            canvas[:, offset:offset + crop.shape[1]] = crop
+            crop = canvas
+        header = np.zeros((128, canvas_width, 3), dtype=np.uint8)
+        line1 = (
+            f"{row['candidate_id']}  dist={float(row['distance']):.1f}  "
+            f"dir={float(row['direction_cosine']):.3f}  score={float(row['recovery_score']):.3f}"
+        )
+        line2 = (
+            f"mean={float(row['mean_probability']):.3f}  q25={float(row['q25_probability']):.3f}  "
+            f"contrast={float(row['background_contrast']):.3f}  ratio={float(row['path_ratio']):.2f}"
+        )
+        line3 = (
+            f"component {row['start_component']} -> {row['target_component']}  "
+            f"connectivity_gain={int(row['connectivity_gain'])}"
+        )
+        cv2.putText(header, line1, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(header, line2, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(header, line3, (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            header, "yellow=existing  cyan=weak  orange=connector  green=endpoint  red=projection",
+            (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (215, 215, 215), 1, cv2.LINE_AA,
+        )
+        candidate_image = np.vstack([header, crop])
+        safe_id = str(row["candidate_id"]).replace(":", "_")
+        image_path = output_dir / f"{safe_id}.png"
+        _save_png(image_path, candidate_image)
+        image_paths.append(image_path)
+    _write_candidate_montage(
+        output_dir / "endpoint_segment_candidates_montage.png", image_paths
+    )
 
 
 def write_scene_probability_diagnostic(
@@ -387,7 +569,12 @@ def _actual_test_config(
     config_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
     weak_parameters = {
         key: value for key, value in config_dict.items()
-        if key.startswith("WEAK_RECOVERY_") or key.startswith("WEAK_BOOTSTRAP_")
+        if (
+            key.startswith("WEAK_RECOVERY_")
+            or key.startswith("WEAK_BOOTSTRAP_")
+            or key.startswith("WEAK_SEGMENT_RECOVERY_")
+            or key.startswith("WEAK_ENDPOINT_DIRECTION_")
+        )
     }
     return {
         "input_image": str(image_path.resolve()),
@@ -413,13 +600,16 @@ def _recovery_payload(
     original_edge_count: int,
 ) -> dict:
     recovered_rows = []
-    for edge_id in range(original_edge_count, len(edges)):
+    recovered_sources = {"weak_recovered", "weak_bootstrap", "weak_segment_connector"}
+    for edge_id, edge_metadata in enumerate(metadata):
+        if edge_metadata.get("line_source") not in recovered_sources:
+            continue
         src_idx, dst_idx = edges[edge_id]
         recovered_rows.append({
             "edge_id": edge_id,
             "src_row": float(nodes_rc[src_idx, 0]), "src_col": float(nodes_rc[src_idx, 1]),
             "dst_row": float(nodes_rc[dst_idx, 0]), "dst_col": float(nodes_rc[dst_idx, 1]),
-            **metadata[edge_id],
+            **edge_metadata,
         })
     return {"summary": summary, "recovered_edges": recovered_rows}
 
@@ -517,6 +707,7 @@ def main(argv: list[str] | None = None) -> int:
     recovery_started = time.perf_counter()
     weak_candidate_audit = []
     bootstrap_candidate_audit = []
+    endpoint_segment_candidate_audit = []
     recovered_nodes, recovered_edges, metadata, recovery_summary = (
         graph_extraction.postprocess_weak_road_network(
             original_nodes,
@@ -526,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
             edge_scores=original_scores,
             weak_candidate_audit=weak_candidate_audit,
             bootstrap_candidate_audit=bootstrap_candidate_audit,
+            endpoint_segment_candidate_audit=endpoint_segment_candidate_audit,
         )
     )
     timing["weak_recovery_seconds"] = time.perf_counter() - recovery_started
@@ -546,6 +738,11 @@ def main(argv: list[str] | None = None) -> int:
         BOOTSTRAP_CANDIDATE_FIELDS,
         bootstrap_candidate_audit,
     )
+    _write_candidate_csv(
+        run_dir / "endpoint_segment_candidates.csv",
+        ENDPOINT_SEGMENT_CANDIDATE_FIELDS,
+        endpoint_segment_candidate_audit,
+    )
 
     _progress("Generating overlays and comparison preview...")
     visualization_started = time.perf_counter()
@@ -554,6 +751,14 @@ def main(argv: list[str] | None = None) -> int:
         metadata,
     )
     write_scene_probability_diagnostic(run_dir, image_rgb, road_probability, config)
+    write_endpoint_segment_candidate_visualizations(
+        run_dir,
+        image_rgb,
+        recovered_nodes,
+        recovered_edges,
+        metadata,
+        endpoint_segment_candidate_audit,
+    )
     timing["visualization_seconds"] = time.perf_counter() - visualization_started
     timing["total_seconds"] = time.perf_counter() - total_started
     _write_json(run_dir / "timing.json", timing)
@@ -568,6 +773,8 @@ def main(argv: list[str] | None = None) -> int:
         f"strong_edge_count={recovery_summary.get('strong_edge_count', 0)}, "
         f"weak_candidate_count={recovery_summary.get('weak_candidate_count', 0)}, "
         f"weak_recovered_edge_count={recovery_summary.get('weak_recovered_edge_count', 0)}, "
+        f"endpoint_segment_accepted_count={recovery_summary.get('endpoint_segment_accepted_count', 0)}, "
+        f"connectivity_gain_total={recovery_summary.get('connectivity_gain_total', 0)}, "
         f"bootstrap_recovered_edge_count={recovery_summary.get('bootstrap_recovered_edge_count', 0)}, "
         f"scene_confidence_state={recovery_summary.get('scene_confidence_state', 'unknown')}"
     )

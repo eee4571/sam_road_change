@@ -14,6 +14,11 @@
 “Enable Bootstrap”开启。界面会显示 Scene Confidence 和 Recommended Profile。
 Bootstrap 参数只影响本次测试，不会写回正式 YAML。
 
+“Endpoint → Segment Recovery”用于验证断头路连接到另一 component 的既有道路
+segment。它使用 segment 最近投影点、LOW probability A*、方向与现有 weak evidence
+规则，并在接受后把目标 segment 拆成真正的 T junction。正式配置默认关闭，只能在
+此测试工具中显式开启。
+
 运行日志、状态和恢复统计会实时显示在窗口中。“打开结果目录”和“打开对比图”
 可直接查看产物。最近一次路径、设备、Batch Size 和高级参数会保存在本地
 `launcher_settings.json`，该文件已被 Git 忽略。
@@ -23,6 +28,9 @@ Bootstrap 参数只影响本次测试，不会写回正式 YAML。
 - `scene_probability_diagnostic.png`：原图、概率热力图、HIGH mask、LOW mask。
 - `bootstrap_overlay.png`：黄色 strong SAMRoad、青色 weak recovered、品红色 weak bootstrap。
 - `recovery_compare.png`：原始 strong graph 与最终三来源 graph 对比。
+- `endpoint_segment_candidates.csv`：endpoint→segment 全部候选及拒绝原因。
+- `endpoint_segment_candidates/endpoint_segment_candidates_montage.png`：接受连接的局部人工检查图。
+- `weak_recovery.json`：包含 components、endpoints、connectivity gain 以及两类恢复统计。
 
 ## 命令行备用方式
 
@@ -48,6 +56,18 @@ python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir d
 
 ```powershell
 python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/test_4096 --threshold-profile weak_sensor --enable-bootstrap --bootstrap-min-length 48 --bootstrap-min-background-contrast 0.08
+```
+
+开启 endpoint→segment 测试：
+
+```powershell
+python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/test_4096 --threshold-profile weak_sensor --disable-bootstrap --enable-segment-recovery --max-segment-distance 64 --min-segment-direction-cosine 0.50 --direction-lookback 32
+```
+
+直接复用 `outputs/2` 运行固定参数 A/B connectivity test：
+
+```powershell
+python dev_tools/weak_road_recovery_test/connectivity_ab_test.py
 ```
 
 黄色为原始 SAMRoad 中心线，青色为新增的 `weak_recovered`，品红色为

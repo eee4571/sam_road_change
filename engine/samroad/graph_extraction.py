@@ -203,10 +203,95 @@ def create_cost_field_astar(
     return cost_field
 
 
-def _endpoint_vectors(nodes_rc, edges):
+def _undirected_adjacency(node_count, edges):
+    """Build unique undirected neighbors from a possibly reciprocal edge list."""
+    adjacency = [set() for _ in range(int(node_count))]
+    for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
+        if src_idx == dst_idx:
+            continue
+        adjacency[src_idx].add(dst_idx)
+        adjacency[dst_idx].add(src_idx)
+    return adjacency
+
+
+def graph_connectivity_stats(nodes_rc, edges):
+    """Return topology metrics using unique undirected neighbors and edges."""
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    unique_edges = {
+        tuple(sorted((int(src_idx), int(dst_idx))))
+        for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist()
+        if int(src_idx) != int(dst_idx)
+    }
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(nodes)))
+    graph.add_edges_from(unique_edges)
+    components = list(nx.connected_components(graph))
+    largest = max(components, key=len) if components else set()
+    largest_edge_count = sum(
+        int(src_idx in largest and dst_idx in largest) for src_idx, dst_idx in unique_edges
+    )
+    node_count = len(nodes)
+    return {
+        "component_count": int(len(components)),
+        "endpoint_count": int(sum(graph.degree(node_idx) == 1 for node_idx in graph.nodes)),
+        "largest_component_node_count": int(len(largest)),
+        "largest_component_edge_count": int(largest_edge_count),
+        "largest_component_fraction": float(len(largest) / node_count) if node_count else 0.0,
+    }
+
+
+def _component_labels(node_count, edges):
+    graph = nx.Graph()
+    graph.add_nodes_from(range(int(node_count)))
+    graph.add_edges_from({
+        tuple(sorted((int(src_idx), int(dst_idx))))
+        for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist()
+        if int(src_idx) != int(dst_idx)
+    })
+    labels = {}
+    for component_id, members in enumerate(nx.connected_components(graph)):
+        for node_idx in members:
+            labels[int(node_idx)] = int(component_id)
+    return labels
+
+
+def estimate_endpoint_direction(nodes_rc, edges, endpoint_idx, lookback_distance=32.0):
+    """Estimate the outward endpoint tangent from a short inward graph trace."""
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    adjacency = _undirected_adjacency(len(nodes), edges)
+    endpoint_idx = int(endpoint_idx)
+    if endpoint_idx < 0 or endpoint_idx >= len(nodes) or len(adjacency[endpoint_idx]) != 1:
+        return None
+    endpoint = nodes[endpoint_idx]
+    previous = endpoint_idx
+    current = next(iter(adjacency[endpoint_idx]))
+    travelled = 0.0
+    inward_point = nodes[current].copy()
+    target_distance = max(float(lookback_distance), 1e-6)
+    while True:
+        segment_start = nodes[previous]
+        segment_end = nodes[current]
+        segment_length = float(np.linalg.norm(segment_end - segment_start))
+        if travelled + segment_length >= target_distance and segment_length > 1e-6:
+            fraction = (target_distance - travelled) / segment_length
+            inward_point = segment_start + fraction * (segment_end - segment_start)
+            break
+        travelled += segment_length
+        inward_point = segment_end.copy()
+        next_nodes = adjacency[current] - {previous}
+        if len(adjacency[current]) != 2 or len(next_nodes) != 1:
+            break
+        previous, current = current, next(iter(next_nodes))
+    vector = endpoint - inward_point
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 1e-6 else None
+
+
+def _endpoint_vectors(nodes_rc, edges, lookback_distance=32.0):
     # SAMRoad can emit reciprocal directed edges. Endpoint degree must be based
     # on unique neighboring nodes, otherwise a true degree-one endpoint appears
     # to have degree two and is silently excluded from recovery proposals.
+    nodes_rc = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
     adjacency = [set() for _ in range(len(nodes_rc))]
     for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
         adjacency[src_idx].add(dst_idx)
@@ -215,11 +300,11 @@ def _endpoint_vectors(nodes_rc, edges):
     for node_idx, neighbors in enumerate(adjacency):
         if len(neighbors) != 1:
             continue
-        neighbor_idx = next(iter(neighbors))
-        vector = nodes_rc[node_idx] - nodes_rc[neighbor_idx]
-        norm = float(np.linalg.norm(vector))
-        if norm > 1e-6:
-            vectors[node_idx] = vector / norm
+        vector = estimate_endpoint_direction(
+            nodes_rc, edges, node_idx, lookback_distance=lookback_distance
+        )
+        if vector is not None:
+            vectors[node_idx] = vector
     return vectors
 
 
@@ -796,6 +881,7 @@ def recover_weak_road_edges(
         "weak_candidate_count": 0,
         "weak_recovered_candidate_count": 0,
         "weak_recovered_edge_count": 0,
+        "weak_connectivity_gain_total": 0,
         "surface_supported_recovery_count": 0,
         "rejected_weak_candidate_count": 0,
         "weak_recovery_reject_reason_counts": {},
@@ -823,8 +909,14 @@ def recover_weak_road_edges(
         "path_margin": max(1.0, float(_config_value(config, "WEAK_RECOVERY_PATH_MARGIN_PX", 16.0)) * scale),
         "sample_step": max(1.0, float(_config_value(config, "WEAK_RECOVERY_SAMPLE_STEP_PX", 12.0)) * scale),
         "auto_score": float(_config_value(config, "WEAK_RECOVERY_AUTO_SCORE", 0.62)),
+        "direction_lookback": max(
+            1.0,
+            float(_config_value(config, "WEAK_ENDPOINT_DIRECTION_LOOKBACK_PX", 32.0)) * scale,
+        ),
     }
-    endpoint_vectors = _endpoint_vectors(nodes, original_edges)
+    endpoint_vectors = _endpoint_vectors(
+        nodes, original_edges, lookback_distance=parameters["direction_lookback"]
+    )
     endpoint_ids = sorted(endpoint_vectors)
     graph = nx.Graph()
     graph.add_nodes_from(range(len(nodes)))
@@ -833,6 +925,7 @@ def recover_weak_road_edges(
     for component_id, members in enumerate(nx.connected_components(graph)):
         for node_idx in members:
             component[node_idx] = component_id
+    initial_component_count = int(nx.number_connected_components(graph))
 
     proposals = []
     reject_counts = Counter()
@@ -840,6 +933,9 @@ def recover_weak_road_edges(
     def reject_candidate(row, reason):
         row["accepted"] = False
         row["reject_reason"] = reason
+        if row.get("component_count_after") is None:
+            row["component_count_after"] = row.get("component_count_before")
+        row["connectivity_gain"] = 0
         summary["rejected_weak_candidate_count"] += 1
         reject_counts[reason] += 1
         if candidate_audit is not None:
@@ -865,6 +961,16 @@ def recover_weak_road_edges(
             "background_probability": None,
             "background_contrast": None,
             "surface_probability": None,
+            "component_before_start": component.get(int(start_idx)),
+            "component_before_target": (
+                component.get(int(end_idx)) if end_idx is not None else None
+            ),
+            "merges_components": bool(
+                end_idx is not None and component.get(int(start_idx)) != component.get(int(end_idx))
+            ),
+            "component_count_before": initial_component_count,
+            "component_count_after": initial_component_count,
+            "connectivity_gain": 0,
             "accepted": False,
             "reject_reason": "",
         }
@@ -989,6 +1095,12 @@ def recover_weak_road_edges(
                         "background_probability": None,
                         "background_contrast": None,
                         "surface_probability": None,
+                        "component_before_start": component.get(int(start_idx)),
+                        "component_before_target": None,
+                        "merges_components": False,
+                        "component_count_before": initial_component_count,
+                        "component_count_after": initial_component_count,
+                        "connectivity_gain": 0,
                         "accepted": False,
                         "reject_reason": "",
                     }, "duplicate_or_suppressed")
@@ -1007,6 +1119,24 @@ def recover_weak_road_edges(
             endpoint_members.add(proposal["end_idx"])
         if endpoint_members & used_endpoints:
             reject_candidate(proposal["audit_row"], "endpoint_already_used")
+            continue
+        before_stats = graph_connectivity_stats(combined_nodes, combined_edges)
+        before_components = _component_labels(len(combined_nodes), combined_edges)
+        start_component = before_components.get(int(proposal["start_idx"]))
+        target_component = (
+            before_components.get(int(proposal["end_idx"]))
+            if proposal["end_idx"] is not None else None
+        )
+        proposal["audit_row"].update({
+            "component_before_start": start_component,
+            "component_before_target": target_component,
+            "merges_components": bool(
+                target_component is not None and start_component != target_component
+            ),
+            "component_count_before": before_stats["component_count"],
+        })
+        if proposal["end_idx"] is not None and start_component == target_component:
+            reject_candidate(proposal["audit_row"], "same_component")
             continue
         path = proposal["path"]
         path_steps = np.concatenate([
@@ -1040,6 +1170,7 @@ def recover_weak_road_edges(
                 combined_nodes.pop()
             chain.append(proposal["end_idx"])
         added_count = 0
+        added_metadata_ids = []
         qa_state = "auto" if proposal["score"] >= parameters["auto_score"] else "review"
         for src_idx, dst_idx in zip(chain[:-1], chain[1:]):
             key = tuple(sorted((int(src_idx), int(dst_idx))))
@@ -1056,14 +1187,35 @@ def recover_weak_road_edges(
                 "recovery_reason": proposal["reason"],
                 "qa_state": qa_state,
                 "recovery_id": f"weak:{recovery_id}",
+                "component_before_start": start_component,
+                "component_before_target": target_component,
+                "merges_components": bool(
+                    target_component is not None and start_component != target_component
+                ),
+                "component_count_before": before_stats["component_count"],
+                "component_count_after": None,
+                "connectivity_gain": 0,
             })
+            added_metadata_ids.append(len(metadata) - 1)
             added_count += 1
         if added_count:
+            after_stats = graph_connectivity_stats(combined_nodes, combined_edges)
+            connectivity_gain = max(
+                0, before_stats["component_count"] - after_stats["component_count"]
+            )
+            proposal["audit_row"].update({
+                "component_count_after": after_stats["component_count"],
+                "connectivity_gain": connectivity_gain,
+            })
+            for metadata_id in added_metadata_ids:
+                metadata[metadata_id]["component_count_after"] = after_stats["component_count"]
+                metadata[metadata_id]["connectivity_gain"] = connectivity_gain
             used_endpoints.update(endpoint_members)
             recovery_id += 1
             summary["weak_recovered_candidate_count"] += 1
             reason_counts[proposal["reason"]] += added_count
             summary["weak_recovered_edge_count"] += added_count
+            summary["weak_connectivity_gain_total"] += connectivity_gain
             if proposal["surface_supported"]:
                 summary["surface_supported_recovery_count"] += added_count
             proposal["audit_row"]["accepted"] = True
@@ -1074,6 +1226,408 @@ def recover_weak_road_edges(
             reject_candidate(proposal["audit_row"], "duplicate_or_suppressed")
     summary["weak_recovery_reject_reason_counts"] = dict(sorted(reject_counts.items()))
     summary["recovery_reason_counts"] = dict(sorted(reason_counts.items()))
+    return (
+        np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
+        np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
+        metadata,
+        summary,
+    )
+
+
+def recover_endpoint_to_segment_connections(
+    nodes_rc,
+    edges,
+    road_probability,
+    config,
+    *,
+    edge_metadata=None,
+    surface_probability=None,
+    distance_scale=1.0,
+    candidate_audit=None,
+):
+    """Connect dangling endpoints to projected points on other graph components."""
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    edge_array = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    road = _probability01(road_probability)
+    surface = None if surface_probability is None else _probability01(surface_probability)
+    if surface is not None and surface.shape != road.shape:
+        raise ValueError(f"Road/surface probability shape mismatch: {road.shape} != {surface.shape}")
+    metadata = [dict(row) for row in (edge_metadata or [])]
+    if not metadata:
+        metadata = [{
+            "line_source": "samroad", "topology_probability": 0.0,
+            "recovery_score": 0.0, "center_conf": 0.0, "surface_conf": 0.0,
+            "recovery_reason": "strong_threshold", "qa_state": "auto", "recovery_id": "",
+        } for _ in range(len(edge_array))]
+    if len(metadata) != len(edge_array):
+        raise ValueError("edge_metadata must align with edges")
+
+    summary = {
+        "endpoint_segment_candidate_count": 0,
+        "endpoint_segment_accepted_count": 0,
+        "endpoint_segment_rejected_count": 0,
+        "endpoint_segment_recovered_edge_count": 0,
+        "endpoint_segment_split_edge_delta": 0,
+        "endpoint_segment_connectivity_gain": 0,
+        "endpoint_segment_reject_reason_counts": {},
+    }
+    enabled = bool(_config_value(config, "WEAK_SEGMENT_RECOVERY_ENABLED", False))
+    if not enabled or len(nodes) == 0 or len(edge_array) == 0:
+        return nodes, edge_array, metadata, summary
+
+    _high_threshold, low_threshold, _profile_name = resolve_road_thresholds(config)
+    scale = max(float(distance_scale), 1e-6)
+    parameters = {
+        "max_distance": float(
+            _config_value(config, "WEAK_SEGMENT_RECOVERY_MAX_DISTANCE_PX", 64.0)
+        ) * scale,
+        "min_alignment": float(
+            _config_value(config, "WEAK_SEGMENT_RECOVERY_MIN_DIRECTION_COSINE", 0.50)
+        ),
+        "direction_lookback": max(
+            1.0,
+            float(_config_value(config, "WEAK_ENDPOINT_DIRECTION_LOOKBACK_PX", 32.0)) * scale,
+        ),
+        "max_path_ratio": float(_config_value(config, "WEAK_RECOVERY_MAX_PATH_RATIO", 1.35)),
+        "min_mean": float(_config_value(config, "WEAK_RECOVERY_MIN_MEAN_PROBABILITY", 0.20)),
+        "min_q25": float(_config_value(config, "WEAK_RECOVERY_MIN_Q25_PROBABILITY", 0.17)),
+        "min_weak_fraction": float(_config_value(config, "WEAK_RECOVERY_MIN_WEAK_FRACTION", 0.80)),
+        "min_contrast": float(_config_value(config, "WEAK_RECOVERY_MIN_BACKGROUND_CONTRAST", 0.08)),
+        "background_offset": float(
+            _config_value(config, "WEAK_RECOVERY_BACKGROUND_OFFSET_PX", 4.0)
+        ) * scale,
+        "surface_threshold": float(_config_value(config, "WEAK_RECOVERY_SURFACE_THRESHOLD", 0.60)),
+        "surface_min_center": float(
+            _config_value(config, "WEAK_RECOVERY_SURFACE_MIN_CENTER_PROBABILITY", 0.10)
+        ),
+        "surface_min_mean": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_MEAN", 0.70)),
+        "surface_min_fraction": float(
+            _config_value(config, "WEAK_RECOVERY_SURFACE_MIN_FRACTION", 0.80)
+        ),
+        "path_margin": max(
+            1.0, float(_config_value(config, "WEAK_RECOVERY_PATH_MARGIN_PX", 16.0)) * scale
+        ),
+        "sample_step": max(
+            1.0, float(_config_value(config, "WEAK_RECOVERY_SAMPLE_STEP_PX", 12.0)) * scale
+        ),
+        "auto_score": float(_config_value(config, "WEAK_RECOVERY_AUTO_SCORE", 0.62)),
+    }
+    endpoint_vectors = _endpoint_vectors(
+        nodes, edge_array, lookback_distance=parameters["direction_lookback"]
+    )
+    endpoint_ids = sorted(endpoint_vectors)
+    components = _component_labels(len(nodes), edge_array)
+    initial_stats = graph_connectivity_stats(nodes, edge_array)
+    reject_counts = Counter()
+    proposals = []
+    candidate_sequence = 0
+
+    segment_edge_ids = {}
+    for edge_id, (src_idx, dst_idx) in enumerate(edge_array.tolist()):
+        if int(src_idx) == int(dst_idx):
+            continue
+        segment_edge_ids.setdefault(tuple(sorted((int(src_idx), int(dst_idx)))), []).append(edge_id)
+    segments = []
+    sample_points = []
+    sample_segment_ids = []
+    spatial_step = max(4.0, min(16.0 * scale, parameters["max_distance"] * 0.5))
+    for segment_id, (node_pair, directed_edge_ids) in enumerate(segment_edge_ids.items()):
+        src_idx, dst_idx = node_pair
+        src, dst = nodes[src_idx], nodes[dst_idx]
+        length = float(np.linalg.norm(dst - src))
+        if length <= 1e-6:
+            continue
+        segments.append({
+            "segment_id": segment_id,
+            "node_pair": node_pair,
+            "edge_ids": directed_edge_ids,
+            "length": length,
+        })
+        sample_count = max(1, int(math.ceil(length / spatial_step)))
+        for sample_index in range(sample_count + 1):
+            fraction = sample_index / sample_count
+            sample_points.append(src + fraction * (dst - src))
+            sample_segment_ids.append(len(segments) - 1)
+    if not sample_points or not endpoint_ids:
+        return nodes, edge_array, metadata, summary
+    sample_tree = KDTree(np.asarray(sample_points, dtype=np.float32))
+
+    def reject(row, reason):
+        row["accepted"] = False
+        row["reject_reason"] = reason
+        row["connectivity_gain"] = 0
+        summary["endpoint_segment_rejected_count"] += 1
+        reject_counts[reason] += 1
+        if candidate_audit is not None:
+            candidate_audit.append(row)
+
+    for endpoint_idx in endpoint_ids:
+        nearby_sample_ids = sample_tree.query_radius(
+            nodes[endpoint_idx][np.newaxis, :],
+            r=parameters["max_distance"] + spatial_step,
+        )[0]
+        nearby_segment_ids = sorted({sample_segment_ids[index] for index in nearby_sample_ids})
+        for segment_index in nearby_segment_ids:
+            segment = segments[segment_index]
+            src_idx, dst_idx = segment["node_pair"]
+            src, dst = nodes[src_idx], nodes[dst_idx]
+            tangent = dst - src
+            length_squared = float(np.dot(tangent, tangent))
+            projection_fraction = float(
+                np.clip(np.dot(nodes[endpoint_idx] - src, tangent) / length_squared, 0.0, 1.0)
+            )
+            projection = src + projection_fraction * tangent
+            delta = projection - nodes[endpoint_idx]
+            distance = float(np.linalg.norm(delta))
+            if distance <= 1e-6 or distance > parameters["max_distance"]:
+                continue
+            candidate_sequence += 1
+            summary["endpoint_segment_candidate_count"] += 1
+            start_component = components.get(endpoint_idx)
+            target_component = components.get(src_idx)
+            row = {
+                "candidate_id": f"segment_candidate:{candidate_sequence}",
+                "endpoint_node": int(endpoint_idx),
+                "target_segment": int(segment["edge_ids"][0]),
+                "target_projection": projection.astype(float).tolist(),
+                "distance": distance,
+                "direction_cosine": None,
+                "path_length": None,
+                "path_ratio": None,
+                "mean_probability": None,
+                "q25_probability": None,
+                "weak_fraction": None,
+                "background_probability": None,
+                "background_contrast": None,
+                "start_component": start_component,
+                "target_component": target_component,
+                "connectivity_gain": 0,
+                "accepted": False,
+                "reject_reason": "",
+                "recovery_score": None,
+                "component_count_before": initial_stats["component_count"],
+                "component_count_after": initial_stats["component_count"],
+                "merges_components": bool(start_component != target_component),
+                "_path": None,
+                "_target_nodes": [src.astype(float).tolist(), dst.astype(float).tolist()],
+            }
+            if start_component == target_component:
+                reject(row, "reject_same_component")
+                continue
+            endpoint_distance = min(
+                float(np.linalg.norm(projection - src)),
+                float(np.linalg.norm(projection - dst)),
+            )
+            if endpoint_distance < max(3.0 * scale, parameters["sample_step"] * 0.25):
+                reject(row, "target_near_endpoint")
+                continue
+            direction = delta / distance
+            alignment = float(np.dot(endpoint_vectors[endpoint_idx], direction))
+            row["direction_cosine"] = alignment
+            if alignment < parameters["min_alignment"]:
+                reject(row, "direction_mismatch")
+                continue
+            target_tangent = tangent / math.sqrt(length_squared)
+            parallel_cosine = abs(float(np.dot(direction, target_tangent)))
+            if parallel_cosine > 0.92 and endpoint_distance > max(8.0 * scale, 0.2 * segment["length"]):
+                reject(row, "target_parallel_mismatch")
+                continue
+            path = _astar_probability_path(
+                nodes[endpoint_idx], projection, road, low_threshold,
+                surface_probability=surface,
+                surface_threshold=parameters["surface_threshold"],
+                margin=parameters["path_margin"],
+            )
+            if len(path) < 2:
+                reject(row, "no_astar_path")
+                continue
+            path_length = float(
+                np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1).sum()
+            )
+            path_ratio = path_length / max(distance, 1e-6)
+            row["path_length"] = path_length
+            row["path_ratio"] = path_ratio
+            row["_path"] = path.astype(float).tolist()
+            if path_ratio > parameters["max_path_ratio"]:
+                reject(row, "path_ratio_too_large")
+                continue
+            evidence = _recovery_path_evidence(path, road, low_threshold, surface, parameters)
+            row.update({
+                "mean_probability": evidence["center_conf"],
+                "q25_probability": evidence["center_q25"],
+                "weak_fraction": evidence["weak_fraction"],
+                "background_probability": evidence["background_conf"],
+                "background_contrast": evidence["probability_contrast"],
+            })
+            if not (evidence["road_supported"] or evidence["surface_supported"]):
+                reject(row, _road_evidence_reject_reason(evidence, parameters))
+                continue
+            directness = min(1.0, 1.0 / max(path_ratio, 1.0))
+            crossing_quality = 1.0 - parallel_cosine
+            recovery_score = (
+                0.28 * min(1.0, evidence["center_conf"] / max(low_threshold, 1e-6))
+                + 0.16 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
+                + 0.22 * alignment
+                + 0.14 * directness
+                + 0.10 * crossing_quality
+                + 0.10 * evidence["surface_conf"]
+            )
+            row["recovery_score"] = recovery_score
+            proposals.append({
+                "score": recovery_score,
+                "endpoint_idx": endpoint_idx,
+                "target_pair": segment["node_pair"],
+                "target_segment_id": int(segment["edge_ids"][0]),
+                "projection": projection.astype(np.float32),
+                "path": path,
+                "evidence": evidence,
+                "row": row,
+            })
+
+    combined_nodes = nodes.tolist()
+    combined_edges = edge_array.tolist()
+    used_endpoints = set()
+    recovery_sequence = 0
+    for proposal in sorted(proposals, key=lambda item: item["score"], reverse=True):
+        endpoint_idx = int(proposal["endpoint_idx"])
+        row = proposal["row"]
+        if endpoint_idx in used_endpoints:
+            reject(row, "endpoint_already_used")
+            continue
+        current_adjacency = _undirected_adjacency(len(combined_nodes), combined_edges)
+        if endpoint_idx >= len(current_adjacency) or len(current_adjacency[endpoint_idx]) != 1:
+            reject(row, "endpoint_already_used")
+            continue
+        target_pair = tuple(proposal["target_pair"])
+        target_edge_ids = [
+            edge_id for edge_id, edge in enumerate(combined_edges)
+            if tuple(sorted((int(edge[0]), int(edge[1])))) == target_pair
+        ]
+        if not target_edge_ids:
+            reject(row, "target_segment_changed")
+            continue
+        before_stats = graph_connectivity_stats(combined_nodes, combined_edges)
+        current_components = _component_labels(len(combined_nodes), combined_edges)
+        start_component = current_components.get(endpoint_idx)
+        target_component = current_components.get(int(target_pair[0]))
+        row.update({
+            "start_component": start_component,
+            "target_component": target_component,
+            "component_count_before": before_stats["component_count"],
+            "merges_components": bool(start_component != target_component),
+        })
+        if start_component == target_component:
+            reject(row, "reject_same_component")
+            continue
+
+        candidate_nodes = [list(point) for point in combined_nodes]
+        candidate_edges = []
+        candidate_metadata = []
+        removed = set(target_edge_ids)
+        removed_rows = []
+        for edge_id, edge in enumerate(combined_edges):
+            if edge_id in removed:
+                removed_rows.append((edge, metadata[edge_id]))
+            else:
+                candidate_edges.append(tuple(map(int, edge)))
+                candidate_metadata.append(dict(metadata[edge_id]))
+        junction_idx = len(candidate_nodes)
+        candidate_nodes.append(proposal["projection"].astype(float).tolist())
+        split_seen = set()
+        for (src_idx, dst_idx), source_metadata in removed_rows:
+            for split_edge in ((int(src_idx), junction_idx), (junction_idx, int(dst_idx))):
+                if split_edge in split_seen:
+                    continue
+                split_seen.add(split_edge)
+                candidate_edges.append(split_edge)
+                split_metadata = dict(source_metadata)
+                split_metadata["split_from_segment"] = int(proposal["target_segment_id"])
+                candidate_metadata.append(split_metadata)
+
+        path = proposal["path"]
+        path_steps = np.concatenate([
+            np.asarray([0.0], dtype=np.float32),
+            np.cumsum(np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1)),
+        ])
+        chain = [endpoint_idx]
+        for sample_distance in np.arange(
+            parameters["sample_step"], path_steps[-1], parameters["sample_step"]
+        ).tolist():
+            path_idx = min(int(np.searchsorted(path_steps, sample_distance)), len(path) - 1)
+            point = path[path_idx].astype(np.float32)
+            if np.array_equal(np.rint(candidate_nodes[chain[-1]]), np.rint(point)):
+                continue
+            candidate_nodes.append(point.astype(float).tolist())
+            chain.append(len(candidate_nodes) - 1)
+        chain.append(junction_idx)
+        qa_state = "auto" if proposal["score"] >= parameters["auto_score"] else "review"
+        connector_metadata_ids = []
+        connector_edge_count = 0
+        existing_undirected = {
+            tuple(sorted((int(src_idx), int(dst_idx)))) for src_idx, dst_idx in candidate_edges
+        }
+        recovery_id = f"segment:{recovery_sequence}"
+        for src_idx, dst_idx in zip(chain[:-1], chain[1:]):
+            edge_key = tuple(sorted((int(src_idx), int(dst_idx))))
+            if src_idx == dst_idx or edge_key in existing_undirected:
+                continue
+            existing_undirected.add(edge_key)
+            candidate_edges.append((int(src_idx), int(dst_idx)))
+            evidence = proposal["evidence"]
+            candidate_metadata.append({
+                "line_source": "weak_segment_connector",
+                "topology_probability": float(proposal["score"]),
+                "recovery_score": float(proposal["score"]),
+                "center_conf": float(evidence["center_conf"]),
+                "center_q25": float(evidence["center_q25"]),
+                "background_conf": float(evidence["background_conf"]),
+                "probability_contrast": float(evidence["probability_contrast"]),
+                "surface_conf": float(evidence["surface_conf"]),
+                "recovery_reason": "weak_probability_endpoint_to_segment",
+                "qa_state": qa_state,
+                "recovery_id": recovery_id,
+                "target_segment_id": int(proposal["target_segment_id"]),
+                "target_projection": proposal["projection"].astype(float).tolist(),
+                "component_before_start": start_component,
+                "component_before_target": target_component,
+                "merges_components": True,
+                "component_count_before": before_stats["component_count"],
+                "component_count_after": None,
+                "connectivity_gain": 0,
+            })
+            connector_metadata_ids.append(len(candidate_metadata) - 1)
+            connector_edge_count += 1
+        if connector_edge_count == 0:
+            reject(row, "duplicate_or_suppressed")
+            continue
+        after_stats = graph_connectivity_stats(candidate_nodes, candidate_edges)
+        connectivity_gain = int(
+            before_stats["component_count"] - after_stats["component_count"]
+        )
+        row["component_count_after"] = after_stats["component_count"]
+        row["connectivity_gain"] = connectivity_gain
+        if connectivity_gain < 1:
+            reject(row, "no_connectivity_gain")
+            continue
+        for metadata_id in connector_metadata_ids:
+            candidate_metadata[metadata_id]["component_count_after"] = after_stats["component_count"]
+            candidate_metadata[metadata_id]["connectivity_gain"] = connectivity_gain
+        row["accepted"] = True
+        row["reject_reason"] = ""
+        row["candidate_id"] = recovery_id
+        if candidate_audit is not None:
+            candidate_audit.append(row)
+        combined_nodes = candidate_nodes
+        combined_edges = candidate_edges
+        metadata = candidate_metadata
+        used_endpoints.add(endpoint_idx)
+        recovery_sequence += 1
+        summary["endpoint_segment_accepted_count"] += 1
+        summary["endpoint_segment_recovered_edge_count"] += connector_edge_count
+        summary["endpoint_segment_split_edge_delta"] += len(removed_rows)
+        summary["endpoint_segment_connectivity_gain"] += connectivity_gain
+
+    summary["endpoint_segment_reject_reason_counts"] = dict(sorted(reject_counts.items()))
     return (
         np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
         np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
@@ -1093,9 +1647,11 @@ def postprocess_weak_road_network(
     distance_scale=1.0,
     weak_candidate_audit=None,
     bootstrap_candidate_audit=None,
+    endpoint_segment_candidate_audit=None,
 ):
-    """Diagnose, optionally bootstrap, then run the existing endpoint recovery."""
+    """Diagnose, bootstrap, recover endpoints, then optionally join endpoints to segments."""
     original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    connectivity_before = graph_connectivity_stats(nodes_rc, original_edges)
     diagnosis = diagnose_scene_confidence(
         road_probability,
         nodes_rc,
@@ -1153,12 +1709,54 @@ def postprocess_weak_road_network(
     )
     if bootstrap_metadata:
         final_metadata[:len(bootstrap_metadata)] = bootstrap_metadata
+    final_nodes, final_edges, final_metadata, segment_summary = (
+        recover_endpoint_to_segment_connections(
+            final_nodes,
+            final_edges,
+            road_probability,
+            config,
+            edge_metadata=final_metadata,
+            surface_probability=surface_probability,
+            distance_scale=distance_scale,
+            candidate_audit=endpoint_segment_candidate_audit,
+        )
+    )
+    connectivity_after = graph_connectivity_stats(final_nodes, final_edges)
     summary = {
         **recovery_summary,
         **diagnosis,
         **bootstrap_summary,
+        **segment_summary,
         "strong_edge_count": int(len(original_edges)),
+        "final_edge_count": int(len(final_edges)),
+        "added_edge_count": int(len(final_edges) - len(original_edges)),
         "bootstrap_ran": bool(should_bootstrap),
+        "component_count_before": connectivity_before["component_count"],
+        "component_count_after": connectivity_after["component_count"],
+        "endpoint_count_before": connectivity_before["endpoint_count"],
+        "endpoint_count_after": connectivity_after["endpoint_count"],
+        "largest_component_node_count_before": connectivity_before[
+            "largest_component_node_count"
+        ],
+        "largest_component_node_count_after": connectivity_after[
+            "largest_component_node_count"
+        ],
+        "largest_component_edge_count_before": connectivity_before[
+            "largest_component_edge_count"
+        ],
+        "largest_component_edge_count_after": connectivity_after[
+            "largest_component_edge_count"
+        ],
+        "largest_component_fraction_before": connectivity_before[
+            "largest_component_fraction"
+        ],
+        "largest_component_fraction_after": connectivity_after[
+            "largest_component_fraction"
+        ],
+        "connectivity_gain_total": max(
+            0,
+            connectivity_before["component_count"] - connectivity_after["component_count"],
+        ),
     }
     return final_nodes, final_edges, final_metadata, summary
 
