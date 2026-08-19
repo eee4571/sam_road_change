@@ -315,6 +315,342 @@ def _recovery_path_evidence(
     }
 
 
+def _graph_raster_mask(nodes_rc, edges, shape):
+    mask = np.zeros(shape, dtype=np.uint8)
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    for src_idx, dst_idx in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
+        src = nodes[int(src_idx)]
+        dst = nodes[int(dst_idx)]
+        cv2.line(
+            mask,
+            (int(round(src[1])), int(round(src[0]))),
+            (int(round(dst[1])), int(round(dst[0]))),
+            1,
+            1,
+            cv2.LINE_8,
+        )
+    return mask
+
+
+def _trace_skeleton_chains(skeleton):
+    """Trace an 8-connected skeleton into junction/endpoint-to-junction chains."""
+    pixels = {tuple(value) for value in np.column_stack(np.where(skeleton)).tolist()}
+    if not pixels:
+        return []
+    offsets = (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1),
+        (0, 1), (1, -1), (1, 0), (1, 1),
+    )
+
+    def neighbors(point):
+        row, col = point
+        result = []
+        for dr, dc in offsets:
+            candidate = (row + dr, col + dc)
+            if candidate not in pixels:
+                continue
+            # Avoid triangular corner shortcuts while retaining true diagonal
+            # skeletons that have no orthogonal connection.
+            if dr and dc and (
+                (row + dr, col) in pixels or (row, col + dc) in pixels
+            ):
+                continue
+            result.append(candidate)
+        return result
+
+    adjacency = {point: neighbors(point) for point in pixels}
+    anchors = {point for point, items in adjacency.items() if len(items) != 2}
+    visited = set()
+    chains = []
+
+    def edge_key(first, second):
+        return tuple(sorted((first, second)))
+
+    def trace(start, first):
+        chain = [start, first]
+        visited.add(edge_key(start, first))
+        previous, current = start, first
+        while current not in anchors:
+            following = [item for item in adjacency[current] if item != previous]
+            if not following:
+                break
+            nxt = following[0]
+            key = edge_key(current, nxt)
+            if key in visited:
+                break
+            visited.add(key)
+            chain.append(nxt)
+            previous, current = current, nxt
+        return chain
+
+    for anchor in sorted(anchors):
+        for neighbor in adjacency[anchor]:
+            if edge_key(anchor, neighbor) not in visited:
+                chains.append(trace(anchor, neighbor))
+    for point in sorted(pixels):
+        for neighbor in adjacency[point]:
+            if edge_key(point, neighbor) not in visited:
+                chains.append(trace(point, neighbor))
+    return [np.asarray(chain, dtype=np.int32) for chain in chains if len(chain) >= 2]
+
+
+def diagnose_scene_confidence(
+    road_probability,
+    nodes_rc,
+    edges,
+    config,
+    *,
+    distance_scale=1.0,
+):
+    """Describe low-response scenes without changing the selected profile."""
+    road = _probability01(road_probability)
+    high_threshold, low_threshold, profile_name = resolve_road_thresholds(config)
+    close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
+    low_mask = (road >= low_threshold).astype(np.uint8)
+    if close_size > 1:
+        kernel = np.ones((close_size, close_size), dtype=np.uint8)
+        low_mask = cv2.morphologyEx(low_mask, cv2.MORPH_CLOSE, kernel)
+    weak_skeleton = skeletonize(low_mask.astype(bool))
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    graph_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    strong_length = float(sum(
+        np.linalg.norm(nodes[int(dst_idx)] - nodes[int(src_idx)])
+        for src_idx, dst_idx in graph_edges.tolist()
+    ))
+    weak_length = float(np.count_nonzero(weak_skeleton))
+    high_ratio = float(np.mean(road >= high_threshold)) if road.size else 0.0
+    low_ratio = float(np.mean(road >= low_threshold)) if road.size else 0.0
+    relative_high = high_ratio / max(low_ratio, 1e-9)
+    relative_strong = strong_length / max(weak_length, 1e-9)
+    minimum_structure = float(
+        _config_value(config, "WEAK_BOOTSTRAP_MIN_LENGTH_PX", 48.0)
+    ) * max(float(distance_scale), 1e-6)
+    has_low_structure = weak_length >= minimum_structure and low_ratio > 0.0
+    percentiles = np.quantile(road, [0.50, 0.90, 0.95, 0.99]) if road.size else np.zeros(4)
+    if has_low_structure and relative_high < 0.12 and relative_strong < 0.20:
+        state = "low_confidence"
+    elif has_low_structure and relative_high < 0.30 and relative_strong < 0.35:
+        state = "low_confidence"
+    elif not len(graph_edges) and high_ratio <= 1e-6 and low_ratio <= 1e-6:
+        state = "very_low_confidence"
+    else:
+        state = "normal"
+    return {
+        "scene_confidence_state": state,
+        "recommended_profile": "weak_sensor" if state != "normal" else "default",
+        "threshold_profile": profile_name,
+        "probability_p50": float(percentiles[0]),
+        "probability_p90": float(percentiles[1]),
+        "probability_p95": float(percentiles[2]),
+        "probability_p99": float(percentiles[3]),
+        "high_pixel_ratio": high_ratio,
+        "low_pixel_ratio": low_ratio,
+        "strong_graph_edge_count": int(len(graph_edges)),
+        "strong_graph_total_length": strong_length,
+        "weak_skeleton_total_length": weak_length,
+    }
+
+
+def bootstrap_weak_road_network(
+    nodes_rc,
+    edges,
+    road_probability,
+    config,
+    *,
+    surface_probability=None,
+    edge_scores=None,
+    distance_scale=1.0,
+):
+    """Conservatively add continuous weak chains that do not need strong seeds."""
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    scores = np.asarray(
+        edge_scores if edge_scores is not None else np.full(len(original_edges), np.nan),
+        dtype=np.float32,
+    )
+    if len(scores) != len(original_edges):
+        raise ValueError("edge_scores must align with edges")
+    road = _probability01(road_probability)
+    surface = None if surface_probability is None else _probability01(surface_probability)
+    if surface is not None and surface.shape != road.shape:
+        raise ValueError(f"Road/surface probability shape mismatch: {road.shape} != {surface.shape}")
+    high_threshold, low_threshold, profile_name = resolve_road_thresholds(config)
+    scale = max(float(distance_scale), 1e-6)
+    parameters = {
+        "min_length": float(_config_value(config, "WEAK_BOOTSTRAP_MIN_LENGTH_PX", 48.0)) * scale,
+        "min_mean": float(_config_value(config, "WEAK_BOOTSTRAP_MIN_MEAN_PROBABILITY", 0.16)),
+        "min_q25": float(_config_value(config, "WEAK_BOOTSTRAP_MIN_Q25_PROBABILITY", 0.12)),
+        "min_contrast": float(_config_value(config, "WEAK_BOOTSTRAP_MIN_BACKGROUND_CONTRAST", 0.08)),
+        "max_tortuosity": float(_config_value(config, "WEAK_BOOTSTRAP_MAX_TORTUOSITY", 1.35)),
+        "min_weak_fraction": float(_config_value(config, "WEAK_BOOTSTRAP_MIN_WEAK_FRACTION", 0.80)),
+        "background_offset": float(_config_value(config, "WEAK_RECOVERY_BACKGROUND_OFFSET_PX", 4.0)) * scale,
+        "surface_threshold": float(_config_value(config, "WEAK_RECOVERY_SURFACE_THRESHOLD", 0.60)),
+        "surface_min_center": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_CENTER_PROBABILITY", 0.10)),
+        "surface_min_mean": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_MEAN", 0.70)),
+        "surface_min_fraction": float(_config_value(config, "WEAK_RECOVERY_SURFACE_MIN_FRACTION", 0.80)),
+        "suppression_radius": max(0, int(round(float(_config_value(config, "WEAK_BOOTSTRAP_STRONG_SUPPRESSION_PX", 3.0)) * scale))),
+        "connection_radius": max(1.0, float(_config_value(config, "WEAK_BOOTSTRAP_STRONG_CONNECTION_PX", 10.0)) * scale),
+        "sample_step": max(1.0, float(_config_value(config, "WEAK_BOOTSTRAP_SAMPLE_STEP_PX", 12.0)) * scale),
+        "auto_score": float(_config_value(config, "WEAK_BOOTSTRAP_AUTO_SCORE", 0.74)),
+        "independent_length_factor": float(_config_value(config, "WEAK_BOOTSTRAP_INDEPENDENT_LENGTH_FACTOR", 1.5)),
+    }
+    metadata = []
+    for edge_id, (src_idx, dst_idx) in enumerate(original_edges.tolist()):
+        rr, cc = line(
+            int(round(nodes[src_idx, 0])), int(round(nodes[src_idx, 1])),
+            int(round(nodes[dst_idx, 0])), int(round(nodes[dst_idx, 1])),
+        )
+        rr = np.clip(rr, 0, road.shape[0] - 1)
+        cc = np.clip(cc, 0, road.shape[1] - 1)
+        center_conf = float(np.mean(road[rr, cc])) if len(rr) else 0.0
+        topology_probability = float(scores[edge_id]) if np.isfinite(scores[edge_id]) else center_conf
+        metadata.append({
+            "line_source": "samroad", "topology_probability": topology_probability,
+            "recovery_score": 0.0, "center_conf": center_conf,
+            "background_conf": 0.0, "probability_contrast": center_conf,
+            "surface_conf": 0.0, "recovery_reason": "strong_threshold",
+            "qa_state": "auto", "recovery_id": "",
+        })
+    summary = {
+        "threshold_profile": profile_name,
+        "bootstrap_candidate_count": 0,
+        "bootstrap_recovered_edge_count": 0,
+        "bootstrap_auto_count": 0,
+        "bootstrap_review_count": 0,
+        "bootstrap_rejected_count": 0,
+    }
+    if not bool(_config_value(config, "WEAK_BOOTSTRAP_ENABLED", True)):
+        return nodes, original_edges, metadata, summary
+
+    close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
+    low_mask = (road >= low_threshold).astype(np.uint8)
+    if close_size > 1:
+        kernel = np.ones((close_size, close_size), dtype=np.uint8)
+        low_mask = cv2.morphologyEx(low_mask, cv2.MORPH_CLOSE, kernel)
+    weak_skeleton = skeletonize(low_mask.astype(bool))
+    strong_mask = _graph_raster_mask(nodes, original_edges, road.shape)
+    if parameters["suppression_radius"] > 0 and np.any(strong_mask):
+        radius = parameters["suppression_radius"]
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+        suppressed = cv2.dilate(strong_mask, kernel) > 0
+        weak_skeleton &= ~suppressed
+    if np.any(strong_mask):
+        strong_distance = cv2.distanceTransform((strong_mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    else:
+        strong_distance = np.full(road.shape, np.inf, dtype=np.float32)
+    chains = _trace_skeleton_chains(weak_skeleton)
+    combined_nodes = nodes.tolist()
+    combined_edges = original_edges.tolist()
+    existing_edges = {tuple(sorted(edge)) for edge in combined_edges}
+    coordinate_nodes = {
+        tuple(np.rint(point).astype(np.int32).tolist()): index
+        for index, point in enumerate(nodes)
+    }
+    node_tree = KDTree(nodes) if len(nodes) else None
+    recovery_id = 0
+    for path in chains:
+        summary["bootstrap_candidate_count"] += 1
+        path_float = path.astype(np.float32)
+        path_length = float(np.linalg.norm(np.diff(path_float, axis=0), axis=1).sum())
+        if path_length < parameters["min_length"]:
+            summary["bootstrap_rejected_count"] += 1
+            continue
+        direct_distance = float(np.linalg.norm(path_float[-1] - path_float[0]))
+        tortuosity = path_length / max(direct_distance, 1e-6)
+        evidence = _recovery_path_evidence(
+            path, road, low_threshold, surface, parameters
+        )
+        endpoint_distances = [
+            float(strong_distance[int(point[0]), int(point[1])]) for point in (path[0], path[-1])
+        ]
+        connection_count = sum(
+            distance <= parameters["connection_radius"] for distance in endpoint_distances
+        )
+        recovery_gap_limit = float(_config_value(config, "WEAK_RECOVERY_MAX_GAP_PX", 64.0)) * scale
+        delegated_gap = connection_count == 2 and path_length <= recovery_gap_limit
+        geometry_supported = tortuosity <= parameters["max_tortuosity"]
+        independent_supported = (
+            connection_count > 0
+            or evidence["surface_supported"]
+            or (
+                path_length >= parameters["min_length"] * parameters["independent_length_factor"]
+                and evidence["center_conf"] >= parameters["min_mean"] + 0.01
+                and evidence["probability_contrast"] >= parameters["min_contrast"] + 0.02
+            )
+        )
+        evidence_supported = evidence["road_supported"] or evidence["surface_supported"]
+        if delegated_gap or not geometry_supported or not evidence_supported or not independent_supported:
+            summary["bootstrap_rejected_count"] += 1
+            continue
+        directness = min(1.0, 1.0 / max(tortuosity, 1.0))
+        proximity = (0.5, 0.8, 1.0)[connection_count]
+        recovery_score = (
+            0.24 * min(1.0, evidence["center_conf"] / max(high_threshold, 1e-6))
+            + 0.18 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
+            + 0.22 * min(1.0, evidence["probability_contrast"] / max(parameters["min_contrast"] * 2.0, 1e-6))
+            + 0.14 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
+            + 0.10 * directness
+            + 0.06 * proximity
+            + 0.06 * evidence["surface_conf"]
+        )
+        qa_state = "auto" if recovery_score >= parameters["auto_score"] else "review"
+        distances = np.concatenate([
+            np.asarray([0.0], dtype=np.float32),
+            np.cumsum(np.linalg.norm(np.diff(path_float, axis=0), axis=1)),
+        ])
+        sample_positions = np.arange(0.0, distances[-1], parameters["sample_step"])
+        sampled = [path_float[min(int(np.searchsorted(distances, value)), len(path_float) - 1)] for value in sample_positions]
+        sampled.append(path_float[-1])
+        chain = []
+        for point_index, point in enumerate(sampled):
+            node_idx = None
+            if node_tree is not None and point_index in {0, len(sampled) - 1}:
+                nearest_distance, nearest_index = node_tree.query(point[np.newaxis, :], k=1)
+                if float(nearest_distance[0, 0]) <= parameters["connection_radius"]:
+                    node_idx = int(nearest_index[0, 0])
+            key = tuple(np.rint(point).astype(np.int32).tolist())
+            if node_idx is None:
+                node_idx = coordinate_nodes.get(key)
+            if node_idx is None:
+                combined_nodes.append(point.tolist())
+                node_idx = len(combined_nodes) - 1
+                coordinate_nodes[key] = node_idx
+            if not chain or chain[-1] != node_idx:
+                chain.append(node_idx)
+        added_count = 0
+        for src_idx, dst_idx in zip(chain[:-1], chain[1:]):
+            key = tuple(sorted((int(src_idx), int(dst_idx))))
+            if src_idx == dst_idx or key in existing_edges:
+                continue
+            existing_edges.add(key)
+            combined_edges.append((int(src_idx), int(dst_idx)))
+            metadata.append({
+                "line_source": "weak_bootstrap",
+                "topology_probability": float(recovery_score),
+                "recovery_score": float(recovery_score),
+                "center_conf": float(evidence["center_conf"]),
+                "background_conf": float(evidence["background_conf"]),
+                "probability_contrast": float(evidence["probability_contrast"]),
+                "surface_conf": float(evidence["surface_conf"]),
+                "recovery_reason": "weak_network_bootstrap",
+                "qa_state": qa_state,
+                "recovery_id": f"bootstrap:{recovery_id}",
+            })
+            added_count += 1
+        if added_count:
+            recovery_id += 1
+            summary["bootstrap_recovered_edge_count"] += added_count
+            summary[f"bootstrap_{qa_state}_count"] += 1
+        else:
+            summary["bootstrap_rejected_count"] += 1
+    return (
+        np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
+        np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
+        metadata,
+        summary,
+    )
+
+
 def recover_weak_road_edges(
     nodes_rc,
     edges,
@@ -577,6 +913,81 @@ def recover_weak_road_edges(
         metadata,
         summary,
     )
+
+
+def postprocess_weak_road_network(
+    nodes_rc,
+    edges,
+    road_probability,
+    config,
+    *,
+    surface_probability=None,
+    edge_scores=None,
+    distance_scale=1.0,
+):
+    """Diagnose, optionally bootstrap, then run the existing endpoint recovery."""
+    original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    diagnosis = diagnose_scene_confidence(
+        road_probability,
+        nodes_rc,
+        original_edges,
+        config,
+        distance_scale=distance_scale,
+    )
+    bootstrap_enabled = bool(_config_value(config, "WEAK_BOOTSTRAP_ENABLED", True))
+    only_low = bool(_config_value(config, "WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE", True))
+    should_bootstrap = bootstrap_enabled and (
+        not only_low or diagnosis["scene_confidence_state"] in {"low_confidence", "very_low_confidence"}
+    )
+    if should_bootstrap:
+        bootstrap_nodes, bootstrap_edges, bootstrap_metadata, bootstrap_summary = (
+            bootstrap_weak_road_network(
+                nodes_rc,
+                original_edges,
+                road_probability,
+                config,
+                surface_probability=surface_probability,
+                edge_scores=edge_scores,
+                distance_scale=distance_scale,
+            )
+        )
+    else:
+        bootstrap_nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+        bootstrap_edges = original_edges
+        bootstrap_metadata = []
+        bootstrap_summary = {
+            "bootstrap_candidate_count": 0,
+            "bootstrap_recovered_edge_count": 0,
+            "bootstrap_auto_count": 0,
+            "bootstrap_review_count": 0,
+            "bootstrap_rejected_count": 0,
+        }
+    if bootstrap_metadata:
+        combined_scores = np.asarray(
+            [row.get("topology_probability", np.nan) for row in bootstrap_metadata],
+            dtype=np.float32,
+        )
+    else:
+        combined_scores = edge_scores
+    final_nodes, final_edges, final_metadata, recovery_summary = recover_weak_road_edges(
+        bootstrap_nodes,
+        bootstrap_edges,
+        road_probability,
+        config,
+        surface_probability=surface_probability,
+        edge_scores=combined_scores,
+        distance_scale=distance_scale,
+    )
+    if bootstrap_metadata:
+        final_metadata[:len(bootstrap_metadata)] = bootstrap_metadata
+    summary = {
+        **recovery_summary,
+        **diagnosis,
+        **bootstrap_summary,
+        "strong_edge_count": int(len(original_edges)),
+        "bootstrap_ran": bool(should_bootstrap),
+    }
+    return final_nodes, final_edges, final_metadata, summary
 
 
 def skeletonize_road_mask(road_mask, threshold, close_kernel_size=3):

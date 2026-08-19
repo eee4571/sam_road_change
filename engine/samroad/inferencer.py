@@ -233,7 +233,7 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 pred_nodes, pred_edges, original_height, original_width, edge_confidences
             )
 
-        pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.recover_weak_road_edges(
+        pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
             pred_nodes,
             pred_edges,
             road_mask,
@@ -270,7 +270,8 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             writer = csv.DictWriter(file, fieldnames=[
                 'edge_id', 'src_row', 'src_col', 'dst_row', 'dst_col',
                 'topology_probability', 'line_source', 'recovery_score',
-                'center_conf', 'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
+                'center_conf', 'background_conf', 'probability_contrast',
+                'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
             ])
             writer.writeheader()
             for edge_id, ((src_idx, dst_idx), score, metadata) in enumerate(
@@ -286,6 +287,8 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                     'line_source': metadata['line_source'],
                     'recovery_score': metadata['recovery_score'],
                     'center_conf': metadata['center_conf'],
+                    'background_conf': metadata.get('background_conf', 0.0),
+                    'probability_contrast': metadata.get('probability_contrast', 0.0),
                     'surface_conf': metadata['surface_conf'],
                     'recovery_reason': metadata['recovery_reason'],
                     'qa_state': metadata['qa_state'],
@@ -325,6 +328,8 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     total_fields = (
         'strong_edge_count', 'weak_candidate_count', 'weak_recovered_edge_count',
         'surface_supported_recovery_count', 'rejected_weak_candidate_count',
+        'bootstrap_candidate_count', 'bootstrap_recovered_edge_count',
+        'bootstrap_auto_count', 'bootstrap_review_count', 'bootstrap_rejected_count',
     )
     recovery_report = {
         'tile_count': len(recovery_summaries),
@@ -704,6 +709,10 @@ if __name__ == "__main__":
                 'road_high_threshold': road_high_threshold,
                 'road_low_threshold': road_low_threshold,
                 'weak_recovery_enabled': bool(config.get('WEAK_RECOVERY_ENABLED', True)),
+                'weak_bootstrap_enabled': bool(config.get('WEAK_BOOTSTRAP_ENABLED', True)),
+                'weak_bootstrap_only_if_low_confidence': bool(
+                    config.get('WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE', True)
+                ),
                 'branch_aware_road_nms': True,
             },
             file,

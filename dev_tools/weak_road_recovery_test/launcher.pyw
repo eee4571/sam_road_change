@@ -49,7 +49,7 @@ CACHE_FILES = (
     "original_graph.p",
     "original_edge_scores.csv",
 )
-PARAMETER_SPECS = (
+RECOVERY_PARAMETER_SPECS = (
     ("road_low_threshold", "Road Low Threshold", "ROAD_LOW_THRESHOLD", "--road-low-threshold", 0.20),
     ("max_gap", "Max Gap", "WEAK_RECOVERY_MAX_GAP_PX", "--max-gap", 64.0),
     ("max_extension", "Max Extension", "WEAK_RECOVERY_MAX_EXTENSION_PX", "--max-extension", 48.0),
@@ -60,11 +60,29 @@ PARAMETER_SPECS = (
     ("min_background_contrast", "Min Background Contrast", "WEAK_RECOVERY_MIN_BACKGROUND_CONTRAST", "--min-background-contrast", 0.08),
     ("auto_score", "Auto Score", "WEAK_RECOVERY_AUTO_SCORE", "--auto-score", 0.62),
 )
+BOOTSTRAP_PARAMETER_SPECS = (
+    ("bootstrap_min_length", "Min Length", "WEAK_BOOTSTRAP_MIN_LENGTH_PX", "--bootstrap-min-length", 48.0),
+    ("bootstrap_min_mean_probability", "Min Mean Probability", "WEAK_BOOTSTRAP_MIN_MEAN_PROBABILITY", "--bootstrap-min-mean-probability", 0.16),
+    ("bootstrap_min_q25_probability", "Min Q25 Probability", "WEAK_BOOTSTRAP_MIN_Q25_PROBABILITY", "--bootstrap-min-q25-probability", 0.12),
+    ("bootstrap_min_background_contrast", "Min Contrast", "WEAK_BOOTSTRAP_MIN_BACKGROUND_CONTRAST", "--bootstrap-min-background-contrast", 0.08),
+    ("bootstrap_max_tortuosity", "Max Tortuosity", "WEAK_BOOTSTRAP_MAX_TORTUOSITY", "--bootstrap-max-tortuosity", 1.35),
+    ("bootstrap_min_weak_fraction", "Min Weak Fraction", "WEAK_BOOTSTRAP_MIN_WEAK_FRACTION", "--bootstrap-min-weak-fraction", 0.80),
+)
+PARAMETER_SPECS = RECOVERY_PARAMETER_SPECS + BOOTSTRAP_PARAMETER_SPECS
 
 
-def load_default_parameters(config_path: Path = DEFAULT_CONFIG) -> dict[str, float]:
+def load_threshold_profiles(config_path: Path = DEFAULT_CONFIG) -> tuple[str, ...]:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
-    profile_name = str(data.get("ROAD_THRESHOLD_PROFILE", "default"))
+    profiles = data.get("ROAD_THRESHOLD_PROFILES", {}) or {}
+    return tuple(str(name) for name in profiles) or ("default",)
+
+
+def load_default_parameters(
+    config_path: Path = DEFAULT_CONFIG,
+    profile_name: str | None = None,
+) -> dict[str, float]:
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+    profile_name = str(profile_name or data.get("ROAD_THRESHOLD_PROFILE", "default"))
     profiles = data.get("ROAD_THRESHOLD_PROFILES", {}) or {}
     profile = profiles.get(profile_name, {}) or {}
     defaults = {}
@@ -90,6 +108,8 @@ def build_command(
     batch_size: int,
     parameters: dict[str, float],
     *,
+    profile_name: str = "default",
+    bootstrap_enabled: bool = True,
     recovery_only: bool,
 ) -> list[str]:
     command = [python_executable, str(run_test_path)]
@@ -102,6 +122,8 @@ def build_command(
             "--device", device.casefold(),
             "--batch-size", str(batch_size),
         ])
+    command.extend(["--threshold-profile", profile_name])
+    command.append("--enable-bootstrap" if bootstrap_enabled else "--disable-bootstrap")
     cli_by_name = {name: cli for name, _label, _key, cli, _fallback in PARAMETER_SPECS}
     for name, value in parameters.items():
         if name in cli_by_name:
@@ -118,6 +140,13 @@ def read_result_summary(run_dir: Path) -> dict:
         "weak_candidate_count": int(summary.get("weak_candidate_count", 0)),
         "weak_recovered_edge_count": int(summary.get("weak_recovered_edge_count", 0)),
         "rejected_weak_candidate_count": int(summary.get("rejected_weak_candidate_count", 0)),
+        "bootstrap_candidate_count": int(summary.get("bootstrap_candidate_count", 0)),
+        "bootstrap_recovered_edge_count": int(summary.get("bootstrap_recovered_edge_count", 0)),
+        "bootstrap_auto_count": int(summary.get("bootstrap_auto_count", 0)),
+        "bootstrap_review_count": int(summary.get("bootstrap_review_count", 0)),
+        "bootstrap_rejected_count": int(summary.get("bootstrap_rejected_count", 0)),
+        "scene_confidence_state": str(summary.get("scene_confidence_state", "unknown")),
+        "recommended_profile": str(summary.get("recommended_profile", "default")),
         "weak_recovery_seconds": float(timing.get("weak_recovery_seconds", 0.0)),
         "total_seconds": float(timing.get("total_seconds", 0.0)),
     }
@@ -138,8 +167,14 @@ class WeakRecoveryLauncher:
         self.current_process: subprocess.Popen | None = None
         self.running = False
         self.advanced_visible = False
-        self.defaults = load_default_parameters()
         self.settings = self._load_settings()
+        self.profile_names = load_threshold_profiles()
+        saved_profile = str(self.settings.get("threshold_profile", "default"))
+        if saved_profile not in self.profile_names:
+            saved_profile = self.profile_names[0]
+        self.profile_var = tk.StringVar(value=saved_profile)
+        self.bootstrap_var = tk.BooleanVar(value=bool(self.settings.get("bootstrap_enabled", True)))
+        self.defaults = load_default_parameters(profile_name=saved_profile)
 
         self.image_var = tk.StringVar(value=str(self.settings.get("image", "")))
         self.output_var = tk.StringVar(value=str(self.settings.get("run_dir", "")))
@@ -151,6 +186,7 @@ class WeakRecoveryLauncher:
             value="CUDA 不可用，已切换到 CPU。" if not available else "等待运行"
         )
         self.summary_var = tk.StringVar(value="尚无运行摘要")
+        self.scene_var = tk.StringVar(value="Scene Confidence：尚未诊断    Recommended Profile：—")
         saved_parameters = self.settings.get("parameters", {})
         self.parameter_vars = {
             name: tk.StringVar(value=f"{float(saved_parameters.get(name, self.defaults[name])):g}")
@@ -162,7 +198,7 @@ class WeakRecoveryLauncher:
 
     def _build_ui(self) -> None:
         self.root.title("Weak Road Recovery Test")
-        self.root.geometry("960x720")
+        self.root.geometry("1000x780")
         self.root.minsize(820, 620)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -170,7 +206,7 @@ class WeakRecoveryLauncher:
         main = ttk.Frame(self.root, padding=14)
         main.grid(sticky="nsew")
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(9, weight=1)
+        main.rowconfigure(10, weight=1)
 
         ttk.Label(main, text="Weak Road Recovery Test", font=("Segoe UI", 16, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 12)
@@ -193,6 +229,13 @@ class WeakRecoveryLauncher:
         ttk.Combobox(
             options, textvariable=self.batch_var, values=("8", "16", "32"), width=8
         ).grid(row=0, column=3)
+        ttk.Label(options, text="Threshold Profile").grid(row=0, column=4, padx=(22, 6))
+        profile_box = ttk.Combobox(
+            options, textvariable=self.profile_var, values=self.profile_names,
+            state="readonly", width=16,
+        )
+        profile_box.grid(row=0, column=5)
+        profile_box.bind("<<ComboboxSelected>>", self._profile_changed)
 
         actions = ttk.Frame(main)
         actions.grid(row=4, column=0, columnspan=3, sticky="w", pady=6)
@@ -207,17 +250,28 @@ class WeakRecoveryLauncher:
 
         self.advanced_button = ttk.Button(main, text="高级参数 ▼", command=self._toggle_advanced)
         self.advanced_button.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 2))
-        self.advanced_frame = ttk.LabelFrame(main, text="弱恢复参数", padding=10)
+        self.advanced_frame = ttk.LabelFrame(main, text="高级参数", padding=10)
         self.advanced_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        self.advanced_frame.columnconfigure(1, weight=1)
-        for row, (name, label, _key, _cli, _fallback) in enumerate(PARAMETER_SPECS):
-            ttk.Label(self.advanced_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(self.advanced_frame, textvariable=self.parameter_vars[name], width=18).grid(
+        recovery_frame = ttk.LabelFrame(self.advanced_frame, text="Weak Endpoint Recovery", padding=8)
+        recovery_frame.grid(row=0, column=0, sticky="nw", padx=(0, 12))
+        bootstrap_frame = ttk.LabelFrame(self.advanced_frame, text="Weak Network Bootstrap", padding=8)
+        bootstrap_frame.grid(row=0, column=1, sticky="nw")
+        for row, (name, label, _key, _cli, _fallback) in enumerate(RECOVERY_PARAMETER_SPECS):
+            ttk.Label(recovery_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(recovery_frame, textvariable=self.parameter_vars[name], width=14).grid(
+                row=row, column=1, sticky="w", padx=8, pady=2
+            )
+        ttk.Checkbutton(
+            bootstrap_frame, text="Enable Bootstrap", variable=self.bootstrap_var
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        for row, (name, label, _key, _cli, _fallback) in enumerate(BOOTSTRAP_PARAMETER_SPECS, 1):
+            ttk.Label(bootstrap_frame, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(bootstrap_frame, textvariable=self.parameter_vars[name], width=14).grid(
                 row=row, column=1, sticky="w", padx=8, pady=2
             )
         ttk.Button(
             self.advanced_frame, text="恢复默认值", command=self._restore_defaults
-        ).grid(row=len(PARAMETER_SPECS), column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.advanced_frame.grid_remove()
 
         status = ttk.Frame(main)
@@ -227,8 +281,11 @@ class WeakRecoveryLauncher:
         ttk.Label(main, textvariable=self.summary_var, font=("Segoe UI", 10, "bold")).grid(
             row=8, column=0, columnspan=3, sticky="w", pady=(0, 8)
         )
+        ttk.Label(main, textvariable=self.scene_var).grid(
+            row=9, column=0, columnspan=3, sticky="w", pady=(0, 8)
+        )
         self.log = scrolledtext.ScrolledText(main, height=18, wrap="word", state="disabled")
-        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=10, column=0, columnspan=3, sticky="nsew")
 
     def _load_settings(self) -> dict:
         if not SETTINGS_PATH.is_file():
@@ -244,6 +301,8 @@ class WeakRecoveryLauncher:
             "run_dir": self.output_var.get().strip(),
             "device": self.device_var.get(),
             "batch_size": self.batch_var.get().strip(),
+            "threshold_profile": self.profile_var.get(),
+            "bootstrap_enabled": bool(self.bootstrap_var.get()),
             "parameters": {name: variable.get().strip() for name, variable in self.parameter_vars.items()},
         }
         SETTINGS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -278,18 +337,28 @@ class WeakRecoveryLauncher:
 
     def _restore_defaults(self) -> None:
         try:
-            self.defaults = load_default_parameters()
+            self.defaults = load_default_parameters(profile_name=self.profile_var.get())
             for name, value in self.defaults.items():
                 self.parameter_vars[name].set(f"{value:g}")
             self.status_var.set("已重新读取正式 YAML 默认值")
         except Exception as exc:
             messagebox.showerror("读取失败", str(exc), parent=self.root)
 
+    def _profile_changed(self, _event=None) -> None:
+        try:
+            defaults = load_default_parameters(profile_name=self.profile_var.get())
+            self.parameter_vars["road_low_threshold"].set(f"{defaults['road_low_threshold']:g}")
+            self.status_var.set(f"本次测试使用 profile：{self.profile_var.get()}")
+        except Exception as exc:
+            messagebox.showerror("Profile 读取失败", str(exc), parent=self.root)
+
     def _parameters(self) -> dict[str, float]:
         values = {}
         probability_names = {
             "road_low_threshold", "min_direction_cosine", "min_mean_probability",
             "min_q25_probability", "min_weak_fraction", "min_background_contrast", "auto_score",
+            "bootstrap_min_mean_probability", "bootstrap_min_q25_probability",
+            "bootstrap_min_background_contrast", "bootstrap_min_weak_fraction",
         }
         for name, variable in self.parameter_vars.items():
             try:
@@ -299,6 +368,8 @@ class WeakRecoveryLauncher:
             if name in probability_names and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} 必须在 0 到 1 之间")
             if name in {"max_gap", "max_extension"} and value <= 0:
+                raise ValueError(f"{name} 必须大于 0")
+            if name in {"bootstrap_min_length", "bootstrap_max_tortuosity"} and value <= 0:
                 raise ValueError(f"{name} 必须大于 0")
             values[name] = value
         return values
@@ -334,7 +405,8 @@ class WeakRecoveryLauncher:
             return
         command = build_command(
             sys.executable, RUN_TEST, image, str(run_dir), self.device_var.get(), batch_size,
-            parameters, recovery_only=recovery_only,
+            parameters, profile_name=self.profile_var.get(),
+            bootstrap_enabled=bool(self.bootstrap_var.get()), recovery_only=recovery_only,
         )
         self._save_settings()
         self._set_running(True)
@@ -348,6 +420,8 @@ class WeakRecoveryLauncher:
             self._append_log(f"Image: {image}")
             self._append_log(f"Device: {self.device_var.get().lower()}")
             self._append_log(f"Batch size: {batch_size}")
+        self._append_log(f"Threshold profile: {self.profile_var.get()}")
+        self._append_log(f"Weak network bootstrap: {bool(self.bootstrap_var.get())}")
         threading.Thread(
             target=self._run_process, args=(command, run_dir), daemon=True
         ).start()
@@ -410,7 +484,12 @@ class WeakRecoveryLauncher:
             self.summary_var.set(
                 "原始边数：{strong_edge_count}    弱候选：{weak_candidate_count}    "
                 "成功恢复边：{weak_recovered_edge_count}    拒绝候选：{rejected_weak_candidate_count}    "
+                "Bootstrap：{bootstrap_recovered_edge_count}（auto {bootstrap_auto_count} / review {bootstrap_review_count}）    "
                 "Weak Recovery：{weak_recovery_seconds:.2f}s    总耗时：{total_seconds:.2f}s".format(**summary)
+            )
+            self.scene_var.set(
+                f"Scene Confidence：{summary['scene_confidence_state']}    "
+                f"Recommended Profile：{summary['recommended_profile']}"
             )
         except Exception as exc:
             self.summary_var.set(f"结果已生成，但摘要读取失败：{exc}")

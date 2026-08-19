@@ -44,6 +44,20 @@ def recovery_config() -> Config:
         WEAK_RECOVERY_SURFACE_MIN_CENTER_PROBABILITY=0.10,
         WEAK_RECOVERY_SURFACE_MIN_MEAN=0.70,
         WEAK_RECOVERY_SURFACE_MIN_FRACTION=0.80,
+        WEAK_BOOTSTRAP_ENABLED=True,
+        WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE=True,
+        WEAK_BOOTSTRAP_CLOSE_KERNEL=3,
+        WEAK_BOOTSTRAP_MIN_LENGTH_PX=30.0,
+        WEAK_BOOTSTRAP_MIN_MEAN_PROBABILITY=0.16,
+        WEAK_BOOTSTRAP_MIN_Q25_PROBABILITY=0.12,
+        WEAK_BOOTSTRAP_MIN_BACKGROUND_CONTRAST=0.08,
+        WEAK_BOOTSTRAP_MAX_TORTUOSITY=1.35,
+        WEAK_BOOTSTRAP_MIN_WEAK_FRACTION=0.80,
+        WEAK_BOOTSTRAP_STRONG_SUPPRESSION_PX=3.0,
+        WEAK_BOOTSTRAP_STRONG_CONNECTION_PX=10.0,
+        WEAK_BOOTSTRAP_SAMPLE_STEP_PX=10.0,
+        WEAK_BOOTSTRAP_AUTO_SCORE=0.70,
+        WEAK_BOOTSTRAP_INDEPENDENT_LENGTH_FACTOR=1.5,
     )
 
 
@@ -179,6 +193,130 @@ class WeakRoadRecoveryTests(unittest.TestCase):
         }
         high, low, profile = graph_extraction.resolve_road_thresholds(config)
         self.assertEqual((high, low, profile), (0.42, 0.16, "sensor_b"))
+
+    def test_bootstrap_case_a_normal_strong_scene_is_not_changed(self):
+        nodes = np.asarray([[48, 8], [48, 112]], dtype=np.float32)
+        edges = np.asarray([[0, 1]], dtype=np.int32)
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:113] = 0.70
+
+        result_nodes, result_edges, metadata, summary = (
+            graph_extraction.postprocess_weak_road_network(
+                nodes, edges, probability, recovery_config(), edge_scores=np.asarray([0.9])
+            )
+        )
+
+        np.testing.assert_array_equal(result_nodes, nodes)
+        np.testing.assert_array_equal(result_edges, edges)
+        self.assertEqual(summary["scene_confidence_state"], "normal")
+        self.assertFalse(summary["bootstrap_ran"])
+        self.assertEqual(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertEqual(metadata[0]["line_source"], "samroad")
+
+    def test_bootstrap_case_b_low_confidence_scene_recovers_long_weak_road(self):
+        config = recovery_config()
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:121] = 0.22
+
+        nodes, edges, metadata, summary = graph_extraction.postprocess_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            config,
+        )
+
+        self.assertEqual(summary["scene_confidence_state"], "low_confidence")
+        self.assertEqual(summary["recommended_profile"], "weak_sensor")
+        self.assertTrue(summary["bootstrap_ran"])
+        self.assertGreater(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertGreater(len(nodes), 0)
+        self.assertGreater(len(edges), 0)
+        self.assertEqual({row["line_source"] for row in metadata}, {"weak_bootstrap"})
+
+    def test_bootstrap_case_c_low_contrast_chain_is_rejected(self):
+        config = recovery_config()
+        config["ROAD_LOW_THRESHOLD"] = 0.15
+        probability = np.full((96, 128), 0.14, dtype=np.float32)
+        probability[47:50, 8:121] = 0.16
+
+        _nodes, edges, _metadata, summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            config,
+        )
+
+        self.assertEqual(len(edges), 0)
+        self.assertEqual(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertGreater(summary["bootstrap_rejected_count"], 0)
+
+    def test_bootstrap_case_d_short_isolated_weak_line_is_rejected(self):
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:28] = 0.24
+
+        _nodes, edges, _metadata, summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            recovery_config(),
+        )
+
+        self.assertEqual(len(edges), 0)
+        self.assertGreater(summary["bootstrap_candidate_count"], 0)
+        self.assertEqual(
+            summary["bootstrap_rejected_count"], summary["bootstrap_candidate_count"]
+        )
+
+    def test_bootstrap_case_e_long_relative_response_is_accepted(self):
+        config = recovery_config()
+        config["ROAD_LOW_THRESHOLD"] = 0.10
+        probability = np.full((112, 160), 0.04, dtype=np.float32)
+        values = np.linspace(0.18, 0.24, 140, dtype=np.float32)
+        probability[55:58, 10:150] = values[np.newaxis, :]
+
+        _nodes, edges, metadata, summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            config,
+        )
+
+        self.assertGreater(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertGreater(len(edges), 0)
+        self.assertTrue(all(row["probability_contrast"] > 0.08 for row in metadata))
+
+    def test_bootstrap_case_f_strong_road_gap_stays_weak_recovered(self):
+        nodes, edges = split_graph()
+        probability = draw_probability(weak_value=0.22)
+
+        _nodes, _edges, metadata, summary = graph_extraction.postprocess_weak_road_network(
+            nodes, edges, probability, recovery_config()
+        )
+
+        self.assertEqual(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertGreater(summary["weak_recovered_edge_count"], 0)
+        added_sources = {row["line_source"] for row in metadata[len(edges):]}
+        self.assertEqual(added_sources, {"weak_recovered"})
+
+    def test_bootstrap_optional_surface_support_can_confirm_low_absolute_response(self):
+        config = recovery_config()
+        config["ROAD_LOW_THRESHOLD"] = 0.10
+        probability = np.full((96, 128), 0.03, dtype=np.float32)
+        probability[47:50, 8:121] = 0.11
+        surface = np.zeros_like(probability)
+        surface[44:53, 8:121] = 0.90
+
+        _nodes, edges, metadata, summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            config,
+            surface_probability=surface,
+        )
+
+        self.assertGreater(len(edges), 0)
+        self.assertGreater(summary["bootstrap_recovered_edge_count"], 0)
+        self.assertTrue(all(row["surface_conf"] > 0.8 for row in metadata))
 
 
 if __name__ == "__main__":

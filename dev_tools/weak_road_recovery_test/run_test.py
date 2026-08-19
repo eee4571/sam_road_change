@@ -39,6 +39,12 @@ OVERRIDES = {
     "min_weak_fraction": "WEAK_RECOVERY_MIN_WEAK_FRACTION",
     "min_background_contrast": "WEAK_RECOVERY_MIN_BACKGROUND_CONTRAST",
     "auto_score": "WEAK_RECOVERY_AUTO_SCORE",
+    "bootstrap_min_length": "WEAK_BOOTSTRAP_MIN_LENGTH_PX",
+    "bootstrap_min_mean_probability": "WEAK_BOOTSTRAP_MIN_MEAN_PROBABILITY",
+    "bootstrap_min_q25_probability": "WEAK_BOOTSTRAP_MIN_Q25_PROBABILITY",
+    "bootstrap_min_background_contrast": "WEAK_BOOTSTRAP_MIN_BACKGROUND_CONTRAST",
+    "bootstrap_max_tortuosity": "WEAK_BOOTSTRAP_MAX_TORTUOSITY",
+    "bootstrap_min_weak_fraction": "WEAK_BOOTSTRAP_MIN_WEAK_FRACTION",
 }
 
 
@@ -51,6 +57,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--checkpoint", help=f"SAMRoad checkpoint (default: {DEFAULT_CHECKPOINT})")
     result.add_argument("--device", default=None, help="cuda, cpu, or auto (default: auto)")
     result.add_argument("--batch-size", type=int, help="Override INFER_BATCH_SIZE for this run")
+    result.add_argument("--threshold-profile", help="ROAD_THRESHOLD_PROFILES entry for this test run")
+    bootstrap_group = result.add_mutually_exclusive_group()
+    bootstrap_group.add_argument("--enable-bootstrap", dest="bootstrap_enabled", action="store_true")
+    bootstrap_group.add_argument("--disable-bootstrap", dest="bootstrap_enabled", action="store_false")
+    result.set_defaults(bootstrap_enabled=None)
     result.add_argument("--road-high-threshold", type=float)
     result.add_argument("--road-low-threshold", type=float)
     result.add_argument("--max-gap", type=float)
@@ -61,6 +72,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-weak-fraction", type=float)
     result.add_argument("--min-background-contrast", type=float)
     result.add_argument("--auto-score", type=float)
+    result.add_argument("--bootstrap-min-length", type=float)
+    result.add_argument("--bootstrap-min-mean-probability", type=float)
+    result.add_argument("--bootstrap-min-q25-probability", type=float)
+    result.add_argument("--bootstrap-min-background-contrast", type=float)
+    result.add_argument("--bootstrap-max-tortuosity", type=float)
+    result.add_argument("--bootstrap-min-weak-fraction", type=float)
     return result
 
 
@@ -139,19 +156,28 @@ def read_original_scores(path: Path, nodes_rc: np.ndarray, edges: np.ndarray) ->
 
 
 def _apply_overrides(config, arguments: argparse.Namespace) -> None:
+    if arguments.threshold_profile:
+        profiles = config.get("ROAD_THRESHOLD_PROFILES", {}) or {}
+        if arguments.threshold_profile not in profiles:
+            raise ValueError(
+                f"Unknown threshold profile {arguments.threshold_profile!r}; "
+                f"available: {', '.join(sorted(profiles))}"
+            )
+        config.ROAD_THRESHOLD_PROFILE = arguments.threshold_profile
     threshold_overridden = (
         arguments.road_high_threshold is not None or arguments.road_low_threshold is not None
     )
     if threshold_overridden:
-        high, low, _profile = graph_extraction.resolve_road_thresholds(config)
-        high = arguments.road_high_threshold if arguments.road_high_threshold is not None else high
-        low = arguments.road_low_threshold if arguments.road_low_threshold is not None else low
-        profiles = dict(config.get("ROAD_THRESHOLD_PROFILES", {}) or {})
-        profiles["weak_recovery_test_cli"] = {
-            "ROAD_HIGH_THRESHOLD": float(high), "ROAD_LOW_THRESHOLD": float(low),
-        }
-        config.ROAD_THRESHOLD_PROFILES = profiles
-        config.ROAD_THRESHOLD_PROFILE = "weak_recovery_test_cli"
+        resolved_high, resolved_low, _profile = graph_extraction.resolve_road_thresholds(config)
+        high = arguments.road_high_threshold if arguments.road_high_threshold is not None else resolved_high
+        low = arguments.road_low_threshold if arguments.road_low_threshold is not None else resolved_low
+        if not (np.isclose(high, resolved_high) and np.isclose(low, resolved_low)):
+            profiles = dict(config.get("ROAD_THRESHOLD_PROFILES", {}) or {})
+            profiles["weak_recovery_test_cli"] = {
+                "ROAD_HIGH_THRESHOLD": float(high), "ROAD_LOW_THRESHOLD": float(low),
+            }
+            config.ROAD_THRESHOLD_PROFILES = profiles
+            config.ROAD_THRESHOLD_PROFILE = "weak_recovery_test_cli"
     for argument_name, config_name in OVERRIDES.items():
         value = getattr(arguments, argument_name)
         if value is not None and argument_name not in {"road_high_threshold", "road_low_threshold"}:
@@ -160,6 +186,8 @@ def _apply_overrides(config, arguments: argparse.Namespace) -> None:
         if arguments.batch_size <= 0:
             raise ValueError("--batch-size must be positive")
         config.INFER_BATCH_SIZE = int(arguments.batch_size)
+    if arguments.bootstrap_enabled is not None:
+        config.WEAK_BOOTSTRAP_ENABLED = bool(arguments.bootstrap_enabled)
 
 
 def _read_probability(path: Path) -> np.ndarray:
@@ -211,26 +239,83 @@ def write_visualizations(
     original_edges: np.ndarray,
     recovered_nodes: np.ndarray,
     recovered_edges: np.ndarray,
+    metadata: list[dict],
 ) -> None:
     original_overlay = _draw_edges(
         image_rgb.copy(), original_nodes, original_edges, (255, 220, 0), 3
     )
-    recovered_overlay = _draw_edges(
-        image_rgb.copy(), recovered_nodes, recovered_edges[:len(original_edges)], (255, 220, 0), 3
-    )
-    recovered_overlay = _draw_edges(
-        recovered_overlay, recovered_nodes, recovered_edges[len(original_edges):], (0, 255, 255), 5
-    )
+    recovered_overlay = image_rgb.copy()
+    source_styles = {
+        "samroad": ((255, 220, 0), 3),
+        "weak_recovered": ((0, 255, 255), 5),
+        "weak_bootstrap": ((255, 0, 255), 5),
+    }
+    for source, (color, thickness) in source_styles.items():
+        edge_ids = [
+            edge_id for edge_id, row in enumerate(metadata)
+            if row.get("line_source") == source
+        ]
+        if edge_ids:
+            recovered_overlay = _draw_edges(
+                recovered_overlay,
+                recovered_nodes,
+                recovered_edges[np.asarray(edge_ids, dtype=np.int32)],
+                color,
+                thickness,
+            )
     _save_png(run_dir / "original_overlay.png", original_overlay)
     _save_png(run_dir / "recovered_overlay.png", recovered_overlay)
+    _save_png(run_dir / "bootstrap_overlay.png", recovered_overlay)
     left = _labeled_preview(original_overlay, "Original SAMRoad (yellow)")
-    right = _labeled_preview(recovered_overlay, "Weak recovered additions (cyan)")
+    right = _labeled_preview(
+        recovered_overlay,
+        "Final: strong yellow / recovered cyan / bootstrap magenta",
+    )
     target_height = min(left.shape[0], right.shape[0])
     if left.shape[0] != target_height:
         left = cv2.resize(left, (int(left.shape[1] * target_height / left.shape[0]), target_height))
     if right.shape[0] != target_height:
         right = cv2.resize(right, (int(right.shape[1] * target_height / right.shape[0]), target_height))
     _save_png(run_dir / "recovery_compare.png", np.concatenate([left, right], axis=1))
+
+
+def write_scene_probability_diagnostic(
+    run_dir: Path,
+    image_rgb: np.ndarray,
+    road_probability: np.ndarray,
+    config,
+) -> None:
+    high_threshold, low_threshold, _profile = graph_extraction.resolve_road_thresholds(config)
+    probability_u8 = np.clip(np.rint(road_probability * 255.0), 0, 255).astype(np.uint8)
+    heatmap = cv2.cvtColor(cv2.applyColorMap(probability_u8, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+    high_mask = np.repeat(
+        ((road_probability >= high_threshold).astype(np.uint8) * 255)[:, :, np.newaxis], 3, axis=2
+    )
+    low_mask = np.repeat(
+        ((road_probability >= low_threshold).astype(np.uint8) * 255)[:, :, np.newaxis], 3, axis=2
+    )
+    panels = [
+        _labeled_preview(image_rgb, "Original image", max_width=800),
+        _labeled_preview(heatmap, "Road probability heatmap", max_width=800),
+        _labeled_preview(high_mask, f"HIGH mask >= {high_threshold:g}", max_width=800),
+        _labeled_preview(low_mask, f"LOW mask >= {low_threshold:g}", max_width=800),
+    ]
+    target_height = min(panel.shape[0] for panel in panels)
+    panels = [
+        cv2.resize(panel, (int(round(panel.shape[1] * target_height / panel.shape[0])), target_height))
+        if panel.shape[0] != target_height else panel
+        for panel in panels
+    ]
+    target_width = min(panel.shape[1] for panel in panels)
+    panels = [
+        cv2.resize(panel, (target_width, target_height)) if panel.shape[1] != target_width else panel
+        for panel in panels
+    ]
+    diagnostic = np.concatenate([
+        np.concatenate(panels[:2], axis=1),
+        np.concatenate(panels[2:], axis=1),
+    ], axis=0)
+    _save_png(run_dir / "scene_probability_diagnostic.png", diagnostic)
 
 
 def _actual_test_config(
@@ -245,7 +330,7 @@ def _actual_test_config(
     config_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
     weak_parameters = {
         key: value for key, value in config_dict.items()
-        if key.startswith("WEAK_RECOVERY_")
+        if key.startswith("WEAK_RECOVERY_") or key.startswith("WEAK_BOOTSTRAP_")
     }
     return {
         "input_image": str(image_path.resolve()),
@@ -368,10 +453,10 @@ def main(argv: list[str] | None = None) -> int:
             run_dir / "original_edge_scores.csv", original_nodes, original_edges, original_scores
         )
 
-    _progress("Weak recovery...")
+    _progress("Scene diagnosis, weak-network bootstrap, and weak recovery...")
     recovery_started = time.perf_counter()
     recovered_nodes, recovered_edges, metadata, recovery_summary = (
-        graph_extraction.recover_weak_road_edges(
+        graph_extraction.postprocess_weak_road_network(
             original_nodes,
             original_edges,
             road_probability,
@@ -391,8 +476,10 @@ def main(argv: list[str] | None = None) -> int:
     _progress("Generating overlays and comparison preview...")
     visualization_started = time.perf_counter()
     write_visualizations(
-        run_dir, image_rgb, original_nodes, original_edges, recovered_nodes, recovered_edges
+        run_dir, image_rgb, original_nodes, original_edges, recovered_nodes, recovered_edges,
+        metadata,
     )
+    write_scene_probability_diagnostic(run_dir, image_rgb, road_probability, config)
     timing["visualization_seconds"] = time.perf_counter() - visualization_started
     timing["total_seconds"] = time.perf_counter() - total_started
     _write_json(run_dir / "timing.json", timing)
@@ -407,7 +494,8 @@ def main(argv: list[str] | None = None) -> int:
         f"strong_edge_count={recovery_summary.get('strong_edge_count', 0)}, "
         f"weak_candidate_count={recovery_summary.get('weak_candidate_count', 0)}, "
         f"weak_recovered_edge_count={recovery_summary.get('weak_recovered_edge_count', 0)}, "
-        f"rejected_weak_candidate_count={recovery_summary.get('rejected_weak_candidate_count', 0)}"
+        f"bootstrap_recovered_edge_count={recovery_summary.get('bootstrap_recovered_edge_count', 0)}, "
+        f"scene_confidence_state={recovery_summary.get('scene_confidence_state', 'unknown')}"
     )
     _progress(f"Done. Total seconds: {timing['total_seconds']:.3f}")
     print(json.dumps({"run_dir": str(run_dir), **recovery_summary, "timing": timing}, ensure_ascii=False, indent=2), flush=True)

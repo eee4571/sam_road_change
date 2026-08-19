@@ -31,6 +31,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
         self.assertAlmostEqual(parameters["road_low_threshold"], 0.20)
         self.assertAlmostEqual(parameters["max_gap"], 64.0)
         self.assertAlmostEqual(parameters["auto_score"], 0.62)
+        self.assertAlmostEqual(parameters["bootstrap_min_length"], 48.0)
+        self.assertEqual(launcher.load_threshold_profiles(), ("default", "weak_sensor"))
 
         command = launcher.build_command(
             "same-python.exe",
@@ -47,6 +49,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
         self.assertIn("cuda", command)
         self.assertIn("--batch-size", command)
         self.assertIn("--road-low-threshold", command)
+        self.assertIn("--threshold-profile", command)
+        self.assertIn("--enable-bootstrap", command)
         self.assertNotIn("--recovery-only", command)
 
     def test_launcher_recovery_command_and_cache_validation(self):
@@ -65,11 +69,15 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "CPU",
                 8,
                 {"max_gap": 80.0, "road_low_threshold": 0.16},
+                profile_name="weak_sensor",
+                bootstrap_enabled=False,
                 recovery_only=True,
             )
             self.assertEqual(command[2:5], ["--recovery-only", "--run-dir", str(run_dir)])
             self.assertIn("--max-gap", command)
             self.assertIn("--road-low-threshold", command)
+            self.assertIn("weak_sensor", command)
+            self.assertIn("--disable-bootstrap", command)
             self.assertNotIn("--device", command)
             self.assertNotIn("--batch-size", command)
 
@@ -83,6 +91,13 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                         "weak_candidate_count": 46,
                         "weak_recovered_edge_count": 12,
                         "rejected_weak_candidate_count": 34,
+                        "bootstrap_candidate_count": 7,
+                        "bootstrap_recovered_edge_count": 5,
+                        "bootstrap_auto_count": 3,
+                        "bootstrap_review_count": 2,
+                        "bootstrap_rejected_count": 2,
+                        "scene_confidence_state": "low_confidence",
+                        "recommended_profile": "weak_sensor",
                     }
                 }),
                 encoding="utf-8",
@@ -94,7 +109,64 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             summary = launcher.read_result_summary(run_dir)
             self.assertEqual(summary["weak_recovered_edge_count"], 12)
             self.assertEqual(summary["rejected_weak_candidate_count"], 34)
+            self.assertEqual(summary["bootstrap_recovered_edge_count"], 5)
+            self.assertEqual(summary["scene_confidence_state"], "low_confidence")
+            self.assertEqual(summary["recommended_profile"], "weak_sensor")
             self.assertAlmostEqual(summary["total_seconds"], 96.4)
+
+    def test_recovery_only_can_bootstrap_from_cached_probability_without_model(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            image_path = root / "weak_sensor.png"
+            image = np.full((96, 128, 3), 35, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+            probability = np.full((96, 128), round(0.03 * 255), dtype=np.uint8)
+            probability[47:50, 8:121] = round(0.22 * 255)
+            self.assertTrue(cv2.imwrite(str(run_dir / "road_probability.png"), probability))
+            run_test.save_graph(
+                run_dir / "original_graph.p",
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 2), dtype=np.int32),
+            )
+            run_test.write_original_scores(
+                run_dir / "original_edge_scores.csv",
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 2), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+            (run_dir / "test_config.json").write_text(
+                json.dumps({
+                    "input_image": str(image_path),
+                    "config": str(ROOT / "config" / "samroad_inference.yaml"),
+                    "checkpoint": str(ROOT / "models" / "samroad" / "samroad.ckpt"),
+                    "device": "cuda",
+                    "batch_size": 16,
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_test.main([
+                "--recovery-only", "--run-dir", str(run_dir),
+                "--threshold-profile", "default", "--enable-bootstrap",
+                "--bootstrap-min-length", "30",
+            ]), 0)
+
+            recovery = json.loads((run_dir / "weak_recovery.json").read_text(encoding="utf-8"))
+            summary = recovery["summary"]
+            self.assertEqual(summary["scene_confidence_state"], "low_confidence")
+            self.assertGreater(summary["bootstrap_recovered_edge_count"], 0)
+            self.assertTrue(recovery["recovered_edges"])
+            self.assertEqual(
+                {row["line_source"] for row in recovery["recovered_edges"]},
+                {"weak_bootstrap"},
+            )
+            for name in (
+                "scene_probability_diagnostic.png", "bootstrap_overlay.png",
+                "recovery_compare.png", "recovered_graph.p",
+            ):
+                self.assertTrue((run_dir / name).is_file(), name)
 
     def test_recovery_only_reuses_immutable_original_cache(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -154,6 +226,7 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             )
             for name in (
                 "original_overlay.png", "recovered_overlay.png", "recovery_compare.png",
+                "bootstrap_overlay.png", "scene_probability_diagnostic.png",
                 "recovered_graph.p", "test_config.json",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
