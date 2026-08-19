@@ -185,7 +185,7 @@ class CanonicalCorridorChangeTests(unittest.TestCase):
             (positive["change_typ"] == "added") & (positive["qa_state"] == "review")
         ]
         self.assertFalse(review_added.empty)
-        self.assertTrue(review_added["audit_reason"].str.contains("centerline_extraction_mismatch").all())
+        self.assertTrue(review_added["audit_reason"].str.contains("surface_present").all())
         self.assertEqual(summary["added_feature_count"], 0)
         self.assertGreater(summary["review_added_feature_count"], 0)
 
@@ -250,7 +250,11 @@ class CanonicalCorridorChangeTests(unittest.TestCase):
         _positive, negative, summary = detect_changes(
             before, after, before_valid_area=before_valid, after_valid_area=after_valid,
         )
-        self.assertTrue(negative.empty)
+        self.assertFalse(negative.empty)
+        self.assertEqual(set(negative["qa_state"]), {"review"})
+        self.assertEqual(set(negative["after_state"]), {"uncertain"})
+        self.assertEqual(set(negative["audit_reason"]), {"invalid_or_nodata_reference"})
+        self.assertEqual(summary["removed_feature_count"], 0)
         self.assertTrue(summary["valid_observation_intersection_applied"])
 
     def test_valid_pixel_mask_is_exported_on_unicode_path(self):

@@ -4403,9 +4403,11 @@ def main() -> int:
         "failure_count": len(failures),
         "failures": failures,
     }
+    # The production pipeline consumes this stable batch contract even when a
+    # developer test contains exactly one image.
+    with open(output_dir / "batch_width_summary.json", "w", encoding="utf-8") as file:
+        json.dump(batch_summary, file, indent=2, ensure_ascii=False)
     if len(jobs) > 1:
-        with open(output_dir / "batch_width_summary.json", "w", encoding="utf-8") as file:
-            json.dump(batch_summary, file, indent=2, ensure_ascii=False)
         print(json.dumps(batch_summary, indent=2, ensure_ascii=False))
     print(f"Outputs written to: {output_dir}")
     if failures:

@@ -23,6 +23,7 @@ from skimage.morphology import skeletonize
 from PIL import Image, ImageDraw, ImageFont
 
 from road_corridor_change import detect_corridor_changes
+from road_existence_evidence import RoadProbabilityRaster
 
 
 LINE_TYPES = {"LineString", "MultiLineString"}
@@ -829,6 +830,8 @@ def _detect_changes_internal(
     after_width_segments: gpd.GeoDataFrame | None = None,
     before_valid_area: gpd.GeoDataFrame | None = None,
     after_valid_area: gpd.GeoDataFrame | None = None,
+    before_probability: RoadProbabilityRaster | None = None,
+    after_probability: RoadProbabilityRaster | None = None,
     artifacts: dict[str, gpd.GeoDataFrame] | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
     before = _clean_geometries(before)
@@ -876,6 +879,7 @@ def _detect_changes_internal(
             before_surfaces=before_surfaces, after_surfaces=after_surfaces,
             before_width_segments=before_width_segments, after_width_segments=after_width_segments,
             before_valid=valid_union(before_valid_area), after_valid=valid_union(after_valid_area),
+            before_probability=before_probability, after_probability=after_probability,
         )
         if artifacts is not None:
             artifacts.update(corridor_artifacts)
@@ -948,10 +952,13 @@ def detect_changes(
     after_width_segments: gpd.GeoDataFrame | None = None,
     before_valid_area: gpd.GeoDataFrame | None = None,
     after_valid_area: gpd.GeoDataFrame | None = None,
+    before_probability: RoadProbabilityRaster | None = None,
+    after_probability: RoadProbabilityRaster | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
     added, removed, _unchanged, summary = _detect_changes_internal(
         before, after, config, before_period, after_period, before_surfaces, after_surfaces,
         before_width_segments, after_width_segments, before_valid_area, after_valid_area,
+        before_probability, after_probability,
     )
     return added, removed, summary
 
@@ -1461,6 +1468,17 @@ def _write_outputs(
     narrowed_output = formal.loc[formal["change_typ"] == "narrowed"].to_crs(output_crs)
     review_output = combined.loc[combined["qa_state"] == "review"].to_crs(output_crs)
 
+    shapefile_names = {
+        "audit_reason": "audit_reas", "before_state": "bef_state", "after_state": "aft_state",
+        "before_geom_cov": "bef_gcov", "after_geom_cov": "aft_gcov",
+        "before_center_evidence": "bef_cmean", "after_center_evidence": "aft_cmean",
+        "before_center_pct": "bef_cpct", "after_center_pct": "aft_cpct",
+        "before_contrast": "bef_ctrst", "after_contrast": "aft_ctrst",
+        "before_surface_cov": "bef_scov", "after_surface_cov": "aft_scov",
+        "before_valid_cov": "bef_vcov", "after_valid_cov": "aft_vcov",
+        "evidence_rule": "evid_rule",
+    }
+
     def remove_shapefile(path: Path) -> None:
         # Only remove the exact product's known sidecars.  This prevents a rerun
         # from mixing the current empty result with an older non-empty SHP.
@@ -1472,6 +1490,9 @@ def _write_outputs(
     def write_shapefile(name: str, frame: gpd.GeoDataFrame, kind: str = geometry_type) -> None:
         path = output_dir / name
         remove_shapefile(path)
+        frame = frame.rename(columns={
+            source: target for source, target in shapefile_names.items() if source in frame.columns
+        })
         pyogrio.write_dataframe(
             frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=kind,
         )
@@ -1521,7 +1542,13 @@ def _write_outputs(
         )
     formal_added = formal.loc[formal["change_typ"].isin(("added", "widened"))]
     formal_removed = formal.loc[formal["change_typ"].isin(("removed", "narrowed"))]
-    write_change_preview(output_dir / "change_preview.png", formal_added, formal_removed, unchanged)
+    write_change_preview(
+        output_dir / "change_preview.png", formal_added, formal_removed, unchanged, review_output,
+    )
+    write_change_preview(
+        output_dir / "sensor_disagreement_preview.png",
+        formal_added.iloc[0:0], formal_removed.iloc[0:0], unchanged, review_output,
+    )
     return formal
 
 
@@ -1541,6 +1568,7 @@ def write_change_preview(
     added: gpd.GeoDataFrame,
     removed: gpd.GeoDataFrame,
     unchanged: gpd.GeoDataFrame,
+    review: gpd.GeoDataFrame | None = None,
 ) -> None:
     """Write a self-contained PNG map for change QA, including empty detections."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1548,8 +1576,11 @@ def write_change_preview(
     image = Image.new("RGBA", (width, height), (250, 252, 253, 255))
     draw = ImageDraw.Draw(image, "RGBA")
     font = ImageFont.load_default()
-    frames = (("unchanged", unchanged), ("changes", added), ("changes", removed))
-    geometries = [geometry for _name, frame in frames for geometry in frame.geometry if geometry is not None and not geometry.is_empty]
+    frames = (("unchanged", unchanged), ("changes", added), ("changes", removed), ("review", review))
+    geometries = [
+        geometry for _name, frame in frames if frame is not None
+        for geometry in frame.geometry if geometry is not None and not geometry.is_empty
+    ]
     if not geometries:
         draw.text((margin, margin), "Road change preview", fill=(20, 45, 60, 255), font=font)
         draw.text((margin, margin + 34), "No detected road changes", fill=(75, 90, 105, 255), font=font)
@@ -1570,6 +1601,7 @@ def write_change_preview(
             "unchanged": (120, 130, 140, 55), "added": (32, 158, 90, 180),
             "removed": (213, 69, 69, 180), "widened": (244, 145, 42, 185),
             "narrowed": (130, 78, 190, 185),
+            "review": (237, 139, 35, 190),
         }
 
         def render(frame: gpd.GeoDataFrame, default_type: str) -> None:
@@ -1586,9 +1618,18 @@ def write_change_preview(
         render(unchanged, "unchanged")
         render(added, "added")
         render(removed, "removed")
+        if review is not None:
+            for _, row in review.iterrows():
+                geometry = row.geometry
+                color = colors["review"]
+                for part in _preview_parts(geometry):
+                    if part.geom_type == "Polygon":
+                        draw.polygon(pixels(part.exterior.coords), fill=color, outline=color[:3] + (255,))
+                    else:
+                        draw.line(pixels(part.coords), fill=color[:3] + (255,), width=4)
         draw.text((margin, 18), "Road change preview", fill=(20, 45, 60, 255), font=font)
 
-    legend = (("Added", (32, 158, 90)), ("Removed", (213, 69, 69)), ("Widened", (244, 145, 42)), ("Narrowed", (130, 78, 190)))
+    legend = (("Added", (32, 158, 90)), ("Removed", (213, 69, 69)), ("Review", (237, 139, 35)), ("Unchanged", (120, 130, 140)))
     x = margin
     for label_text, color in legend:
         draw.rectangle((x, height - 32, x + 16, height - 16), fill=color + (255,))
@@ -1607,6 +1648,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--after-width-segments", default="", help="Optional measured local-width line segments.")
     parser.add_argument("--before-valid-area", default="", help="Polygon extent of valid before-period observations.")
     parser.add_argument("--after-valid-area", default="", help="Polygon extent of valid after-period observations.")
+    parser.add_argument("--before-probability", default="", help="Optional georeferenced before-period SAMRoad probability raster.")
+    parser.add_argument("--after-probability", default="", help="Optional georeferenced after-period SAMRoad probability raster.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--before-period", default="before")
     parser.add_argument("--after-period", default="after")
@@ -1663,6 +1706,8 @@ def main(argv: list[str] | None = None) -> int:
     after_width_segments = gpd.read_file(args.after_width_segments) if args.after_width_segments else None
     before_valid_area = gpd.read_file(args.before_valid_area) if args.before_valid_area else None
     after_valid_area = gpd.read_file(args.after_valid_area) if args.after_valid_area else None
+    before_probability = RoadProbabilityRaster.from_path(args.before_probability) if args.before_probability else None
+    after_probability = RoadProbabilityRaster.from_path(args.after_probability) if args.after_probability else None
     output_crs = after.crs
     artifacts: dict[str, gpd.GeoDataFrame] = {}
     added, removed, unchanged, summary = _detect_changes_internal(
@@ -1690,6 +1735,8 @@ def main(argv: list[str] | None = None) -> int:
         after_width_segments,
         before_valid_area,
         after_valid_area,
+        before_probability,
+        after_probability,
         artifacts,
     )
     # detect_changes keeps metric geometries in its selected projected CRS.
@@ -1727,7 +1774,12 @@ def main(argv: list[str] | None = None) -> int:
         "road_corridors": str(output_dir / "road_corridors.shp"),
         "road_matches": str(output_dir / "road_matches.shp"),
         "canonical_roads": str(output_dir / "canonical_roads.shp"),
+        "sensor_disagreement_preview": str(output_dir / "sensor_disagreement_preview.png"),
     }
+    summary["before_probability_available"] = before_probability is not None
+    summary["after_probability_available"] = after_probability is not None
+    summary["before_probability_scene_percentiles"] = before_probability.scene_percentiles if before_probability is not None else None
+    summary["after_probability_scene_percentiles"] = after_probability.scene_percentiles if after_probability is not None else None
     with (output_dir / "change_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
     audit_keys = [

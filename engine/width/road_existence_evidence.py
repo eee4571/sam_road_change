@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+"""Symmetric, scene-relative evidence for cross-period road existence."""
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import rasterio
+from pyproj import CRS, Transformer
+from rasterio.features import rasterize
+from rasterio.windows import Window, from_bounds
+from shapely import make_valid
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform as transform_geometry
+
+
+@dataclass(frozen=True)
+class RoadExistenceEvidence:
+    geometry_coverage: float
+    center_probability_mean: float | None
+    center_probability_q25: float | None
+    local_background_probability: float | None
+    local_probability_contrast: float | None
+    scene_percentile_rank: float | None
+    background_percentile_rank: float | None
+    surface_coverage: float | None
+    valid_coverage: float
+    existence_state: str
+    existence_reason: str
+    evidence_rule: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class RoadProbabilityRaster:
+    """One georeferenced probability raster with per-scene relative statistics."""
+
+    def __init__(self, values: np.ndarray, transform, crs, valid_mask: np.ndarray | None = None):
+        array = np.asarray(values, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError("Road probability must be a two-dimensional raster.")
+        if float(np.nanmax(array, initial=0.0)) > 1.0:
+            array = array / 255.0
+        self.values = np.clip(array, 0.0, 1.0)
+        self.transform = transform
+        self.crs = CRS.from_user_input(crs)
+        self.valid_mask = (
+            np.asarray(valid_mask, dtype=bool)
+            if valid_mask is not None else np.isfinite(self.values)
+        )
+        if self.valid_mask.shape != self.values.shape:
+            raise ValueError("Probability valid mask shape does not match the raster.")
+        scene = self.values[self.valid_mask & np.isfinite(self.values)]
+        if scene.size > 1_000_000:
+            stride = int(np.ceil(scene.size / 1_000_000))
+            scene = scene[::stride]
+        self.scene_values = np.sort(scene.astype(np.float32, copy=False))
+        self.scene_percentiles = {
+            f"p{percentile}": float(np.percentile(scene, percentile)) if scene.size else None
+            for percentile in (50, 90, 95, 99)
+        }
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "RoadProbabilityRaster":
+        with rasterio.open(path) as dataset:
+            masked = dataset.read(1, masked=True)
+            values = np.asarray(masked.data, dtype=np.float32)
+            valid = ~np.ma.getmaskarray(masked) & np.isfinite(values)
+            return cls(values, dataset.transform, dataset.crs, valid)
+
+    def percentile_rank(self, value: float | None) -> float | None:
+        if value is None or not np.isfinite(value) or self.scene_values.size == 0:
+            return None
+        # Strict rank avoids treating a large tied background plateau (often 0)
+        # as high roadness merely because most scene pixels share that value.
+        return float(np.searchsorted(self.scene_values, value, side="left") / self.scene_values.size)
+
+    def _in_raster_crs(self, geometry: BaseGeometry, geometry_crs) -> BaseGeometry:
+        source = CRS.from_user_input(geometry_crs)
+        if source == self.crs:
+            return geometry
+        transformer = Transformer.from_crs(source, self.crs, always_xy=True)
+        return transform_geometry(transformer.transform, geometry)
+
+    def sample_axis(
+        self,
+        axis: BaseGeometry,
+        axis_crs,
+        *,
+        road_width: float,
+        position_tolerance: float,
+    ) -> dict[str, float | None]:
+        axis = self._in_raster_crs(axis, axis_crs)
+        pixel_x = abs(float(self.transform.a))
+        pixel_y = abs(float(self.transform.e))
+        pixel = max(min(pixel_x, pixel_y), 1e-6)
+        center_radius = max(pixel * 1.25, position_tolerance * 0.20, road_width * 0.12)
+        inner_radius = max(center_radius * 2.0, road_width * 0.60, pixel * 2.5)
+        outer_radius = max(inner_radius + pixel * 3.0, road_width * 1.35, position_tolerance * 1.5)
+        center_geometry = make_valid(axis.buffer(center_radius, cap_style="flat"))
+        background_geometry = make_valid(
+            axis.buffer(outer_radius, cap_style="flat").difference(
+                axis.buffer(inner_radius, cap_style="flat")
+            )
+        )
+        bounds = background_geometry.bounds
+        raw_window = from_bounds(*bounds, transform=self.transform)
+        col0 = max(0, int(np.floor(raw_window.col_off)))
+        row0 = max(0, int(np.floor(raw_window.row_off)))
+        col1 = min(self.values.shape[1], int(np.ceil(raw_window.col_off + raw_window.width)))
+        row1 = min(self.values.shape[0], int(np.ceil(raw_window.row_off + raw_window.height)))
+        if col1 <= col0 or row1 <= row0:
+            return {
+                "center_probability_mean": None, "center_probability_q25": None,
+                "local_background_probability": None, "local_probability_contrast": None,
+                "scene_percentile_rank": None, "background_percentile_rank": None,
+            }
+        window = Window(col0, row0, col1 - col0, row1 - row0)
+        window_transform = rasterio.windows.transform(window, self.transform)
+        shape = (row1 - row0, col1 - col0)
+        center_mask = rasterize(
+            [(center_geometry, 1)], out_shape=shape, transform=window_transform,
+            fill=0, all_touched=True, dtype="uint8",
+        ).astype(bool)
+        background_mask = rasterize(
+            [(background_geometry, 1)], out_shape=shape, transform=window_transform,
+            fill=0, all_touched=True, dtype="uint8",
+        ).astype(bool)
+        values = self.values[row0:row1, col0:col1]
+        valid = self.valid_mask[row0:row1, col0:col1]
+        center = values[center_mask & valid & np.isfinite(values)]
+        background = values[background_mask & valid & np.isfinite(values)]
+        center_mean = float(np.mean(center)) if center.size else None
+        center_q25 = float(np.quantile(center, 0.25)) if center.size else None
+        background_mean = float(np.mean(background)) if background.size else None
+        contrast = (
+            center_mean - background_mean
+            if center_mean is not None and background_mean is not None else None
+        )
+        return {
+            "center_probability_mean": center_mean,
+            "center_probability_q25": center_q25,
+            "local_background_probability": background_mean,
+            "local_probability_contrast": contrast,
+            "scene_percentile_rank": self.percentile_rank(center_mean),
+            "background_percentile_rank": self.percentile_rank(background_mean),
+        }
+
+
+def _line_coverage(axis: BaseGeometry, support: BaseGeometry | None) -> float | None:
+    if support is None:
+        return None
+    if axis.is_empty or float(axis.length) <= 0 or support.is_empty:
+        return 0.0
+    return float(np.clip(axis.intersection(support).length / max(float(axis.length), 1e-9), 0.0, 1.0))
+
+
+def evaluate_road_existence_evidence(
+    candidate_axis: BaseGeometry,
+    *,
+    centerline_cover: BaseGeometry | None,
+    road_surface: BaseGeometry | None,
+    valid_area: BaseGeometry | None,
+    probability: RoadProbabilityRaster | None = None,
+    crs=None,
+    road_width: float = 0.0,
+    position_tolerance: float = 3.0,
+) -> RoadExistenceEvidence:
+    """Classify one period as present, absent or uncertain on a known road axis.
+
+    Positive evidence may come from geometry, scene-relative probability or road
+    surface.  Absence requires valid observation plus multiple negative sources.
+    """
+    geometry_coverage = float(_line_coverage(candidate_axis, centerline_cover) or 0.0)
+    surface_coverage = _line_coverage(candidate_axis, road_surface)
+    valid_coverage = float(_line_coverage(candidate_axis, valid_area) if valid_area is not None else 1.0)
+    probability_values = {
+        "center_probability_mean": None, "center_probability_q25": None,
+        "local_background_probability": None, "local_probability_contrast": None,
+        "scene_percentile_rank": None, "background_percentile_rank": None,
+    }
+    if probability is not None:
+        probability_values = probability.sample_axis(
+            candidate_axis, crs, road_width=max(road_width, 2.0 * position_tolerance),
+            position_tolerance=position_tolerance,
+        )
+    center_pct = probability_values["scene_percentile_rank"]
+    background_pct = probability_values["background_percentile_rank"]
+    scene_p50 = probability.scene_percentiles.get("p50") if probability is not None else None
+    scene_p99 = probability.scene_percentiles.get("p99") if probability is not None else None
+    scene_dynamic = (
+        float(scene_p99 - scene_p50)
+        if scene_p50 is not None and scene_p99 is not None else None
+    )
+    percentile_separation = (
+        center_pct - background_pct
+        if center_pct is not None and background_pct is not None else None
+    )
+    probability_present = bool(
+        center_pct is not None
+        and scene_dynamic is not None and scene_dynamic >= 0.01
+        and (
+            (center_pct >= 0.85 and (percentile_separation is None or percentile_separation >= 0.10))
+            or (center_pct >= 0.95)
+        )
+    )
+    surface_present = surface_coverage is not None and surface_coverage >= 0.55
+
+    if geometry_coverage >= 0.50:
+        state, reason = "present", "geometry_match_strong"
+    elif probability_present:
+        state, reason = "present", "reference_centerline_missing_but_probability_present"
+    elif surface_present:
+        state, reason = "present", "reference_centerline_missing_but_surface_present"
+    elif valid_coverage < 0.80:
+        state, reason = "uncertain", "invalid_or_nodata_reference"
+    else:
+        probability_negative = bool(
+            center_pct is not None and (
+                (
+                    scene_dynamic is not None and scene_dynamic < 0.01
+                    and (probability_values["center_probability_mean"] or 0.0) <= 0.10
+                )
+                or (
+                    center_pct <= 0.70
+                    and (percentile_separation is None or percentile_separation <= 0.10)
+                )
+            )
+        )
+        surface_negative = surface_coverage is not None and surface_coverage <= 0.10
+        geometry_negative = geometry_coverage <= 0.10
+        if (
+            geometry_negative and surface_negative and valid_coverage >= 0.90
+            and (probability_negative or probability is None)
+        ):
+            state, reason = "absent", "true_absence_confirmed"
+        else:
+            state, reason = "uncertain", "insufficient_negative_evidence"
+    rule = "geometry_or_relative_probability_or_surface_present; multi_negative_valid_observation_absent"
+    return RoadExistenceEvidence(
+        geometry_coverage=geometry_coverage,
+        surface_coverage=surface_coverage,
+        valid_coverage=valid_coverage,
+        existence_state=state,
+        existence_reason=reason,
+        evidence_rule=rule,
+        **probability_values,
+    )
+
+
+def cross_period_change_decision(
+    before: RoadExistenceEvidence,
+    after: RoadExistenceEvidence,
+    requested_change_type: str,
+) -> tuple[str, str]:
+    if requested_change_type == "added" and before.existence_state == "absent" and after.existence_state == "present":
+        return "auto", "dual_period_confirmed_change"
+    if requested_change_type == "removed" and before.existence_state == "present" and after.existence_state == "absent":
+        return "auto", "dual_period_confirmed_change"
+    reasons = {before.existence_reason, after.existence_reason}
+    if "invalid_or_nodata_reference" in reasons:
+        return "review", "invalid_or_nodata_reference"
+    if "reference_centerline_missing_but_probability_present" in reasons:
+        return "review", "reference_centerline_missing_but_probability_present"
+    if "reference_centerline_missing_but_surface_present" in reasons:
+        return "review", "reference_centerline_missing_but_surface_present"
+    if "insufficient_negative_evidence" in reasons:
+        return "review", "insufficient_negative_evidence"
+    if before.existence_state == after.existence_state == "present":
+        return "review", "cross_sensor_extraction_disagreement"
+    return "review", "geometry_mismatch_only"
+
+
+def evidence_audit_fields(before: RoadExistenceEvidence, after: RoadExistenceEvidence) -> dict:
+    return {
+        "before_state": before.existence_state,
+        "after_state": after.existence_state,
+        "before_geom_cov": before.geometry_coverage,
+        "after_geom_cov": after.geometry_coverage,
+        "before_center_evidence": before.center_probability_mean,
+        "after_center_evidence": after.center_probability_mean,
+        "before_center_pct": before.scene_percentile_rank,
+        "after_center_pct": after.scene_percentile_rank,
+        "before_contrast": before.local_probability_contrast,
+        "after_contrast": after.local_probability_contrast,
+        "before_surface_cov": before.surface_coverage,
+        "after_surface_cov": after.surface_coverage,
+        "before_valid_cov": before.valid_coverage,
+        "after_valid_cov": after.valid_coverage,
+        "evidence_rule": before.evidence_rule,
+    }

@@ -38,7 +38,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".img", ".jp2", ".vrt", ".png", ".jpg", ".jpeg", ".bmp"}
 DIRECT_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-PIPELINE_VERSION = "2026.08-user-batch-5-canonical-corridor-change"
+PIPELINE_VERSION = "2026.08-user-batch-6-cross-period-existence-evidence"
 
 PERIOD_STAGE_DEFINITIONS = (
     ("centerline", "道路提取"),
@@ -249,6 +249,7 @@ def _ensure_extract_manifest_fields(result: dict | None) -> dict:
         ("width_segments", "road_width_segments.shp"),
         ("corridors", "road_corridors.shp"),
         ("valid_observation", "valid_observation.shp"),
+        ("road_probability", "road_probability.tif"),
     ):
         if not payload.get(key) and products is not None and (products / name).is_file():
             payload[key] = str((products / name).resolve())
@@ -1886,6 +1887,84 @@ def _write_valid_observation_area(image_dir: Path, output: Path) -> str | None:
     return str(output.resolve())
 
 
+def _write_probability_mosaic(
+    image_dir: Path,
+    probability_dir: Path,
+    output: Path,
+    suffix: str = "_centerline_probability.png",
+) -> str | None:
+    """Georeference already-produced SAMRoad probability PNGs without inference."""
+    import numpy as np
+    import rasterio
+    from PIL import Image
+    from rasterio.transform import from_origin
+    from rasterio.warp import Resampling, reproject
+
+    sources = []
+    for image_path in listed_rasters(image_dir):
+        probability_path = probability_dir / f"{image_path.stem}{suffix}"
+        if not probability_path.is_file():
+            continue
+        try:
+            with rasterio.open(image_path) as dataset:
+                probability = np.asarray(Image.open(probability_path).convert("L"), dtype=np.uint8)
+                if probability.shape != dataset.shape or dataset.crs is None:
+                    continue
+                sources.append({
+                    "probability": probability,
+                    "valid": dataset.dataset_mask() > 0,
+                    "transform": dataset.transform,
+                    "crs": dataset.crs,
+                    "bounds": dataset.bounds,
+                    "xres": abs(float(dataset.transform.a)),
+                    "yres": abs(float(dataset.transform.e)),
+                })
+        except (OSError, ValueError, rasterio.errors.RasterioError):
+            continue
+    if not sources:
+        return None
+    target_crs = sources[0]["crs"]
+    compatible = [source for source in sources if source["crs"] == target_crs]
+    if not compatible:
+        return None
+    xres = float(np.median([source["xres"] for source in compatible]))
+    yres = float(np.median([source["yres"] for source in compatible]))
+    left = min(source["bounds"].left for source in compatible)
+    bottom = min(source["bounds"].bottom for source in compatible)
+    right = max(source["bounds"].right for source in compatible)
+    top = max(source["bounds"].top for source in compatible)
+    width = max(1, int(np.ceil((right - left) / xres)))
+    height = max(1, int(np.ceil((top - bottom) / yres)))
+    transform = from_origin(left, top, xres, yres)
+    mosaic = np.zeros((height, width), dtype=np.uint8)
+    valid = np.zeros((height, width), dtype=np.uint8)
+    for source in compatible:
+        reproject(
+            source["probability"], mosaic,
+            src_transform=source["transform"], src_crs=source["crs"],
+            dst_transform=transform, dst_crs=target_crs,
+            resampling=Resampling.bilinear, init_dest_nodata=False,
+        )
+        reproject(
+            source["valid"].astype(np.uint8) * 255, valid,
+            src_transform=source["transform"], src_crs=source["crs"],
+            dst_transform=transform, dst_crs=target_crs,
+            resampling=Resampling.nearest, init_dest_nodata=False,
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        output, "w", driver="GTiff", width=width, height=height, count=1,
+        dtype="uint8", crs=target_crs, transform=transform, compress="deflate",
+    ) as dataset:
+        dataset.write(mosaic, 1)
+        dataset.write_mask(valid)
+        dataset.update_tags(
+            evidence_type="SAMRoad scene-relative road probability",
+            source="existing per-tile probability products; no inference rerun",
+        )
+    return str(output.resolve())
+
+
 def extract(args: argparse.Namespace) -> dict:
     started = time.monotonic()
     workspace = Path(args.workspace).expanduser().resolve()
@@ -2057,12 +2136,16 @@ def extract(args: argparse.Namespace) -> dict:
     })
     write_json(period_state_path, period_state)
     valid_observation = _write_valid_observation_area(images, products / "valid_observation.shp")
+    road_probability = _write_probability_mosaic(
+        images, width_dir, products / "road_probability.tif",
+    )
     result = _ensure_extract_manifest_fields({
         "workspace": str(workspace), "run_id": run_id, "run_root": str(run_root),
         "centerlines": str(centerline), "surfaces": str(surface), "gpkg": str(gpkg),
         "width_segments": str(products / "road_width_segments.shp"),
         "corridors": str(products / "road_corridors.shp"),
         "valid_observation": valid_observation,
+        "road_probability": road_probability,
         "width_review": str(width_dir), "final_dir": str(final_dir),
         "period_state": str(period_state_path),
     })
@@ -2095,6 +2178,8 @@ def change(args: argparse.Namespace) -> dict:
         ("--after-width-segments", "width_segments", after),
         ("--before-valid-area", "valid_observation", before),
         ("--after-valid-area", "valid_observation", after),
+        ("--before-probability", "road_probability", before),
+        ("--after-probability", "road_probability", after),
     ):
         value = str(payload.get(key, "") or "").strip()
         if value and Path(value).expanduser().is_file():
@@ -3662,6 +3747,7 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--pixel-size", default="0.0"); a.add_argument("--rescale", choices=["on", "off"], default="off")
     a.add_argument("--junction-node-mode", choices=["sparse", "dense_legacy"], default="sparse")
     a.add_argument("--run-id", default="")
+    a.add_argument("--resume", action="store_true")
     a = sub.add_parser("change", help="两期道路宽度变化检测")
     a.add_argument("--before-result", required=True); a.add_argument("--after-result", required=True); a.add_argument("--output", required=True)
     a.add_argument("--before-period", default="before"); a.add_argument("--after-period", default="after")

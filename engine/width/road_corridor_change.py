@@ -21,6 +21,12 @@ from road_pair_matcher import (
     direction_similarity,
     match_road_segments,
 )
+from road_existence_evidence import (
+    RoadProbabilityRaster,
+    cross_period_change_decision,
+    evidence_audit_fields,
+    evaluate_road_existence_evidence,
+)
 
 
 def _parts(geometry: BaseGeometry, family: str) -> Iterable[BaseGeometry]:
@@ -217,6 +223,8 @@ def detect_corridor_changes(
     after_width_segments: gpd.GeoDataFrame | None = None,
     before_valid: BaseGeometry | None = None,
     after_valid: BaseGeometry | None = None,
+    before_probability: RoadProbabilityRaster | None = None,
+    after_probability: RoadProbabilityRaster | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, dict, dict[str, gpd.GeoDataFrame]]:
     crs = before.crs
     before_segments = build_width_segments(before, before_width_segments)
@@ -247,6 +255,8 @@ def detect_corridor_changes(
         common_valid = make_valid(before_valid)
     elif after_valid is not None:
         common_valid = make_valid(after_valid)
+    before_network_cover = build_network_cover(before_segments, config.position_tolerance)
+    after_network_cover = build_network_cover(after_segments, config.position_tolerance)
 
     reliable_pairs: list[dict] = []
     before_intervals: dict[int, list[tuple[float, float]]] = defaultdict(list)
@@ -326,10 +336,29 @@ def detect_corridor_changes(
             and same_direction_ratio >= config.width_same_direction_ratio
             and relative <= config.width_change_max_ratio
         ):
+            before_evidence = evaluate_road_existence_evidence(
+                pair["canonical"], centerline_cover=before_network_cover,
+                road_surface=before_surface, valid_area=before_valid,
+                probability=before_probability, crs=crs, road_width=before_width,
+                position_tolerance=config.position_tolerance,
+            )
+            after_evidence = evaluate_road_existence_evidence(
+                pair["canonical"], centerline_cover=after_network_cover,
+                road_surface=after_surface, valid_area=after_valid,
+                probability=after_probability, crs=crs, road_width=after_width,
+                position_tolerance=config.position_tolerance,
+            )
+            evidence_qa = (
+                "auto"
+                if before_evidence.existence_state == after_evidence.existence_state == "present"
+                else "review"
+            )
             width_candidates.append({
                 **common, "canonical": pair["canonical"], "before_part": pair["before_part"],
                 "after_part": pair["after_part"], "sign": 1 if width_delta > 0 else -1,
                 "valid_ratio": valid_ratio, "same_dir": same_direction_ratio,
+                "qa_state": "review" if qa_state == "review" or evidence_qa == "review" else "auto",
+                "evidence_fields": evidence_audit_fields(before_evidence, after_evidence),
             })
 
     positive_rows: list[dict] = []
@@ -361,23 +390,29 @@ def detect_corridor_changes(
             "width_diff": float(np.median([row["width_diff"] for row in selected])),
             "qa_state": "review" if any(row["qa_state"] == "review" for row in selected) else "auto",
             "audit_reason": "local_width_change_thresholds_met",
+            **selected[0].get("evidence_fields", {}),
         }
         _append_change(target_rows, geometry, max(config.min_polygon_area, config.width_min_polygon_area), values)
 
-    before_network_cover = build_network_cover(before_segments, config.position_tolerance)
-    after_network_cover = build_network_cover(after_segments, config.position_tolerance)
     presence_confirmed = presence_review = 0
+    audit_counts = defaultdict(int)
+    raw_unmatched_length = 0.0
 
     def append_uncovered(
         source_segments: gpd.GeoDataFrame,
+        source_network_cover: BaseGeometry | None,
         reference_network_cover: BaseGeometry | None,
         source_surface: BaseGeometry | None,
         reference_surface: BaseGeometry | None,
+        source_valid: BaseGeometry | None,
+        reference_valid: BaseGeometry | None,
+        source_probability: RoadProbabilityRaster | None,
+        reference_probability: RoadProbabilityRaster | None,
         change_type: str,
         period: str,
         target: list[dict],
     ) -> None:
-        nonlocal presence_confirmed, presence_review
+        nonlocal presence_confirmed, presence_review, raw_unmatched_length
         source_lines = [geometry for geometry in source_segments.geometry if not geometry.is_empty]
         if not source_lines:
             return
@@ -386,12 +421,11 @@ def detect_corridor_changes(
             source_network if reference_network_cover is None
             else source_network.difference(reference_network_cover)
         )
-        if common_valid is not None:
-            uncovered = make_valid(uncovered.intersection(common_valid))
         uncovered = line_merge(uncovered)
         for part_index, line_part in enumerate(_parts(uncovered, "line")):
             if float(line_part.length) < config.min_line_length:
                 continue
+            raw_unmatched_length += float(line_part.length)
             contributors = source_segments.loc[
                 source_segments.geometry.map(
                     lambda geometry: float(geometry.intersection(line_part.buffer(1e-6)).length) > 1e-6
@@ -412,35 +446,51 @@ def detect_corridor_changes(
                 str(value) for value in contributors.get("line_source", pd.Series(dtype="object"))
             }
             corridor = line_part.buffer(width * 0.5, cap_style="flat", join_style="round")
-            if common_valid is not None:
-                corridor = make_valid(corridor.intersection(common_valid))
-            source_coverage = _surface_coverage(line_part, source_surface, config.position_tolerance)
-            reference_coverage = _surface_coverage(line_part, reference_surface, config.position_tolerance)
-            has_surface_evidence = source_surface is not None and reference_surface is not None
-            source_supported = source_coverage >= 0.60
-            reference_supported = reference_coverage > 0.20
-            reliable_source = (
-                "review" not in qa_values
-                and "C" not in quality_values
-                and "connector" not in source_values
+            source_evidence = evaluate_road_existence_evidence(
+                line_part, centerline_cover=source_network_cover, road_surface=source_surface,
+                valid_area=source_valid, probability=source_probability, crs=crs,
+                road_width=width, position_tolerance=config.position_tolerance,
             )
-            confirmed = reliable_source and (
-                not has_surface_evidence or (source_supported and not reference_supported)
+            reference_evidence = evaluate_road_existence_evidence(
+                line_part, centerline_cover=reference_network_cover, road_surface=reference_surface,
+                valid_area=reference_valid, probability=reference_probability, crs=crs,
+                road_width=width, position_tolerance=config.position_tolerance,
             )
-            reasons = []
-            if has_surface_evidence and source_supported and reference_supported:
-                reasons.append("centerline_extraction_mismatch")
-            else:
-                if has_surface_evidence and not source_supported:
-                    reasons.append("source_surface_support_low")
-                if has_surface_evidence and reference_supported:
-                    reasons.append("reference_surface_residual")
-            if "C" in quality_values:
-                reasons.append("low_width_quality")
-            if "connector" in source_values:
-                reasons.append("connector_source")
+            before_evidence, after_evidence = (
+                (reference_evidence, source_evidence)
+                if change_type == "added" else (source_evidence, reference_evidence)
+            )
+            qa_state, audit_reason = cross_period_change_decision(
+                before_evidence, after_evidence, change_type,
+            )
+            reliable_source = "review" not in qa_values and "connector" not in source_values
+            if not reliable_source:
+                qa_state = "review"
+                audit_reason = "geometry_mismatch_only"
+            confirmed = qa_state == "auto"
             presence_confirmed += int(confirmed)
             presence_review += int(not confirmed)
+            audit_counts["geometry_only_added_candidates" if change_type == "added" else "geometry_only_removed_candidates"] += 1
+            audit_counts["confirmed_absent_count"] += int(
+                before_evidence.existence_state == "absent" or after_evidence.existence_state == "absent"
+            )
+            audit_counts["uncertain_count"] += int(
+                "uncertain" in {before_evidence.existence_state, after_evidence.existence_state}
+            )
+            audit_counts["present_by_probability_count"] += int(
+                "probability_present" in before_evidence.existence_reason
+                or "probability_present" in after_evidence.existence_reason
+            )
+            audit_counts["present_by_surface_count"] += int(
+                "surface_present" in before_evidence.existence_reason
+                or "surface_present" in after_evidence.existence_reason
+            )
+            audit_counts["suppressed_extraction_disagreement_count"] += int(
+                not confirmed and (
+                    reference_evidence.existence_state == "present"
+                    or reference_evidence.existence_state == "uncertain"
+                )
+            )
             source_ids = sorted(str(value) for value in contributors.get("segment_id", contributors.index))
             _append_change(target, corridor, config.min_polygon_area, {
                 "change_typ": change_type,
@@ -451,19 +501,21 @@ def detect_corridor_changes(
                 "before_w": width if change_type == "removed" else 0.0,
                 "after_w": width if change_type == "added" else 0.0,
                 "width_diff": width if change_type == "added" else -width,
-                "qa_state": "auto" if confirmed else "review",
-                "audit_reason": ";".join(reasons) if reasons else "reliable_network_uncovered_road",
+                "qa_state": qa_state,
+                "audit_reason": audit_reason,
                 "line_source": "connector" if "connector" in source_values else "samroad",
                 "quality_gr": max(quality_values) if quality_values else "C",
-                "source_cov": source_coverage, "refer_cov": reference_coverage,
+                **evidence_audit_fields(before_evidence, after_evidence),
             })
 
     append_uncovered(
-        after_segments, before_network_cover, after_surface, before_surface,
+        after_segments, after_network_cover, before_network_cover, after_surface, before_surface,
+        after_valid, before_valid, after_probability, before_probability,
         "added", after_period, positive_rows,
     )
     append_uncovered(
-        before_segments, after_network_cover, before_surface, after_surface,
+        before_segments, before_network_cover, after_network_cover, before_surface, after_surface,
+        before_valid, after_valid, before_probability, after_probability,
         "removed", before_period, negative_rows,
     )
 
@@ -519,7 +571,7 @@ def detect_corridor_changes(
     ], ignore_index=True), geometry="geometry", crs=crs)
     period_corridors = gpd.GeoDataFrame(pd.concat([before_corridors, after_corridors], ignore_index=True), geometry="geometry", crs=crs)
     summary = {
-        "classification_method": "whole_network_presence_and_strict_match_canonical_axis_width",
+        "classification_method": "two_stage_geometry_candidate_then_symmetric_existence_evidence",
         "matched_centerline_count": len(reliable_pairs),
         "width_changed_centerline_count": width_changed_count,
         "width_change_absolute_m": config.width_change_absolute,
@@ -536,6 +588,8 @@ def detect_corridor_changes(
         "presence_confirmed_count": presence_confirmed,
         "presence_review_count": presence_review,
         "presence_suppressed_low_confidence_count": 0,
+        "raw_unmatched_length": raw_unmatched_length,
+        **dict(audit_counts),
         "valid_observation_intersection_applied": common_valid is not None,
         "actual_surface_source": before_surface is not None and after_surface is not None,
         **match_metadata,
