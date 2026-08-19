@@ -69,6 +69,7 @@ class DetectionConfig:
     width_exclude_low_quality: bool = True
     width_min_valid_ratio: float = 0.60
     width_same_direction_ratio: float = 0.70
+    allow_legacy_absence_without_valid_mask: bool = False
 
 
 def _clean_geometries(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -250,6 +251,12 @@ def _detect_centerline_width_changes(
     before_surface_union: BaseGeometry,
     after_surface_union: BaseGeometry,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
+    """Deprecated legacy detector retained only for import compatibility.
+
+    Formal change detection is routed through ``detect_corridor_changes`` and
+    ``road_existence_evidence`` in ``_detect_changes_internal``.  This fixed
+    surface-threshold implementation must not be used for formal products.
+    """
     before_geometries = np.asarray(before.geometry.values, dtype=object)
     after_geometries = np.asarray(after.geometry.values, dtype=object)
     before_tree = STRtree(before_geometries) if len(before_geometries) else None

@@ -25,7 +25,8 @@ class RoadExistenceEvidence:
     scene_percentile_rank: float | None
     background_percentile_rank: float | None
     surface_coverage: float | None
-    valid_coverage: float
+    valid_coverage: float | None
+    validity_known: bool
     existence_state: str
     existence_reason: str
     evidence_rule: str
@@ -167,6 +168,7 @@ def evaluate_road_existence_evidence(
     crs=None,
     road_width: float = 0.0,
     position_tolerance: float = 3.0,
+    allow_legacy_absence_without_valid_mask: bool = False,
 ) -> RoadExistenceEvidence:
     """Classify one period as present, absent or uncertain on a known road axis.
 
@@ -175,7 +177,11 @@ def evaluate_road_existence_evidence(
     """
     geometry_coverage = float(_line_coverage(candidate_axis, centerline_cover) or 0.0)
     surface_coverage = _line_coverage(candidate_axis, road_surface)
-    valid_coverage = float(_line_coverage(candidate_axis, valid_area) if valid_area is not None else 1.0)
+    validity_known = valid_area is not None
+    valid_coverage = (
+        float(_line_coverage(candidate_axis, valid_area))
+        if validity_known else None
+    )
     probability_values = {
         "center_probability_mean": None, "center_probability_q25": None,
         "local_background_probability": None, "local_probability_contrast": None,
@@ -198,13 +204,13 @@ def evaluate_road_existence_evidence(
         center_pct - background_pct
         if center_pct is not None and background_pct is not None else None
     )
+    local_contrast = probability_values["local_probability_contrast"]
     probability_present = bool(
         center_pct is not None
         and scene_dynamic is not None and scene_dynamic >= 0.01
-        and (
-            (center_pct >= 0.85 and (percentile_separation is None or percentile_separation >= 0.10))
-            or (center_pct >= 0.95)
-        )
+        and center_pct >= 0.85
+        and percentile_separation is not None and percentile_separation >= 0.10
+        and local_contrast is not None and local_contrast > 0.0
     )
     surface_present = surface_coverage is not None and surface_coverage >= 0.55
 
@@ -214,7 +220,9 @@ def evaluate_road_existence_evidence(
         state, reason = "present", "reference_centerline_missing_but_probability_present"
     elif surface_present:
         state, reason = "present", "reference_centerline_missing_but_surface_present"
-    elif valid_coverage < 0.80:
+    elif not validity_known and not allow_legacy_absence_without_valid_mask:
+        state, reason = "uncertain", "valid_observation_unknown"
+    elif valid_coverage is not None and valid_coverage < 0.80:
         state, reason = "uncertain", "invalid_or_nodata_reference"
     else:
         probability_negative = bool(
@@ -232,7 +240,11 @@ def evaluate_road_existence_evidence(
         surface_negative = surface_coverage is not None and surface_coverage <= 0.10
         geometry_negative = geometry_coverage <= 0.10
         if (
-            geometry_negative and surface_negative and valid_coverage >= 0.90
+            geometry_negative and surface_negative
+            and (
+                (valid_coverage is not None and valid_coverage >= 0.90)
+                or (not validity_known and allow_legacy_absence_without_valid_mask)
+            )
             and (probability_negative or probability is None)
         ):
             state, reason = "absent", "true_absence_confirmed"
@@ -243,6 +255,7 @@ def evaluate_road_existence_evidence(
         geometry_coverage=geometry_coverage,
         surface_coverage=surface_coverage,
         valid_coverage=valid_coverage,
+        validity_known=validity_known,
         existence_state=state,
         existence_reason=reason,
         evidence_rule=rule,
@@ -262,6 +275,8 @@ def cross_period_change_decision(
     reasons = {before.existence_reason, after.existence_reason}
     if "invalid_or_nodata_reference" in reasons:
         return "review", "invalid_or_nodata_reference"
+    if "valid_observation_unknown" in reasons:
+        return "review", "valid_observation_unknown"
     if "reference_centerline_missing_but_probability_present" in reasons:
         return "review", "reference_centerline_missing_but_probability_present"
     if "reference_centerline_missing_but_surface_present" in reasons:
@@ -289,5 +304,7 @@ def evidence_audit_fields(before: RoadExistenceEvidence, after: RoadExistenceEvi
         "after_surface_cov": after.surface_coverage,
         "before_valid_cov": before.valid_coverage,
         "after_valid_cov": after.valid_coverage,
+        "before_valid_known": before.validity_known,
+        "after_valid_known": after.validity_known,
         "evidence_rule": before.evidence_rule,
     }

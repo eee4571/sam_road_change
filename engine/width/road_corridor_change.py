@@ -341,12 +341,18 @@ def detect_corridor_changes(
                 road_surface=before_surface, valid_area=before_valid,
                 probability=before_probability, crs=crs, road_width=before_width,
                 position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
             )
             after_evidence = evaluate_road_existence_evidence(
                 pair["canonical"], centerline_cover=after_network_cover,
                 road_surface=after_surface, valid_area=after_valid,
                 probability=after_probability, crs=crs, road_width=after_width,
                 position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
             )
             evidence_qa = (
                 "auto"
@@ -450,11 +456,17 @@ def detect_corridor_changes(
                 line_part, centerline_cover=source_network_cover, road_surface=source_surface,
                 valid_area=source_valid, probability=source_probability, crs=crs,
                 road_width=width, position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
             )
             reference_evidence = evaluate_road_existence_evidence(
                 line_part, centerline_cover=reference_network_cover, road_surface=reference_surface,
                 valid_area=reference_valid, probability=reference_probability, crs=crs,
                 road_width=width, position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
             )
             before_evidence, after_evidence = (
                 (reference_evidence, source_evidence)

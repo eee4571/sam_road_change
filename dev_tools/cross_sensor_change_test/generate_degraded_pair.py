@@ -40,6 +40,29 @@ def write_rgb(path: Path, rgb: np.ndarray, profile: dict, mask: np.ndarray) -> N
         dataset.write_mask(mask)
 
 
+def paint_controlled_road(rgb: np.ndarray, row0: int, row1: int, col0: int, col1: int) -> np.ndarray:
+    result = rgb.copy()
+    neighborhood = result[max(0, row0 - 24):max(1, row0 - 4), col0:col1]
+    local = np.median(neighborhood, axis=(0, 1)) if neighborhood.size else np.asarray([128] * 3)
+    road_color = np.clip(local * 0.45 + 42, 0, 255).astype(np.uint8)
+    result[row0:row1, col0:col1] = road_color
+    center = (row0 + row1) // 2
+    result[max(row0, center - 1):min(row1, center + 2), col0:col1] = np.clip(
+        road_color.astype(np.int16) + 55, 0, 255
+    ).astype(np.uint8)
+    return result
+
+
+def erase_controlled_corridor(rgb: np.ndarray, row0: int, row1: int, col0: int, col1: int) -> np.ndarray:
+    result = rgb.copy()
+    top = result[max(0, row0 - 24):max(1, row0 - 4), col0:col1]
+    bottom = result[min(result.shape[0] - 1, row1 + 4):min(result.shape[0], row1 + 24), col0:col1]
+    samples = [part.reshape(-1, 3) for part in (top, bottom) if part.size]
+    fill = np.median(np.concatenate(samples, axis=0), axis=0) if samples else np.asarray([128] * 3)
+    result[row0:row1, col0:col1] = np.clip(fill, 0, 255).astype(np.uint8)
+    return result
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Create a geometry-preserving sensor-style A/B image pair.")
     parser.add_argument("--input", required=True)
@@ -68,24 +91,22 @@ def main(argv=None) -> int:
         mask = source.dataset_mask()
         profile = source.profile
         transform, crs = source.transform, source.crs
-    before = rgb.copy()
-    after = degrade(
-        rgb, scale=args.scale, blur=args.blur, brightness=args.brightness,
-        contrast=args.contrast, gamma=args.gamma, channel_scale=tuple(args.channel_scale),
-        noise=args.noise, seed=args.seed,
-    )
     height, width = rgb.shape[:2]
     row0, row1 = int(height * 0.46), max(int(height * 0.46) + 5, int(height * 0.49))
     col0, col1 = int(width * 0.18), int(width * 0.82)
     truth_path = None
+    before_source = rgb.copy()
+    after_source = rgb.copy()
     if args.change != "none":
+        # Both periods start from the same explicitly cleared corridor, so the
+        # synthetic direction never depends on whatever happened to exist at a
+        # fixed location in the source image.
+        before_source = erase_controlled_corridor(before_source, row0, row1, col0, col1)
+        after_source = erase_controlled_corridor(after_source, row0, row1, col0, col1)
         if args.change == "added":
-            local = np.median(after[max(0, row0 - 20):row0, col0:col1], axis=(0, 1))
-            road_color = np.clip(local * 1.35 + 25, 0, 255).astype(np.uint8)
-            after[row0:row1, col0:col1] = road_color
+            after_source = paint_controlled_road(after_source, row0, row1, col0, col1)
         else:
-            local = np.median(before[max(0, row0 - 20):row0, col0:col1], axis=(0, 1))
-            before[row0:row1, col0:col1] = np.clip(local, 0, 255).astype(np.uint8)
+            before_source = paint_controlled_road(before_source, row0, row1, col0, col1)
         left, top = transform * (col0, row0)
         right, bottom = transform * (col1, row1)
         truth = gpd.GeoDataFrame(
@@ -93,6 +114,12 @@ def main(argv=None) -> int:
         )
         truth_path = output / f"truth_{args.change}.shp"
         truth.to_file(truth_path, driver="ESRI Shapefile", encoding="UTF-8")
+    before = before_source
+    after = degrade(
+        after_source, scale=args.scale, blur=args.blur, brightness=args.brightness,
+        contrast=args.contrast, gamma=args.gamma, channel_scale=tuple(args.channel_scale),
+        noise=args.noise, seed=args.seed,
+    )
     write_rgb(output / "A_original.tif", before, profile, mask)
     write_rgb(output / "B_degraded.tif", after, profile, mask)
     print(f"before={output / 'A_original.tif'}")

@@ -2150,6 +2150,21 @@ def extract(args: argparse.Namespace) -> dict:
         "period_state": str(period_state_path),
     })
     result["fusion"] = build_fusion_metadata(final_dir)
+    profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
+    if profile_decisions_path.is_file():
+        profile_payload = read_json(profile_decisions_path)
+        result["profile_selection"] = {
+            "mode": profile_payload.get("requested_profile", "default"),
+            "selection_mode": profile_payload.get("profile_selection_mode", "manual"),
+            "diagnostic_reference_profile": profile_payload.get(
+                "diagnostic_reference_profile", "default"
+            ),
+            "default_count": int(profile_payload.get("default_image_count", 0)),
+            "weak_sensor_count": int(profile_payload.get("weak_sensor_image_count", 0)),
+            "mixed": bool(profile_payload.get("mixed_profile", False)),
+            "decisions_path": str(profile_decisions_path.resolve()),
+            "decisions": profile_payload.get("decisions", []),
+        }
     result["stage_timings"] = stage_timings
     result["elapsed_seconds"] = elapsed_seconds(started)
     result["completed_at"] = now_text()

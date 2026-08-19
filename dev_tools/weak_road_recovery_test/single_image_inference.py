@@ -105,7 +105,10 @@ def filter_graph_to_image_bounds(nodes, edges, height, width, scores):
     )
 
 
-def infer_one_image(model, image: np.ndarray, config, device: torch.device, timing: dict):
+def infer_one_image(
+    model, image: np.ndarray, config, device: torch.device, timing: dict,
+    diagnostic_shape=None,
+):
     """Independent single-image orchestration using the formal model and graph code."""
     height, width = image.shape[:2]
     patch_size = int(config.PATCH_SIZE)
@@ -149,6 +152,14 @@ def infer_one_image(model, image: np.ndarray, config, device: torch.device, timi
     timing["samroad_mask_seconds"] = time.perf_counter() - mask_started
 
     topology_started = time.perf_counter()
+    diagnostic_probability = road_u8
+    if diagnostic_shape is not None:
+        diagnostic_probability = road_u8[:diagnostic_shape[0], :diagnostic_shape[1]]
+    if str(config.get("ROAD_THRESHOLD_PROFILE", "default")) == "auto":
+        decision = graph_extraction.resolve_effective_road_profile(
+            diagnostic_probability, config
+        )
+        config.ROAD_THRESHOLD_PROFILE = decision["effective_profile"]
     graph_points = graph_extraction.extract_graph_points(keypoint_u8, road_u8, config)
     if not len(graph_points):
         timing["topology_seconds"] = time.perf_counter() - topology_started

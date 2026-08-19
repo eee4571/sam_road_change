@@ -247,7 +247,12 @@ def _apply_overrides(config, arguments: argparse.Namespace) -> None:
         arguments.road_high_threshold is not None or arguments.road_low_threshold is not None
     )
     if threshold_overridden:
-        resolved_high, resolved_low, _profile = graph_extraction.resolve_road_thresholds(config)
+        base_profile = str(config.get("ROAD_THRESHOLD_PROFILE", "default"))
+        if base_profile == "auto":
+            base_profile = str(config.get("SCENE_DIAGNOSTIC_REFERENCE_PROFILE", "default"))
+        resolved_high, resolved_low, _profile = graph_extraction.resolve_road_thresholds(
+            config, profile_name=base_profile
+        )
         high = arguments.road_high_threshold if arguments.road_high_threshold is not None else resolved_high
         low = arguments.road_low_threshold if arguments.road_low_threshold is not None else resolved_low
         if not (np.isclose(high, resolved_high) and np.isclose(low, resolved_low)):
@@ -686,7 +691,8 @@ def main(argv: list[str] | None = None) -> int:
             original_nodes, original_edges, original_scores,
             intersection_probability, road_probability_u8,
         ) = single_image_inference.infer_one_image(
-            model, padded, config, device=device, timing=inference_timing
+            model, padded, config, device=device, timing=inference_timing,
+            diagnostic_shape=image_rgb.shape[:2],
         )
         height, width = image_rgb.shape[:2]
         road_probability_u8 = road_probability_u8[:height, :width]
@@ -702,6 +708,10 @@ def main(argv: list[str] | None = None) -> int:
         write_original_scores(
             run_dir / "original_edge_scores.csv", original_nodes, original_edges, original_scores
         )
+
+    if str(config.get("ROAD_THRESHOLD_PROFILE", "default")) == "auto":
+        decision = graph_extraction.resolve_effective_road_profile(road_probability, config)
+        config.ROAD_THRESHOLD_PROFILE = decision["effective_profile"]
 
     _progress("Scene diagnosis, weak-network bootstrap, and weak recovery...")
     recovery_started = time.perf_counter()

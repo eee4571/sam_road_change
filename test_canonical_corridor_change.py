@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import geopandas as gpd
@@ -24,6 +25,7 @@ from road_change_detection import (  # noqa: E402
     _write_outputs,
     detect_changes,
 )
+import road_change_detection  # noqa: E402
 import user_pipeline  # noqa: E402
 
 
@@ -47,6 +49,23 @@ def surfaces(lines, widths):
 
 
 class CanonicalCorridorChangeTests(unittest.TestCase):
+    def test_formal_detection_never_calls_legacy_surface_presence_detector(self):
+        line = LineString([(0, 0), (100, 0)])
+        with mock.patch.object(
+            road_change_detection,
+            "_detect_centerline_width_changes",
+            side_effect=AssertionError("legacy presence path was called"),
+        ):
+            _positive, _negative, summary = detect_changes(
+                roads([(line, 6, "A")]), roads([(line, 6, "A")]),
+                before_surfaces=surfaces([line], [6]),
+                after_surfaces=surfaces([line], [6]),
+            )
+        self.assertEqual(
+            summary["classification_method"],
+            "two_stage_geometry_candidate_then_symmetric_existence_evidence",
+        )
+
     def test_offset_same_width_has_no_width_change(self):
         before_line = LineString([(0, 0), (100, 0)])
         after_line = LineString([(0, 1.8), (100, 1.8)])
@@ -161,6 +180,12 @@ class CanonicalCorridorChangeTests(unittest.TestCase):
             before, after,
             before_surfaces=surfaces([existing], [6]),
             after_surfaces=surfaces([existing, new_road], [6, 6]),
+            before_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=before.crs
+            ),
+            after_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=after.crs
+            ),
         )
         added = positive.loc[
             (positive["change_typ"] == "added") & (positive["qa_state"] == "auto")
@@ -208,6 +233,12 @@ class CanonicalCorridorChangeTests(unittest.TestCase):
             before, after,
             before_surfaces=surfaces([existing, removed_road], [6, 6]),
             after_surfaces=surfaces([existing], [6]),
+            before_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=before.crs
+            ),
+            after_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=after.crs
+            ),
         )
         removed = negative.loc[
             (negative["change_typ"] == "removed") & (negative["qa_state"] == "auto")

@@ -16,7 +16,10 @@ if str(WIDTH) not in sys.path:
     sys.path.insert(0, str(WIDTH))
 
 from road_change_detection import detect_changes  # noqa: E402
-from road_existence_evidence import RoadProbabilityRaster  # noqa: E402
+from road_existence_evidence import (  # noqa: E402
+    RoadProbabilityRaster,
+    evaluate_road_existence_evidence,
+)
 
 
 CRS = "EPSG:3857"
@@ -54,6 +57,42 @@ def probability(lines=(), scale=1.0, noise=0.0):
 
 
 class CrossSensorExistenceEvidenceTests(unittest.TestCase):
+    def test_missing_valid_observation_cannot_confirm_absence(self):
+        evidence = evaluate_road_existence_evidence(
+            EXISTING,
+            centerline_cover=None,
+            road_surface=surfaces([CHANGED]).geometry.iloc[0],
+            valid_area=None,
+            probability=probability([]),
+            crs=CRS,
+            road_width=6.0,
+        )
+        self.assertFalse(evidence.validity_known)
+        self.assertIsNone(evidence.valid_coverage)
+        self.assertEqual(evidence.existence_state, "uncertain")
+        self.assertEqual(evidence.existence_reason, "valid_observation_unknown")
+
+    def test_scene_top_five_percent_without_local_separation_is_not_present(self):
+        values = np.zeros((400, 400), dtype=np.float32)
+        transform = from_origin(-50, 100, 1, 1)
+        # Cover both the candidate corridor and its local-background annulus
+        # with the same high response.  It is globally rare but not road-like
+        # relative to its surroundings.
+        values[80:121, 45:156] = 0.90
+        raster = RoadProbabilityRaster(values, transform, CRS)
+        evidence = evaluate_road_existence_evidence(
+            EXISTING,
+            centerline_cover=None,
+            road_surface=None,
+            valid_area=box(-50, -80, 150, 80),
+            probability=raster,
+            crs=CRS,
+            road_width=6.0,
+        )
+        self.assertGreaterEqual(evidence.scene_percentile_rank, 0.95)
+        self.assertAlmostEqual(evidence.local_probability_contrast, 0.0, places=6)
+        self.assertNotEqual(evidence.existence_state, "present")
+
     def test_case_1_same_imagery_different_segmentation_has_zero_auto_change(self):
         before = roads([EXISTING])
         after = roads([LineString([(0, 0), (48, 0)]), LineString([(52, 0), (100, 0)])])

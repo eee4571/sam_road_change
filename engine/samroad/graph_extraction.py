@@ -134,6 +134,11 @@ def resolve_road_thresholds(config, profile_name=None):
         if profile_name is not None
         else _config_value(config, "ROAD_THRESHOLD_PROFILE", "default")
     )
+    if profile_name == "auto":
+        raise ValueError(
+            "ROAD_THRESHOLD_PROFILE=auto must be resolved from the complete "
+            "road-probability image before thresholds are consumed."
+        )
     profiles = _config_value(config, "ROAD_THRESHOLD_PROFILES", {}) or {}
     profile = profiles.get(profile_name, {}) if hasattr(profiles, "get") else {}
 
@@ -508,17 +513,9 @@ def _trace_skeleton_chains(skeleton):
     return [np.asarray(chain, dtype=np.int32) for chain in chains if len(chain) >= 2]
 
 
-def diagnose_scene_confidence(
-    road_probability,
-    nodes_rc,
-    edges,
-    config,
-    *,
-    distance_scale=1.0,
-):
-    """Describe low-response scenes without changing the selected profile."""
+def diagnose_probability_profile(road_probability, config, *, distance_scale=1.0):
+    """Diagnose one complete probability image using a fixed reference profile."""
     road = _probability01(road_probability)
-    active_high, active_low, active_profile = resolve_road_thresholds(config)
     reference_high, reference_low, reference_profile = resolve_scene_diagnostic_thresholds(config)
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
     low_mask = (road >= reference_low).astype(np.uint8)
@@ -529,12 +526,6 @@ def diagnose_scene_confidence(
         high_mask = cv2.morphologyEx(high_mask, cv2.MORPH_CLOSE, kernel)
     weak_skeleton = skeletonize(low_mask.astype(bool))
     reference_strong_skeleton = skeletonize(high_mask.astype(bool))
-    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
-    graph_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
-    active_graph_length = float(sum(
-        np.linalg.norm(nodes[int(dst_idx)] - nodes[int(src_idx)])
-        for src_idx, dst_idx in graph_edges.tolist()
-    ))
     weak_length = float(np.count_nonzero(weak_skeleton))
     reference_strong_length = float(np.count_nonzero(reference_strong_skeleton))
     high_ratio = float(np.mean(road >= reference_high)) if road.size else 0.0
@@ -556,12 +547,12 @@ def diagnose_scene_confidence(
         state = "normal"
     return {
         "scene_confidence_state": state,
-        "recommended_profile": "weak_sensor" if state != "normal" else "default",
-        "threshold_profile": active_profile,
-        "active_profile": active_profile,
+        # A scene without any usable LOW structure is not recoverable merely by
+        # lowering thresholds; keep the standard profile to avoid background
+        # hallucination.
+        "recommended_profile": "weak_sensor" if state == "low_confidence" else "default",
+        "reference_profile": reference_profile,
         "diagnostic_reference_profile": reference_profile,
-        "active_high_threshold": active_high,
-        "active_low_threshold": active_low,
         "reference_high_threshold": reference_high,
         "reference_low_threshold": reference_low,
         "probability_p50": float(percentiles[0]),
@@ -570,10 +561,92 @@ def diagnose_scene_confidence(
         "probability_p99": float(percentiles[3]),
         "high_pixel_ratio": high_ratio,
         "low_pixel_ratio": low_ratio,
-        "strong_graph_edge_count": int(len(graph_edges)),
-        "strong_graph_total_length": active_graph_length,
         "reference_strong_skeleton_total_length": reference_strong_length,
         "weak_skeleton_total_length": weak_length,
+        "relative_high": relative_high,
+        "relative_strong": relative_strong,
+        "has_low_structure": bool(has_low_structure),
+    }
+
+
+def resolve_effective_road_profile(
+    road_probability,
+    config,
+    *,
+    distance_scale=1.0,
+    requested_profile=None,
+):
+    """Resolve ``auto`` to a real threshold profile for one complete image."""
+    requested = str(
+        requested_profile
+        if requested_profile is not None
+        else _config_value(config, "ROAD_THRESHOLD_PROFILE", "default")
+    )
+    if requested not in {"auto", "default", "weak_sensor"}:
+        raise ValueError(
+            "ROAD_THRESHOLD_PROFILE must be one of auto, default, weak_sensor; "
+            f"got {requested!r}."
+        )
+    diagnosis = diagnose_probability_profile(
+        road_probability, config, distance_scale=distance_scale
+    )
+    effective = diagnosis["recommended_profile"] if requested == "auto" else requested
+    high, low, effective = resolve_road_thresholds(config, profile_name=effective)
+    return {
+        **diagnosis,
+        "requested_profile": requested,
+        "effective_profile": effective,
+        "profile_selection_mode": "automatic" if requested == "auto" else "manual",
+        "road_high_threshold": high,
+        "road_low_threshold": low,
+    }
+
+
+def summarize_profile_decisions(requested_profile, reference_profile, decisions):
+    """Build auditable per-batch profile metadata from per-image decisions."""
+    rows = [dict(row) for row in decisions]
+    default_count = sum(row.get("effective_profile") == "default" for row in rows)
+    weak_count = sum(row.get("effective_profile") == "weak_sensor" for row in rows)
+    requested = str(requested_profile)
+    return {
+        "requested_profile": requested,
+        "profile_selection_mode": "automatic" if requested == "auto" else "manual",
+        "diagnostic_reference_profile": str(reference_profile),
+        "image_count": len(rows),
+        "default_image_count": int(default_count),
+        "weak_sensor_image_count": int(weak_count),
+        "mixed_profile": bool(default_count and weak_count),
+        "decisions": rows,
+    }
+
+
+def diagnose_scene_confidence(
+    road_probability,
+    nodes_rc,
+    edges,
+    config,
+    *,
+    distance_scale=1.0,
+):
+    """Add graph QA fields to the shared probability-only diagnosis."""
+    diagnosis = diagnose_probability_profile(
+        road_probability, config, distance_scale=distance_scale
+    )
+    active_high, active_low, active_profile = resolve_road_thresholds(config)
+    nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
+    graph_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    active_graph_length = float(sum(
+        np.linalg.norm(nodes[int(dst_idx)] - nodes[int(src_idx)])
+        for src_idx, dst_idx in graph_edges.tolist()
+    ))
+    return {
+        **diagnosis,
+        "threshold_profile": active_profile,
+        "active_profile": active_profile,
+        "active_high_threshold": active_high,
+        "active_low_threshold": active_low,
+        "strong_graph_edge_count": int(len(graph_edges)),
+        "strong_graph_total_length": active_graph_length,
     }
 
 

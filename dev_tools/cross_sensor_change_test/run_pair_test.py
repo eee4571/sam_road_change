@@ -37,6 +37,14 @@ def frame_stats(result: dict) -> tuple[float, float]:
     return float(centerlines.geometry.length.sum()), float(surfaces.geometry.area.sum())
 
 
+def profile_audit(result: dict) -> tuple[str, str]:
+    selection = result.get("profile_selection", {})
+    decisions = selection.get("decisions", [])
+    requested = str(selection.get("mode", "unknown"))
+    effective = str(decisions[0].get("effective_profile", "unknown")) if decisions else "unknown"
+    return requested, effective
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run a real extraction-to-change cross-sensor pair test.")
     parser.add_argument("--before-image", default="")
@@ -79,8 +87,14 @@ def main(argv=None) -> int:
     summary = json.loads((change_output / "change_summary.json").read_text(encoding="utf-8"))
     before_length, before_area = frame_stats(before_payload)
     after_length, after_area = frame_stats(after_payload)
+    before_requested, before_effective = profile_audit(before_payload)
+    after_requested, after_effective = profile_audit(after_payload)
     report = {
         "label": args.label,
+        "before_requested_profile": before_requested,
+        "before_effective_profile": before_effective,
+        "after_requested_profile": after_requested,
+        "after_effective_profile": after_effective,
         "before_centerline_length": before_length,
         "after_centerline_length": after_length,
         "before_surface_area": before_area,

@@ -25,6 +25,7 @@ import rtree
 from collections import defaultdict
 import time
 import os
+import copy
 from argparse import ArgumentParser
 from pathlib import Path
 from package_paths import INFER_RUNS_ROOT, PROJECT_ROOT, resolve_path
@@ -163,11 +164,15 @@ def gather_inference_inputs(input_dir="", input_txt_dir=""):
 def run_inference_on_images(net, config, input_img_paths, output_dir, input_label):
     total_inference_seconds = 0.0
     recovery_summaries = []
+    profile_decisions = []
     print(f'Found {len(input_img_paths)} image(s) under {input_label}.')
     print(f'Inference patch size: {config.PATCH_SIZE}x{config.PATCH_SIZE}')
     print(f'Inference device: {resolved_device_name}')
 
     for img_path in input_img_paths:
+        # Threshold selection is per complete image.  Never mutate the shared
+        # batch config, otherwise one weak image would leak into the next tile.
+        image_config = copy.deepcopy(config)
         img_path = Path(img_path)
         img_id = img_path.stem
         print(f'Processing {img_path}')
@@ -210,7 +215,11 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             candidate_confidences,
             itsc_mask,
             road_mask,
-        ) = infer_one_img(net, padded_img, config)
+            profile_decision,
+        ) = infer_one_img(
+            net, padded_img, image_config,
+            diagnostic_shape=(infer_height, infer_width),
+        )
         total_inference_seconds += (time.time() - start_seconds)
 
         itsc_mask = itsc_mask[:infer_height, :infer_width]
@@ -237,14 +246,22 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             pred_nodes,
             pred_edges,
             road_mask,
-            config,
+            image_config,
             edge_scores=edge_confidences,
             distance_scale=1.0 / max(float(resize_factor), 1e-6),
         )
         edge_confidences = np.asarray(
             [row["topology_probability"] for row in edge_metadata], dtype=np.float32
         )
-        recovery_summary = {"tile": img_id, **recovery_summary}
+        profile_decision = {"image": str(img_path), "tile": img_id, **profile_decision}
+        profile_decisions.append(profile_decision)
+        recovery_summary = {
+            "tile": img_id,
+            **profile_decision,
+            **recovery_summary,
+            "requested_profile": profile_decision["requested_profile"],
+            "effective_profile": profile_decision["effective_profile"],
+        }
         recovery_summaries.append(recovery_summary)
 
         viz_img = np.copy(img)
@@ -313,7 +330,7 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                     'src_row': float(src_row), 'src_col': float(src_col),
                     'dst_row': float(dst_row), 'dst_col': float(dst_col),
                     'topology_probability': float(score),
-                    'selected': int(float(score) > float(config.TOPO_THRESHOLD)),
+                    'selected': int(float(score) > float(image_config.TOPO_THRESHOLD)),
                 })
 
         print(f'Done for {img_id}.')
@@ -372,7 +389,18 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     }
     with open(os.path.join(output_dir, 'weak_recovery_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(recovery_report, file, ensure_ascii=False, indent=2)
+    profile_report = graph_extraction.summarize_profile_decisions(
+        _config_profile(config),
+        config.get("SCENE_DIAGNOSTIC_REFERENCE_PROFILE", "default"),
+        profile_decisions,
+    )
+    with open(os.path.join(output_dir, 'profile_decisions.json'), 'w', encoding='utf-8') as file:
+        json.dump(profile_report, file, ensure_ascii=False, indent=2)
     return total_inference_seconds
+
+
+def _config_profile(config):
+    return config.get("ROAD_THRESHOLD_PROFILE", "default")
 
 
 def get_geotiff_gsd(path):
@@ -497,7 +525,7 @@ def get_batch_img_patches(img, batch_patch_info):
     batch = torch.stack(patches, 0).contiguous()
     return batch
 
-def infer_one_img(net, img, config):
+def infer_one_img(net, img, config, *, diagnostic_shape=None):
     # TODO(congrui): centralize these configs
     image_height, image_width = img.shape[:2]
     batch_size = config.INFER_BATCH_SIZE
@@ -561,13 +589,24 @@ def infer_one_img(net, img, config):
     fused_road_mask = (fused_road_mask * 255).to(torch.uint8).cpu().numpy()
 
     print(fused_road_mask.shape)
+    diagnostic_probability = fused_road_mask
+    if diagnostic_shape is not None:
+        diagnostic_height, diagnostic_width = diagnostic_shape
+        diagnostic_probability = fused_road_mask[:diagnostic_height, :diagnostic_width]
+    profile_decision = graph_extraction.resolve_effective_road_profile(
+        diagnostic_probability, config
+    )
+    config.ROAD_THRESHOLD_PROFILE = profile_decision["effective_profile"]
     graph_points = graph_extraction.extract_graph_points(fused_keypoint_mask, fused_road_mask, config)
     if graph_points.shape[0] == 0:
         print(1)
         print(graph_points)
         empty_edges = np.zeros((0, 2), dtype=np.int32)
         empty_scores = np.zeros((0,), dtype=np.float32)
-        return graph_points, empty_edges, empty_scores, empty_edges, empty_scores, fused_keypoint_mask, fused_road_mask
+        return (
+            graph_points, empty_edges, empty_scores, empty_edges, empty_scores,
+            fused_keypoint_mask, fused_road_mask, profile_decision,
+        )
     # for box query
     graph_rtree = rtree.index.Index()
     for i, v in enumerate(graph_points):
@@ -683,6 +722,7 @@ def infer_one_img(net, img, config):
         candidate_edge_scores,
         fused_keypoint_mask,
         fused_road_mask,
+        profile_decision,
     )
 
 if __name__ == "__main__":
@@ -719,7 +759,7 @@ if __name__ == "__main__":
     else:
         base_output_dir = create_output_dir_and_save_config(output_dir_prefix, config)
 
-    road_high_threshold, road_low_threshold, road_threshold_profile = graph_extraction.resolve_road_thresholds(config)
+    requested_profile = str(config.get('ROAD_THRESHOLD_PROFILE', 'default'))
     with open(os.path.join(base_output_dir, 'inference_metadata.json'), 'w', encoding='utf-8') as file:
         json.dump(
             {
@@ -728,9 +768,13 @@ if __name__ == "__main__":
                 'device': resolved_device_name,
                 'topology_threshold': float(config.TOPO_THRESHOLD),
                 'topology_candidate_threshold': float(config.get('TOPO_CANDIDATE_THRESHOLD', 0.20)),
-                'road_threshold_profile': road_threshold_profile,
-                'road_high_threshold': road_high_threshold,
-                'road_low_threshold': road_low_threshold,
+                'requested_road_threshold_profile': requested_profile,
+                'diagnostic_reference_profile': str(
+                    config.get('SCENE_DIAGNOSTIC_REFERENCE_PROFILE', 'default')
+                ),
+                'profile_selection_mode': (
+                    'automatic' if requested_profile == 'auto' else 'manual'
+                ),
                 'weak_recovery_enabled': bool(config.get('WEAK_RECOVERY_ENABLED', True)),
                 'weak_bootstrap_enabled': bool(config.get('WEAK_BOOTSTRAP_ENABLED', True)),
                 'weak_bootstrap_only_if_low_confidence': bool(

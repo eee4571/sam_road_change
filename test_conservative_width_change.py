@@ -135,6 +135,12 @@ class ConservativeWidthChangeTests(unittest.TestCase):
 
         positive, negative, summary = detect_changes(
             before, after, before_surfaces=before_surface, after_surfaces=after_surface,
+            before_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=before.crs
+            ),
+            after_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=after.crs
+            ),
         )
 
         self.assertIn("removed", set(negative["change_typ"]))
@@ -153,6 +159,12 @@ class ConservativeWidthChangeTests(unittest.TestCase):
         )
         positive, negative, summary = detect_changes(
             before, after, before_surfaces=before_surface, after_surfaces=after_surface,
+            before_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=before.crs
+            ),
+            after_valid_area=gpd.GeoDataFrame(
+                geometry=[box(-20, -20, 120, 60)], crs=after.crs
+            ),
         )
         self.assertIn("added", set(positive["change_typ"]))
         self.assertTrue(negative.empty)
