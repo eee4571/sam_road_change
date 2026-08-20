@@ -449,6 +449,8 @@ def _relative_path_evidence(path, relative_context):
             "relative_fraction": 0.0,
             "relative_only_fraction": 0.0,
             "relative_supported": False,
+            "backbone_line_source": "",
+            "backbone_reason": "",
         }
     score = np.asarray(relative_context.get("relative_score", []), dtype=np.float32)
     if score.ndim != 2 or score.size == 0:
@@ -471,6 +473,21 @@ def _relative_path_evidence(path, relative_context):
     scale_agreement = sampled("scale_agreement_fraction")
     relative_structure = sampled("relative_skeleton") > 0
     relative_only = sampled("relative_only_skeleton") > 0
+    source_value = relative_context.get("relative_backbone_source_labels")
+    source_array = np.asarray(source_value, dtype=np.uint8) if source_value is not None else None
+    source_codes = (
+        source_array[rows, cols]
+        if source_array is not None and source_array.shape == score.shape
+        else np.zeros(len(rows), dtype=np.uint8)
+    )
+    positive_source_codes = source_codes[source_codes > 0]
+    dominant_source = (
+        int(np.bincount(positive_source_codes, minlength=5).argmax())
+        if len(positive_source_codes) else 0
+    )
+    backbone_source, backbone_reason = _RELATIVE_BACKBONE_SOURCES.get(
+        dominant_source, ("", "")
+    )
     diagnostics = relative_context.get("diagnostics", {})
     weak_threshold = float(diagnostics.get("relative_weak_threshold", 0.0))
     q25 = float(np.quantile(values, 0.25)) if values.size else 0.0
@@ -492,6 +509,8 @@ def _relative_path_evidence(path, relative_context):
             and q25 >= max(weak_threshold - 1e-6, 0.0)
             and float(np.mean(normalized_contrast)) > 0.0
         ),
+        "backbone_line_source": backbone_source,
+        "backbone_reason": backbone_reason,
     }
 
 
@@ -1641,6 +1660,301 @@ def extract_relative_ridge_centerline(
     }
 
 
+_RELATIVE_BACKBONE_SOURCES = {
+    1: ("relative_ridge_seed", "ridge_seed"),
+    2: ("relative_backbone_bridge", "ridge_to_ridge_bridge"),
+    3: ("relative_backbone_extension", "directional_extension"),
+    4: ("relative_backbone_branch", "independent_supported_branch"),
+}
+
+
+def build_relative_support_graph(
+    binary_skeleton,
+    *,
+    relative_score=None,
+    scene_rank=None,
+    ridge_mask=None,
+    ridge_strength=None,
+    ridge_orientation=None,
+    scale_agreement=None,
+    candidate_mask=None,
+    ridge_projection_radius=2,
+):
+    """Describe the unmodified Binary Skeleton as traversable micro-chains.
+
+    Ridge pixels are projected only onto nearby, orientation-compatible Binary
+    Skeleton pixels.  This lets a ridge seed identify its road direction
+    without turning a perpendicular fishbone at the same junction into a seed.
+    """
+    binary = np.asarray(binary_skeleton, dtype=bool)
+    if binary.ndim != 2:
+        raise ValueError("binary_skeleton must be a 2D array")
+
+    shape = binary.shape
+
+    def optional_map(value, dtype=np.float32):
+        if value is None:
+            return None
+        array = np.asarray(value, dtype=dtype)
+        if array.shape != shape:
+            raise ValueError("Relative support maps must align with binary_skeleton")
+        return array
+
+    score = optional_map(relative_score)
+    rank = optional_map(scene_rank)
+    ridge = optional_map(ridge_mask, np.uint8)
+    strength = optional_map(ridge_strength)
+    orientation = optional_map(ridge_orientation)
+    agreement = optional_map(scale_agreement)
+    candidate = optional_map(candidate_mask, np.uint8)
+    grouping = build_relative_chain_corridors(
+        binary,
+        relative_score=score,
+        scene_rank=rank,
+        scale_agreement=agreement,
+        candidate_mask=candidate,
+    )
+
+    radius = max(0, int(ridge_projection_radius))
+    ridge_bool = np.zeros(shape, dtype=bool) if ridge is None else ridge > 0
+    if radius > 0 and np.any(ridge_bool):
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+        )
+        ridge_near = cv2.dilate(ridge_bool.astype(np.uint8), kernel) > 0
+        nearby_strength = (
+            cv2.dilate(np.maximum(strength, 0.0), kernel)
+            if strength is not None else ridge_near.astype(np.float32)
+        )
+    else:
+        ridge_near = ridge_bool
+        nearby_strength = (
+            np.maximum(strength, 0.0)
+            if strength is not None else ridge_bool.astype(np.float32)
+        )
+
+    projected_seed_mask = np.zeros(shape, dtype=np.uint8)
+    for record in grouping["chains"]:
+        path = record["path"]
+        rows, cols = path[:, 0], path[:, 1]
+        points = path.astype(np.float32)
+        if len(points) >= 2:
+            tangent = np.gradient(points, axis=0)
+            tangent_orientation = np.mod(
+                np.arctan2(tangent[:, 0], tangent[:, 1]), math.pi
+            )
+        else:
+            tangent_orientation = np.zeros(len(points), dtype=np.float32)
+        if orientation is not None:
+            orientation_agreement = np.cos(
+                tangent_orientation - orientation[rows, cols]
+            ) ** 2
+        else:
+            orientation_agreement = np.ones(len(path), dtype=np.float32)
+        seed_flags = ridge_near[rows, cols] & (orientation_agreement >= 0.5)
+        # A single contact at a shared junction is not an independent seed.
+        if np.count_nonzero(seed_flags) == 1:
+            seed_flags[:] = False
+        projected_seed_mask[rows[seed_flags], cols[seed_flags]] = 1
+        record.update({
+            "ridge_overlap": float(np.mean(ridge_bool[rows, cols])) if len(path) else 0.0,
+            "ridge_projected_overlap": float(np.mean(seed_flags)) if len(path) else 0.0,
+            "ridge_strength": float(np.mean(nearby_strength[rows, cols])) if len(path) else 0.0,
+            "local_orientation": float(np.mod(
+                np.arctan2(
+                    np.mean(np.sin(2.0 * tangent_orientation)),
+                    np.mean(np.cos(2.0 * tangent_orientation)),
+                ) / 2.0,
+                math.pi,
+            )) if len(path) else 0.0,
+            "orientation_agreement": float(np.mean(orientation_agreement)) if len(path) else 0.0,
+            "scale_agreement": float(np.mean(agreement[rows, cols])) if agreement is not None and len(path) else 0.0,
+            "ridge_supported": bool(np.any(seed_flags)),
+            "_ridge_seed_flags": seed_flags,
+        })
+
+    seed_component_count = (
+        cv2.connectedComponents(projected_seed_mask, 8)[0] - 1
+        if np.any(projected_seed_mask) else 0
+    )
+    return {
+        **grouping,
+        "binary_skeleton": binary.astype(np.uint8),
+        "projected_ridge_seed_mask": projected_seed_mask,
+        "ridge_seed_component_count": int(seed_component_count),
+    }
+
+
+def trace_relative_backbone(
+    support_graph,
+    *,
+    min_chain_length=48.0,
+    relative_weak_threshold=0.0,
+    independent_length_factor=1.5,
+):
+    """Select original Binary Skeleton paths using Ridge-seeded corridors.
+
+    A directionally grouped corridor containing Ridge support is retained in
+    full: internal Ridge gaps become bridges and the remaining tails become
+    endpoint extensions.  A corridor without a Ridge seed is retained only as
+    an independently supported long branch.  No path is drawn off the Binary
+    Skeleton and no junction geometry is collapsed or reconnected.
+    """
+    binary = np.asarray(support_graph["binary_skeleton"], dtype=np.uint8) > 0
+    backbone = np.zeros(binary.shape, dtype=np.uint8)
+    rejected = np.zeros(binary.shape, dtype=np.uint8)
+    source_labels = np.zeros(binary.shape, dtype=np.uint8)
+    records = support_graph["chains"]
+    records_by_id = {int(row["chain_id"]): row for row in records}
+    corridors_by_id = {
+        int(row["corridor_id"]): row for row in support_graph["corridors"]
+    }
+    chain_groups = defaultdict(list)
+    for record in records:
+        chain_groups[int(record["corridor_id"])].append(record)
+
+    weak_gate = max(float(relative_weak_threshold) - 1e-6, 0.0)
+    selected_corridor_ids = set()
+    source_lengths = Counter()
+    source_counts = Counter()
+    spur_count = 0
+    spur_length = 0.0
+
+    for corridor_id, corridor_records in chain_groups.items():
+        corridor = corridors_by_id[corridor_id]
+        seed_ids = {
+            int(record["chain_id"])
+            for record in corridor_records if record.get("ridge_supported", False)
+        }
+        independent_supported = bool(
+            not seed_ids
+            and float(corridor["total_length"])
+                >= float(min_chain_length) * float(independent_length_factor)
+            and float(corridor.get("relative_score_q25", 0.0)) >= weak_gate
+            and float(corridor.get("scene_rank_q25", 1.0)) >= 0.50
+            and float(corridor.get("scale_agreement_mean", 0.0)) > 0.0
+        )
+        if not seed_ids and not independent_supported:
+            for record in corridor_records:
+                path = record["path"]
+                rejected[path[:, 0], path[:, 1]] = 1
+                record.update({
+                    "selected": False,
+                    "line_source": "",
+                    "backbone_reason": "short_unsupported_spur",
+                })
+                spur_count += 1
+                spur_length += float(record["length"])
+            continue
+
+        selected_corridor_ids.add(corridor_id)
+        corridor_chain_ids = {int(record["chain_id"]) for record in corridor_records}
+        chain_graph = nx.Graph()
+        chain_graph.add_nodes_from(corridor_chain_ids)
+        for record in corridor_records:
+            chain_id = int(record["chain_id"])
+            for neighbor_id in record.get("neighbor_chain_ids", []):
+                if int(neighbor_id) in corridor_chain_ids:
+                    chain_graph.add_edge(chain_id, int(neighbor_id))
+
+        bridge_chain_ids = set()
+        if len(seed_ids) >= 2:
+            core = chain_graph.copy()
+            queue = deque(
+                node for node in core.nodes
+                if node not in seed_ids and core.degree(node) <= 1
+            )
+            while queue:
+                node = queue.popleft()
+                if node not in core or node in seed_ids or core.degree(node) > 1:
+                    continue
+                neighbors = list(core.neighbors(node))
+                core.remove_node(node)
+                for neighbor in neighbors:
+                    if (
+                        neighbor in core and neighbor not in seed_ids
+                        and core.degree(neighbor) <= 1
+                    ):
+                        queue.append(neighbor)
+            bridge_chain_ids = set(core.nodes) - seed_ids
+
+        for record in corridor_records:
+            path = record["path"]
+            chain_id = int(record["chain_id"])
+            codes = np.zeros(len(path), dtype=np.uint8)
+            if independent_supported:
+                codes[:] = 4
+            elif record.get("ridge_supported", False):
+                seed_flags = np.asarray(record["_ridge_seed_flags"], dtype=bool)
+                seed_positions = np.flatnonzero(seed_flags)
+                codes[seed_flags] = 1
+                if len(seed_positions):
+                    first, last = int(seed_positions[0]), int(seed_positions[-1])
+                    codes[first:last + 1][codes[first:last + 1] == 0] = 2
+                    codes[:first][codes[:first] == 0] = 3
+                    codes[last + 1:][codes[last + 1:] == 0] = 3
+            elif chain_id in bridge_chain_ids:
+                codes[:] = 2
+            else:
+                codes[:] = 3
+            # Degenerate shared endpoints inherit the chain's dominant source.
+            if not np.any(codes):
+                codes[:] = 3
+            dominant_code = int(np.bincount(codes, minlength=5)[1:].argmax() + 1)
+            existing = source_labels[path[:, 0], path[:, 1]]
+            source_labels[path[:, 0], path[:, 1]] = np.maximum(existing, codes)
+            backbone[path[:, 0], path[:, 1]] = 1
+
+            step_lengths = (
+                np.linalg.norm(np.diff(path.astype(np.float32), axis=0), axis=1)
+                if len(path) >= 2 else np.zeros(0, dtype=np.float32)
+            )
+            for code in range(1, 5):
+                if len(step_lengths):
+                    edge_codes = np.maximum(codes[:-1], codes[1:])
+                    source_lengths[code] += float(np.sum(step_lengths[edge_codes == code]))
+                if np.any(codes == code):
+                    source_counts[code] += 1
+            line_source, reason = _RELATIVE_BACKBONE_SOURCES[dominant_code]
+            record.update({
+                "selected": True,
+                "line_source": line_source,
+                "backbone_reason": reason,
+            })
+
+    def length(code):
+        return float(source_lengths.get(code, 0.0))
+
+    selected_corridors = [
+        row for row in support_graph["corridors"]
+        if int(row["corridor_id"]) in selected_corridor_ids
+    ]
+    diagnostics = {
+        "binary_skeleton_length": int(np.count_nonzero(binary)),
+        "ridge_seed_length": length(1),
+        "ridge_seed_component_count": int(support_graph["ridge_seed_component_count"]),
+        "ridge_to_ridge_bridge_count": int(source_counts.get(2, 0)),
+        "ridge_to_ridge_bridge_length": length(2),
+        "extension_count": int(source_counts.get(3, 0)),
+        "extension_length": length(3),
+        "branch_count": int(source_counts.get(4, 0)),
+        "branch_length": length(4),
+        "spur_rejected_count": int(spur_count),
+        "spur_rejected_length": float(spur_length),
+        "final_backbone_length": float(sum(source_lengths.values())),
+    }
+    return {
+        "relative_backbone_mask": backbone,
+        "relative_backbone_source_labels": source_labels,
+        "relative_rejected_skeleton": rejected,
+        "relative_chain_labels": support_graph["chain_labels"],
+        "relative_corridor_labels": support_graph["corridor_labels"],
+        "chains": records,
+        "corridors": selected_corridors,
+        "diagnostics": diagnostics,
+    }
+
+
 def extract_relative_skeleton(
     candidate_mask,
     config,
@@ -1828,6 +2142,8 @@ def compute_relative_roadness(
             "relative_candidate_mask": np.zeros(road.shape, dtype=np.uint8),
             "relative_binary_skeleton": np.zeros(road.shape, dtype=np.uint8),
             "relative_ridge_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_backbone_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_backbone_source_labels": np.zeros(road.shape, dtype=np.uint8),
             "ridge_orientation": empty.copy(),
             "ridge_strength": empty.copy(),
             "relative_skeleton_raw": np.zeros(road.shape, dtype=np.uint8),
@@ -1892,28 +2208,95 @@ def compute_relative_roadness(
     )
     binary_relative_skeleton = ridge_result["binary_skeleton"]
     raw_relative_skeleton = ridge_result["relative_ridge_mask"]
-    normalization = normalize_relative_skeleton(
-        raw_relative_skeleton,
-        candidate,
-        config,
-        relative_score=relative_score,
-        scale_agreement=scale_agreement,
-        distance_scale=distance_scale,
-    )
-    normalized_relative_skeleton = normalization["normalized_skeleton"]
-    relative_skeleton, relative_rejected_skeleton, structure_summary = extract_relative_skeleton(
-        candidate,
-        config,
-        distance_scale=distance_scale,
+    support_graph = build_relative_support_graph(
+        binary_relative_skeleton,
         relative_score=relative_score,
         scene_rank=scene_rank,
+        ridge_mask=raw_relative_skeleton,
+        ridge_strength=ridge_result["ridge_strength"],
+        ridge_orientation=ridge_result["ridge_orientation"],
         scale_agreement=scale_agreement,
-        relative_weak_threshold=threshold_summary.get("relative_weak_threshold", 0.0),
-        input_skeleton=normalized_relative_skeleton,
-        junction_zone_labels=normalization["junction_zone_labels"],
+        candidate_mask=candidate,
     )
-    relative_chain_labels = structure_summary.pop("_relative_chain_labels")
-    relative_corridor_labels = structure_summary.pop("_relative_corridor_labels")
+    backbone_result = trace_relative_backbone(
+        support_graph,
+        min_chain_length=min_chain_length,
+        relative_weak_threshold=threshold_summary.get("relative_weak_threshold", 0.0),
+    )
+    relative_skeleton = backbone_result["relative_backbone_mask"]
+    relative_rejected_skeleton = backbone_result["relative_rejected_skeleton"]
+    relative_chain_labels = backbone_result["relative_chain_labels"]
+    relative_corridor_labels = backbone_result["relative_corridor_labels"]
+    source_labels = backbone_result["relative_backbone_source_labels"]
+    selected_records = [row for row in backbone_result["chains"] if row.get("selected")]
+    retained_components = (
+        cv2.connectedComponents(relative_skeleton.astype(np.uint8), 8)[0] - 1
+        if np.any(relative_skeleton) else 0
+    )
+    candidate_components = (
+        cv2.connectedComponents(candidate.astype(np.uint8), 8)[0] - 1
+        if np.any(candidate) else 0
+    )
+    audited_chains = []
+    for record in backbone_result["chains"]:
+        audited_chains.append({
+            key: value for key, value in record.items()
+            if key not in {"path", "geometry", "_ridge_seed_flags"}
+        } | {
+            "micro_chain_length": float(record["length"]),
+            "accepted": bool(record.get("selected", False)),
+            "reject_reason": "" if record.get("selected", False) else "backbone_spur",
+        })
+    structure_summary = {
+        "relative_component_count": int(candidate_components),
+        "relative_retained_component_count": int(retained_components),
+        "relative_rejected_component_count": max(0, int(candidate_components - retained_components)),
+        "relative_skeleton_before_structure_filter": int(np.count_nonzero(binary_relative_skeleton)),
+        "relative_skeleton_after_structure_filter": int(np.count_nonzero(relative_skeleton)),
+        "relative_chain_count": int(len(support_graph["chains"])),
+        "micro_chain_count": int(len(support_graph["chains"])),
+        "too_short_micro_chain_count": int(sum(
+            float(row["length"]) < min_chain_length for row in support_graph["chains"]
+        )),
+        "corridor_count": int(len(support_graph["corridors"])),
+        "corridor_pairing_count": int(support_graph["pairing_count"]),
+        "corridor_ambiguous_junction_count": int(support_graph["ambiguous_junction_count"]),
+        "corridor_rescued_chain_count": int(sum(
+            row.get("line_source") in {
+                "relative_backbone_bridge", "relative_backbone_extension"
+            } for row in selected_records
+        )),
+        "corridor_rescued_length": float(
+            backbone_result["diagnostics"]["ridge_to_ridge_bridge_length"]
+            + backbone_result["diagnostics"]["extension_length"]
+        ),
+        "structure_rescued_chain_count": int(sum(
+            row.get("line_source") in {
+                "relative_backbone_bridge", "relative_backbone_extension"
+            } for row in selected_records
+        )),
+        "structure_rescued_length": float(
+            backbone_result["diagnostics"]["ridge_to_ridge_bridge_length"]
+            + backbone_result["diagnostics"]["extension_length"]
+        ),
+        "isolated_short_rejected_count": int(
+            backbone_result["diagnostics"]["spur_rejected_count"]
+        ),
+        "relative_chain_geometry_pass": int(len(selected_records)),
+        "relative_structure_reject_reason_counts": {
+            "backbone_spur": int(backbone_result["diagnostics"]["spur_rejected_count"])
+        },
+        "relative_skeleton_total_length": int(np.count_nonzero(relative_skeleton)),
+        "relative_micro_chains": audited_chains,
+        "relative_corridors": backbone_result["corridors"],
+        **backbone_result["diagnostics"],
+        # Backbone tracing is selection-only; these compatibility diagnostics
+        # explicitly confirm that no junction geometry was rewritten.
+        "pruned_spur_count": 0,
+        "collapsed_zone_count": 0,
+        "complex_junction_zone_count": 0,
+        "complex_zone_skipped_collapse_count": 0,
+    }
     high_threshold, _low_threshold, profile_name = resolve_road_thresholds(config)
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
     absolute_skeleton = skeletonize_road_mask(
@@ -1948,7 +2331,6 @@ def compute_relative_roadness(
         "combined_skeleton_total_length": int(np.count_nonzero(combined)),
         **threshold_summary,
         **ridge_result["diagnostics"],
-        **normalization["diagnostics"],
         **structure_summary,
     }
     return {
@@ -1962,17 +2344,19 @@ def compute_relative_roadness(
         "relative_candidate_mask": candidate.astype(np.uint8),
         "relative_binary_skeleton": binary_relative_skeleton.astype(np.uint8),
         "relative_ridge_mask": raw_relative_skeleton.astype(np.uint8),
+        "relative_backbone_mask": relative_skeleton.astype(np.uint8),
+        "relative_backbone_source_labels": source_labels.astype(np.uint8),
         "ridge_orientation": ridge_result["ridge_orientation"].astype(np.float32),
         "ridge_strength": ridge_result["ridge_strength"].astype(np.float32),
         "relative_skeleton_raw": raw_relative_skeleton.astype(np.uint8),
-        "relative_skeleton_normalized": normalized_relative_skeleton.astype(np.uint8),
+        "relative_skeleton_normalized": relative_skeleton.astype(np.uint8),
         "relative_skeleton": relative_skeleton.astype(np.uint8),
         "relative_rejected_skeleton": relative_rejected_skeleton.astype(np.uint8),
         "relative_chain_labels": relative_chain_labels.astype(np.int32),
         "relative_corridor_labels": relative_corridor_labels.astype(np.int32),
-        "junction_zone_mask": normalization["junction_zone_mask"].astype(np.uint8),
-        "pruned_spur_mask": normalization["pruned_spur_mask"].astype(np.uint8),
-        "collapsed_zone_mask": normalization["collapsed_zone_mask"].astype(np.uint8),
+        "junction_zone_mask": np.zeros(road.shape, dtype=np.uint8),
+        "pruned_spur_mask": np.zeros(road.shape, dtype=np.uint8),
+        "collapsed_zone_mask": np.zeros(road.shape, dtype=np.uint8),
         "absolute_skeleton": absolute_skeleton.astype(np.uint8),
         "relative_only_skeleton": relative_only.astype(np.uint8),
         "combined_skeleton": combined.astype(np.uint8),
@@ -2202,8 +2586,14 @@ def bootstrap_weak_road_network(
             else "absolute"
         )
         topology_probability = float(scores[edge_id]) if np.isfinite(scores[edge_id]) else center_conf
+        backbone_line_source = relative_evidence.get("backbone_line_source", "")
         metadata.append({
-            "line_source": "relative_roadness" if candidate_source == "relative" else "samroad",
+            "line_source": (
+                backbone_line_source
+                if candidate_source == "relative" and backbone_line_source
+                else "relative_roadness" if candidate_source == "relative" else "samroad"
+            ),
+            "backbone_reason": relative_evidence.get("backbone_reason", ""),
             "candidate_source": candidate_source,
             "topology_probability": topology_probability,
             "recovery_score": 0.0, "center_conf": center_conf,
@@ -2679,7 +3069,16 @@ def bootstrap_weak_road_network(
             existing_edges.add(key)
             combined_edges.append((int(src_idx), int(dst_idx)))
             metadata.append({
-                "line_source": "relative_roadness" if relative_branch_candidate else "weak_bootstrap",
+                "line_source": (
+                    relative_evidence.get("backbone_line_source", "")
+                    if relative_branch_candidate
+                    and relative_evidence.get("backbone_line_source", "")
+                    else "relative_roadness" if relative_branch_candidate else "weak_bootstrap"
+                ),
+                "backbone_reason": (
+                    relative_evidence.get("backbone_reason", "")
+                    if relative_branch_candidate else ""
+                ),
                 "candidate_source": candidate_source,
                 "topology_probability": float(
                     topology_score_mean if relative_branch_candidate else recovery_score
@@ -3664,7 +4063,8 @@ def postprocess_weak_road_network(
     )
     connectivity_after = graph_connectivity_stats(final_nodes, final_edges)
     relative_topology_edge_count = sum(
-        row.get("line_source") == "relative_roadness" for row in final_metadata
+        str(row.get("line_source", "")).startswith("relative")
+        for row in final_metadata
     )
     relative_total_edge_count = sum(
         row.get("candidate_source") in {"relative", "absolute+relative"}
@@ -3682,115 +4082,24 @@ def postprocess_weak_road_network(
         np.linalg.norm(final_nodes_array[int(dst_idx)] - final_nodes_array[int(src_idx)])
         for src_idx, dst_idx in final_edges.tolist()
     ))
-    structure_rejects = dict(
-        relative_context.get("diagnostics", {}).get("relative_structure_reject_reason_counts", {})
-        if relative_context else {}
+    backbone_diagnostics = (
+        relative_context.get("diagnostics", {}) if relative_context else {}
     )
-    acceptance_rejects = dict(bootstrap_summary.get("relative_reject_reason_counts", {}))
-    funnel_rejects = Counter(structure_rejects)
-    funnel_rejects.update(acceptance_rejects)
     funnel = {
-        "relative_candidate_pixels": int(
-            relative_context.get("diagnostics", {}).get("relative_candidate_pixel_count", 0)
-            if relative_context else 0
-        ),
-        "relative_candidate_components": int(
-            relative_context.get("diagnostics", {}).get("relative_component_count", 0)
-            if relative_context else 0
-        ),
-        "relative_skeleton_before_structure_filter": int(
-            relative_context.get("diagnostics", {}).get("relative_skeleton_before_structure_filter", 0)
-            if relative_context else 0
-        ),
-        "relative_skeleton_after_structure_filter": int(
-            relative_context.get("diagnostics", {}).get("relative_skeleton_after_structure_filter", 0)
-            if relative_context else 0
-        ),
-        "relative_chain_count": int(
-            relative_context.get("diagnostics", {}).get("relative_chain_count", 0)
-            if relative_context else 0
-        ),
-        "micro_chain_count": int(
-            relative_context.get("diagnostics", {}).get("micro_chain_count", 0)
-            if relative_context else 0
-        ),
-        "too_short_micro_chain_count": int(
-            relative_context.get("diagnostics", {}).get("too_short_micro_chain_count", 0)
-            if relative_context else 0
-        ),
-        "corridor_count": int(
-            relative_context.get("diagnostics", {}).get("corridor_count", 0)
-            if relative_context else 0
-        ),
-        "corridor_rescued_chain_count": int(
-            relative_context.get("diagnostics", {}).get("corridor_rescued_chain_count", 0)
-            if relative_context else 0
-        ),
-        "corridor_rescued_length": float(
-            relative_context.get("diagnostics", {}).get("corridor_rescued_length", 0.0)
-            if relative_context else 0.0
-        ),
-        "isolated_short_rejected_count": int(
-            relative_context.get("diagnostics", {}).get("isolated_short_rejected_count", 0)
-            if relative_context else 0
-        ),
-        "complex_junction_zone_count": int(
-            relative_context.get("diagnostics", {}).get("complex_junction_zone_count", 0)
-            if relative_context else 0
-        ),
-        "complex_zone_skipped_collapse_count": int(
-            relative_context.get("diagnostics", {}).get("complex_zone_skipped_collapse_count", 0)
-            if relative_context else 0
-        ),
-        "raw_chain_count": int(
-            relative_context.get("diagnostics", {}).get("raw_chain_count", 0)
-            if relative_context else 0
-        ),
-        "raw_too_short_count": int(
-            relative_context.get("diagnostics", {}).get("raw_short_chain_count", 0)
-            if relative_context else 0
-        ),
-        "normalized_chain_count": int(
-            relative_context.get("diagnostics", {}).get("normalized_chain_count", 0)
-            if relative_context else 0
-        ),
-        "normalized_too_short_count": int(
-            relative_context.get("diagnostics", {}).get("normalized_short_chain_count", 0)
-            if relative_context else 0
-        ),
-        "structure_rescued_chain_count": int(
-            relative_context.get("diagnostics", {}).get("structure_rescued_chain_count", 0)
-            if relative_context else 0
-        ),
-        "structure_rescued_length": float(
-            relative_context.get("diagnostics", {}).get("structure_rescued_length", 0.0)
-            if relative_context else 0.0
-        ),
-        "relative_chain_geometry_pass": int(
-            relative_context.get("diagnostics", {}).get("relative_chain_geometry_pass", 0)
-            if relative_context else 0
-        ),
-        "relative_graph_point_count": int(
-            (
-                relative_context.get("diagnostics", {}).get("relative_graph_point_count", 0)
-                if relative_context else 0
-            )
-            or bootstrap_summary.get("relative_graph_point_count", 0)
-        ),
-        "relative_topology_candidate_edge_count": int(
-            bootstrap_summary.get("relative_topology_candidate_edge_count", 0)
-        ),
-        "relative_topology_selected_edge_count": int(
-            bootstrap_summary.get("relative_topology_selected_edge_count", 0)
-        ),
-        "relative_bootstrap_candidate_count": int(bootstrap_summary.get("relative_candidate_count", 0)),
-        "relative_auto_count": int(bootstrap_summary.get("relative_auto_count", 0)),
-        "relative_review_count": int(bootstrap_summary.get("relative_review_count", 0)),
-        "relative_rejected_count": int(bootstrap_summary.get("relative_rejected_count", 0)),
-        "relative_final_edge_count": int(relative_total_edge_count),
-        "relative_final_length_px": relative_final_length,
-        "final_total_centerline_length_px": final_total_length,
-        "reject_reason_counts": dict(sorted(funnel_rejects.items())),
+        "binary_skeleton_length": int(backbone_diagnostics.get("binary_skeleton_length", 0)),
+        "ridge_seed_length": float(backbone_diagnostics.get("ridge_seed_length", 0.0)),
+        "ridge_seed_component_count": int(backbone_diagnostics.get("ridge_seed_component_count", 0)),
+        "ridge_to_ridge_bridge_count": int(backbone_diagnostics.get("ridge_to_ridge_bridge_count", 0)),
+        "ridge_to_ridge_bridge_length": float(backbone_diagnostics.get("ridge_to_ridge_bridge_length", 0.0)),
+        "extension_count": int(backbone_diagnostics.get("extension_count", 0)),
+        "extension_length": float(backbone_diagnostics.get("extension_length", 0.0)),
+        "branch_count": int(backbone_diagnostics.get("branch_count", 0)),
+        "branch_length": float(backbone_diagnostics.get("branch_length", 0.0)),
+        "spur_rejected_count": int(backbone_diagnostics.get("spur_rejected_count", 0)),
+        "spur_rejected_length": float(backbone_diagnostics.get("spur_rejected_length", 0.0)),
+        "final_backbone_length": float(backbone_diagnostics.get("final_backbone_length", 0.0)),
+        "final_relative_length": relative_final_length,
+        "final_total_graph_length": final_total_length,
     }
     summary = {
         **recovery_summary,

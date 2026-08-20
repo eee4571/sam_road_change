@@ -619,6 +619,10 @@ def write_relative_roadness_diagnostic(
         context["relative_ridge_mask"].astype(np.uint8) * 255,
     )
     _save_png(
+        run_dir / "relative_backbone_mask.png",
+        context["relative_backbone_mask"].astype(np.uint8) * 255,
+    )
+    _save_png(
         run_dir / "relative_skeleton_normalized.png",
         context["relative_skeleton_normalized"].astype(np.uint8) * 255,
     )
@@ -638,6 +642,10 @@ def write_relative_roadness_diagnostic(
     for source, color, thickness in (
         ("samroad", (255, 220, 0), 3),
         ("relative_roadness", (0, 255, 0), 4),
+        ("relative_ridge_seed", (0, 255, 0), 4),
+        ("relative_backbone_bridge", (0, 220, 255), 4),
+        ("relative_backbone_extension", (255, 165, 0), 4),
+        ("relative_backbone_branch", (255, 64, 255), 4),
         ("weak_recovered", (0, 255, 255), 5),
         ("weak_bootstrap", (255, 0, 255), 5),
         ("relative_bootstrap", (255, 64, 255), 5),
@@ -822,6 +830,49 @@ def write_relative_roadness_diagnostic(
         np.concatenate(ridge_debug_panels, axis=1),
     )
 
+    backbone_binary_panel = image_rgb.copy()
+    backbone_binary_panel[context["relative_binary_skeleton"] > 0] = (255, 64, 64)
+    traced_panel = image_rgb.copy()
+    source_labels = context["relative_backbone_source_labels"]
+    for source_code, color in (
+        (1, (0, 255, 0)),       # Ridge-supported Binary pixels.
+        (2, (0, 220, 255)),     # Ridge-to-Ridge Binary bridge.
+        (3, (255, 165, 0)),     # Directional endpoint extension.
+        (4, (255, 64, 255)),    # Independent supported branch.
+    ):
+        traced_panel[source_labels == source_code] = color
+    backbone_panels = [
+        _labeled_preview(image_rgb, "1 Original", max_width=800),
+        _labeled_preview(
+            cv2.cvtColor(
+                cv2.applyColorMap(relative_u8, cv2.COLORMAP_VIRIDIS),
+                cv2.COLOR_BGR2RGB,
+            ),
+            "2 Relative score",
+            max_width=800,
+        ),
+        _labeled_preview(backbone_binary_panel, "3 Binary Skeleton", max_width=800),
+        _labeled_preview(
+            traced_panel,
+            "4 Ridge green / bridge cyan / extension orange / branch magenta",
+            max_width=800,
+        ),
+        _labeled_preview(final_overlay, "5 Final vector", max_width=800),
+    ]
+    backbone_height = min(panel.shape[0] for panel in backbone_panels)
+    backbone_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * backbone_height / panel.shape[0]))), backbone_height),
+        )
+        if panel.shape[0] != backbone_height else panel
+        for panel in backbone_panels
+    ]
+    _save_png(
+        run_dir / "relative_backbone_debug.png",
+        np.concatenate(backbone_panels, axis=1),
+    )
+
     def labeled_structure_panel(label_name, title):
         panel = image_rgb[crop].copy()
         labels = np.asarray(context.get(label_name, []), dtype=np.int32)
@@ -915,25 +966,9 @@ def write_relative_roadness_diagnostic(
             ),
         },
     )
-    corridor_keys = (
-        "micro_chain_count", "too_short_micro_chain_count", "corridor_count",
-        "corridor_rescued_chain_count", "corridor_rescued_length",
-        "isolated_short_rejected_count", "complex_junction_zone_count",
-        "complex_zone_skipped_collapse_count", "relative_final_length_px",
-        "final_total_centerline_length_px",
-    )
     _write_json(
-        run_dir / "relative_corridor_audit.json",
-        {
-            "summary": {
-                key: recovery_summary.get(
-                    key, context["diagnostics"].get(key, 0)
-                )
-                for key in corridor_keys
-            },
-            "micro_chains": context["diagnostics"].get("relative_micro_chains", []),
-            "corridors": context["diagnostics"].get("relative_corridors", []),
-        },
+        run_dir / "relative_backbone_audit.json",
+        recovery_summary.get("relative_acceptance_funnel", {}),
     )
 
 
@@ -989,7 +1024,8 @@ def _recovery_payload(
         "relative_roadness", "weak_segment_connector",
     }
     for edge_id, edge_metadata in enumerate(metadata):
-        if edge_metadata.get("line_source") not in recovered_sources:
+        line_source = str(edge_metadata.get("line_source", ""))
+        if line_source not in recovered_sources and not line_source.startswith("relative_"):
             continue
         src_idx, dst_idx = edges[edge_id]
         recovered_rows.append({

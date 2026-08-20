@@ -1,6 +1,6 @@
 {
-  "load_cache_seconds": 0.29524260002654046,
-  "weak_recovery_seconds": 157.48983120010234,
-  "visualization_seconds": 62.996738300076686,
-  "total_seconds": 221.70564269996248
+  "load_cache_seconds": 0.3294888000236824,
+  "weak_recovery_seconds": 275.35561999992933,
+  "visualization_seconds": 46.9055878999643,
+  "total_seconds": 323.9053334000055
 }

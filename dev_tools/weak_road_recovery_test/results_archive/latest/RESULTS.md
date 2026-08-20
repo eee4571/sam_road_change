@@ -1,61 +1,59 @@
-# Logical Corridor Grouping recovery-only result
+# Relative Backbone Tracing recovery-only result
 
-## 本轮修改
+## 本轮实现
 
-- 保持 `RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX = 48`，将短链结构判断从单条 micro-chain 提升为 logical corridor。
-- corridor 只合并判断单元；Final Graph 继续逐条使用原始 constituent micro-chain path，不做端点直连、PCA 重画或跨 junction shortcut。
-- junction normalization 改为保守模式：复杂、超长、多方向 junction zone 全部跳过 collapse，仅允许删除明确 tiny ladder spur。
-- short chain 审计区分 `isolated_short`、`corridor_supported_short` 和 `ladder_spur`，并记录 corridor id、micro-chain 长度、corridor 总长度和 rescue 状态。
-- 修正 TopoNet audit bookkeeping：本轮 relative topology candidate / selected 为 `51 / 51`，不再出现 `0 / positive`。
+- 保留 `skeletonize(relative_candidate_mask)` 产生的 Binary Skeleton，作为唯一可遍历 support geometry。
+- 保留 Orientation-aware Ridge，但只把投影到 Binary Skeleton 且方向一致的部分作为高置信 seed。
+- 在现有 Logical Corridor 之上执行 Backbone Tracing：补齐 Ridge-to-Ridge 缺口、延伸方向连续的 Binary 路径，并保留有独立长程证据的真实 branch。
+- 所有最终 geometry 均来自原 Binary Skeleton；没有 PCA collapse、端点直连、二维直线 shortcut 或 triangle 重画。
+- provenance 使用 `relative_ridge_seed`、`relative_backbone_bridge`、`relative_backbone_extension`、`relative_backbone_branch`。
+- 本轮未修改 HIGH / LOW、weak_sensor、Relative percentile、48 px、TOPO_THRESHOLD、Ridge coherence 或 Ridge NMS。
 
-## 真实影像结果
+## 同一次 recovery-only 结果
 
-本轮只复用 `outputs/relative_roadness_ab/junction_normalized_v2/` 中已有的 `road_probability.png` 和 `original_graph.p`，执行一次 recovery-only；没有重新运行 SAMRoad 或生成 probability。
+复用既有 `road_probability` 和 `original_graph`，没有重新运行 SAMRoad、没有重新生成 probability，也没有参数 sweep。
 
-| 指标 | 本轮结果 |
+| 指标 | 结果 |
 |---|---:|
-| micro-chain 数量 | 9,824 |
-| `<48px` micro-chain 数量 | 9,554 |
-| corridor 数量 | 5,282 |
-| corridor rescued short chain | 2,257 |
-| rescued short-chain length | 30,660.129 px |
-| isolated short rejected | 7,283 |
-| complex junction zone | 99 |
-| complex zone skipped collapse | 99 |
-| physically collapsed zone | 0 |
-| tiny ladder spur pruned | 1 |
-| Final Relative length | 47,169.328 px |
-| Final total graph length | 67,188.766 px |
+| Binary Skeleton length | 124,914 px |
+| Ridge seed length | 45,277.964 px |
+| Ridge seed component count | 4,524 |
+| Ridge-to-Ridge bridge count / length | 1,444 / 15,143.414 px |
+| Extension count / length | 4,691 / 43,046.792 px |
+| Independent branch count / length | 46 / 443.894 px |
+| Spur rejected count / length | 3,610 / 40,026.347 px |
+| Final Backbone length | 103,912.065 px |
+| Final Relative length | 49,180.059 px |
+| Final total graph length | 68,702.078 px |
 
-上一轮 normalization 后记录了 2,568 条 too-short chain，并依赖物理 collapse 救回 140 条结构链。本轮保留原 skeleton 后共有 9,554 条原始短链，其中 2,257 条由 logical corridor 救回、7,283 条按 `isolated_short` 拒绝；因此新旧“too_short”口径不再直接等价。acceptance funnel 中仍有 141 个 `too_short`，来自 absolute/relative overlap candidate，而 direct Relative micro-chain 已使用新分类。
+相较当前 Ridge-only 审核结果（Final Relative 约 22,218 px、Final total 约 41,940 px），Backbone Tracing 明显恢复了真实道路连续性。Final Backbone length 是 Binary support path 的几何审计长度；Final Relative length 是经过下游 bootstrap/去重后实际进入最终图的相对道路长度，两者口径不同。
 
-Final Relative length 相比上一轮 36,272.211 px 增加 10,897.117 px；Final total graph length相比 56,508.816 px 增加 10,679.949 px。
+## 人工 Geometry 检查
 
-## Geometry 检查
+已检查全景 `relative_backbone_debug.png`、问题 crop 的 `relative_ridge_debug.png`、全景 compare 和 acceptance overlay：
 
-5-panel corridor debug、全景 relative compare 和 acceptance overlay 均已检查。高架主线、环形匝道、平行道路及问题 crop 中的横向道路保持原 skeleton 走形；本轮未见新增 triangle、跨 junction shortcut 或 PCA/直线重画。`collapsed_zone_count = 0`，所以复杂立交 geometry 未被 normalization 改写。
+- Ridge 原有的断段由 cyan bridge 和 orange extension 沿 Binary Skeleton 补齐，高架主线、弯道、环形匝道和真实交叉仍保持原始走形。
+- 旧 Binary Skeleton 中成排的短横刺没有大规模回到最终矢量；问题区域的大量鱼骨仍显示为 rejected red。
+- 局部仍有少量短 extension 片段，但未恢复成旧版密集鱼骨，也未见跨 candidate 区域的直线捷径。
 
 ## 测试与耗时
 
-- 4 个指定 targeted synthetic tests：`4/4 PASS`，执行 0.039 s。
-  - 多个 `<48px` 直路 chain 可由 corridor 整体救回。
-  - T junction 三个 branch 保留。
-  - 两条平行道路保持两个独立 corridor。
-  - crossing/interchange 不产生 triangle 或对角 shortcut。
-- `test_relative_roadness.py`：`19/19 PASS`，执行 0.371 s。
-- 相关 bootstrap tests：`7/7 PASS`，执行 0.038 s。
-- 唯一一次真实 recovery-only：总耗时 243.390 s；其中 cache load 0.381 s、recovery 169.555 s、visualization 71.815 s。
+- 新增 3 个 targeted tests：`3/3 PASS`，0.054 s。
+  - 水平主干保留、无长程支持的横刺删除。
+  - Ridge 中间缺口沿 Binary support 恢复。
+  - 横竖均有持续 Ridge/Relative 支持的真实 T junction 完整保留。
+- 直接相关的 Ridge、corridor、calibration、noise 与 bootstrap 测试：`9/9 PASS`。
+- 唯一一次 recovery-only：总耗时 323.905 s；cache load 0.329 s、recovery 275.356 s、visualization 46.906 s。
 
 ## 归档文件
 
-- `relative_corridor_debug.png`
+- `relative_backbone_debug.png`
+- `relative_ridge_debug.png`
 - `relative_roadness_compare.png`
 - `relative_acceptance_overlay.png`
+- `relative_backbone_audit.json`
 - `relative_acceptance_funnel.json`
-- `relative_skeleton_normalization.json`
-- `relative_corridor_audit.json`
-- `bootstrap_candidates.csv`
-- `relative_review_candidates.csv`
 - `timing.json`
+- `RESULTS.md`
 
-归档不包含 TIFF、pickle、checkpoint、模型、环境或 probability/cache 文件。
+归档不包含巨大 corridor audit、candidate CSV、TIFF、pickle、checkpoint、cache、模型或旧轮次输出。

@@ -291,6 +291,87 @@ class RelativeRoadnessTests(unittest.TestCase):
         off_axis = ridge & (np.abs(rows - 56.0) > 2) & (np.abs(cols - 56.0) > 2)
         self.assertEqual(np.count_nonzero(off_axis), 0)
 
+    def test_relative_backbone_keeps_main_ridge_and_rejects_fishbone_spurs(self):
+        binary = np.zeros((96, 180), dtype=np.uint8)
+        cv2.line(binary, (15, 48), (165, 48), 1, 1)
+        for col in range(30, 166, 18):
+            cv2.line(binary, (col, 38), (col, 58), 1, 1)
+        ridge = np.zeros_like(binary)
+        cv2.line(ridge, (15, 48), (165, 48), 1, 1)
+        evidence = binary.astype(np.float32)
+        support = graph_extraction.build_relative_support_graph(
+            binary,
+            relative_score=evidence,
+            scene_rank=evidence,
+            ridge_mask=ridge,
+            ridge_strength=ridge.astype(np.float32),
+            ridge_orientation=np.zeros(binary.shape, dtype=np.float32),
+            scale_agreement=evidence,
+            candidate_mask=binary,
+        )
+        result = graph_extraction.trace_relative_backbone(
+            support, min_chain_length=48.0, relative_weak_threshold=0.5
+        )
+        backbone = result["relative_backbone_mask"] > 0
+        self.assertGreater(np.count_nonzero(backbone[47:50, 15:166]), 145)
+        self.assertEqual(np.count_nonzero(backbone[:45]), 0)
+        self.assertEqual(np.count_nonzero(backbone[52:]), 0)
+        self.assertGreater(result["diagnostics"]["spur_rejected_count"], 0)
+
+    def test_relative_backbone_bridges_a_ridge_gap_on_binary_support(self):
+        binary = np.zeros((96, 180), dtype=np.uint8)
+        cv2.line(binary, (15, 48), (165, 48), 1, 1)
+        ridge = np.zeros_like(binary)
+        cv2.line(ridge, (15, 48), (62, 48), 1, 1)
+        cv2.line(ridge, (101, 48), (165, 48), 1, 1)
+        evidence = binary.astype(np.float32)
+        support = graph_extraction.build_relative_support_graph(
+            binary,
+            relative_score=evidence,
+            scene_rank=evidence,
+            ridge_mask=ridge,
+            ridge_strength=ridge.astype(np.float32),
+            ridge_orientation=np.zeros(binary.shape, dtype=np.float32),
+            scale_agreement=evidence,
+            candidate_mask=binary,
+        )
+        result = graph_extraction.trace_relative_backbone(
+            support, min_chain_length=48.0, relative_weak_threshold=0.5
+        )
+        backbone = result["relative_backbone_mask"] > 0
+        sources = result["relative_backbone_source_labels"]
+        self.assertGreater(np.count_nonzero(backbone[47:50, 15:166]), 145)
+        self.assertGreater(np.count_nonzero(sources[48, 65:99] == 2), 25)
+        self.assertGreater(
+            result["diagnostics"]["ridge_to_ridge_bridge_length"], 25.0
+        )
+
+    def test_relative_backbone_preserves_supported_t_junction_branch(self):
+        binary = np.zeros((160, 180), dtype=np.uint8)
+        cv2.line(binary, (15, 62), (165, 62), 1, 1)
+        cv2.line(binary, (90, 62), (90, 145), 1, 1)
+        ridge = binary.copy()
+        evidence = binary.astype(np.float32)
+        orientation = np.zeros(binary.shape, dtype=np.float32)
+        orientation[62:146, 88:93] = np.float32(np.pi / 2.0)
+        support = graph_extraction.build_relative_support_graph(
+            binary,
+            relative_score=evidence,
+            scene_rank=evidence,
+            ridge_mask=ridge,
+            ridge_strength=ridge.astype(np.float32),
+            ridge_orientation=orientation,
+            scale_agreement=evidence,
+            candidate_mask=binary,
+        )
+        result = graph_extraction.trace_relative_backbone(
+            support, min_chain_length=48.0, relative_weak_threshold=0.5
+        )
+        backbone = result["relative_backbone_mask"] > 0
+        self.assertGreater(np.count_nonzero(backbone[60:65, 15:166]), 145)
+        self.assertGreater(np.count_nonzero(backbone[62:146, 88:93]), 75)
+        self.assertEqual(result["diagnostics"]["spur_rejected_count"], 0)
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)
@@ -463,7 +544,9 @@ class RelativeRoadnessTests(unittest.TestCase):
             include_absolute_candidates=False,
         )
         self.assertGreater(summary["relative_recovered_edge_count"], 0)
-        self.assertIn("relative_roadness", {row["line_source"] for row in metadata})
+        self.assertTrue(all(
+            str(row["line_source"]).startswith("relative") for row in metadata
+        ))
         self.assertTrue(all(row["center_conf"] < 0.12 for row in metadata))
 
     def test_relative_review_is_preserved_without_being_called_rejected(self):
