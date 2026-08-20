@@ -1,0 +1,31 @@
+{
+  "relative_candidate_pixels": 1647179,
+  "relative_candidate_components": 148,
+  "relative_skeleton_before_structure_filter": 70732,
+  "relative_skeleton_after_structure_filter": 39876,
+  "relative_chain_count": 2890,
+  "raw_chain_count": 9823,
+  "raw_too_short_count": 9553,
+  "normalized_chain_count": 2890,
+  "normalized_too_short_count": 2568,
+  "structure_rescued_chain_count": 140,
+  "structure_rescued_length": 23600.472984313965,
+  "relative_chain_geometry_pass": 319,
+  "relative_graph_point_count": 4096,
+  "relative_topology_candidate_edge_count": 0,
+  "relative_topology_selected_edge_count": 45,
+  "relative_bootstrap_candidate_count": 357,
+  "relative_auto_count": 167,
+  "relative_review_count": 47,
+  "relative_rejected_count": 143,
+  "relative_final_edge_count": 3250,
+  "relative_final_length_px": 36272.2109375,
+  "final_total_centerline_length_px": 56508.81640625,
+  "reject_reason_counts": {
+    "background_contrast_low": 14,
+    "duplicate_or_suppressed": 22,
+    "mean_probability_low": 11,
+    "too_short": 2664,
+    "tortuosity": 3
+  }
+}
