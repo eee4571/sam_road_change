@@ -29,6 +29,10 @@ segment。它使用 segment 最近投影点、LOW probability A*、方向与现�
 - `relative_roadness_compare.png`：原图、原始中心线概率、相对候选、结构链、Auto/Review/Rejected、最终矢量六联图。
 - `relative_acceptance_overlay.png`：原图上的 Relative 接受结果；绿色 Auto、橙色 Review、红色 Rejected。
 - `relative_acceptance_funnel.json`：Candidate → structure → topology → acceptance → final 的逐层数量和拒绝原因。
+- `relative_skeleton_raw.png`、`relative_skeleton_normalized.png`、`relative_junction_zones.png`：junction-zone 归一化前后骨架及分区掩膜。
+- `relative_skeleton_normalization.json`：全景与问题 crop 的 raw/normalized chain 数量、短链长度统计、折叠区和结构救回长度。
+- `relative_junction_debug.png`：问题 crop 的原图、Relative candidate、raw skeleton、junction/spur、normalized skeleton 五联图。
+- `relative_chain_debug.png`：同一问题 crop 的 raw chain 与 normalized chain 着色对比。
 - `relative_review_candidates.csv`：保留完整几何与 provenance 的 Review 候选，不混入 Reject。
 - `centerline_probability.png`、`relative_roadness.png`、`relative_candidate.png`、`combined_candidate.png`：相对分支的逐层 QA。
 - `relative_roadness_summary.json`：相对阈值、候选像素、保留/拒绝组件与骨架长度。

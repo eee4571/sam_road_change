@@ -604,6 +604,18 @@ def write_relative_roadness_diagnostic(
     _save_png(run_dir / "relative_roadness.png", relative_u8)
     _save_png(run_dir / "relative_candidate.png", relative_candidate)
     _save_png(run_dir / "combined_candidate.png", combined)
+    _save_png(
+        run_dir / "relative_skeleton_raw.png",
+        context["relative_skeleton_raw"].astype(np.uint8) * 255,
+    )
+    _save_png(
+        run_dir / "relative_skeleton_normalized.png",
+        context["relative_skeleton_normalized"].astype(np.uint8) * 255,
+    )
+    _save_png(
+        run_dir / "relative_junction_zones.png",
+        context["junction_zone_mask"].astype(np.uint8) * 255,
+    )
 
     probability_rgb = cv2.cvtColor(
         cv2.applyColorMap(probability_u8, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB
@@ -678,6 +690,107 @@ def write_relative_roadness_diagnostic(
     )
     _save_png(run_dir / "relative_acceptance_overlay.png", acceptance_overlay)
     _write_json(run_dir / "relative_roadness_summary.json", context["diagnostics"])
+    height, width = image_rgb.shape[:2]
+    requested_roi = (1513, 3079, 2130, 3557)
+    if width >= requested_roi[2] and height >= requested_roi[3]:
+        x0, y0, x1, y1 = requested_roi
+    else:
+        x0, y0, x1, y1 = 0, 0, width, height
+    crop = np.s_[y0:y1, x0:x1]
+
+    candidate_panel = image_rgb[crop].copy()
+    candidate_panel[context["relative_candidate_mask"][crop] > 0] = (
+        0.55 * candidate_panel[context["relative_candidate_mask"][crop] > 0]
+        + 0.45 * np.asarray([255, 165, 0])
+    ).astype(np.uint8)
+    raw_panel = image_rgb[crop].copy()
+    raw_panel[context["relative_skeleton_raw"][crop] > 0] = (255, 0, 0)
+    zone_panel = image_rgb[crop].copy()
+    zone_panel[context["junction_zone_mask"][crop] > 0] = (0, 128, 255)
+    zone_panel[context["collapsed_zone_mask"][crop] > 0] = (180, 0, 255)
+    zone_panel[context["pruned_spur_mask"][crop] > 0] = (255, 0, 0)
+    normalized_panel = image_rgb[crop].copy()
+    normalized_panel[context["relative_skeleton_normalized"][crop] > 0] = (0, 255, 0)
+    junction_panels = [
+        _labeled_preview(image_rgb[crop], "Original", max_width=900),
+        _labeled_preview(candidate_panel, "Relative candidate", max_width=900),
+        _labeled_preview(raw_panel, "Raw skeleton", max_width=900),
+        _labeled_preview(zone_panel, "Junction zones / pruned spurs", max_width=900),
+        _labeled_preview(normalized_panel, "Normalized skeleton", max_width=900),
+    ]
+    panel_height = min(panel.shape[0] for panel in junction_panels)
+    junction_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * panel_height / panel.shape[0]))), panel_height),
+        )
+        if panel.shape[0] != panel_height else panel
+        for panel in junction_panels
+    ]
+    _save_png(run_dir / "relative_junction_debug.png", np.concatenate(junction_panels, axis=1))
+
+    palette = (
+        (255, 64, 64), (64, 255, 64), (64, 128, 255),
+        (255, 192, 64), (192, 64, 255), (64, 255, 224),
+    )
+
+    def chain_panel(name):
+        panel = image_rgb[crop].copy()
+        chains = graph_extraction._trace_skeleton_chains(context[name][crop] > 0)
+        for chain_id, path in enumerate(chains):
+            cv2.polylines(
+                panel,
+                [path[:, ::-1].reshape(-1, 1, 2)],
+                False,
+                palette[chain_id % len(palette)],
+                2,
+                cv2.LINE_AA,
+            )
+        lengths = [
+            graph_extraction._relative_chain_geometry(path)["path_length"]
+            for path in chains
+        ]
+        return panel, chains, lengths
+
+    raw_chain_panel, raw_crop_chains, raw_crop_lengths = chain_panel("relative_skeleton_raw")
+    normalized_chain_panel, normalized_crop_chains, normalized_crop_lengths = chain_panel(
+        "relative_skeleton_normalized"
+    )
+    raw_chain_panel = _labeled_preview(raw_chain_panel, "Raw chains", max_width=1200)
+    normalized_chain_panel = _labeled_preview(
+        normalized_chain_panel, "Normalized chains", max_width=1200
+    )
+    target_height = min(raw_chain_panel.shape[0], normalized_chain_panel.shape[0])
+    raw_chain_panel = cv2.resize(raw_chain_panel, (raw_chain_panel.shape[1], target_height))
+    normalized_chain_panel = cv2.resize(
+        normalized_chain_panel, (normalized_chain_panel.shape[1], target_height)
+    )
+    _save_png(
+        run_dir / "relative_chain_debug.png",
+        np.concatenate([raw_chain_panel, normalized_chain_panel], axis=1),
+    )
+
+    minimum_length = float(config.get("RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0))
+
+    def crop_chain_stats(chains, lengths):
+        return {
+            "chain_count": int(len(chains)),
+            "too_short_count": int(sum(length < minimum_length for length in lengths)),
+            "median_chain_length": float(np.median(lengths)) if lengths else 0.0,
+            "max_chain_length": float(max(lengths)) if lengths else 0.0,
+        }
+
+    _write_json(
+        run_dir / "relative_skeleton_normalization.json",
+        {
+            **context["diagnostics"],
+            "problem_crop_xyxy": [x0, y0, x1, y1],
+            "problem_crop_raw": crop_chain_stats(raw_crop_chains, raw_crop_lengths),
+            "problem_crop_normalized": crop_chain_stats(
+                normalized_crop_chains, normalized_crop_lengths
+            ),
+        },
+    )
     _write_json(
         run_dir / "relative_acceptance_funnel.json",
         recovery_summary.get("relative_acceptance_funnel", {}),

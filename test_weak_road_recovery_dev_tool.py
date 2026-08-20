@@ -189,6 +189,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "relative_roadness_compare.png", "relative_roadness_summary.json",
                 "relative_acceptance_overlay.png", "relative_acceptance_funnel.json",
                 "relative_review_candidates.csv",
+                "relative_skeleton_normalization.json", "relative_junction_debug.png",
+                "relative_chain_debug.png",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
             self.assertEqual(

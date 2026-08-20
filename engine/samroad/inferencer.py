@@ -294,6 +294,14 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             os.path.join(mask_save_dir, f'{img_id}_relative_candidate.png'),
             relative_context['relative_candidate_mask'].astype(np.uint8) * 255,
         )
+        for mask_name in (
+            'relative_skeleton_raw', 'relative_skeleton_normalized',
+            'junction_zone_mask', 'pruned_spur_mask', 'collapsed_zone_mask',
+        ):
+            cv2.imwrite(
+                os.path.join(mask_save_dir, f'{img_id}_{mask_name}.png'),
+                np.asarray(relative_context[mask_name], dtype=np.uint8) * 255,
+            )
         high_threshold, _low_threshold, _profile = graph_extraction.resolve_road_thresholds(image_config)
         combined_candidate = (
             (graph_extraction._probability01(road_mask) >= high_threshold)
@@ -443,6 +451,23 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
         with open(os.path.join(graph_save_dir, f'{img_id}_relative_acceptance_funnel.json'), 'w', encoding='utf-8') as file:
             json.dump(recovery_summary.get('relative_acceptance_funnel', {}), file, ensure_ascii=False, indent=2)
+        with open(os.path.join(graph_save_dir, f'{img_id}_relative_skeleton_normalization.json'), 'w', encoding='utf-8') as file:
+            json.dump(
+                {
+                    key: value for key, value in relative_context.get('diagnostics', {}).items()
+                    if key.startswith('raw_')
+                    or key.startswith('normalized_')
+                    or key.startswith('structure_rescued_')
+                    or key in {
+                        'pruned_spur_count', 'collapsed_zone_count',
+                        'junction_zone_radius_px', 'junction_cluster_radius_px',
+                        'junction_zones',
+                    }
+                },
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
         review_rows = [
             row for row in bootstrap_candidate_audit
             if row.get('decision') == 'review'

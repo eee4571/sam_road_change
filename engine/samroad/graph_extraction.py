@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import cv2
 import math
 import tcod
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from sklearn.neighbors import KDTree
 from skimage.draw import line
 from skimage.morphology import skeletonize
@@ -573,11 +573,9 @@ def _endpoint_alignment(path, nodes, edges, connection_radius):
     return float(np.mean(alignments)) if alignments else 0.0
 
 
-def _trace_skeleton_chains(skeleton):
-    """Trace an 8-connected skeleton into junction/endpoint-to-junction chains."""
+def _skeleton_adjacency(skeleton):
+    """Return corner-safe 8-connected adjacency for foreground skeleton pixels."""
     pixels = {tuple(value) for value in np.column_stack(np.where(skeleton)).tolist()}
-    if not pixels:
-        return []
     offsets = (
         (-1, -1), (-1, 0), (-1, 1), (0, -1),
         (0, 1), (1, -1), (1, 0), (1, 1),
@@ -599,7 +597,16 @@ def _trace_skeleton_chains(skeleton):
             result.append(candidate)
         return result
 
-    adjacency = {point: neighbors(point) for point in pixels}
+    return {point: neighbors(point) for point in pixels}
+
+
+def _trace_skeleton_chains(skeleton):
+    """Trace an 8-connected skeleton into junction/endpoint-to-junction chains."""
+    adjacency = _skeleton_adjacency(skeleton)
+    if not adjacency:
+        return []
+
+    pixels = set(adjacency)
     anchors = {point for point, items in adjacency.items() if len(items) != 2}
     visited = set()
     chains = []
@@ -633,6 +640,445 @@ def _trace_skeleton_chains(skeleton):
             if edge_key(point, neighbor) not in visited:
                 chains.append(trace(point, neighbor))
     return [np.asarray(chain, dtype=np.int32) for chain in chains if len(chain) >= 2]
+
+
+def _shortest_path_in_skeleton(mask, starts, goals):
+    """Find an unweighted skeleton path between two pixel sets."""
+    adjacency = _skeleton_adjacency(mask)
+    start_points = [tuple(map(int, point)) for point in starts if tuple(map(int, point)) in adjacency]
+    goal_points = {tuple(map(int, point)) for point in goals if tuple(map(int, point)) in adjacency}
+    if not start_points or not goal_points:
+        return []
+    queue = deque(start_points)
+    parents = {point: None for point in start_points}
+    target = None
+    while queue:
+        point = queue.popleft()
+        if point in goal_points:
+            target = point
+            break
+        for neighbor in adjacency[point]:
+            if neighbor not in parents:
+                parents[neighbor] = point
+                queue.append(neighbor)
+    if target is None:
+        return []
+    result = []
+    while target is not None:
+        result.append(target)
+        target = parents[target]
+    result.reverse()
+    return result
+
+
+def _skeleton_chain_summary(skeleton, min_length):
+    chains = _trace_skeleton_chains(skeleton)
+    lengths = [float(_relative_chain_geometry(path)["path_length"]) for path in chains]
+    return chains, lengths, {
+        "chain_count": int(len(chains)),
+        "short_chain_count": int(sum(length < min_length for length in lengths)),
+        "median_chain_length": float(np.median(lengths)) if lengths else 0.0,
+        "max_chain_length": float(max(lengths)) if lengths else 0.0,
+    }
+
+
+def _junction_zone_radius(config, distance_scale):
+    """Tie junction clustering to the smallest existing local-background scale."""
+    configured = _config_value(config, "RELATIVE_ROADNESS_BACKGROUND_SCALES_PX", [9, 21, 41])
+    if not isinstance(configured, (list, tuple)):
+        configured = [configured]
+    positive = [float(value) for value in configured if float(value) > 0]
+    reference = min(positive) if positive else 9.0
+    return max(2, int(round(reference * 0.9 * max(float(distance_scale), 1e-6))))
+
+
+def _junction_cluster_radius(config, distance_scale):
+    """Return the grouping reach while keeping the narrower zone influence."""
+    configured = _config_value(config, "RELATIVE_ROADNESS_BACKGROUND_SCALES_PX", [9, 21, 41])
+    if not isinstance(configured, (list, tuple)):
+        configured = [configured]
+    positive = [float(value) for value in configured if float(value) > 0]
+    reference = min(positive) if positive else 9.0
+    return max(2, int(round(reference * 1.25 * max(float(distance_scale), 1e-6))))
+
+
+def find_skeleton_junction_zones(skeleton, config, *, distance_scale=1.0):
+    """Cluster nearby degree>=3 pixels into spatial junction zones."""
+    value = np.asarray(skeleton, dtype=bool)
+    adjacency = _skeleton_adjacency(value)
+    junction_mask = np.zeros(value.shape, dtype=np.uint8)
+    for point, neighbors in adjacency.items():
+        if len(neighbors) >= 3:
+            junction_mask[point] = 1
+    radius = _junction_zone_radius(config, distance_scale)
+    cluster_radius = _junction_cluster_radius(config, distance_scale)
+    cluster_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (cluster_radius * 2 + 1, cluster_radius * 2 + 1)
+    )
+    support_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
+    expanded = (
+        cv2.dilate(junction_mask, cluster_kernel)
+        if np.any(junction_mask) else junction_mask.copy()
+    )
+    zone_count, expanded_labels = cv2.connectedComponents(expanded.astype(np.uint8), 8)
+    zone_labels = np.zeros(value.shape, dtype=np.int32)
+    zones = []
+    next_zone = 1
+    for label_id in range(1, zone_count):
+        member_mask = (expanded_labels == label_id) & (junction_mask > 0)
+        points = np.column_stack(np.where(member_mask))
+        if len(points) == 0:
+            continue
+        minimum = points.min(axis=0)
+        maximum = points.max(axis=0)
+        # Cluster with the wider reach, then form the actual zone from a thin
+        # convex corridor around its member junctions.  This bridges repeated
+        # ladder junctions without giving the zone enough lateral reach to
+        # swallow a real branch or an adjacent parallel road.
+        row0 = max(0, int(minimum[0]) - radius)
+        row1 = min(value.shape[0], int(maximum[0]) + radius + 1)
+        col0 = max(0, int(minimum[1]) - radius)
+        col1 = min(value.shape[1], int(maximum[1]) + radius + 1)
+        member_core = np.zeros((row1 - row0, col1 - col0), dtype=np.uint8)
+        hull_points = (
+            points[:, ::-1].astype(np.int32)
+            - np.asarray([col0, row0], dtype=np.int32)
+        )
+        if len(hull_points) >= 3:
+            cv2.fillConvexPoly(member_core, cv2.convexHull(hull_points), 1)
+        elif len(hull_points) == 2:
+            cv2.line(member_core, tuple(hull_points[0]), tuple(hull_points[1]), 1, 1)
+        else:
+            member_core[int(points[0, 0]) - row0, int(points[0, 1]) - col0] = 1
+        support = cv2.dilate(member_core, support_kernel) > 0
+        zone_crop = zone_labels[row0:row1, col0:col1]
+        zone_crop[support] = next_zone
+        centered = points.astype(np.float32) - np.mean(points, axis=0, keepdims=True)
+        covariance = centered.T @ centered / max(len(points) - 1, 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major_index = int(np.argmax(eigenvalues))
+        major = eigenvectors[:, major_index].astype(np.float32)
+        major_value = float(eigenvalues[major_index])
+        minor_value = float(eigenvalues[1 - major_index])
+        explained = major_value / max(major_value + minor_value, 1e-6)
+        zones.append({
+            "zone_id": next_zone,
+            "pixel_count": int(len(points)),
+            "bbox": [int(minimum[0]), int(minimum[1]), int(maximum[0]), int(maximum[1])],
+            "centroid": np.mean(points, axis=0).astype(np.float32),
+            "major_direction": major,
+            "major_explained_fraction": float(explained),
+            "cluster_radius": int(cluster_radius),
+            "incident_branches": [],
+            "branch_tangents": [],
+            "branch_lengths": [],
+        })
+        next_zone += 1
+    return junction_mask, zone_labels, zones, radius
+
+
+def _zone_incident_branches(
+    skeleton,
+    zone_mask,
+    relative_score,
+    candidate_mask,
+    scale_agreement,
+):
+    """Summarize outside branches touching one junction zone."""
+    value = np.asarray(skeleton, dtype=bool)
+    outside = value & ~zone_mask
+    component_count, component_labels = cv2.connectedComponents(outside.astype(np.uint8), 8)
+    contact = outside & (cv2.dilate(zone_mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
+    contact_count, contact_labels = cv2.connectedComponents(contact.astype(np.uint8), 8)
+    inside = value & zone_mask
+    inside_points = np.column_stack(np.where(inside))
+    records = []
+    for contact_id in range(1, contact_count):
+        contact_points = np.column_stack(np.where(contact_labels == contact_id))
+        if len(contact_points) == 0:
+            continue
+        component_values = component_labels[contact_points[:, 0], contact_points[:, 1]]
+        component_values = component_values[component_values > 0]
+        if len(component_values) == 0:
+            continue
+        component_id = int(np.bincount(component_values).argmax())
+        component_points = np.column_stack(np.where(component_labels == component_id))
+        entry = np.mean(contact_points, axis=0).astype(np.float32)
+        offsets = component_points.astype(np.float32) - entry[None, :]
+        distances = np.linalg.norm(offsets, axis=1)
+        continuation = float(np.max(distances)) if len(distances) else 0.0
+        local = (distances >= min(8.0, max(continuation * 0.4, 1.0))) & (distances <= 30.0)
+        if not np.any(local):
+            local = distances == np.max(distances)
+        local_offsets = offsets[local]
+        local_distances = distances[local]
+        tangent_offset = local_offsets[int(np.argmax(local_distances))]
+        tangent_norm = float(np.linalg.norm(tangent_offset))
+        tangent = tangent_offset / max(tangent_norm, 1e-6)
+        sample_points = component_points[distances <= min(30.0, max(continuation, 1.0))]
+        if len(sample_points) == 0:
+            sample_points = contact_points
+        rr = sample_points[:, 0]
+        cc = sample_points[:, 1]
+        score_mean = float(np.mean(relative_score[rr, cc])) if relative_score is not None else 0.0
+        candidate_fraction = float(np.mean(candidate_mask[rr, cc] > 0))
+        scale_mean = float(np.mean(scale_agreement[rr, cc])) if scale_agreement is not None else 0.0
+        if len(inside_points):
+            delta = inside_points.astype(np.float32)[:, None, :] - contact_points.astype(np.float32)[None, :, :]
+            nearest_flat = int(np.argmin(np.sum(delta * delta, axis=2)))
+            inside_index, _contact_index = np.unravel_index(nearest_flat, delta.shape[:2])
+            inside_entry = inside_points[inside_index]
+        else:
+            inside_entry = np.rint(entry).astype(np.int32)
+        records.append({
+            "contact_points": contact_points,
+            "inside_entry": np.asarray(inside_entry, dtype=np.int32),
+            "component_id": component_id,
+            "component_points": component_points,
+            "continuation_length": continuation,
+            "outward_tangent": tangent.astype(np.float32),
+            "relative_score": score_mean,
+            "candidate_coverage": candidate_fraction,
+            "scale_agreement": scale_mean,
+        })
+    return records
+
+
+def normalize_relative_skeleton(
+    raw_skeleton,
+    candidate_mask,
+    config,
+    *,
+    relative_score=None,
+    scale_agreement=None,
+    distance_scale=1.0,
+):
+    """Collapse elongated dense-junction ladder zones into meaningful corridors."""
+    raw = np.asarray(raw_skeleton, dtype=bool)
+    candidate = np.asarray(candidate_mask, dtype=np.uint8)
+    score = None if relative_score is None else np.asarray(relative_score, dtype=np.float32)
+    agreement = None if scale_agreement is None else np.asarray(scale_agreement, dtype=np.float32)
+    minimum_length = float(_config_value(
+        config, "RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0
+    )) * max(float(distance_scale), 1e-6)
+    raw_chains, raw_lengths, raw_summary = _skeleton_chain_summary(raw, minimum_length)
+    junction_mask, zone_labels, zones, radius = find_skeleton_junction_zones(
+        raw, config, distance_scale=distance_scale
+    )
+    normalized = raw.copy()
+    pruned_spurs = np.zeros(raw.shape, dtype=bool)
+    collapsed_zones = np.zeros(raw.shape, dtype=bool)
+    collapsed_count = 0
+    pruned_count = 0
+    zone_records = []
+
+    for zone in zones:
+        zone_record = {
+            "zone_id": int(zone["zone_id"]),
+            "pixel_count": int(zone["pixel_count"]),
+            "bbox": zone["bbox"],
+            "centroid": np.asarray(zone["centroid"], dtype=float).tolist(),
+            "major_direction": np.asarray(zone["major_direction"], dtype=float).tolist(),
+            "major_explained_fraction": float(zone["major_explained_fraction"]),
+            "incident_branch_count": 0,
+            "incident_branches": [],
+            "branch_tangents": [],
+            "branch_lengths": [],
+            "preserved_branch_count": 0,
+            "collapsed": False,
+            "skip_reason": "",
+        }
+        # Single real T/X junctions are compact. Ladder artifacts contain many
+        # nearby junction pixels distributed along one dominant corridor.
+        if zone["pixel_count"] < 4 or zone["major_explained_fraction"] < 0.72:
+            zone_record["skip_reason"] = "compact_or_no_dominant_corridor"
+            zone_records.append(zone_record)
+            continue
+        global_zone_mask = zone_labels == zone["zone_id"]
+        zone_rows, zone_cols = np.where(global_zone_mask)
+        padding = max(32, radius * 4)
+        row0 = max(0, int(zone_rows.min()) - padding)
+        row1 = min(raw.shape[0], int(zone_rows.max()) + padding + 1)
+        col0 = max(0, int(zone_cols.min()) - padding)
+        col1 = min(raw.shape[1], int(zone_cols.max()) + padding + 1)
+        region = np.s_[row0:row1, col0:col1]
+        raw_crop = raw[region]
+        zone_mask = global_zone_mask[region]
+        inside = raw_crop & zone_mask
+        if np.count_nonzero(inside) < 3:
+            zone_record["skip_reason"] = "insufficient_inside_skeleton"
+            zone_records.append(zone_record)
+            continue
+        branches = _zone_incident_branches(
+            raw_crop,
+            zone_mask,
+            None if score is None else score[region],
+            candidate[region],
+            None if agreement is None else agreement[region],
+        )
+        branch_records = [
+            {
+                "branch_id": int(branch_index),
+                "continuation_length": float(branch["continuation_length"]),
+                "outward_tangent": np.asarray(
+                    branch["outward_tangent"], dtype=float
+                ).tolist(),
+                "relative_score": float(branch["relative_score"]),
+                "candidate_coverage": float(branch["candidate_coverage"]),
+                "scale_agreement": float(branch["scale_agreement"]),
+                "role": "incident",
+            }
+            for branch_index, branch in enumerate(branches)
+        ]
+        zone_record.update({
+            "incident_branch_count": int(len(branches)),
+            "incident_branches": branch_records,
+            "branch_tangents": [row["outward_tangent"] for row in branch_records],
+            "branch_lengths": [row["continuation_length"] for row in branch_records],
+        })
+        if len(branches) < 2:
+            zone_record["skip_reason"] = "fewer_than_two_incident_branches"
+            zone_records.append(zone_record)
+            continue
+        major = zone["major_direction"]
+        branch_strengths = []
+        for branch in branches:
+            projection = float(np.dot(branch["outward_tangent"], major))
+            evidence = (
+                1.0
+                + branch["relative_score"]
+                + branch["candidate_coverage"]
+                + branch["scale_agreement"]
+            )
+            strength = abs(projection) * max(branch["continuation_length"], 1.0) * evidence
+            branch_strengths.append((projection, strength))
+        positive = [index for index, item in enumerate(branch_strengths) if item[0] >= 0]
+        negative = [index for index, item in enumerate(branch_strengths) if item[0] < 0]
+        if not positive or not negative:
+            zone_record["skip_reason"] = "no_opposite_through_pair"
+            zone_records.append(zone_record)
+            continue
+        positive_index = max(positive, key=lambda index: branch_strengths[index][1])
+        negative_index = max(negative, key=lambda index: branch_strengths[index][1])
+        main_indices = {positive_index, negative_index}
+        for branch_index in main_indices:
+            branch_records[branch_index]["role"] = "through"
+        main_path = _shortest_path_in_skeleton(
+            inside,
+            [branches[positive_index]["inside_entry"]],
+            [branches[negative_index]["inside_entry"]],
+        )
+        if len(main_path) < 2:
+            zone_record["skip_reason"] = "through_pair_not_connected_inside_zone"
+            zone_records.append(zone_record)
+            continue
+
+        normalized_crop = normalized[region]
+        collapsed_crop = collapsed_zones[region]
+        pruned_crop = pruned_spurs[region]
+        normalized_crop[inside] = False
+        main_array = np.asarray(main_path, dtype=np.int32)
+        normalized_crop[main_array[:, 0], main_array[:, 1]] = True
+        collapsed_crop[inside] = True
+        collapsed_count += 1
+        preserved_branch_count = 0
+        for branch_index, branch in enumerate(branches):
+            if branch_index in main_indices:
+                continue
+            tangent = branch["outward_tangent"]
+            main_alignment = abs(float(np.dot(tangent, major)))
+            transverse_alignment = math.sqrt(max(0.0, 1.0 - main_alignment * main_alignment))
+            extends_outside_zone = branch["continuation_length"] > 1.5 * radius
+            evidence_continues = bool(
+                branch["candidate_coverage"] >= 0.5
+                and (branch["relative_score"] > 0.0 or branch["scale_agreement"] > 0.0)
+            )
+            # A same-direction rail inside the same dense zone is part of the
+            # ladder. A transverse branch that genuinely exits the zone keeps
+            # its topology even when it is shorter than 48 px.
+            preserve = bool(
+                transverse_alignment > main_alignment
+                and extends_outside_zone
+                and evidence_continues
+            )
+            if preserve:
+                connector = _shortest_path_in_skeleton(
+                    inside,
+                    [branch["inside_entry"]],
+                    main_path,
+                )
+                if connector:
+                    connector_array = np.asarray(connector, dtype=np.int32)
+                    normalized_crop[connector_array[:, 0], connector_array[:, 1]] = True
+                    preserved_branch_count += 1
+                    branch_records[branch_index]["role"] = "preserved_real_branch"
+                else:
+                    branch_records[branch_index]["role"] = "unconnected_transverse_branch"
+            elif branch["continuation_length"] <= 2.0 * radius:
+                component_points = branch["component_points"]
+                normalized_crop[component_points[:, 0], component_points[:, 1]] = False
+                pruned_crop[component_points[:, 0], component_points[:, 1]] = True
+                pruned_count += 1
+                branch_records[branch_index]["role"] = "pruned_ladder_spur"
+            else:
+                branch_records[branch_index]["role"] = "suppressed_ladder_rail"
+        zone_record.update({
+            "preserved_branch_count": int(preserved_branch_count),
+            "collapsed": True,
+        })
+        zone_records.append(zone_record)
+
+    normalized_chains, normalized_lengths, normalized_summary = _skeleton_chain_summary(
+        normalized, minimum_length
+    )
+    raw_chain_labels = np.zeros(raw.shape, dtype=np.int32)
+    for chain_id, path in enumerate(raw_chains, start=1):
+        raw_chain_labels[path[:, 0], path[:, 1]] = chain_id
+    rescued_count = 0
+    rescued_length = 0.0
+    for path, length in zip(normalized_chains, normalized_lengths):
+        if length < minimum_length:
+            continue
+        if not np.any(collapsed_zones[path[:, 0], path[:, 1]]):
+            continue
+        raw_ids = set(raw_chain_labels[path[:, 0], path[:, 1]].tolist()) - {0}
+        short_ids = [chain_id for chain_id in raw_ids if raw_lengths[chain_id - 1] < minimum_length]
+        if len(short_ids) >= 2:
+            rescued_count += 1
+            rescued_length += length
+    normalized_adjacency = _skeleton_adjacency(normalized)
+    normalized_junction_count = sum(len(items) >= 3 for items in normalized_adjacency.values())
+    diagnostics = {
+        "raw_junction_pixel_count": int(np.count_nonzero(junction_mask)),
+        "raw_junction_zone_count": int(len(zones)),
+        "raw_chain_count": raw_summary["chain_count"],
+        "raw_short_chain_count": raw_summary["short_chain_count"],
+        "raw_median_chain_length": raw_summary["median_chain_length"],
+        "raw_max_chain_length": raw_summary["max_chain_length"],
+        "normalized_junction_count": int(normalized_junction_count),
+        "normalized_chain_count": normalized_summary["chain_count"],
+        "normalized_short_chain_count": normalized_summary["short_chain_count"],
+        "normalized_median_chain_length": normalized_summary["median_chain_length"],
+        "normalized_max_chain_length": normalized_summary["max_chain_length"],
+        "pruned_spur_count": int(pruned_count),
+        "collapsed_zone_count": int(collapsed_count),
+        "junction_zone_radius_px": int(radius),
+        "junction_cluster_radius_px": int(_junction_cluster_radius(config, distance_scale)),
+        "structure_rescued_chain_count": int(rescued_count),
+        "structure_rescued_length": float(rescued_length),
+        "junction_zones": zone_records,
+    }
+    return {
+        "normalized_skeleton": normalized.astype(np.uint8),
+        "junction_pixel_mask": junction_mask.astype(np.uint8),
+        "junction_zone_mask": (zone_labels > 0).astype(np.uint8),
+        "junction_zone_labels": zone_labels,
+        "pruned_spur_mask": pruned_spurs.astype(np.uint8),
+        "collapsed_zone_mask": collapsed_zones.astype(np.uint8),
+        "diagnostics": diagnostics,
+    }
 
 
 def _relative_chain_geometry(path):
@@ -775,6 +1221,7 @@ def extract_relative_skeleton(
     relative_score=None,
     scene_rank=None,
     relative_weak_threshold=0.0,
+    input_skeleton=None,
 ):
     """Retain valid chains independently, without rejecting a whole road component."""
     candidate = np.asarray(candidate_mask, dtype=np.uint8) > 0
@@ -792,9 +1239,18 @@ def extract_relative_skeleton(
     reject_counts = Counter()
     score_map = np.asarray(relative_score, dtype=np.float32) if relative_score is not None else None
     rank_map = np.asarray(scene_rank, dtype=np.float32) if scene_rank is not None else None
+    supplied_skeleton = (
+        np.asarray(input_skeleton, dtype=bool)
+        if input_skeleton is not None and np.asarray(input_skeleton).shape == candidate.shape
+        else None
+    )
     for component_id in range(1, component_count):
         component = labels == component_id
-        skeleton = skeletonize(component)
+        skeleton = (
+            supplied_skeleton & component
+            if supplied_skeleton is not None
+            else skeletonize(component)
+        )
         skeleton_before |= skeleton
         chains = _trace_skeleton_chains(skeleton)
         component_retained = False
@@ -881,8 +1337,13 @@ def compute_relative_roadness(
             "scale_support_count": np.zeros(road.shape, dtype=np.uint8),
             "scale_agreement_fraction": empty.copy(),
             "relative_candidate_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_skeleton_raw": np.zeros(road.shape, dtype=np.uint8),
+            "relative_skeleton_normalized": np.zeros(road.shape, dtype=np.uint8),
             "relative_skeleton": np.zeros(road.shape, dtype=np.uint8),
             "relative_rejected_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "junction_zone_mask": np.zeros(road.shape, dtype=np.uint8),
+            "pruned_spur_mask": np.zeros(road.shape, dtype=np.uint8),
+            "collapsed_zone_mask": np.zeros(road.shape, dtype=np.uint8),
             "absolute_skeleton": np.zeros(road.shape, dtype=np.uint8),
             "relative_only_skeleton": np.zeros(road.shape, dtype=np.uint8),
             "combined_skeleton": np.zeros(road.shape, dtype=np.uint8),
@@ -924,6 +1385,16 @@ def compute_relative_roadness(
     candidate, threshold_summary = build_relative_candidate_mask(
         relative_score, config, scene_state=scene_state
     )
+    raw_relative_skeleton = skeletonize(candidate.astype(bool)).astype(np.uint8)
+    normalization = normalize_relative_skeleton(
+        raw_relative_skeleton,
+        candidate,
+        config,
+        relative_score=relative_score,
+        scale_agreement=scale_agreement,
+        distance_scale=distance_scale,
+    )
+    normalized_relative_skeleton = normalization["normalized_skeleton"]
     relative_skeleton, relative_rejected_skeleton, structure_summary = extract_relative_skeleton(
         candidate,
         config,
@@ -931,6 +1402,7 @@ def compute_relative_roadness(
         relative_score=relative_score,
         scene_rank=scene_rank,
         relative_weak_threshold=threshold_summary.get("relative_weak_threshold", 0.0),
+        input_skeleton=normalized_relative_skeleton,
     )
     high_threshold, _low_threshold, profile_name = resolve_road_thresholds(config)
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
@@ -965,6 +1437,7 @@ def compute_relative_roadness(
         "relative_only_skeleton_total_length": int(np.count_nonzero(relative_only)),
         "combined_skeleton_total_length": int(np.count_nonzero(combined)),
         **threshold_summary,
+        **normalization["diagnostics"],
         **structure_summary,
     }
     return {
@@ -976,8 +1449,13 @@ def compute_relative_roadness(
         "scale_support_count": scale_support_count,
         "scale_agreement_fraction": scale_agreement.astype(np.float32),
         "relative_candidate_mask": candidate.astype(np.uint8),
+        "relative_skeleton_raw": raw_relative_skeleton.astype(np.uint8),
+        "relative_skeleton_normalized": normalized_relative_skeleton.astype(np.uint8),
         "relative_skeleton": relative_skeleton.astype(np.uint8),
         "relative_rejected_skeleton": relative_rejected_skeleton.astype(np.uint8),
+        "junction_zone_mask": normalization["junction_zone_mask"].astype(np.uint8),
+        "pruned_spur_mask": normalization["pruned_spur_mask"].astype(np.uint8),
+        "collapsed_zone_mask": normalization["collapsed_zone_mask"].astype(np.uint8),
         "absolute_skeleton": absolute_skeleton.astype(np.uint8),
         "relative_only_skeleton": relative_only.astype(np.uint8),
         "combined_skeleton": combined.astype(np.uint8),
@@ -2601,6 +3079,30 @@ def postprocess_weak_road_network(
             relative_context.get("diagnostics", {}).get("relative_chain_count", 0)
             if relative_context else 0
         ),
+        "raw_chain_count": int(
+            relative_context.get("diagnostics", {}).get("raw_chain_count", 0)
+            if relative_context else 0
+        ),
+        "raw_too_short_count": int(
+            relative_context.get("diagnostics", {}).get("raw_short_chain_count", 0)
+            if relative_context else 0
+        ),
+        "normalized_chain_count": int(
+            relative_context.get("diagnostics", {}).get("normalized_chain_count", 0)
+            if relative_context else 0
+        ),
+        "normalized_too_short_count": int(
+            relative_context.get("diagnostics", {}).get("normalized_short_chain_count", 0)
+            if relative_context else 0
+        ),
+        "structure_rescued_chain_count": int(
+            relative_context.get("diagnostics", {}).get("structure_rescued_chain_count", 0)
+            if relative_context else 0
+        ),
+        "structure_rescued_length": float(
+            relative_context.get("diagnostics", {}).get("structure_rescued_length", 0.0)
+            if relative_context else 0.0
+        ),
         "relative_chain_geometry_pass": int(
             relative_context.get("diagnostics", {}).get("relative_chain_geometry_pass", 0)
             if relative_context else 0
@@ -2633,7 +3135,11 @@ def postprocess_weak_road_network(
         **bootstrap_summary,
         **segment_summary,
         **(
-            dict(relative_context.get("diagnostics", {}))
+            {
+                key: value
+                for key, value in relative_context.get("diagnostics", {}).items()
+                if key != "junction_zones"
+            }
             if relative_context else {}
         ),
         "strong_edge_count": int(len(original_edges)),

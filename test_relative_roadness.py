@@ -69,6 +69,90 @@ def straight_scene(center, background):
 
 
 class RelativeRoadnessTests(unittest.TestCase):
+    @staticmethod
+    def _ladder_skeleton(with_branch=False):
+        skeleton = np.zeros((140, 240), dtype=np.uint8)
+        cv2.line(skeleton, (15, 52), (225, 52), 1, 1)
+        cv2.line(skeleton, (15, 64), (225, 64), 1, 1)
+        for col in range(40, 221, 16):
+            cv2.line(skeleton, (col, 52), (col, 64), 1, 1)
+        if with_branch:
+            cv2.line(skeleton, (120, 64), (120, 100), 1, 1)
+        return skeleton
+
+    @staticmethod
+    def _normalize_synthetic(skeleton, config=None):
+        candidate = cv2.dilate(skeleton, np.ones((3, 3), dtype=np.uint8))
+        evidence = candidate.astype(np.float32)
+        return graph_extraction.normalize_relative_skeleton(
+            skeleton,
+            candidate,
+            config or relative_config(),
+            relative_score=evidence,
+            scale_agreement=evidence,
+        )
+
+    def test_ladder_junction_zone_becomes_one_long_corridor(self):
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        result = self._normalize_synthetic(self._ladder_skeleton(), cfg)
+        diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["raw_chain_count"], 38)
+        self.assertEqual(diagnostics["raw_short_chain_count"], 38)
+        self.assertEqual(diagnostics["normalized_chain_count"], 1)
+        self.assertEqual(diagnostics["normalized_short_chain_count"], 0)
+        self.assertGreater(diagnostics["normalized_max_chain_length"], 200.0)
+        self.assertEqual(diagnostics["collapsed_zone_count"], 1)
+        zone = diagnostics["junction_zones"][0]
+        self.assertEqual(len(zone["branch_lengths"]), zone["incident_branch_count"])
+        self.assertEqual(len(zone["branch_tangents"]), zone["incident_branch_count"])
+
+    def test_dense_ladder_keeps_real_branch_that_leaves_zone(self):
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        result = self._normalize_synthetic(self._ladder_skeleton(with_branch=True), cfg)
+        normalized = result["normalized_skeleton"] > 0
+        self.assertGreater(np.count_nonzero(normalized[65:101, 118:123]), 30)
+        self.assertEqual(result["diagnostics"]["junction_zones"][0]["preserved_branch_count"], 1)
+
+    def test_compact_t_and_x_junctions_are_unchanged(self):
+        for branch_start in (70, 20):
+            skeleton = np.zeros((140, 180), dtype=np.uint8)
+            cv2.line(skeleton, (15, 70), (165, 70), 1, 1)
+            cv2.line(skeleton, (90, branch_start), (90, 125), 1, 1)
+            result = self._normalize_synthetic(skeleton)
+            self.assertTrue(np.array_equal(result["normalized_skeleton"] > 0, skeleton > 0))
+            self.assertEqual(result["diagnostics"]["collapsed_zone_count"], 0)
+
+    def test_roof_grid_is_not_normalized_into_a_road(self):
+        skeleton = np.zeros((140, 200), dtype=np.uint8)
+        for row in (30, 60, 90):
+            cv2.line(skeleton, (30, row), (150, row), 1, 1)
+        for col in (40, 80, 120):
+            cv2.line(skeleton, (col, 20), (col, 100), 1, 1)
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        result = self._normalize_synthetic(skeleton, cfg)
+        self.assertEqual(result["diagnostics"]["collapsed_zone_count"], 0)
+        self.assertTrue(np.array_equal(result["normalized_skeleton"] > 0, skeleton > 0))
+        retained, _rejected, _summary = graph_extraction.extract_relative_skeleton(
+            cv2.dilate(skeleton, np.ones((3, 3), dtype=np.uint8)),
+            cfg,
+            input_skeleton=result["normalized_skeleton"],
+        )
+        self.assertEqual(np.count_nonzero(retained), 0)
+
+    def test_parallel_roads_and_ring_are_unchanged(self):
+        parallel = np.zeros((140, 240), dtype=np.uint8)
+        cv2.line(parallel, (15, 52), (225, 52), 1, 1)
+        cv2.line(parallel, (15, 64), (225, 64), 1, 1)
+        ring = np.zeros((140, 240), dtype=np.uint8)
+        cv2.ellipse(ring, (110, 70), (52, 35), 0, 0, 360, 1, 1)
+        for skeleton in (parallel, ring):
+            result = self._normalize_synthetic(skeleton)
+            self.assertTrue(np.array_equal(result["normalized_skeleton"] > 0, skeleton > 0))
+            self.assertEqual(result["diagnostics"]["collapsed_zone_count"], 0)
+
     def test_t_junction_is_filtered_chain_by_chain_not_by_component_elongation(self):
         candidate = np.zeros((128, 128), dtype=np.uint8)
         cv2.line(candidate, (12, 62), (116, 62), 1, 1)
