@@ -26,7 +26,10 @@ segment。它使用 segment 最近投影点、LOW probability A*、方向与现�
 主要诊断产物：
 
 - `scene_probability_diagnostic.png`：原图、概率热力图、HIGH mask、LOW mask。
-- `relative_roadness_compare.png`：原图、原始中心线概率、相对道路候选、最终矢量四联图。
+- `relative_roadness_compare.png`：原图、原始中心线概率、相对候选、结构链、Auto/Review/Rejected、最终矢量六联图。
+- `relative_acceptance_overlay.png`：原图上的 Relative 接受结果；绿色 Auto、橙色 Review、红色 Rejected。
+- `relative_acceptance_funnel.json`：Candidate → structure → topology → acceptance → final 的逐层数量和拒绝原因。
+- `relative_review_candidates.csv`：保留完整几何与 provenance 的 Review 候选，不混入 Reject。
 - `centerline_probability.png`、`relative_roadness.png`、`relative_candidate.png`、`combined_candidate.png`：相对分支的逐层 QA。
 - `relative_roadness_summary.json`：相对阈值、候选像素、保留/拒绝组件与骨架长度。
 - `bootstrap_overlay.png`：黄色 strong SAMRoad、青色 weak recovered、品红色 weak bootstrap。
@@ -68,7 +71,8 @@ python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir d
 python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/auto_relative --threshold-profile auto --enable-relative-roadness
 ```
 
-Relative 的中等置信链只写入 `bootstrap_candidates.csv`，状态为 `review`；
+Relative 的中等置信链同时写入 `bootstrap_candidates.csv` 和
+`relative_review_candidates.csv`，状态为 `review`；
 只有 `auto` 链会进入 `recovered_graph.p`。原始 `road_probability.png` 不会被相对分支改写。
 
 开启 endpoint→segment 测试：
@@ -84,7 +88,7 @@ python dev_tools/weak_road_recovery_test/connectivity_ab_test.py
 ```
 
 黄色为原始 SAMRoad 中心线，青色为新增的 `weak_recovered`，品红色为
-`weak_bootstrap` / `relative_bootstrap`。每次 recovery-only 都从
+`weak_bootstrap`，绿色为 `relative_roadness`。每次 recovery-only 都从
 `original_graph.p` 开始，不会累加上一次恢复结果。
 
 本目录是独立开发测试工具，不接入正式 GUI、`user_pipeline.py` 或正式用户工作流。

@@ -249,6 +249,10 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             scene_state=profile_decision["scene_confidence_state"],
             distance_scale=postprocess_distance_scale,
         )
+        relative_context["diagnostics"]["relative_graph_point_count"] = int(
+            profile_decision.get("relative_graph_point_count", 0)
+        )
+        bootstrap_candidate_audit = []
         pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
             pred_nodes,
             pred_edges,
@@ -257,6 +261,10 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             edge_scores=edge_confidences,
             distance_scale=postprocess_distance_scale,
             relative_context=relative_context,
+            bootstrap_candidate_audit=bootstrap_candidate_audit,
+            topology_candidate_nodes_rc=candidate_nodes,
+            topology_candidate_edges=candidate_edges,
+            topology_candidate_scores=candidate_confidences,
         )
         edge_confidences = np.asarray(
             [row["topology_probability"] for row in edge_metadata], dtype=np.float32
@@ -307,8 +315,58 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             cv2.COLORMAP_VIRIDIS,
         )
         relative_color[relative_context['relative_candidate_mask'] > 0] = (0, 165, 255)
-        compare_panels = [img, probability_color, relative_color, viz_img]
-        compare_labels = ['image', 'raw probability', 'relative candidate', 'final vector']
+        chain_panel = np.copy(img)
+        chain_panel[relative_context['relative_skeleton'] > 0] = (0, 255, 0)
+        acceptance_overlay = np.copy(img)
+        rejected_structure = np.asarray(relative_context.get('relative_rejected_skeleton', []))
+        if rejected_structure.shape == acceptance_overlay.shape[:2]:
+            acceptance_overlay[rejected_structure > 0] = (0, 0, 255)
+        decision_colors = {
+            'auto': (0, 255, 0),
+            'review': (0, 165, 255),
+            'rejected': (0, 0, 255),
+        }
+        for row in bootstrap_candidate_audit:
+            if row.get('candidate_source') not in {'relative', 'absolute+relative'}:
+                continue
+            path = np.asarray(row.get('path', []), dtype=np.int32).reshape(-1, 2)
+            if len(path) < 2:
+                continue
+            points = path[:, ::-1].reshape(-1, 1, 2)
+            cv2.polylines(
+                acceptance_overlay,
+                [points],
+                False,
+                decision_colors.get(row.get('decision', row.get('qa_state')), (0, 0, 255)),
+                3,
+                cv2.LINE_AA,
+            )
+        final_colored = np.copy(img)
+        for edge_id, (src_idx, dst_idx) in enumerate(pred_edges.tolist()):
+            row = edge_metadata[edge_id]
+            relative_edge = (
+                row.get('candidate_source') in {'relative', 'absolute+relative'}
+                or str(row.get('line_source', '')).startswith('relative')
+            )
+            color = (0, 255, 0) if relative_edge else (0, 220, 255)
+            src = pred_nodes[src_idx]
+            dst = pred_nodes[dst_idx]
+            cv2.line(
+                final_colored,
+                (int(round(src[1])), int(round(src[0]))),
+                (int(round(dst[1])), int(round(dst[0]))),
+                color,
+                3,
+                cv2.LINE_AA,
+            )
+        compare_panels = [
+            img, probability_color, relative_color,
+            chain_panel, acceptance_overlay, final_colored,
+        ]
+        compare_labels = [
+            'image', 'raw probability', 'relative candidate',
+            'relative chain', 'auto / review / rejected', 'final vector',
+        ]
         max_panel_width = 720
         if original_width > max_panel_width:
             panel_scale = max_panel_width / float(original_width)
@@ -325,7 +383,14 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             cv2.putText(panel, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
         cv2.imwrite(
             os.path.join(viz_save_dir, f'{img_id}_relative_compare.png'),
-            np.concatenate(compare_panels, axis=1),
+            np.concatenate([
+                np.concatenate(compare_panels[:3], axis=1),
+                np.concatenate(compare_panels[3:], axis=1),
+            ], axis=0),
+        )
+        cv2.imwrite(
+            os.path.join(viz_save_dir, f'{img_id}_relative_acceptance_overlay.png'),
+            acceptance_overlay,
         )
 
         large_map_sat2graph_format = graph_utils.convert_to_sat2graph_format(pred_nodes, pred_edges)
@@ -376,6 +441,35 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 })
         with open(os.path.join(graph_save_dir, f'{img_id}_weak_recovery.json'), 'w', encoding='utf-8') as file:
             json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
+        with open(os.path.join(graph_save_dir, f'{img_id}_relative_acceptance_funnel.json'), 'w', encoding='utf-8') as file:
+            json.dump(recovery_summary.get('relative_acceptance_funnel', {}), file, ensure_ascii=False, indent=2)
+        review_rows = [
+            row for row in bootstrap_candidate_audit
+            if row.get('decision') == 'review'
+            and row.get('candidate_source') in {'relative', 'absolute+relative'}
+        ]
+        review_path = os.path.join(graph_save_dir, f'{img_id}_relative_review_candidates.csv')
+        review_fields = [
+            'candidate_id', 'decision', 'review_reason', 'candidate_source',
+            'path_length', 'tortuosity', 'relative_evidence_tier',
+            'relative_score_mean', 'relative_score_q25', 'scene_rank_mean',
+            'normalized_contrast_mean', 'scale_agreement_mean',
+            'connection_count', 'endpoint_alignment',
+            'topology_candidate_support_fraction', 'path',
+        ]
+        with open(review_path, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=review_fields)
+            writer.writeheader()
+            for candidate_id, row in enumerate(review_rows):
+                writer.writerow({
+                    key: (
+                        candidate_id if key == 'candidate_id'
+                        else json.dumps(row.get(key, []), ensure_ascii=False)
+                        if key == 'path'
+                        else row.get(key, '')
+                    )
+                    for key in review_fields
+                })
         candidate_path = os.path.join(graph_save_dir, f'{img_id}_edge_candidates.csv')
         with open(candidate_path, 'w', newline='', encoding='utf-8') as file:
             writer = csv.DictWriter(
@@ -678,6 +772,14 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         config,
         relative_context=relative_context,
     )
+    relative_graph_point_count = 0
+    if len(graph_points):
+        relative_skeleton = np.asarray(relative_context.get('relative_only_skeleton', []))
+        if relative_skeleton.shape == fused_road_mask.shape:
+            point_cols = np.clip(np.rint(graph_points[:, 0]).astype(np.int32), 0, relative_skeleton.shape[1] - 1)
+            point_rows = np.clip(np.rint(graph_points[:, 1]).astype(np.int32), 0, relative_skeleton.shape[0] - 1)
+            relative_graph_point_count = int(np.count_nonzero(relative_skeleton[point_rows, point_cols]))
+    profile_decision['relative_graph_point_count'] = relative_graph_point_count
     if graph_points.shape[0] == 0:
         print(1)
         print(graph_points)

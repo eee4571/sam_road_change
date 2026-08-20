@@ -179,7 +179,7 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             self.assertTrue(recovery["recovered_edges"])
             self.assertEqual(
                 {row["line_source"] for row in recovery["recovered_edges"]},
-                {"relative_bootstrap"},
+                {"relative_roadness"},
             )
             self.assertGreater(summary["relative_recovered_edge_count"], 0)
             for name in (
@@ -187,6 +187,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "recovery_compare.png", "recovered_graph.p",
                 "weak_recovery_candidates.csv", "bootstrap_candidates.csv",
                 "relative_roadness_compare.png", "relative_roadness_summary.json",
+                "relative_acceptance_overlay.png", "relative_acceptance_funnel.json",
+                "relative_review_candidates.csv",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
             self.assertEqual(

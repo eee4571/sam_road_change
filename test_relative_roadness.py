@@ -69,6 +69,26 @@ def straight_scene(center, background):
 
 
 class RelativeRoadnessTests(unittest.TestCase):
+    def test_t_junction_is_filtered_chain_by_chain_not_by_component_elongation(self):
+        candidate = np.zeros((128, 128), dtype=np.uint8)
+        cv2.line(candidate, (12, 62), (116, 62), 1, 1)
+        cv2.line(candidate, (64, 62), (64, 116), 1, 1)
+        retained, _rejected, summary = graph_extraction.extract_relative_skeleton(
+            candidate, relative_config()
+        )
+        self.assertGreater(np.count_nonzero(retained[60:65, 12:117]), 90)
+        self.assertGreater(np.count_nonzero(retained[62:117, 62:67]), 45)
+        self.assertGreaterEqual(summary["relative_chain_geometry_pass"], 3)
+
+    def test_long_smooth_curve_is_not_rejected_by_endpoint_tortuosity(self):
+        candidate = np.zeros((160, 160), dtype=np.uint8)
+        cv2.ellipse(candidate, (80, 80), (52, 52), 0, 0, 210, 1, 1)
+        retained, _rejected, summary = graph_extraction.extract_relative_skeleton(
+            candidate, relative_config()
+        )
+        self.assertGreater(np.count_nonzero(retained), 120)
+        self.assertEqual(summary["relative_structure_reject_reason_counts"].get("tortuosity", 0), 0)
+
     def test_calibration_invariance_across_four_probability_scales(self):
         scenes = [
             straight_scene(0.70, 0.05),
@@ -88,6 +108,26 @@ class RelativeRoadnessTests(unittest.TestCase):
             union = np.count_nonzero(mask | masks[0])
             self.assertGreater(intersection / max(union, 1), 0.95)
 
+        final_lengths = []
+        for scene in scenes:
+            context = graph_extraction.compute_relative_roadness(
+                scene, relative_config(), scene_state="normal"
+            )
+            nodes, edges, _metadata, _summary = graph_extraction.bootstrap_weak_road_network(
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 2), dtype=np.int32),
+                scene,
+                relative_config(),
+                relative_context=context,
+                include_absolute_candidates=False,
+            )
+            final_lengths.append(sum(
+                float(np.linalg.norm(nodes[dst] - nodes[src])) for src, dst in edges
+            ))
+        self.assertGreater(final_lengths[0], 100.0)
+        for length in final_lengths[1:]:
+            self.assertAlmostEqual(length, final_lengths[0], delta=1.0)
+
     def test_background_only_noise_does_not_form_long_roads(self):
         rng = np.random.default_rng(7)
         probability = np.clip(
@@ -96,7 +136,16 @@ class RelativeRoadnessTests(unittest.TestCase):
         result = graph_extraction.compute_relative_roadness(
             probability, relative_config(), scene_state="normal"
         )
-        self.assertEqual(np.count_nonzero(result["relative_skeleton"]), 0)
+        nodes, edges, _metadata, _summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            relative_config(),
+            relative_context=result,
+            include_absolute_candidates=False,
+        )
+        false_length = sum(float(np.linalg.norm(nodes[dst] - nodes[src])) for src, dst in edges)
+        self.assertEqual(false_length, 0.0)
 
     def test_compact_blobs_and_rectangles_are_rejected(self):
         probability = np.full((128, 192), 0.04, dtype=np.float32)
@@ -105,7 +154,15 @@ class RelativeRoadnessTests(unittest.TestCase):
         result = graph_extraction.compute_relative_roadness(
             probability, relative_config(), scene_state="low_confidence"
         )
-        self.assertEqual(np.count_nonzero(result["relative_skeleton"]), 0)
+        nodes, edges, _metadata, _summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            probability,
+            relative_config(),
+            relative_context=result,
+            include_absolute_candidates=False,
+        )
+        self.assertEqual(len(edges), 0)
 
     def test_strong_and_weak_roads_coexist(self):
         probability = np.full((160, 192), 0.005, dtype=np.float32)
@@ -146,16 +203,17 @@ class RelativeRoadnessTests(unittest.TestCase):
             include_absolute_candidates=False,
         )
         self.assertGreater(summary["relative_recovered_edge_count"], 0)
-        self.assertIn("relative_bootstrap", {row["line_source"] for row in metadata})
+        self.assertIn("relative_roadness", {row["line_source"] for row in metadata})
         self.assertTrue(all(row["center_conf"] < 0.12 for row in metadata))
 
-    def test_relative_review_candidate_is_not_written_to_final_graph(self):
+    def test_relative_review_is_preserved_without_being_called_rejected(self):
         cfg = relative_config()
         cfg["WEAK_BOOTSTRAP_AUTO_SCORE"] = 0.99
         road = straight_scene(0.07, 0.01)
         context = graph_extraction.compute_relative_roadness(
             road, cfg, scene_state="low_confidence"
         )
+        context["scale_agreement_fraction"][:] = 0.0
         audit = []
         _nodes, edges, _metadata, summary = graph_extraction.bootstrap_weak_road_network(
             np.empty((0, 2), dtype=np.float32),
@@ -171,7 +229,36 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertEqual(summary["relative_review_count"], 1)
         self.assertEqual(summary["relative_recovered_edge_count"], 0)
         self.assertEqual(audit[0]["qa_state"], "review")
-        self.assertEqual(audit[0]["reject_reason"], "manual_review_required")
+        self.assertEqual(audit[0]["decision"], "review")
+        self.assertEqual(audit[0]["reject_reason"], "")
+        self.assertEqual(audit[0]["review_reason"], "relative_evidence_requires_review")
+
+    def test_low_topology_relative_candidate_is_promoted_by_combined_evidence(self):
+        cfg = relative_config()
+        cfg["WEAK_BOOTSTRAP_AUTO_SCORE"] = 0.99
+        road = np.full((96, 128), 0.01, dtype=np.float32)
+        road[47:50, 34:82] = 0.07
+        context = graph_extraction.compute_relative_roadness(
+            road, cfg, scene_state="low_confidence"
+        )
+        topology_nodes = np.asarray([[48.0, 34.0], [48.0, 81.0]], dtype=np.float32)
+        topology_edges = np.asarray([[0, 1]], dtype=np.int32)
+        nodes, edges, metadata, summary = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            road,
+            cfg,
+            relative_context=context,
+            include_absolute_candidates=False,
+            topology_candidate_nodes_rc=topology_nodes,
+            topology_candidate_edges=topology_edges,
+            topology_candidate_scores=np.asarray([0.30], dtype=np.float32),
+        )
+        self.assertGreater(len(edges), 0)
+        self.assertGreater(sum(np.linalg.norm(nodes[d] - nodes[s]) for s, d in edges), 40.0)
+        self.assertEqual(summary["relative_auto_count"], 1)
+        self.assertTrue(all(row["topology_probability"] < 0.5 for row in metadata))
+        self.assertTrue(all(row["relative_evidence_tier"] == "A" for row in metadata))
 
 
 if __name__ == "__main__":

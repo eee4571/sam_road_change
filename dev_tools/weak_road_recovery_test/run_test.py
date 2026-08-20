@@ -48,11 +48,15 @@ ENDPOINT_SEGMENT_CANDIDATE_FIELDS = (
 BOOTSTRAP_CANDIDATE_FIELDS = (
     "path_length", "direct_distance", "tortuosity", "mean_probability",
     "q25_probability", "weak_fraction", "background_probability",
-    "background_contrast", "connection_count", "accepted", "qa_state",
-    "reject_reason",
+    "background_contrast", "connection_count", "endpoint_alignment",
+    "absolute_proximity_fraction", "accepted", "decision", "qa_state",
+    "reject_reason", "review_reason", "relative_evidence_tier",
     "candidate_source", "scene_rank_mean", "local_background_mean",
     "local_contrast_mean", "normalized_contrast_mean",
     "relative_score_mean", "relative_score_q25", "relative_fraction",
+    "scale_agreement_mean", "scale_agreement_q25",
+    "topology_candidate_support_fraction", "topology_candidate_score_mean",
+    "path",
 )
 
 OVERRIDES = {
@@ -140,7 +144,7 @@ def _write_candidate_csv(path: Path, fieldnames, rows: list[dict]) -> None:
         writer.writeheader()
         for row in rows:
             payload = dict(row)
-            for name in ("start", "end", "target_projection", "endpoint_node", "target_segment"):
+            for name in ("start", "end", "target_projection", "endpoint_node", "target_segment", "path"):
                 if isinstance(payload.get(name), (list, tuple)):
                     payload[name] = json.dumps(payload[name], ensure_ascii=False)
             writer.writerow(payload)
@@ -583,6 +587,8 @@ def write_relative_roadness_diagnostic(
     recovered_nodes: np.ndarray,
     recovered_edges: np.ndarray,
     metadata: list[dict],
+    candidate_audit: list[dict],
+    recovery_summary: dict,
 ) -> None:
     context = graph_extraction.compute_relative_roadness(
         road_probability, config, scene_state=scene_state
@@ -627,11 +633,38 @@ def write_relative_roadness_diagnostic(
                 color,
                 thickness,
             )
+    chain_overlay = image_rgb.copy()
+    chain_overlay[context["relative_skeleton"] > 0] = (0, 255, 0)
+    acceptance_overlay = image_rgb.copy()
+    rejected_structure = np.asarray(context.get("relative_rejected_skeleton", []))
+    if rejected_structure.shape == image_rgb.shape[:2]:
+        acceptance_overlay[rejected_structure > 0] = (255, 0, 0)
+    decision_colors = {
+        "auto": (0, 255, 0),
+        "review": (255, 165, 0),
+        "rejected": (255, 0, 0),
+    }
+    for row in candidate_audit:
+        if row.get("candidate_source") not in {"relative", "absolute+relative"}:
+            continue
+        path = np.asarray(row.get("path", []), dtype=np.int32).reshape(-1, 2)
+        if len(path) < 2:
+            continue
+        cv2.polylines(
+            acceptance_overlay,
+            [path[:, ::-1].reshape(-1, 1, 2)],
+            False,
+            decision_colors.get(row.get("decision", row.get("qa_state")), (255, 0, 0)),
+            3,
+            cv2.LINE_AA,
+        )
     panels = [
         _labeled_preview(image_rgb, "Original image", max_width=800),
         _labeled_preview(probability_rgb, "Raw centerline probability", max_width=800),
         _labeled_preview(relative_rgb, "Relative roadness + candidates", max_width=800),
-        _labeled_preview(final_overlay, "Final vector: relative additions magenta", max_width=800),
+        _labeled_preview(chain_overlay, "Relative chain after structure filter", max_width=800),
+        _labeled_preview(acceptance_overlay, "Auto green / Review orange / Rejected red", max_width=800),
+        _labeled_preview(final_overlay, "Final vector", max_width=800),
     ]
     target_height = min(panel.shape[0] for panel in panels)
     target_width = min(panel.shape[1] for panel in panels)
@@ -639,11 +672,16 @@ def write_relative_roadness_diagnostic(
     _save_png(
         run_dir / "relative_roadness_compare.png",
         np.concatenate([
-            np.concatenate(panels[:2], axis=1),
-            np.concatenate(panels[2:], axis=1),
+            np.concatenate(panels[:3], axis=1),
+            np.concatenate(panels[3:], axis=1),
         ], axis=0),
     )
+    _save_png(run_dir / "relative_acceptance_overlay.png", acceptance_overlay)
     _write_json(run_dir / "relative_roadness_summary.json", context["diagnostics"])
+    _write_json(
+        run_dir / "relative_acceptance_funnel.json",
+        recovery_summary.get("relative_acceptance_funnel", {}),
+    )
 
 
 def _actual_test_config(
@@ -840,6 +878,15 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_candidate_audit,
     )
     _write_candidate_csv(
+        run_dir / "relative_review_candidates.csv",
+        BOOTSTRAP_CANDIDATE_FIELDS,
+        [
+            row for row in bootstrap_candidate_audit
+            if row.get("decision") == "review"
+            and row.get("candidate_source") in {"relative", "absolute+relative"}
+        ],
+    )
+    _write_candidate_csv(
         run_dir / "endpoint_segment_candidates.csv",
         ENDPOINT_SEGMENT_CANDIDATE_FIELDS,
         endpoint_segment_candidate_audit,
@@ -861,6 +908,8 @@ def main(argv: list[str] | None = None) -> int:
         recovered_nodes,
         recovered_edges,
         metadata,
+        bootstrap_candidate_audit,
+        recovery_summary,
     )
     write_endpoint_segment_candidate_visualizations(
         run_dir,
