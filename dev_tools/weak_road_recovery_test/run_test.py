@@ -50,6 +50,9 @@ BOOTSTRAP_CANDIDATE_FIELDS = (
     "q25_probability", "weak_fraction", "background_probability",
     "background_contrast", "connection_count", "accepted", "qa_state",
     "reject_reason",
+    "candidate_source", "scene_rank_mean", "local_background_mean",
+    "local_contrast_mean", "normalized_contrast_mean",
+    "relative_score_mean", "relative_score_q25", "relative_fraction",
 )
 
 OVERRIDES = {
@@ -89,6 +92,14 @@ def parser() -> argparse.ArgumentParser:
     bootstrap_group.add_argument("--enable-bootstrap", dest="bootstrap_enabled", action="store_true")
     bootstrap_group.add_argument("--disable-bootstrap", dest="bootstrap_enabled", action="store_false")
     result.set_defaults(bootstrap_enabled=None)
+    relative_group = result.add_mutually_exclusive_group()
+    relative_group.add_argument(
+        "--enable-relative-roadness", dest="relative_roadness_enabled", action="store_true"
+    )
+    relative_group.add_argument(
+        "--disable-relative-roadness", dest="relative_roadness_enabled", action="store_false"
+    )
+    result.set_defaults(relative_roadness_enabled=None)
     segment_group = result.add_mutually_exclusive_group()
     segment_group.add_argument(
         "--enable-segment-recovery", dest="segment_recovery_enabled", action="store_true"
@@ -237,10 +248,10 @@ def load_original_scored_graph(
 def _apply_overrides(config, arguments: argparse.Namespace) -> None:
     if arguments.threshold_profile:
         profiles = config.get("ROAD_THRESHOLD_PROFILES", {}) or {}
-        if arguments.threshold_profile not in profiles:
+        if arguments.threshold_profile != "auto" and arguments.threshold_profile not in profiles:
             raise ValueError(
                 f"Unknown threshold profile {arguments.threshold_profile!r}; "
-                f"available: {', '.join(sorted(profiles))}"
+                f"available: auto, {', '.join(sorted(profiles))}"
             )
         config.ROAD_THRESHOLD_PROFILE = arguments.threshold_profile
     threshold_overridden = (
@@ -272,6 +283,8 @@ def _apply_overrides(config, arguments: argparse.Namespace) -> None:
         config.INFER_BATCH_SIZE = int(arguments.batch_size)
     if arguments.bootstrap_enabled is not None:
         config.WEAK_BOOTSTRAP_ENABLED = bool(arguments.bootstrap_enabled)
+    if arguments.relative_roadness_enabled is not None:
+        config.RELATIVE_ROADNESS_ENABLED = bool(arguments.relative_roadness_enabled)
     if arguments.segment_recovery_enabled is not None:
         config.WEAK_SEGMENT_RECOVERY_ENABLED = bool(arguments.segment_recovery_enabled)
 
@@ -333,8 +346,10 @@ def write_visualizations(
     recovered_overlay = image_rgb.copy()
     source_styles = {
         "samroad": ((255, 220, 0), 3),
+        "relative_roadness": ((0, 255, 0), 4),
         "weak_recovered": ((0, 255, 255), 5),
         "weak_bootstrap": ((255, 0, 255), 5),
+        "relative_bootstrap": ((255, 64, 255), 5),
         "weak_segment_connector": ((255, 128, 0), 6),
     }
     for source, (color, thickness) in source_styles.items():
@@ -356,7 +371,7 @@ def write_visualizations(
     left = _labeled_preview(original_overlay, "Original SAMRoad (yellow)")
     right = _labeled_preview(
         recovered_overlay,
-        "Final: strong yellow / recovered cyan / segment orange",
+        "Final: strong yellow / relative magenta / weak cyan / segment orange",
     )
     target_height = min(left.shape[0], right.shape[0])
     if left.shape[0] != target_height:
@@ -559,6 +574,78 @@ def write_scene_probability_diagnostic(
     _save_png(run_dir / "scene_probability_diagnostic.png", diagnostic)
 
 
+def write_relative_roadness_diagnostic(
+    run_dir: Path,
+    image_rgb: np.ndarray,
+    road_probability: np.ndarray,
+    config,
+    scene_state: str,
+    recovered_nodes: np.ndarray,
+    recovered_edges: np.ndarray,
+    metadata: list[dict],
+) -> None:
+    context = graph_extraction.compute_relative_roadness(
+        road_probability, config, scene_state=scene_state
+    )
+    probability_u8 = np.clip(np.rint(road_probability * 255.0), 0, 255).astype(np.uint8)
+    relative_u8 = np.clip(np.rint(context["relative_score"] * 255.0), 0, 255).astype(np.uint8)
+    relative_candidate = context["relative_candidate_mask"].astype(np.uint8) * 255
+    high, _low, _profile = graph_extraction.resolve_road_thresholds(config)
+    combined = (
+        (road_probability >= high) | (context["relative_candidate_mask"] > 0)
+    ).astype(np.uint8) * 255
+    _save_png(run_dir / "centerline_probability.png", probability_u8)
+    _save_png(run_dir / "relative_roadness.png", relative_u8)
+    _save_png(run_dir / "relative_candidate.png", relative_candidate)
+    _save_png(run_dir / "combined_candidate.png", combined)
+
+    probability_rgb = cv2.cvtColor(
+        cv2.applyColorMap(probability_u8, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB
+    )
+    relative_rgb = cv2.cvtColor(
+        cv2.applyColorMap(relative_u8, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB
+    )
+    relative_rgb[relative_candidate > 0] = (255, 165, 0)
+    final_overlay = image_rgb.copy()
+    for source, color, thickness in (
+        ("samroad", (255, 220, 0), 3),
+        ("relative_roadness", (0, 255, 0), 4),
+        ("weak_recovered", (0, 255, 255), 5),
+        ("weak_bootstrap", (255, 0, 255), 5),
+        ("relative_bootstrap", (255, 64, 255), 5),
+        ("weak_segment_connector", (255, 128, 0), 6),
+    ):
+        edge_ids = [
+            edge_id for edge_id, row in enumerate(metadata)
+            if row.get("line_source") == source
+        ]
+        if edge_ids:
+            final_overlay = _draw_edges(
+                final_overlay,
+                recovered_nodes,
+                recovered_edges[np.asarray(edge_ids, dtype=np.int32)],
+                color,
+                thickness,
+            )
+    panels = [
+        _labeled_preview(image_rgb, "Original image", max_width=800),
+        _labeled_preview(probability_rgb, "Raw centerline probability", max_width=800),
+        _labeled_preview(relative_rgb, "Relative roadness + candidates", max_width=800),
+        _labeled_preview(final_overlay, "Final vector: relative additions magenta", max_width=800),
+    ]
+    target_height = min(panel.shape[0] for panel in panels)
+    target_width = min(panel.shape[1] for panel in panels)
+    panels = [cv2.resize(panel, (target_width, target_height)) for panel in panels]
+    _save_png(
+        run_dir / "relative_roadness_compare.png",
+        np.concatenate([
+            np.concatenate(panels[:2], axis=1),
+            np.concatenate(panels[2:], axis=1),
+        ], axis=0),
+    )
+    _write_json(run_dir / "relative_roadness_summary.json", context["diagnostics"])
+
+
 def _actual_test_config(
     arguments: argparse.Namespace,
     config,
@@ -579,6 +666,7 @@ def _actual_test_config(
             or key.startswith("WEAK_BOOTSTRAP_")
             or key.startswith("WEAK_SEGMENT_RECOVERY_")
             or key.startswith("WEAK_ENDPOINT_DIRECTION_")
+            or key.startswith("RELATIVE_ROADNESS_")
         )
     }
     return {
@@ -605,7 +693,10 @@ def _recovery_payload(
     original_edge_count: int,
 ) -> dict:
     recovered_rows = []
-    recovered_sources = {"weak_recovered", "weak_bootstrap", "weak_segment_connector"}
+    recovered_sources = {
+        "weak_recovered", "weak_bootstrap", "relative_bootstrap",
+        "relative_roadness", "weak_segment_connector",
+    }
     for edge_id, edge_metadata in enumerate(metadata):
         if edge_metadata.get("line_source") not in recovered_sources:
             continue
@@ -761,6 +852,16 @@ def main(argv: list[str] | None = None) -> int:
         metadata,
     )
     write_scene_probability_diagnostic(run_dir, image_rgb, road_probability, config)
+    write_relative_roadness_diagnostic(
+        run_dir,
+        image_rgb,
+        road_probability,
+        config,
+        recovery_summary.get("scene_confidence_state", "normal"),
+        recovered_nodes,
+        recovered_edges,
+        metadata,
+    )
     write_endpoint_segment_candidate_visualizations(
         run_dir,
         image_rgb,
@@ -786,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
         f"endpoint_segment_accepted_count={recovery_summary.get('endpoint_segment_accepted_count', 0)}, "
         f"connectivity_gain_total={recovery_summary.get('connectivity_gain_total', 0)}, "
         f"bootstrap_recovered_edge_count={recovery_summary.get('bootstrap_recovered_edge_count', 0)}, "
+        f"relative_recovered_edge_count={recovery_summary.get('relative_recovered_edge_count', 0)}, "
         f"scene_confidence_state={recovery_summary.get('scene_confidence_state', 'unknown')}"
     )
     _progress(f"Done. Total seconds: {timing['total_seconds']:.3f}")

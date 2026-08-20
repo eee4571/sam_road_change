@@ -242,13 +242,21 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 pred_nodes, pred_edges, original_height, original_width, edge_confidences
             )
 
+        postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
+        relative_context = graph_extraction.compute_relative_roadness(
+            road_mask,
+            image_config,
+            scene_state=profile_decision["scene_confidence_state"],
+            distance_scale=postprocess_distance_scale,
+        )
         pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
             pred_nodes,
             pred_edges,
             road_mask,
             image_config,
             edge_scores=edge_confidences,
-            distance_scale=1.0 / max(float(resize_factor), 1e-6),
+            distance_scale=postprocess_distance_scale,
+            relative_context=relative_context,
         )
         edge_confidences = np.asarray(
             [row["topology_probability"] for row in edge_metadata], dtype=np.float32
@@ -269,12 +277,56 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
         os.makedirs(mask_save_dir, exist_ok=True)
         cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_road.png'), road_mask)
         cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_itsc.png'), itsc_mask)
+        cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_centerline_probability.png'), road_mask)
+        cv2.imwrite(
+            os.path.join(mask_save_dir, f'{img_id}_relative_roadness.png'),
+            np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
+        )
+        cv2.imwrite(
+            os.path.join(mask_save_dir, f'{img_id}_relative_candidate.png'),
+            relative_context['relative_candidate_mask'].astype(np.uint8) * 255,
+        )
+        high_threshold, _low_threshold, _profile = graph_extraction.resolve_road_thresholds(image_config)
+        combined_candidate = (
+            (graph_extraction._probability01(road_mask) >= high_threshold)
+            | (relative_context['relative_candidate_mask'] > 0)
+        )
+        cv2.imwrite(
+            os.path.join(mask_save_dir, f'{img_id}_combined_candidate.png'),
+            combined_candidate.astype(np.uint8) * 255,
+        )
 
         viz_save_dir = os.path.join(output_dir, 'viz')
         os.makedirs(viz_save_dir, exist_ok=True)
         norm_scale = np.array([[viz_img.shape[0], viz_img.shape[1]]], dtype=np.float32)
         viz_img = triage.visualize_image_and_graph(viz_img, pred_nodes / norm_scale, pred_edges, viz_img.shape[0])
         cv2.imwrite(os.path.join(viz_save_dir, f'{img_id}.png'), viz_img)
+        probability_color = cv2.applyColorMap(road_mask, cv2.COLORMAP_VIRIDIS)
+        relative_color = cv2.applyColorMap(
+            np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
+            cv2.COLORMAP_VIRIDIS,
+        )
+        relative_color[relative_context['relative_candidate_mask'] > 0] = (0, 165, 255)
+        compare_panels = [img, probability_color, relative_color, viz_img]
+        compare_labels = ['image', 'raw probability', 'relative candidate', 'final vector']
+        max_panel_width = 720
+        if original_width > max_panel_width:
+            panel_scale = max_panel_width / float(original_width)
+            compare_panels = [
+                cv2.resize(
+                    panel,
+                    (max_panel_width, max(1, int(round(original_height * panel_scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                for panel in compare_panels
+            ]
+        for panel, label in zip(compare_panels, compare_labels):
+            cv2.rectangle(panel, (0, 0), (220, 30), (255, 255, 255), -1)
+            cv2.putText(panel, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.imwrite(
+            os.path.join(viz_save_dir, f'{img_id}_relative_compare.png'),
+            np.concatenate(compare_panels, axis=1),
+        )
 
         large_map_sat2graph_format = graph_utils.convert_to_sat2graph_format(pred_nodes, pred_edges)
         graph_save_dir = os.path.join(output_dir, 'graph')
@@ -289,6 +341,9 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                 'topology_probability', 'line_source', 'recovery_score',
                 'center_conf', 'background_conf', 'probability_contrast',
                 'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
+                'candidate_source', 'scene_rank_mean', 'local_background_mean',
+                'local_contrast_mean', 'normalized_contrast_mean',
+                'relative_score_mean', 'relative_score_q25', 'relative_fraction',
             ])
             writer.writeheader()
             for edge_id, ((src_idx, dst_idx), score, metadata) in enumerate(
@@ -310,6 +365,14 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                     'recovery_reason': metadata['recovery_reason'],
                     'qa_state': metadata['qa_state'],
                     'recovery_id': metadata['recovery_id'],
+                    'candidate_source': metadata.get('candidate_source', 'absolute'),
+                    'scene_rank_mean': metadata.get('scene_rank_mean', 0.0),
+                    'local_background_mean': metadata.get('local_background_mean', 0.0),
+                    'local_contrast_mean': metadata.get('local_contrast_mean', 0.0),
+                    'normalized_contrast_mean': metadata.get('normalized_contrast_mean', 0.0),
+                    'relative_score_mean': metadata.get('relative_score_mean', 0.0),
+                    'relative_score_q25': metadata.get('relative_score_q25', 0.0),
+                    'relative_fraction': metadata.get('relative_fraction', 0.0),
                 })
         with open(os.path.join(graph_save_dir, f'{img_id}_weak_recovery.json'), 'w', encoding='utf-8') as file:
             json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
@@ -348,6 +411,9 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
         'bootstrap_candidate_count', 'bootstrap_accepted_candidate_count',
         'bootstrap_recovered_edge_count',
         'bootstrap_auto_count', 'bootstrap_review_count', 'bootstrap_rejected_count',
+        'relative_candidate_count', 'relative_accepted_candidate_count',
+        'relative_recovered_edge_count', 'relative_auto_count',
+        'relative_review_count', 'relative_rejected_count',
     )
     recovery_report = {
         'tile_count': len(recovery_summaries),
@@ -597,7 +663,21 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         diagnostic_probability, config
     )
     config.ROAD_THRESHOLD_PROFILE = profile_decision["effective_profile"]
-    graph_points = graph_extraction.extract_graph_points(fused_keypoint_mask, fused_road_mask, config)
+    relative_context_unpadded = graph_extraction.compute_relative_roadness(
+        diagnostic_probability,
+        config,
+        scene_state=profile_decision["scene_confidence_state"],
+    )
+    relative_context = graph_extraction.embed_relative_roadness_context(
+        relative_context_unpadded, fused_road_mask.shape
+    )
+    profile_decision.update(relative_context_unpadded.get("diagnostics", {}))
+    graph_points = graph_extraction.extract_graph_points(
+        fused_keypoint_mask,
+        fused_road_mask,
+        config,
+        relative_context=relative_context,
+    )
     if graph_points.shape[0] == 0:
         print(1)
         print(graph_points)

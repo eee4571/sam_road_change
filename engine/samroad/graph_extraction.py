@@ -434,6 +434,58 @@ def _road_evidence_reject_reason(evidence, parameters):
     return "insufficient_independent_support"
 
 
+def _relative_path_evidence(path, relative_context):
+    """Sample relative-roadness evidence without imposing raw probability gates."""
+    if not relative_context:
+        return {
+            "relative_score_mean": 0.0,
+            "relative_score_q25": 0.0,
+            "scene_rank_mean": 0.0,
+            "local_background_mean": 0.0,
+            "local_contrast_mean": 0.0,
+            "normalized_contrast_mean": 0.0,
+            "relative_fraction": 0.0,
+            "relative_supported": False,
+        }
+    score = np.asarray(relative_context.get("relative_score", []), dtype=np.float32)
+    if score.ndim != 2 or score.size == 0:
+        return _relative_path_evidence(path, None)
+    rows = np.clip(path[:, 0], 0, score.shape[0] - 1)
+    cols = np.clip(path[:, 1], 0, score.shape[1] - 1)
+
+    def sampled(name):
+        value = relative_context.get(name)
+        if value is None:
+            return np.zeros(len(rows), dtype=np.float32)
+        array = np.asarray(value, dtype=np.float32)
+        return array[rows, cols] if array.shape == score.shape else np.zeros(len(rows), dtype=np.float32)
+
+    values = sampled("relative_score")
+    scene_rank = sampled("scene_rank")
+    local_background = sampled("local_background")
+    local_contrast = sampled("local_contrast")
+    normalized_contrast = sampled("normalized_contrast")
+    relative_only = sampled("relative_only_skeleton") > 0
+    diagnostics = relative_context.get("diagnostics", {})
+    weak_threshold = float(diagnostics.get("relative_weak_threshold", 0.0))
+    q25 = float(np.quantile(values, 0.25)) if values.size else 0.0
+    fraction = float(np.mean(relative_only)) if values.size else 0.0
+    return {
+        "relative_score_mean": float(np.mean(values)) if values.size else 0.0,
+        "relative_score_q25": q25,
+        "scene_rank_mean": float(np.mean(scene_rank)) if values.size else 0.0,
+        "local_background_mean": float(np.mean(local_background)) if values.size else 0.0,
+        "local_contrast_mean": float(np.mean(local_contrast)) if values.size else 0.0,
+        "normalized_contrast_mean": float(np.mean(normalized_contrast)) if values.size else 0.0,
+        "relative_fraction": fraction,
+        "relative_supported": bool(
+            fraction >= 0.50
+            and q25 >= max(weak_threshold - 1e-6, 0.0)
+            and float(np.mean(normalized_contrast)) > 0.0
+        ),
+    }
+
+
 def _graph_raster_mask(nodes_rc, edges, shape):
     mask = np.zeros(shape, dtype=np.uint8)
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
@@ -511,6 +563,250 @@ def _trace_skeleton_chains(skeleton):
             if edge_key(point, neighbor) not in visited:
                 chains.append(trace(point, neighbor))
     return [np.asarray(chain, dtype=np.int32) for chain in chains if len(chain) >= 2]
+
+
+def _scene_rank_map(probability, bins=4096):
+    """Return a calibration-invariant empirical rank for every scene pixel."""
+    values = _probability01(probability)
+    if values.size == 0:
+        return np.zeros_like(values, dtype=np.float32)
+    bin_count = max(32, int(bins))
+    indices = np.minimum(
+        np.floor(values * (bin_count - 1)).astype(np.int32), bin_count - 1
+    )
+    histogram = np.bincount(indices.ravel(), minlength=bin_count)
+    less_than = np.concatenate(([0], np.cumsum(histogram[:-1], dtype=np.int64)))
+    # Mid-ranks keep a constant-valued road above a constant-valued background,
+    # without making the result depend on the probability calibration scale.
+    ranks = (less_than[indices] + 0.5 * histogram[indices]) / float(values.size)
+    return ranks.astype(np.float32)
+
+
+def _relative_component_elongation(points_rc):
+    points = np.asarray(points_rc, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 3:
+        return 1.0
+    centered = points - np.mean(points, axis=0, keepdims=True)
+    eigenvalues = np.linalg.eigvalsh(centered.T @ centered / max(len(points) - 1, 1))
+    return float(math.sqrt(max(float(eigenvalues[-1]), 1e-6) / max(float(eigenvalues[0]), 1e-6)))
+
+
+def build_relative_candidate_mask(relative_score, config, *, scene_state="normal"):
+    """Select relative candidates with scene-adaptive rank thresholds and hysteresis."""
+    score = np.asarray(relative_score, dtype=np.float32)
+    positive = score[score > 0]
+    if positive.size == 0:
+        return np.zeros(score.shape, dtype=np.uint8), {
+            "relative_weak_percentile": 0.0,
+            "relative_strong_percentile": 0.0,
+            "relative_weak_threshold": 0.0,
+            "relative_strong_threshold": 0.0,
+        }
+    low_scene = str(scene_state) in {"low_confidence", "very_low_confidence"}
+    weak_percentile = float(_config_value(
+        config,
+        "RELATIVE_ROADNESS_LOW_SCENE_WEAK_PERCENTILE" if low_scene else "RELATIVE_ROADNESS_NORMAL_WEAK_PERCENTILE",
+        25.0 if low_scene else 45.0,
+    ))
+    strong_percentile = float(_config_value(
+        config,
+        "RELATIVE_ROADNESS_LOW_SCENE_STRONG_PERCENTILE" if low_scene else "RELATIVE_ROADNESS_NORMAL_STRONG_PERCENTILE",
+        85.0 if low_scene else 95.0,
+    ))
+    weak_threshold = float(np.percentile(positive, np.clip(weak_percentile, 0.0, 100.0)))
+    strong_threshold = float(np.percentile(positive, np.clip(strong_percentile, 0.0, 100.0)))
+    weak = (score >= weak_threshold).astype(np.uint8)
+    strong = score >= strong_threshold
+    close_size = max(1, int(round(_config_value(config, "RELATIVE_ROADNESS_CLOSE_KERNEL", 3))))
+    if close_size > 1:
+        kernel = np.ones((close_size, close_size), dtype=np.uint8)
+        weak = cv2.morphologyEx(weak, cv2.MORPH_CLOSE, kernel)
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(weak, 8)
+    candidate = np.zeros(score.shape, dtype=np.uint8)
+    min_pixels = max(2, int(round(_config_value(config, "RELATIVE_ROADNESS_MIN_COMPONENT_PIXELS", 12))))
+    # Hysteresis keeps strong-seeded components. A seedless component can only
+    # survive when it already has clear line geometry; this is what allows a
+    # uniformly weak but continuous road to coexist with a much stronger road.
+    min_elongation = float(_config_value(config, "RELATIVE_ROADNESS_MIN_ELONGATION", 3.0))
+    for component_id in range(1, component_count):
+        component = labels == component_id
+        if int(stats[component_id, cv2.CC_STAT_AREA]) < min_pixels:
+            continue
+        points = np.column_stack(np.where(component))
+        elongated = _relative_component_elongation(points) >= min_elongation
+        if np.any(strong & component) or elongated:
+            candidate[component] = 1
+    return candidate, {
+        "relative_weak_percentile": weak_percentile,
+        "relative_strong_percentile": strong_percentile,
+        "relative_weak_threshold": weak_threshold,
+        "relative_strong_threshold": strong_threshold,
+    }
+
+
+def extract_relative_skeleton(candidate_mask, config, *, distance_scale=1.0):
+    """Reject compact regions and retain long, straight relative-road chains."""
+    candidate = np.asarray(candidate_mask, dtype=np.uint8) > 0
+    component_count, labels = cv2.connectedComponents(candidate.astype(np.uint8), 8)
+    retained = np.zeros(candidate.shape, dtype=bool)
+    scale = max(float(distance_scale), 1e-6)
+    min_length = float(_config_value(config, "RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0)) * scale
+    min_elongation = float(_config_value(config, "RELATIVE_ROADNESS_MIN_ELONGATION", 3.0))
+    max_tortuosity = float(_config_value(config, "RELATIVE_ROADNESS_MAX_TORTUOSITY", 1.5))
+    retained_components = 0
+    rejected_components = 0
+    for component_id in range(1, component_count):
+        component = labels == component_id
+        skeleton = skeletonize(component)
+        skeleton_length = int(np.count_nonzero(skeleton))
+        points = np.column_stack(np.where(component))
+        elongation = _relative_component_elongation(points)
+        chains = _trace_skeleton_chains(skeleton)
+        chain_geometry_ok = False
+        for path in chains:
+            path_float = path.astype(np.float32)
+            length = float(np.linalg.norm(np.diff(path_float, axis=0), axis=1).sum())
+            direct = float(np.linalg.norm(path_float[-1] - path_float[0]))
+            if length >= min_length and length / max(direct, 1e-6) <= max_tortuosity:
+                chain_geometry_ok = True
+                break
+        if skeleton_length >= min_length and elongation >= min_elongation and chain_geometry_ok:
+            retained |= skeleton
+            retained_components += 1
+        else:
+            rejected_components += 1
+    return retained.astype(np.uint8), {
+        "relative_component_count": max(0, int(component_count - 1)),
+        "relative_retained_component_count": int(retained_components),
+        "relative_rejected_component_count": int(rejected_components),
+        "relative_skeleton_total_length": int(np.count_nonzero(retained)),
+    }
+
+
+def compute_relative_roadness(
+    road_probability,
+    config,
+    *,
+    scene_state="normal",
+    distance_scale=1.0,
+):
+    """Compute full-scene roadness from scene rank and local background contrast.
+
+    All statistics are computed on the supplied (unpadded) image. The returned
+    arrays have the same shape and never replace or rewrite road_probability.
+    """
+    road = _probability01(road_probability)
+    enabled = bool(_config_value(config, "RELATIVE_ROADNESS_ENABLED", False))
+    empty = np.zeros(road.shape, dtype=np.float32)
+    if not enabled or road.size == 0:
+        return {
+            "relative_score": empty,
+            "scene_rank": empty.copy(),
+            "local_background": empty.copy(),
+            "local_contrast": empty.copy(),
+            "normalized_contrast": empty.copy(),
+            "relative_candidate_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "absolute_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "relative_only_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "combined_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "diagnostics": {"relative_roadness_enabled": enabled, "relative_skeleton_total_length": 0},
+        }
+    configured_scales = _config_value(config, "RELATIVE_ROADNESS_BACKGROUND_SCALES_PX", [9, 21, 41])
+    if not isinstance(configured_scales, (list, tuple)):
+        configured_scales = [configured_scales]
+    backgrounds = []
+    used_scales = []
+    for value in configured_scales:
+        size = max(3, int(round(float(value) * max(float(distance_scale), 1e-6))))
+        size += 1 - size % 2
+        size = min(size, max(3, min(road.shape) // 2 * 2 - 1))
+        if size < 3:
+            continue
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        backgrounds.append(cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_REFLECT_101))
+        used_scales.append(size)
+    local_background = np.minimum.reduce(backgrounds) if backgrounds else np.zeros_like(road)
+    local_contrast = np.maximum(road - local_background, 0.0)
+    positive_contrast = local_contrast[local_contrast > 0]
+    contrast_scale = float(np.percentile(positive_contrast, 90.0)) if positive_contrast.size else 0.0
+    if contrast_scale <= 1e-8:
+        normalized_contrast = np.zeros_like(road)
+    else:
+        normalized_contrast = np.clip(local_contrast / contrast_scale, 0.0, 1.0)
+    scene_rank = _scene_rank_map(road)
+    relative_score = np.sqrt(np.clip(scene_rank * normalized_contrast, 0.0, 1.0)).astype(np.float32)
+    candidate, threshold_summary = build_relative_candidate_mask(
+        relative_score, config, scene_state=scene_state
+    )
+    relative_skeleton, structure_summary = extract_relative_skeleton(
+        candidate, config, distance_scale=distance_scale
+    )
+    high_threshold, _low_threshold, profile_name = resolve_road_thresholds(config)
+    close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
+    absolute_skeleton = skeletonize_road_mask(
+        (road * 255.0).astype(np.uint8), high_threshold * 255.0, close_size
+    ) > 0
+    suppression_radius = max(0, int(round(
+        float(_config_value(config, "RELATIVE_ROADNESS_ABSOLUTE_SUPPRESSION_PX", 3.0))
+        * max(float(distance_scale), 1e-6)
+    )))
+    absolute_neighborhood = absolute_skeleton
+    if suppression_radius > 0 and np.any(absolute_skeleton):
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (suppression_radius * 2 + 1, suppression_radius * 2 + 1),
+        )
+        absolute_neighborhood = cv2.dilate(absolute_skeleton.astype(np.uint8), kernel) > 0
+    relative_only = (relative_skeleton > 0) & ~absolute_neighborhood
+    combined = absolute_skeleton | relative_only
+    diagnostics = {
+        "relative_roadness_enabled": True,
+        "relative_scene_state": str(scene_state),
+        "relative_threshold_profile": profile_name,
+        "relative_background_scales_px": used_scales,
+        "relative_contrast_scale": contrast_scale,
+        "relative_score_p50": float(np.percentile(relative_score, 50.0)),
+        "relative_score_p90": float(np.percentile(relative_score, 90.0)),
+        "relative_score_p95": float(np.percentile(relative_score, 95.0)),
+        "relative_score_p99": float(np.percentile(relative_score, 99.0)),
+        "relative_candidate_pixel_count": int(np.count_nonzero(candidate)),
+        "absolute_skeleton_total_length": int(np.count_nonzero(absolute_skeleton)),
+        "relative_only_skeleton_total_length": int(np.count_nonzero(relative_only)),
+        "combined_skeleton_total_length": int(np.count_nonzero(combined)),
+        **threshold_summary,
+        **structure_summary,
+    }
+    return {
+        "relative_score": relative_score,
+        "scene_rank": scene_rank,
+        "local_background": local_background.astype(np.float32),
+        "local_contrast": local_contrast.astype(np.float32),
+        "normalized_contrast": normalized_contrast.astype(np.float32),
+        "relative_candidate_mask": candidate.astype(np.uint8),
+        "relative_skeleton": relative_skeleton.astype(np.uint8),
+        "absolute_skeleton": absolute_skeleton.astype(np.uint8),
+        "relative_only_skeleton": relative_only.astype(np.uint8),
+        "combined_skeleton": combined.astype(np.uint8),
+        "diagnostics": diagnostics,
+    }
+
+
+def embed_relative_roadness_context(context, shape):
+    """Embed an unpadded relative-roadness context into a padded image shape."""
+    height, width = map(int, shape)
+    result = {"diagnostics": dict(context.get("diagnostics", {}))}
+    for name, value in context.items():
+        if name == "diagnostics":
+            continue
+        array = np.asarray(value)
+        canvas = np.zeros((height, width), dtype=array.dtype)
+        copy_height = min(height, array.shape[0])
+        copy_width = min(width, array.shape[1])
+        canvas[:copy_height, :copy_width] = array[:copy_height, :copy_width]
+        result[name] = canvas
+    result["valid_shape"] = tuple(context.get("relative_score", np.zeros((0, 0))).shape)
+    return result
 
 
 def diagnose_probability_profile(road_probability, config, *, distance_scale=1.0):
@@ -660,6 +956,8 @@ def bootstrap_weak_road_network(
     edge_scores=None,
     distance_scale=1.0,
     candidate_audit=None,
+    relative_context=None,
+    include_absolute_candidates=True,
 ):
     """Conservatively add continuous weak chains that do not need strong seeds."""
     nodes = np.asarray(nodes_rc, dtype=np.float32).reshape(-1, 2)
@@ -703,13 +1001,25 @@ def bootstrap_weak_road_network(
         rr = np.clip(rr, 0, road.shape[0] - 1)
         cc = np.clip(cc, 0, road.shape[1] - 1)
         center_conf = float(np.mean(road[rr, cc])) if len(rr) else 0.0
+        relative_evidence = _relative_path_evidence(
+            np.column_stack((rr, cc)).astype(np.int32), relative_context
+        )
+        relative_fraction = relative_evidence["relative_fraction"]
+        candidate_source = (
+            "absolute+relative" if 0.05 < relative_fraction < 0.95
+            else "relative" if relative_fraction >= 0.95
+            else "absolute"
+        )
         topology_probability = float(scores[edge_id]) if np.isfinite(scores[edge_id]) else center_conf
         metadata.append({
-            "line_source": "samroad", "topology_probability": topology_probability,
+            "line_source": "relative_roadness" if candidate_source == "relative" else "samroad",
+            "candidate_source": candidate_source,
+            "topology_probability": topology_probability,
             "recovery_score": 0.0, "center_conf": center_conf,
             "background_conf": 0.0, "probability_contrast": center_conf,
             "surface_conf": 0.0, "recovery_reason": "strong_threshold",
             "qa_state": "auto", "recovery_id": "",
+            **relative_evidence,
         })
     summary = {
         "threshold_profile": profile_name,
@@ -720,16 +1030,37 @@ def bootstrap_weak_road_network(
         "bootstrap_review_count": 0,
         "bootstrap_rejected_count": 0,
         "bootstrap_reject_reason_counts": {},
+        "relative_candidate_count": 0,
+        "relative_accepted_candidate_count": 0,
+        "relative_recovered_edge_count": 0,
+        "relative_auto_count": 0,
+        "relative_review_count": 0,
+        "relative_rejected_count": 0,
+        "relative_reject_reason_counts": {},
     }
     if not bool(_config_value(config, "WEAK_BOOTSTRAP_ENABLED", True)):
         return nodes, original_edges, metadata, summary
 
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
-    low_mask = (road >= low_threshold).astype(np.uint8)
+    low_mask = (
+        (road >= low_threshold).astype(np.uint8)
+        if include_absolute_candidates
+        else np.zeros(road.shape, dtype=np.uint8)
+    )
+    relative_candidate_mask = np.zeros(road.shape, dtype=np.uint8)
+    relative_skeleton = np.zeros(road.shape, dtype=bool)
+    if relative_context is not None:
+        candidate_value = np.asarray(relative_context.get("relative_candidate_mask", []))
+        skeleton_value = np.asarray(relative_context.get("relative_skeleton", []))
+        if candidate_value.shape == road.shape:
+            relative_candidate_mask = (candidate_value > 0).astype(np.uint8)
+            low_mask |= relative_candidate_mask
+        if skeleton_value.shape == road.shape:
+            relative_skeleton = skeleton_value > 0
     if close_size > 1:
         kernel = np.ones((close_size, close_size), dtype=np.uint8)
         low_mask = cv2.morphologyEx(low_mask, cv2.MORPH_CLOSE, kernel)
-    weak_skeleton = skeletonize(low_mask.astype(bool))
+    weak_skeleton = skeletonize(low_mask.astype(bool)) | relative_skeleton
     strong_mask = _graph_raster_mask(nodes, original_edges, road.shape)
     if parameters["suppression_radius"] > 0 and np.any(strong_mask):
         radius = parameters["suppression_radius"]
@@ -751,6 +1082,7 @@ def bootstrap_weak_road_network(
     node_tree = KDTree(nodes) if len(nodes) else None
     recovery_id = 0
     reject_counts = Counter()
+    relative_reject_counts = Counter()
 
     def reject_candidate(row, reason):
         row["accepted"] = False
@@ -758,6 +1090,8 @@ def bootstrap_weak_road_network(
         row["reject_reason"] = reason
         summary["bootstrap_rejected_count"] += 1
         reject_counts[reason] += 1
+        if row.get("candidate_source") in {"relative", "absolute+relative"}:
+            relative_reject_counts[reason] += 1
         if candidate_audit is not None:
             candidate_audit.append(row)
 
@@ -767,6 +1101,22 @@ def bootstrap_weak_road_network(
         path_length = float(np.linalg.norm(np.diff(path_float, axis=0), axis=1).sum())
         direct_distance = float(np.linalg.norm(path_float[-1] - path_float[0]))
         tortuosity = path_length / max(direct_distance, 1e-6)
+        relative_evidence = _relative_path_evidence(path, relative_context)
+        relative_fraction = relative_evidence["relative_fraction"]
+        absolute_fraction = float(np.mean(
+            road[
+                np.clip(path[:, 0], 0, road.shape[0] - 1),
+                np.clip(path[:, 1], 0, road.shape[1] - 1),
+            ] >= low_threshold
+        ))
+        candidate_source = (
+            "absolute+relative" if relative_fraction >= 0.25 and absolute_fraction >= 0.25
+            else "relative" if relative_fraction >= 0.50
+            else "absolute"
+        )
+        relative_branch_candidate = candidate_source != "absolute"
+        if relative_branch_candidate:
+            summary["relative_candidate_count"] += 1
         audit_row = {
             "path_length": path_length,
             "direct_distance": direct_distance,
@@ -780,6 +1130,8 @@ def bootstrap_weak_road_network(
             "accepted": False,
             "qa_state": "rejected",
             "reject_reason": "",
+            "candidate_source": candidate_source,
+            **{key: value for key, value in relative_evidence.items() if key != "relative_supported"},
         }
         if path_length < parameters["min_length"]:
             reject_candidate(audit_row, "too_short")
@@ -800,20 +1152,28 @@ def bootstrap_weak_road_network(
             "background_probability": evidence["background_conf"],
             "background_contrast": evidence["probability_contrast"],
             "connection_count": connection_count,
+            "candidate_source": candidate_source,
+            **{key: value for key, value in relative_evidence.items() if key != "relative_supported"},
         })
         recovery_gap_limit = float(_config_value(config, "WEAK_RECOVERY_MAX_GAP_PX", 64.0)) * scale
         delegated_gap = connection_count == 2 and path_length <= recovery_gap_limit
         geometry_supported = tortuosity <= parameters["max_tortuosity"]
+        relative_supported = bool(relative_evidence["relative_supported"])
         independent_supported = (
             connection_count > 0
             or evidence["surface_supported"]
+            or relative_supported
             or (
                 path_length >= parameters["min_length"] * parameters["independent_length_factor"]
                 and evidence["center_conf"] >= parameters["min_mean"] + 0.01
                 and evidence["probability_contrast"] >= parameters["min_contrast"] + 0.02
             )
         )
-        evidence_supported = evidence["road_supported"] or evidence["surface_supported"]
+        evidence_supported = (
+            evidence["road_supported"]
+            or evidence["surface_supported"]
+            or relative_supported
+        )
         if delegated_gap:
             reject_candidate(audit_row, "delegated_to_weak_recovery")
             continue
@@ -823,7 +1183,9 @@ def bootstrap_weak_road_network(
         if not evidence_supported:
             reject_candidate(
                 audit_row,
-                _road_evidence_reject_reason(evidence, parameters),
+                "relative_structure_unsupported"
+                if candidate_source == "relative"
+                else _road_evidence_reject_reason(evidence, parameters),
             )
             continue
         if not independent_supported:
@@ -831,16 +1193,37 @@ def bootstrap_weak_road_network(
             continue
         directness = min(1.0, 1.0 / max(tortuosity, 1.0))
         proximity = (0.5, 0.8, 1.0)[connection_count]
-        recovery_score = (
-            0.24 * min(1.0, evidence["center_conf"] / max(high_threshold, 1e-6))
-            + 0.18 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
-            + 0.22 * min(1.0, evidence["probability_contrast"] / max(parameters["min_contrast"] * 2.0, 1e-6))
-            + 0.14 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
-            + 0.10 * directness
-            + 0.06 * proximity
-            + 0.06 * evidence["surface_conf"]
-        )
+        if relative_supported:
+            recovery_score = (
+                0.28 * relative_evidence["relative_score_mean"]
+                + 0.18 * relative_evidence["relative_score_q25"]
+                + 0.16 * relative_evidence["scene_rank_mean"]
+                + 0.12 * relative_evidence["normalized_contrast_mean"]
+                + 0.12 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
+                + 0.08 * directness
+                + 0.06 * proximity
+            )
+        else:
+            recovery_score = (
+                0.24 * min(1.0, evidence["center_conf"] / max(high_threshold, 1e-6))
+                + 0.18 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
+                + 0.22 * min(1.0, evidence["probability_contrast"] / max(parameters["min_contrast"] * 2.0, 1e-6))
+                + 0.14 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
+                + 0.10 * directness
+                + 0.06 * proximity
+                + 0.06 * evidence["surface_conf"]
+            )
         qa_state = "auto" if recovery_score >= parameters["auto_score"] else "review"
+        if relative_supported and qa_state == "review":
+            summary["bootstrap_review_count"] += 1
+            summary["relative_review_count"] += 1
+            audit_row["accepted"] = False
+            audit_row["qa_state"] = "review"
+            audit_row["reject_reason"] = "manual_review_required"
+            audit_row["path"] = path.astype(int).tolist()
+            if candidate_audit is not None:
+                candidate_audit.append(audit_row)
+            continue
         distances = np.concatenate([
             np.asarray([0.0], dtype=np.float32),
             np.cumsum(np.linalg.norm(np.diff(path_float, axis=0), axis=1)),
@@ -872,7 +1255,8 @@ def bootstrap_weak_road_network(
             existing_edges.add(key)
             combined_edges.append((int(src_idx), int(dst_idx)))
             metadata.append({
-                "line_source": "weak_bootstrap",
+                "line_source": "relative_bootstrap" if relative_supported else "weak_bootstrap",
+                "candidate_source": candidate_source,
                 "topology_probability": float(recovery_score),
                 "recovery_score": float(recovery_score),
                 "center_conf": float(evidence["center_conf"]),
@@ -882,6 +1266,7 @@ def bootstrap_weak_road_network(
                 "recovery_reason": "weak_network_bootstrap",
                 "qa_state": qa_state,
                 "recovery_id": f"bootstrap:{recovery_id}",
+                **relative_evidence,
             })
             added_count += 1
         if added_count:
@@ -889,6 +1274,10 @@ def bootstrap_weak_road_network(
             summary["bootstrap_accepted_candidate_count"] += 1
             summary["bootstrap_recovered_edge_count"] += added_count
             summary[f"bootstrap_{qa_state}_count"] += 1
+            if relative_branch_candidate:
+                summary["relative_accepted_candidate_count"] += 1
+                summary["relative_recovered_edge_count"] += added_count
+                summary[f"relative_{qa_state}_count"] += 1
             audit_row["accepted"] = True
             audit_row["qa_state"] = qa_state
             audit_row["reject_reason"] = ""
@@ -897,6 +1286,15 @@ def bootstrap_weak_road_network(
         else:
             reject_candidate(audit_row, "duplicate_or_suppressed")
     summary["bootstrap_reject_reason_counts"] = dict(sorted(reject_counts.items()))
+    summary["relative_reject_reason_counts"] = dict(
+        sorted(relative_reject_counts.items())
+    )
+    summary["relative_rejected_count"] = max(
+        0,
+        summary["relative_candidate_count"]
+        - summary["relative_accepted_candidate_count"]
+        - summary["relative_review_count"],
+    )
     return (
         np.asarray(combined_nodes, dtype=np.float32).reshape(-1, 2),
         np.asarray(combined_edges, dtype=np.int32).reshape(-1, 2),
@@ -1721,6 +2119,7 @@ def postprocess_weak_road_network(
     weak_candidate_audit=None,
     bootstrap_candidate_audit=None,
     endpoint_segment_candidate_audit=None,
+    relative_context=None,
 ):
     """Diagnose, bootstrap, recover endpoints, then optionally join endpoints to segments."""
     original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
@@ -1732,11 +2131,23 @@ def postprocess_weak_road_network(
         config,
         distance_scale=distance_scale,
     )
+    if relative_context is None:
+        relative_context = compute_relative_roadness(
+            road_probability,
+            config,
+            scene_state=diagnosis["scene_confidence_state"],
+            distance_scale=distance_scale,
+        )
+    relative_enabled = bool(
+        relative_context
+        and relative_context.get("diagnostics", {}).get("relative_roadness_enabled", False)
+    )
     bootstrap_enabled = bool(_config_value(config, "WEAK_BOOTSTRAP_ENABLED", True))
     only_low = bool(_config_value(config, "WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE", True))
-    should_bootstrap = bootstrap_enabled and (
+    absolute_bootstrap = (
         not only_low or diagnosis["scene_confidence_state"] in {"low_confidence", "very_low_confidence"}
     )
+    should_bootstrap = bootstrap_enabled and (absolute_bootstrap or relative_enabled)
     if should_bootstrap:
         bootstrap_nodes, bootstrap_edges, bootstrap_metadata, bootstrap_summary = (
             bootstrap_weak_road_network(
@@ -1748,6 +2159,8 @@ def postprocess_weak_road_network(
                 edge_scores=edge_scores,
                 distance_scale=distance_scale,
                 candidate_audit=bootstrap_candidate_audit,
+                relative_context=relative_context,
+                include_absolute_candidates=absolute_bootstrap,
             )
         )
     else:
@@ -1762,6 +2175,13 @@ def postprocess_weak_road_network(
             "bootstrap_review_count": 0,
             "bootstrap_rejected_count": 0,
             "bootstrap_reject_reason_counts": {},
+            "relative_candidate_count": 0,
+            "relative_accepted_candidate_count": 0,
+            "relative_recovered_edge_count": 0,
+            "relative_auto_count": 0,
+            "relative_review_count": 0,
+            "relative_rejected_count": 0,
+            "relative_reject_reason_counts": {},
         }
     if bootstrap_metadata:
         combined_scores = np.asarray(
@@ -1795,15 +2215,46 @@ def postprocess_weak_road_network(
         )
     )
     connectivity_after = graph_connectivity_stats(final_nodes, final_edges)
+    relative_topology_edge_count = sum(
+        row.get("line_source") == "relative_roadness" for row in final_metadata
+    )
+    relative_total_edge_count = sum(
+        row.get("candidate_source") in {"relative", "absolute+relative"}
+        or str(row.get("line_source", "")).startswith("relative")
+        for row in final_metadata
+    )
     summary = {
         **recovery_summary,
         **diagnosis,
         **bootstrap_summary,
         **segment_summary,
+        **(
+            dict(relative_context.get("diagnostics", {}))
+            if relative_context else {}
+        ),
         "strong_edge_count": int(len(original_edges)),
         "final_edge_count": int(len(final_edges)),
         "added_edge_count": int(len(final_edges) - len(original_edges)),
         "bootstrap_ran": bool(should_bootstrap),
+        "absolute_bootstrap_ran": bool(should_bootstrap and absolute_bootstrap),
+        "relative_bootstrap_ran": bool(should_bootstrap and relative_enabled),
+        "relative_topology_edge_count": int(relative_topology_edge_count),
+        "relative_total_edge_count": int(relative_total_edge_count),
+        "relative_chain_candidate_count": int(
+            bootstrap_summary.get("relative_candidate_count", 0)
+        ),
+        "relative_chain_accepted_count": int(
+            bootstrap_summary.get("relative_accepted_candidate_count", 0)
+        ),
+        "relative_chain_auto_count": int(
+            bootstrap_summary.get("relative_auto_count", 0)
+        ),
+        "relative_chain_review_count": int(
+            bootstrap_summary.get("relative_review_count", 0)
+        ),
+        "relative_chain_rejected_count": int(
+            bootstrap_summary.get("relative_rejected_count", 0)
+        ),
         "component_count_before": connectivity_before["component_count"],
         "component_count_after": connectivity_after["component_count"],
         "endpoint_count_before": connectivity_before["endpoint_count"],
@@ -1917,7 +2368,7 @@ def branch_aware_nms_points(
     return points[active]
 
 
-def extract_graph_points(keypoint_mask, road_mask, config):
+def extract_graph_points(keypoint_mask, road_mask, config, *, relative_context=None):
     high_threshold, _low_threshold, _profile_name = resolve_road_thresholds(config)
     kp_candidates, kp_scores = get_points_and_scores_from_mask(keypoint_mask, config.ITSC_THRESHOLD * 255)
     kps_0 = nms_points(kp_candidates, kp_scores, config.ITSC_NMS_RADIUS)
@@ -1926,8 +2377,25 @@ def extract_graph_points(keypoint_mask, road_mask, config):
     if kps_0.shape[0]:
         kps_0 = nms_points(kps_0, np.ones(kps_0.shape[0]), config.ROAD_NMS_RADIUS)
     road_skel_mask = skeletonize_road_mask(road_mask, high_threshold * 255)
+    relative_score = None
+    if relative_context is not None and bool(
+        _config_value(config, "RELATIVE_ROADNESS_ENABLED", False)
+    ):
+        combined = np.asarray(relative_context.get("combined_skeleton", []))
+        if combined.shape == road_skel_mask.shape:
+            road_skel_mask = np.maximum(
+                road_skel_mask, (combined > 0).astype(np.uint8) * 255
+            )
+        candidate_score = np.asarray(relative_context.get("relative_score", []), dtype=np.float32)
+        if candidate_score.shape == road_skel_mask.shape:
+            relative_score = candidate_score
     kp_candidates, kp_scores = get_points_and_scores_from_mask(road_skel_mask, 0)
     road_scores = road_mask[kp_candidates[:, 1], kp_candidates[:, 0]] if kp_candidates.shape[0] else kp_scores
+    if relative_score is not None and kp_candidates.shape[0]:
+        road_scores = np.maximum(
+            road_scores.astype(np.float32) / 255.0,
+            relative_score[kp_candidates[:, 1], kp_candidates[:, 0]],
+        )
     kps_1 = branch_aware_nms_points(
         kp_candidates,
         road_scores,
@@ -1956,8 +2424,10 @@ def extract_graph_points(keypoint_mask, road_mask, config):
     return np.concatenate([kps_0, kps_1], axis=0).astype(np.float32)
 
 
-def extract_graph_astar(keypoint_mask, road_mask, config):
-    kps = extract_graph_points(keypoint_mask, road_mask, config)
+def extract_graph_astar(keypoint_mask, road_mask, config, *, relative_context=None):
+    kps = extract_graph_points(
+        keypoint_mask, road_mask, config, relative_context=relative_context
+    )
 
     # cost_field = create_cost_field(kps, road_mask)
     _high_threshold, low_threshold, _profile_name = resolve_road_thresholds(config)

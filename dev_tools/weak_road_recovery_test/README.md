@@ -26,6 +26,9 @@ segment。它使用 segment 最近投影点、LOW probability A*、方向与现�
 主要诊断产物：
 
 - `scene_probability_diagnostic.png`：原图、概率热力图、HIGH mask、LOW mask。
+- `relative_roadness_compare.png`：原图、原始中心线概率、相对道路候选、最终矢量四联图。
+- `centerline_probability.png`、`relative_roadness.png`、`relative_candidate.png`、`combined_candidate.png`：相对分支的逐层 QA。
+- `relative_roadness_summary.json`：相对阈值、候选像素、保留/拒绝组件与骨架长度。
 - `bootstrap_overlay.png`：黄色 strong SAMRoad、青色 weak recovered、品红色 weak bootstrap。
 - `recovery_compare.png`：原始 strong graph 与最终三来源 graph 对比。
 - `endpoint_segment_candidates.csv`：endpoint→segment 全部候选及拒绝原因。
@@ -58,6 +61,16 @@ python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir d
 python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/test_4096 --threshold-profile weak_sensor --enable-bootstrap --bootstrap-min-length 48 --bootstrap-min-background-contrast 0.08
 ```
 
+同一概率缓存的 Auto 与 Auto+Relative 对比：
+
+```powershell
+python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/auto_only --threshold-profile auto --disable-relative-roadness
+python dev_tools/weak_road_recovery_test/run_test.py --recovery-only --run-dir dev_tools/weak_road_recovery_test/outputs/auto_relative --threshold-profile auto --enable-relative-roadness
+```
+
+Relative 的中等置信链只写入 `bootstrap_candidates.csv`，状态为 `review`；
+只有 `auto` 链会进入 `recovered_graph.p`。原始 `road_probability.png` 不会被相对分支改写。
+
 开启 endpoint→segment 测试：
 
 ```powershell
@@ -71,6 +84,7 @@ python dev_tools/weak_road_recovery_test/connectivity_ab_test.py
 ```
 
 黄色为原始 SAMRoad 中心线，青色为新增的 `weak_recovered`，品红色为
-`weak_bootstrap`。每次 recovery-only 都从 `original_graph.p` 开始，不会累加上一次恢复结果。
+`weak_bootstrap` / `relative_bootstrap`。每次 recovery-only 都从
+`original_graph.p` 开始，不会累加上一次恢复结果。
 
 本目录是独立开发测试工具，不接入正式 GUI、`user_pipeline.py` 或正式用户工作流。
