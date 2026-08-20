@@ -623,6 +623,10 @@ def write_relative_roadness_diagnostic(
         context["relative_backbone_mask"].astype(np.uint8) * 255,
     )
     _save_png(
+        run_dir / "relative_ribbon_centerline.png",
+        context["relative_ribbon_centerline"].astype(np.uint8) * 255,
+    )
+    _save_png(
         run_dir / "relative_skeleton_normalized.png",
         context["relative_skeleton_normalized"].astype(np.uint8) * 255,
     )
@@ -646,6 +650,7 @@ def write_relative_roadness_diagnostic(
         ("relative_backbone_bridge", (0, 220, 255), 4),
         ("relative_backbone_extension", (255, 165, 0), 4),
         ("relative_backbone_branch", (255, 64, 255), 4),
+        ("relative_ribbon_centerline", (0, 255, 0), 4),
         ("weak_recovered", (0, 255, 255), 5),
         ("weak_bootstrap", (255, 0, 255), 5),
         ("relative_bootstrap", (255, 64, 255), 5),
@@ -873,6 +878,73 @@ def write_relative_roadness_diagnostic(
         np.concatenate(backbone_panels, axis=1),
     )
 
+    candidate_full_panel = image_rgb.copy()
+    candidate_full_panel[context["relative_candidate_mask"] > 0] = (
+        0.55 * candidate_full_panel[context["relative_candidate_mask"] > 0]
+        + 0.45 * np.asarray([255, 165, 0])
+    ).astype(np.uint8)
+    preference_u8 = np.clip(
+        np.rint(context["relative_ribbon_center_preference"] * 255.0), 0, 255
+    ).astype(np.uint8)
+    preference_rgb = cv2.cvtColor(
+        cv2.applyColorMap(preference_u8, cv2.COLORMAP_VIRIDIS),
+        cv2.COLOR_BGR2RGB,
+    )
+    ribbon_panel = image_rgb.copy()
+    ribbon_panel[context["relative_ribbon_centerline"] > 0] = (0, 255, 0)
+    ribbon_debug_panels = [
+        _labeled_preview(image_rgb, "1 Original", max_width=700),
+        _labeled_preview(
+            cv2.cvtColor(
+                cv2.applyColorMap(relative_u8, cv2.COLORMAP_VIRIDIS),
+                cv2.COLOR_BGR2RGB,
+            ),
+            "2 Relative Score",
+            max_width=700,
+        ),
+        _labeled_preview(candidate_full_panel, "3 Relative Candidate", max_width=700),
+        _labeled_preview(preference_rgb, "4 Distance x score center preference", max_width=700),
+        _labeled_preview(ribbon_panel, "5 Ribbon Centerline", max_width=700),
+        _labeled_preview(final_overlay, "6 Final Vector", max_width=700),
+    ]
+    ribbon_height = min(panel.shape[0] for panel in ribbon_debug_panels)
+    ribbon_debug_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * ribbon_height / panel.shape[0]))), ribbon_height),
+        )
+        if panel.shape[0] != ribbon_height else panel
+        for panel in ribbon_debug_panels
+    ]
+    _save_png(
+        run_dir / "relative_ribbon_centerline_debug.png",
+        np.concatenate(ribbon_debug_panels, axis=1),
+    )
+
+    crop_ribbon_panel = image_rgb[crop].copy()
+    crop_ribbon_panel[context["relative_ribbon_centerline"][crop] > 0] = (0, 255, 0)
+    ribbon_crop_panels = [
+        _labeled_preview(image_rgb[crop], "1 Original", max_width=800),
+        _labeled_preview(candidate_panel, "2 Candidate", max_width=800),
+        _labeled_preview(binary_panel, "3 Old Binary Skeleton", max_width=800),
+        _labeled_preview(ridge_panel, "4 Ridge", max_width=800),
+        _labeled_preview(crop_ribbon_panel, "5 Ribbon Centerline", max_width=800),
+        _labeled_preview(final_overlay[crop], "6 Final", max_width=800),
+    ]
+    ribbon_crop_height = min(panel.shape[0] for panel in ribbon_crop_panels)
+    ribbon_crop_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * ribbon_crop_height / panel.shape[0]))), ribbon_crop_height),
+        )
+        if panel.shape[0] != ribbon_crop_height else panel
+        for panel in ribbon_crop_panels
+    ]
+    _save_png(
+        run_dir / "relative_ribbon_crop_debug.png",
+        np.concatenate(ribbon_crop_panels, axis=1),
+    )
+
     def labeled_structure_panel(label_name, title):
         panel = image_rgb[crop].copy()
         labels = np.asarray(context.get(label_name, []), dtype=np.int32)
@@ -966,9 +1038,41 @@ def write_relative_roadness_diagnostic(
             ),
         },
     )
+    ribbon_audit_keys = (
+        "relative_candidate_pixel_count", "old_binary_skeleton_length",
+        "ridge_skeleton_length", "ribbon_centerline_length",
+        "binary_junction_count", "ribbon_junction_count",
+        "binary_component_count", "ridge_component_count",
+        "ribbon_component_count", "ribbon_centerline_total_length",
+    )
+    ribbon_audit = {
+        "candidate_pixel_count": int(
+            context["diagnostics"].get("relative_candidate_pixel_count", 0)
+        ),
+        "binary_skeleton_length": int(
+            context["diagnostics"].get("old_binary_skeleton_length", 0)
+        ),
+        "ridge_length": int(
+            context["diagnostics"].get("ridge_skeleton_length", 0)
+        ),
+        **{
+            key: context["diagnostics"].get(key, 0)
+            for key in ribbon_audit_keys[3:]
+        },
+        "final_relative_length": float(
+            recovery_summary.get("relative_final_length_px", 0.0)
+        ),
+        "final_total_graph_length": float(
+            recovery_summary.get("final_total_centerline_length_px", 0.0)
+        ),
+        "centerline_to_final_retention_ratio": float(
+            recovery_summary.get("centerline_to_final_retention_ratio", 0.0)
+        ),
+    }
+    _write_json(run_dir / "relative_ribbon_audit.json", ribbon_audit)
     _write_json(
-        run_dir / "relative_backbone_audit.json",
-        recovery_summary.get("relative_acceptance_funnel", {}),
+        run_dir / "relative_centerline_loss_audit.json",
+        recovery_summary.get("relative_centerline_loss_audit", {}),
     )
 
 

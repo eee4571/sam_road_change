@@ -372,6 +372,65 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(backbone[62:146, 88:93]), 75)
         self.assertEqual(result["diagnostics"]["spur_rejected_count"], 0)
 
+    def test_relative_ribbon_varying_width_has_one_continuous_centerline(self):
+        height, width = 120, 210
+        candidate = np.zeros((height, width), dtype=np.uint8)
+        for col in range(10, 200):
+            half_width = (4, 8, 5, 10)[min(3, (col - 10) // 48)]
+            candidate[60 - half_width:61 + half_width, col] = 1
+        score = candidate.astype(np.float32) * 0.6
+        result = graph_extraction.extract_relative_ribbon_centerline(
+            score, candidate, np.zeros_like(score)
+        )
+        centerline = result["ribbon_centerline_mask"] > 0
+        self.assertGreater(np.count_nonzero(centerline[58:63, 10:200]), 180)
+        self.assertEqual(np.count_nonzero(centerline[:55]), 0)
+        self.assertEqual(np.count_nonzero(centerline[66:]), 0)
+        self.assertEqual(result["diagnostics"]["ribbon_junction_count"], 0)
+
+    def test_relative_ribbon_flat_probability_top_remains_continuous(self):
+        candidate = np.zeros((96, 180), dtype=np.uint8)
+        candidate[44:50, 12:168] = 1
+        score = np.zeros(candidate.shape, dtype=np.float32)
+        profile = np.asarray([0.20, 0.30, 0.32, 0.32, 0.31, 0.20], dtype=np.float32)
+        score[44:50, 12:168] = profile[:, None]
+        result = graph_extraction.extract_relative_ribbon_centerline(
+            score, candidate, np.zeros_like(score)
+        )
+        centerline = result["ribbon_centerline_mask"] > 0
+        self.assertGreater(np.count_nonzero(centerline[45:49, 12:168]), 145)
+        self.assertGreater(len(np.unique(np.where(centerline)[1])), 145)
+        self.assertEqual(result["diagnostics"]["ribbon_component_count"], 1)
+
+    def test_relative_ribbon_preserves_three_way_t_junction(self):
+        candidate = np.zeros((160, 190), dtype=np.uint8)
+        candidate[57:66, 15:176] = 1
+        candidate[61:148, 91:100] = 1
+        score = candidate.astype(np.float32) * 0.7
+        orientation = np.zeros(candidate.shape, dtype=np.float32)
+        orientation[64:148, 88:103] = np.float32(np.pi / 2.0)
+        result = graph_extraction.extract_relative_ribbon_centerline(
+            score, candidate, orientation
+        )
+        centerline = result["ribbon_centerline_mask"] > 0
+        self.assertGreater(np.count_nonzero(centerline[59:64, 15:176]), 145)
+        self.assertGreater(np.count_nonzero(centerline[61:148, 93:98]), 75)
+        self.assertGreaterEqual(result["diagnostics"]["ribbon_junction_count"], 1)
+
+    def test_relative_ribbon_keeps_close_parallel_ribbons_separate(self):
+        candidate = np.zeros((112, 190), dtype=np.uint8)
+        candidate[36:45, 12:178] = 1
+        candidate[57:66, 12:178] = 1
+        score = candidate.astype(np.float32) * 0.65
+        result = graph_extraction.extract_relative_ribbon_centerline(
+            score, candidate, np.zeros_like(score)
+        )
+        centerline = result["ribbon_centerline_mask"] > 0
+        self.assertGreater(np.count_nonzero(centerline[38:43]), 155)
+        self.assertGreater(np.count_nonzero(centerline[59:64]), 155)
+        self.assertEqual(np.count_nonzero(centerline[46:56]), 0)
+        self.assertEqual(result["diagnostics"]["ribbon_component_count"], 2)
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)

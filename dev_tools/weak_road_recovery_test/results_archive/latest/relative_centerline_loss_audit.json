@@ -1,0 +1,21 @@
+{
+  "generated_centerline_length": 49639.22766470909,
+  "entered_acceptance_length": 56529.0517539978,
+  "accepted_auto_length": 23490.392153263092,
+  "accepted_review_length": 17652.969770550728,
+  "rejected_length": 15385.689830183983,
+  "rejected_length_by_reason": {
+    "isolated_short": 1690.5727313756943,
+    "too_short": 1432.1879770755768,
+    "relative_structure_unsupported": 1726.489482164383,
+    "insufficient_independent_support": 0.0,
+    "tortuosity": 87.35533905029297,
+    "duplicate_or_suppressed": 6089.748847484589,
+    "background_contrast_low": 2844.424575805664,
+    "mean_probability_low": 1514.9108772277832,
+    "q25_probability_low": 0.0,
+    "other": 0.0
+  },
+  "ribbon_final_length": 22229.931640625,
+  "centerline_to_final_retention_ratio": 0.4478299257752015
+}

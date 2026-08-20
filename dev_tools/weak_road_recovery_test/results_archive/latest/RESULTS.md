@@ -1,59 +1,79 @@
-# Relative Backbone Tracing recovery-only result
+# Relative Ribbon Centerline recovery-only result
 
-## 本轮实现
+## 结论
 
-- 保留 `skeletonize(relative_candidate_mask)` 产生的 Binary Skeleton，作为唯一可遍历 support geometry。
-- 保留 Orientation-aware Ridge，但只把投影到 Binary Skeleton 且方向一致的部分作为高置信 seed。
-- 在现有 Logical Corridor 之上执行 Backbone Tracing：补齐 Ridge-to-Ridge 缺口、延伸方向连续的 Binary 路径，并保留有独立长程证据的真实 branch。
-- 所有最终 geometry 均来自原 Binary Skeleton；没有 PCA collapse、端点直连、二维直线 shortcut 或 triangle 重画。
-- provenance 使用 `relative_ridge_seed`、`relative_backbone_bridge`、`relative_backbone_extension`、`relative_backbone_branch`。
-- 本轮未修改 HIGH / LOW、weak_sensor、Relative percentile、48 px、TOPO_THRESHOLD、Ridge coherence 或 Ridge NMS。
+本轮实现了基于 Relative Score、局部方向和 Distance Transform 横截面加权中心的 Ribbon Centerline，并把 Ribbon 结构 provenance 传入 acceptance。Binary Skeleton、Ridge、Logical Corridor 和 Backbone 均保留为 baseline / 辅助证据 / 局部 junction fallback。
 
-## 同一次 recovery-only 结果
+这次真实结果没有达到替代 Backbone 的目标：鱼骨明显减少，但中心线仍然碎，Final Relative 和 Final total 均低于当前 Ridge + Backbone baseline。结果按实际失败状态归档，不作为改善结果表述。
 
-复用既有 `road_probability` 和 `original_graph`，没有重新运行 SAMRoad、没有重新生成 probability，也没有参数 sweep。
+## Baseline 与本轮结果
 
-| 指标 | 结果 |
+当前 Ridge + Backbone baseline：
+
+- Final Relative：约 49,180 px
+- Final total：约 68,702 px
+
+本轮复用相同缓存 `road_probability` 和 `original_graph`，未重新运行 SAMRoad、未重新生成 probability、未做参数 sweep。
+
+| 指标 | Ribbon 结果 |
 |---|---:|
+| Candidate pixels | 1,647,179 |
 | Binary Skeleton length | 124,914 px |
-| Ridge seed length | 45,277.964 px |
-| Ridge seed component count | 4,524 |
-| Ridge-to-Ridge bridge count / length | 1,444 / 15,143.414 px |
-| Extension count / length | 4,691 / 43,046.792 px |
-| Independent branch count / length | 46 / 443.894 px |
-| Spur rejected count / length | 3,610 / 40,026.347 px |
-| Final Backbone length | 103,912.065 px |
-| Final Relative length | 49,180.059 px |
-| Final total graph length | 68,702.078 px |
+| Ridge length | 68,830 px |
+| Ribbon centerline length | 46,235 px |
+| Ribbon geometric total length | 49,639.228 px |
+| Binary / Ridge / Ribbon components | 148 / 4,083 / 2,490 |
+| Binary / Ribbon junction pixels | 5,303 / 544 |
+| Tracking bridges | 264（944 px） |
+| Final Relative | 23,959 px |
+| Final total graph | 43,813.973 px |
+| Final 中实际 Ribbon 长度 | 22,229.932 px |
+| Centerline → Final retention | 44.783% |
 
-相较当前 Ridge-only 审核结果（Final Relative 约 22,218 px、Final total 约 41,940 px），Backbone Tracing 明显恢复了真实道路连续性。Final Backbone length 是 Binary support path 的几何审计长度；Final Relative length 是经过下游 bootstrap/去重后实际进入最终图的相对道路长度，两者口径不同。
+## Centerline → Final loss
+
+| 阶段 | 长度 |
+|---|---:|
+| Generated centerline | 49,639.228 px |
+| Entered acceptance | 56,529.052 px |
+| Accepted auto | 23,490.392 px |
+| Accepted review | 17,652.970 px |
+| Rejected | 15,385.690 px |
+
+最大 rejected loss 是 `duplicate_or_suppressed`：6,089.749 px；它表示与已有强图重叠或被去重。非重复损失中最大的是 `background_contrast_low`：2,844.425 px。`isolated_short` 为 1,690.573 px，说明 Ribbon provenance 已避免大部分内部 `<48` 短段在第一道规则中被直接误杀，但大量短段转入 review，并未自动进入最终图。
 
 ## 人工 Geometry 检查
 
-已检查全景 `relative_backbone_debug.png`、问题 crop 的 `relative_ridge_debug.png`、全景 compare 和 acceptance overlay：
-
-- Ridge 原有的断段由 cyan bridge 和 orange extension 沿 Binary Skeleton 补齐，高架主线、弯道、环形匝道和真实交叉仍保持原始走形。
-- 旧 Binary Skeleton 中成排的短横刺没有大规模回到最终矢量；问题区域的大量鱼骨仍显示为 rejected red。
-- 局部仍有少量短 extension 片段，但未恢复成旧版密集鱼骨，也未见跨 candidate 区域的直线捷径。
+- 鱼骨：Ribbon 相比 Binary 基本消除了成排横向鱼骨，仍有少量 junction/纹理支刺。
+- 主道路连续性：没有明显优于 Backbone；全景和 crop 都能看到密集短断点，2,490 个分量也支持这一结论。
+- T junction：四个方向/三方向的小数组测试正常；真实图中的局部连接仍不稳定。
+- 高架与匝道：未见 triangle、PCA 重画、跨 candidate 直线 shortcut；环形匝道走形正常，但部分段落仍断裂。
+- 平行道路：保持分离，未见两条分离 ribbon 被求成一条平均中心或横向粘连。
 
 ## 测试与耗时
 
-- 新增 3 个 targeted tests：`3/3 PASS`，0.054 s。
-  - 水平主干保留、无长程支持的横刺删除。
-  - Ridge 中间缺口沿 Binary support 恢复。
-  - 横竖均有持续 Ridge/Relative 支持的真实 T junction 完整保留。
-- 直接相关的 Ridge、corridor、calibration、noise 与 bootstrap 测试：`9/9 PASS`。
-- 唯一一次 recovery-only：总耗时 323.905 s；cache load 0.329 s、recovery 275.356 s、visualization 46.906 s。
+- 新增且仅新增 4 个 targeted tests：`4/4 PASS`。
+  - 宽度变化 ribbon：单一连续中心，无横向鱼骨。
+  - 平顶概率：中心线保持连续。
+  - 真实 T junction：三个方向保留。
+  - 靠近平行 ribbon：两条中心线保持分离。
+- 8 个直接相关现有测试：`8/8 PASS`，包含 logical corridor、calibration、纯噪声、紧凑块、强弱道路共存、raw q25 与 review 语义。
+- Recovery-only：总耗时 401.171 s；cache load 0.317 s、recovery 342.304 s、visualization 57.329 s。
+
+## 冻结项
+
+本轮未修改 HIGH / LOW、`weak_sensor`、Relative percentiles、48 px、`TOPO_THRESHOLD`、Ridge coherence/NMS、Backbone Tracing、Logical Corridor、junction collapse 或 change detection。
 
 ## 归档文件
 
-- `relative_backbone_debug.png`
-- `relative_ridge_debug.png`
+- `relative_ribbon_centerline_debug.png`
+- `relative_ribbon_crop_debug.png`
 - `relative_roadness_compare.png`
 - `relative_acceptance_overlay.png`
-- `relative_backbone_audit.json`
+- `relative_ribbon_audit.json`
+- `relative_centerline_loss_audit.json`
 - `relative_acceptance_funnel.json`
 - `timing.json`
 - `RESULTS.md`
 
-归档不包含巨大 corridor audit、candidate CSV、TIFF、pickle、checkpoint、cache、模型或旧轮次输出。
+归档不包含 TIFF、pickle、checkpoint、cache、模型、CSV、巨大 corridor audit 或旧轮次输出。

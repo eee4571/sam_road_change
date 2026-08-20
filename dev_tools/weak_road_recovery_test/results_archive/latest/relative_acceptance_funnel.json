@@ -1,16 +1,23 @@
 {
-  "binary_skeleton_length": 124914,
-  "ridge_seed_length": 45277.96425676346,
-  "ridge_seed_component_count": 4524,
-  "ridge_to_ridge_bridge_count": 1444,
-  "ridge_to_ridge_bridge_length": 15143.413930535316,
-  "extension_count": 4691,
-  "extension_length": 43046.79240870476,
-  "branch_count": 46,
-  "branch_length": 443.8944354057312,
-  "spur_rejected_count": 3610,
-  "spur_rejected_length": 40026.347319960594,
-  "final_backbone_length": 103912.06503140926,
-  "final_relative_length": 49180.05859375,
-  "final_total_graph_length": 68702.078125
+  "generated_centerline_length": 49639.22766470909,
+  "entered_acceptance_length": 56529.0517539978,
+  "accepted_auto_length": 23490.392153263092,
+  "accepted_review_length": 17652.969770550728,
+  "rejected_length": 15385.689830183983,
+  "rejected_length_by_reason": {
+    "isolated_short": 1690.5727313756943,
+    "too_short": 1432.1879770755768,
+    "relative_structure_unsupported": 1726.489482164383,
+    "insufficient_independent_support": 0.0,
+    "tortuosity": 87.35533905029297,
+    "duplicate_or_suppressed": 6089.748847484589,
+    "background_contrast_low": 2844.424575805664,
+    "mean_probability_low": 1514.9108772277832,
+    "q25_probability_low": 0.0,
+    "other": 0.0
+  },
+  "ribbon_final_length": 22229.931640625,
+  "centerline_to_final_retention_ratio": 0.4478299257752015,
+  "final_relative_length": 23959.0,
+  "final_total_graph_length": 43813.97265625
 }

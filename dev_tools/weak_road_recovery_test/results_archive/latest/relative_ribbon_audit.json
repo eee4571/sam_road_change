@@ -1,0 +1,15 @@
+{
+  "candidate_pixel_count": 1647179,
+  "binary_skeleton_length": 124914,
+  "ridge_length": 68830,
+  "ribbon_centerline_length": 46235,
+  "binary_junction_count": 5303,
+  "ribbon_junction_count": 544,
+  "binary_component_count": 148,
+  "ridge_component_count": 4083,
+  "ribbon_component_count": 2490,
+  "ribbon_centerline_total_length": 49639.22766470909,
+  "final_relative_length": 23959.0,
+  "final_total_graph_length": 43813.97265625,
+  "centerline_to_final_retention_ratio": 0.4478299257752015
+}
