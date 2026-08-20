@@ -56,6 +56,8 @@ BOOTSTRAP_CANDIDATE_FIELDS = (
     "relative_score_mean", "relative_score_q25", "relative_fraction",
     "scale_agreement_mean", "scale_agreement_q25",
     "topology_candidate_support_fraction", "topology_candidate_score_mean",
+    "corridor_id", "micro_chain_length", "corridor_total_length",
+    "rescued_by_corridor", "short_chain_classification",
     "path",
 )
 
@@ -770,6 +772,46 @@ def write_relative_roadness_diagnostic(
         np.concatenate([raw_chain_panel, normalized_chain_panel], axis=1),
     )
 
+    def labeled_structure_panel(label_name, title):
+        panel = image_rgb[crop].copy()
+        labels = np.asarray(context.get(label_name, []), dtype=np.int32)
+        if labels.shape == image_rgb.shape[:2]:
+            labels = labels[crop]
+            for label_id in np.unique(labels):
+                if label_id <= 0:
+                    continue
+                hue = int((int(label_id) * 47) % 180)
+                color = cv2.cvtColor(
+                    np.asarray([[[hue, 220, 255]]], dtype=np.uint8),
+                    cv2.COLOR_HSV2RGB,
+                )[0, 0]
+                mask = labels == label_id
+                panel[mask] = (
+                    0.30 * panel[mask] + 0.70 * color.astype(np.float32)
+                ).astype(np.uint8)
+        return _labeled_preview(panel, title, max_width=900)
+
+    corridor_panels = [
+        _labeled_preview(image_rgb[crop], "1 Original", max_width=900),
+        _labeled_preview(raw_panel, "2 Raw skeleton", max_width=900),
+        labeled_structure_panel("relative_chain_labels", "3 Micro chains"),
+        labeled_structure_panel("relative_corridor_labels", "4 Logical corridors"),
+        _labeled_preview(final_overlay[crop], "5 Final vector", max_width=900),
+    ]
+    corridor_height = min(panel.shape[0] for panel in corridor_panels)
+    corridor_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * corridor_height / panel.shape[0]))), corridor_height),
+        )
+        if panel.shape[0] != corridor_height else panel
+        for panel in corridor_panels
+    ]
+    _save_png(
+        run_dir / "relative_corridor_debug.png",
+        np.concatenate(corridor_panels, axis=1),
+    )
+
     minimum_length = float(config.get("RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0))
 
     def crop_chain_stats(chains, lengths):
@@ -783,7 +825,10 @@ def write_relative_roadness_diagnostic(
     _write_json(
         run_dir / "relative_skeleton_normalization.json",
         {
-            **context["diagnostics"],
+            **{
+                key: value for key, value in context["diagnostics"].items()
+                if key not in {"relative_micro_chains", "relative_corridors"}
+            },
             "problem_crop_xyxy": [x0, y0, x1, y1],
             "problem_crop_raw": crop_chain_stats(raw_crop_chains, raw_crop_lengths),
             "problem_crop_normalized": crop_chain_stats(
@@ -794,6 +839,26 @@ def write_relative_roadness_diagnostic(
     _write_json(
         run_dir / "relative_acceptance_funnel.json",
         recovery_summary.get("relative_acceptance_funnel", {}),
+    )
+    corridor_keys = (
+        "micro_chain_count", "too_short_micro_chain_count", "corridor_count",
+        "corridor_rescued_chain_count", "corridor_rescued_length",
+        "isolated_short_rejected_count", "complex_junction_zone_count",
+        "complex_zone_skipped_collapse_count", "relative_final_length_px",
+        "final_total_centerline_length_px",
+    )
+    _write_json(
+        run_dir / "relative_corridor_audit.json",
+        {
+            "summary": {
+                key: recovery_summary.get(
+                    key, context["diagnostics"].get(key, 0)
+                )
+                for key in corridor_keys
+            },
+            "micro_chains": context["diagnostics"].get("relative_micro_chains", []),
+            "corridors": context["diagnostics"].get("relative_corridors", []),
+        },
     )
 
 

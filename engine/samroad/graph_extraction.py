@@ -682,6 +682,235 @@ def _skeleton_chain_summary(skeleton, min_length):
     }
 
 
+def _chain_endpoint_tangent(path, endpoint_index, lookback=8.0):
+    """Return the unit vector pointing from one endpoint into its chain."""
+    points = np.asarray(path, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 2:
+        return np.zeros(2, dtype=np.float32)
+    ordered = points if endpoint_index == 0 else points[::-1]
+    distances = np.concatenate((
+        np.asarray([0.0], dtype=np.float32),
+        np.cumsum(np.linalg.norm(np.diff(ordered, axis=0), axis=1)),
+    ))
+    sample_index = min(
+        max(int(np.searchsorted(distances, min(float(lookback), float(distances[-1])))), 1),
+        len(ordered) - 1,
+    )
+    tangent = ordered[sample_index] - ordered[0]
+    norm = float(np.linalg.norm(tangent))
+    return (tangent / max(norm, 1e-6)).astype(np.float32)
+
+
+def build_relative_chain_corridors(
+    skeleton,
+    *,
+    relative_score=None,
+    scene_rank=None,
+    scale_agreement=None,
+    candidate_mask=None,
+    junction_zone_labels=None,
+):
+    """Group traced micro-chains logically without changing their geometry.
+
+    Chains are joined only at a real shared skeleton endpoint and only when
+    they are mutual, unambiguous, near-opposite tangent continuations.  The
+    grouping therefore keeps T/X directions separate and cannot bridge a gap
+    between nearby parallel roads.
+    """
+    value = np.asarray(skeleton, dtype=bool)
+    chains = _trace_skeleton_chains(value)
+    shape = value.shape
+
+    def optional_map(array, dtype=np.float32):
+        if array is None:
+            return None
+        result = np.asarray(array, dtype=dtype)
+        return result if result.shape == shape else None
+
+    score_map = optional_map(relative_score)
+    rank_map = optional_map(scene_rank)
+    agreement_map = optional_map(scale_agreement)
+    candidate = optional_map(candidate_mask, np.uint8)
+    zone_labels = optional_map(junction_zone_labels, np.int32)
+
+    parent = list(range(len(chains)))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(first, second):
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    records = []
+    endpoint_members = defaultdict(list)
+    pixel_adjacency = _skeleton_adjacency(value)
+    exact_junction_ids = {}
+    next_junction_id = 1
+    for chain_index, path in enumerate(chains):
+        rows, cols = path[:, 0], path[:, 1]
+
+        def values(array, default):
+            return array[rows, cols] if array is not None else np.full(len(path), default)
+
+        scores = values(score_map, 0.0).astype(np.float32)
+        ranks = values(rank_map, 1.0).astype(np.float32)
+        agreements = values(agreement_map, 1.0).astype(np.float32)
+        coverage = values(candidate, 1).astype(np.float32)
+        endpoints = [tuple(map(int, path[0])), tuple(map(int, path[-1]))]
+        tangents = [
+            _chain_endpoint_tangent(path, 0),
+            _chain_endpoint_tangent(path, 1),
+        ]
+        junction_ids = []
+        for endpoint_index, point in enumerate(endpoints):
+            is_junction = len(pixel_adjacency.get(point, [])) >= 3
+            zone_id = int(zone_labels[point]) if zone_labels is not None else 0
+            if is_junction:
+                if zone_id > 0:
+                    junction_id = zone_id
+                else:
+                    if point not in exact_junction_ids:
+                        exact_junction_ids[point] = next_junction_id
+                        next_junction_id += 1
+                    junction_id = exact_junction_ids[point]
+            else:
+                junction_id = 0
+            junction_ids.append(junction_id)
+            endpoint_members[point].append({
+                "chain_index": chain_index,
+                "endpoint_index": endpoint_index,
+                "tangent": tangents[endpoint_index],
+            })
+        geometry = _relative_chain_geometry(path)
+        records.append({
+            "chain_id": chain_index + 1,
+            "path": path,
+            "length": float(geometry["path_length"]),
+            "start": list(endpoints[0]),
+            "end": list(endpoints[1]),
+            "endpoint_tangents": [tangent.astype(float).tolist() for tangent in tangents],
+            "relative_score_mean": float(np.mean(scores)) if len(scores) else 0.0,
+            "relative_score_q25": float(np.quantile(scores, 0.25)) if len(scores) else 0.0,
+            "scene_rank_mean": float(np.mean(ranks)) if len(ranks) else 0.0,
+            "scene_rank_q25": float(np.quantile(ranks, 0.25)) if len(ranks) else 0.0,
+            "scale_agreement_mean": float(np.mean(agreements)) if len(agreements) else 0.0,
+            "scale_agreement_q25": float(np.quantile(agreements, 0.25)) if len(agreements) else 0.0,
+            "candidate_coverage": float(np.mean(coverage > 0)) if len(coverage) else 0.0,
+            "neighbor_chain_ids": [],
+            "junction_ids": junction_ids,
+            "geometry": geometry,
+        })
+
+    pairing_count = 0
+    ambiguous_junction_count = 0
+    for point, members in endpoint_members.items():
+        unique_chain_ids = sorted({item["chain_index"] for item in members})
+        for chain_index in unique_chain_ids:
+            records[chain_index]["neighbor_chain_ids"] = sorted(set(
+                records[chain_index]["neighbor_chain_ids"]
+                + [other + 1 for other in unique_chain_ids if other != chain_index]
+            ))
+        if len(members) < 2:
+            continue
+        pair_scores = {}
+        ranked = defaultdict(list)
+        for first_index in range(len(members)):
+            for second_index in range(first_index + 1, len(members)):
+                first, second = members[first_index], members[second_index]
+                if first["chain_index"] == second["chain_index"]:
+                    continue
+                continuation = -float(np.dot(first["tangent"], second["tangent"]))
+                if continuation < 0.70:
+                    continue
+                first_record = records[first["chain_index"]]
+                second_record = records[second["chain_index"]]
+                if min(first_record["candidate_coverage"], second_record["candidate_coverage"]) < 0.50:
+                    continue
+                key = (first_index, second_index)
+                # Evidence is deliberately a tie-breaker, not a hard gate: a
+                # short weak bridge between two strong pieces must stay in the
+                # same otherwise coherent corridor.
+                evidence_similarity = 1.0 - min(
+                    abs(first_record["relative_score_mean"] - second_record["relative_score_mean"]),
+                    1.0,
+                )
+                pair_scores[key] = continuation + 0.05 * evidence_similarity
+                ranked[first_index].append((pair_scores[key], second_index))
+                ranked[second_index].append((pair_scores[key], first_index))
+        best = {}
+        ambiguous = set()
+        for member_index, candidates in ranked.items():
+            candidates.sort(reverse=True)
+            best[member_index] = candidates[0][1]
+            if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.08:
+                ambiguous.add(member_index)
+        if ambiguous:
+            ambiguous_junction_count += 1
+        used = set()
+        for first_index, second_index in sorted(best.items()):
+            if first_index in used or second_index in used:
+                continue
+            if first_index in ambiguous or second_index in ambiguous:
+                continue
+            if best.get(second_index) != first_index:
+                continue
+            first_chain = members[first_index]["chain_index"]
+            second_chain = members[second_index]["chain_index"]
+            union(first_chain, second_chain)
+            used.update((first_index, second_index))
+            pairing_count += 1
+
+    grouped = defaultdict(list)
+    for chain_index in range(len(records)):
+        grouped[find(chain_index)].append(chain_index)
+    ordered_groups = sorted(grouped.values(), key=lambda group: min(group))
+    corridors = []
+    chain_labels = np.zeros(shape, dtype=np.int32)
+    corridor_labels = np.zeros(shape, dtype=np.int32)
+    for corridor_id, group in enumerate(ordered_groups, start=1):
+        lengths = np.asarray([records[index]["length"] for index in group], dtype=np.float32)
+        total_length = float(np.sum(lengths))
+        total_weight = max(total_length, 1e-6)
+
+        def weighted(name):
+            return float(sum(records[index][name] * records[index]["length"] for index in group) / total_weight)
+
+        corridor = {
+            "corridor_id": corridor_id,
+            "chain_ids": [index + 1 for index in group],
+            "chain_count": int(len(group)),
+            "total_length": total_length,
+            "relative_score_mean": weighted("relative_score_mean"),
+            "relative_score_q25": weighted("relative_score_q25"),
+            "scene_rank_mean": weighted("scene_rank_mean"),
+            "scene_rank_q25": weighted("scene_rank_q25"),
+            "scale_agreement_mean": weighted("scale_agreement_mean"),
+            "scale_agreement_q25": weighted("scale_agreement_q25"),
+        }
+        corridors.append(corridor)
+        for chain_index in group:
+            record = records[chain_index]
+            record["corridor_id"] = corridor_id
+            record["corridor_total_length"] = total_length
+            path = record["path"]
+            chain_labels[path[:, 0], path[:, 1]] = record["chain_id"]
+            corridor_labels[path[:, 0], path[:, 1]] = corridor_id
+    return {
+        "chains": records,
+        "corridors": corridors,
+        "chain_labels": chain_labels,
+        "corridor_labels": corridor_labels,
+        "pairing_count": int(pairing_count),
+        "junction_count": int(sum(len(items) >= 3 for items in pixel_adjacency.values())),
+        "ambiguous_junction_count": int(ambiguous_junction_count),
+    }
+
+
 def _junction_zone_radius(config, distance_scale):
     """Tie junction clustering to the smallest existing local-background scale."""
     configured = _config_value(config, "RELATIVE_ROADNESS_BACKGROUND_SCALES_PX", [9, 21, 41])
@@ -855,7 +1084,7 @@ def normalize_relative_skeleton(
     scale_agreement=None,
     distance_scale=1.0,
 ):
-    """Collapse elongated dense-junction ladder zones into meaningful corridors."""
+    """Prune only unmistakable tiny spurs; never redraw a junction corridor."""
     raw = np.asarray(raw_skeleton, dtype=bool)
     candidate = np.asarray(candidate_mask, dtype=np.uint8)
     score = None if relative_score is None else np.asarray(relative_score, dtype=np.float32)
@@ -872,6 +1101,8 @@ def normalize_relative_skeleton(
     collapsed_zones = np.zeros(raw.shape, dtype=bool)
     collapsed_count = 0
     pruned_count = 0
+    complex_zone_count = 0
+    complex_zone_skipped_count = 0
     zone_records = []
 
     for zone in zones:
@@ -942,6 +1173,41 @@ def normalize_relative_skeleton(
             zone_record["skip_reason"] = "fewer_than_two_incident_branches"
             zone_records.append(zone_record)
             continue
+        bbox = zone["bbox"]
+        bbox_span = max(int(bbox[2]) - int(bbox[0]), int(bbox[3]) - int(bbox[1]))
+        long_branch_count = sum(
+            branch["continuation_length"] > 2.0 * radius for branch in branches
+        )
+        plausible_pairs = 0
+        for first_index in range(len(branches)):
+            for second_index in range(first_index + 1, len(branches)):
+                if -float(np.dot(
+                    branches[first_index]["outward_tangent"],
+                    branches[second_index]["outward_tangent"],
+                )) >= 0.70:
+                    plausible_pairs += 1
+        complex_zone = bool(
+            bbox_span > 6 * radius
+            or len(branches) >= 4
+            or long_branch_count >= 3
+            or plausible_pairs >= 2
+        )
+        zone_record.update({
+            "bbox_span_px": int(bbox_span),
+            "long_branch_count": int(long_branch_count),
+            "plausible_through_pair_count": int(plausible_pairs),
+            "complex_junction_zone": complex_zone,
+        })
+        if complex_zone:
+            # Large/ambiguous zones include T/X crossings, interchanges,
+            # parallel rails and chains of nearby junctions.  Keep every raw
+            # skeleton pixel and let logical corridor grouping reason about
+            # continuation without inventing geometry or topology.
+            complex_zone_count += 1
+            complex_zone_skipped_count += 1
+            zone_record["skip_reason"] = "complex_junction_zone"
+            zone_records.append(zone_record)
+            continue
         major = zone["major_direction"]
         branch_strengths = []
         for branch in branches:
@@ -976,13 +1242,7 @@ def normalize_relative_skeleton(
             continue
 
         normalized_crop = normalized[region]
-        collapsed_crop = collapsed_zones[region]
         pruned_crop = pruned_spurs[region]
-        normalized_crop[inside] = False
-        main_array = np.asarray(main_path, dtype=np.int32)
-        normalized_crop[main_array[:, 0], main_array[:, 1]] = True
-        collapsed_crop[inside] = True
-        collapsed_count += 1
         preserved_branch_count = 0
         for branch_index, branch in enumerate(branches):
             if branch_index in main_indices:
@@ -998,35 +1258,32 @@ def normalize_relative_skeleton(
             # A same-direction rail inside the same dense zone is part of the
             # ladder. A transverse branch that genuinely exits the zone keeps
             # its topology even when it is shorter than 48 px.
-            preserve = bool(
-                transverse_alignment > main_alignment
-                and extends_outside_zone
-                and evidence_continues
+            # The only allowed physical edit is removal of a component that is
+            # wholly local to the zone.  We never clear/retrace the junction
+            # interior and never connect an entry to a chosen main path.
+            tiny_local_spur = bool(
+                branch["continuation_length"] <= radius
+                and len(branch["component_points"]) <= max(3, 2 * radius)
+                and not extends_outside_zone
             )
-            if preserve:
-                connector = _shortest_path_in_skeleton(
-                    inside,
-                    [branch["inside_entry"]],
-                    main_path,
-                )
-                if connector:
-                    connector_array = np.asarray(connector, dtype=np.int32)
-                    normalized_crop[connector_array[:, 0], connector_array[:, 1]] = True
-                    preserved_branch_count += 1
-                    branch_records[branch_index]["role"] = "preserved_real_branch"
-                else:
-                    branch_records[branch_index]["role"] = "unconnected_transverse_branch"
-            elif branch["continuation_length"] <= 2.0 * radius:
+            if tiny_local_spur:
                 component_points = branch["component_points"]
                 normalized_crop[component_points[:, 0], component_points[:, 1]] = False
                 pruned_crop[component_points[:, 0], component_points[:, 1]] = True
                 pruned_count += 1
                 branch_records[branch_index]["role"] = "pruned_ladder_spur"
             else:
-                branch_records[branch_index]["role"] = "suppressed_ladder_rail"
+                preserved_branch_count += 1
+                branch_records[branch_index]["role"] = (
+                    "preserved_real_branch" if evidence_continues
+                    else "preserved_ambiguous_branch"
+                )
         zone_record.update({
             "preserved_branch_count": int(preserved_branch_count),
-            "collapsed": True,
+            "collapsed": False,
+            "skip_reason": "tiny_ladder_spur_pruned" if any(
+                row["role"] == "pruned_ladder_spur" for row in branch_records
+            ) else "no_unmistakable_tiny_spur",
         })
         zone_records.append(zone_record)
 
@@ -1064,6 +1321,8 @@ def normalize_relative_skeleton(
         "normalized_max_chain_length": normalized_summary["max_chain_length"],
         "pruned_spur_count": int(pruned_count),
         "collapsed_zone_count": int(collapsed_count),
+        "complex_junction_zone_count": int(complex_zone_count),
+        "complex_zone_skipped_collapse_count": int(complex_zone_skipped_count),
         "junction_zone_radius_px": int(radius),
         "junction_cluster_radius_px": int(_junction_cluster_radius(config, distance_scale)),
         "structure_rescued_chain_count": int(rescued_count),
@@ -1220,10 +1479,12 @@ def extract_relative_skeleton(
     distance_scale=1.0,
     relative_score=None,
     scene_rank=None,
+    scale_agreement=None,
     relative_weak_threshold=0.0,
     input_skeleton=None,
+    junction_zone_labels=None,
 ):
-    """Retain valid chains independently, without rejecting a whole road component."""
+    """Filter micro-chains using logical-corridor length and evidence."""
     candidate = np.asarray(candidate_mask, dtype=np.uint8) > 0
     component_count, labels = cv2.connectedComponents(candidate.astype(np.uint8), 8)
     retained = np.zeros(candidate.shape, dtype=bool)
@@ -1231,84 +1492,143 @@ def extract_relative_skeleton(
     scale = max(float(distance_scale), 1e-6)
     min_length = float(_config_value(config, "RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0)) * scale
     max_tortuosity = float(_config_value(config, "RELATIVE_ROADNESS_MAX_TORTUOSITY", 1.5))
-    retained_components = 0
-    rejected_components = 0
-    skeleton_before = np.zeros(candidate.shape, dtype=bool)
-    chain_count = 0
+    skeleton_before = (
+        np.asarray(input_skeleton, dtype=bool)
+        if input_skeleton is not None and np.asarray(input_skeleton).shape == candidate.shape
+        else skeletonize(candidate)
+    )
     geometry_pass_count = 0
     reject_counts = Counter()
     score_map = np.asarray(relative_score, dtype=np.float32) if relative_score is not None else None
     rank_map = np.asarray(scene_rank, dtype=np.float32) if scene_rank is not None else None
-    supplied_skeleton = (
-        np.asarray(input_skeleton, dtype=bool)
-        if input_skeleton is not None and np.asarray(input_skeleton).shape == candidate.shape
-        else None
+    agreement_map = (
+        np.asarray(scale_agreement, dtype=np.float32)
+        if scale_agreement is not None else None
     )
-    for component_id in range(1, component_count):
-        component = labels == component_id
-        skeleton = (
-            supplied_skeleton & component
-            if supplied_skeleton is not None
-            else skeletonize(component)
+    corridor_evidence_available = bool(
+        score_map is not None and score_map.shape == candidate.shape
+    )
+    grouping = build_relative_chain_corridors(
+        skeleton_before,
+        relative_score=score_map,
+        scene_rank=rank_map,
+        scale_agreement=agreement_map,
+        candidate_mask=candidate,
+        junction_zone_labels=junction_zone_labels,
+    )
+    corridors_by_id = {
+        row["corridor_id"]: row for row in grouping["corridors"]
+    }
+    rescued_count = 0
+    rescued_length = 0.0
+    isolated_short_count = 0
+    audited_chains = []
+    weak_gate = max(float(relative_weak_threshold) - 1e-6, 0.0)
+    for record in grouping["chains"]:
+        path = record["path"]
+        geometry = record["geometry"]
+        path_length = float(record["length"])
+        corridor = corridors_by_id[record["corridor_id"]]
+        corridor_total = float(corridor["total_length"])
+        is_short = path_length < min_length
+        rescued = bool(
+            is_short
+            and corridor_total >= min_length
+            and corridor_evidence_available
         )
-        skeleton_before |= skeleton
-        chains = _trace_skeleton_chains(skeleton)
-        component_retained = False
-        for path in chains:
-            chain_count += 1
-            geometry = _relative_chain_geometry(path)
-            if geometry["path_length"] < min_length:
-                reject_counts["too_short"] += 1
-                rejected[path[:, 0], path[:, 1]] = True
-                continue
-            if score_map is not None and score_map.shape == candidate.shape:
-                chain_scores = score_map[path[:, 0], path[:, 1]]
-                chain_q25 = float(np.quantile(chain_scores, 0.25))
-                chain_ranks = (
-                    rank_map[path[:, 0], path[:, 1]]
-                    if rank_map is not None and rank_map.shape == candidate.shape
-                    else np.ones(len(path), dtype=np.float32)
-                )
-                # Closing may bridge across weak texture. A valid chain must
-                # keep relative evidence along most of its own centerline.
-                if (
-                    chain_q25 < max(float(relative_weak_threshold) - 1e-6, 0.0)
-                    or float(np.quantile(chain_ranks, 0.25)) < 0.50
-                ):
-                    reject_counts["relative_structure_unsupported"] += 1
-                    rejected[path[:, 0], path[:, 1]] = True
-                    continue
-            # Direct chains retain the historical check. Long chains may be
-            # globally curved (ramps, mountain roads, rings) when their local
-            # tangent changes remain smooth and never fold back abruptly.
-            geometry_ok = bool(
-                geometry["tortuosity"] <= max_tortuosity
-                or (
-                    geometry["path_length"] >= 1.5 * min_length
-                    and geometry["locally_smooth"]
-                )
+        classification = "corridor_supported_short" if rescued else "accepted_chain"
+        reject_reason = ""
+        if is_short and not rescued:
+            classification = "isolated_short"
+            reject_reason = "isolated_short"
+            isolated_short_count += 1
+        chain_evidence_ok = bool(
+            record["relative_score_q25"] >= weak_gate
+            and record["scene_rank_q25"] >= 0.50
+        )
+        corridor_evidence_ok = bool(
+            corridor["relative_score_q25"] >= weak_gate
+            and corridor["scene_rank_q25"] >= 0.50
+        )
+        if not reject_reason and not (
+            chain_evidence_ok or (rescued and corridor_evidence_ok)
+        ):
+            reject_reason = "relative_structure_unsupported"
+        geometry_ok = bool(
+            geometry["tortuosity"] <= max_tortuosity
+            or (
+                path_length >= 1.5 * min_length
+                and geometry["locally_smooth"]
             )
-            if not geometry_ok:
-                reject_counts["tortuosity"] += 1
-                rejected[path[:, 0], path[:, 1]] = True
-                continue
+            or (
+                rescued
+                and geometry["reversal_fraction"] <= 0.05
+            )
+        )
+        if not reject_reason and not geometry_ok:
+            reject_reason = "tortuosity"
+        accepted = not reject_reason
+        if accepted:
             retained[path[:, 0], path[:, 1]] = True
-            component_retained = True
             geometry_pass_count += 1
-        if component_retained:
-            retained_components += 1
+            if rescued:
+                rescued_count += 1
+                rescued_length += path_length
         else:
-            rejected_components += 1
+            rejected[path[:, 0], path[:, 1]] = True
+            reject_counts[reject_reason] += 1
+        audited_chains.append({
+            key: value for key, value in record.items()
+            if key not in {"path", "geometry"}
+        } | {
+            "micro_chain_length": path_length,
+            "classification": classification,
+            "rescued_by_corridor": bool(accepted and rescued),
+            "accepted": bool(accepted),
+            "reject_reason": reject_reason,
+        })
+
+    retained_component_ids = set(labels[retained].tolist()) - {0}
+    rejected_component_ids = set(range(1, component_count)) - retained_component_ids
+    audited_corridors = []
+    for corridor in grouping["corridors"]:
+        audited_corridors.append({
+            **corridor,
+            "accepted_chain_count": int(sum(
+                row["accepted"] for row in audited_chains
+                if row["corridor_id"] == corridor["corridor_id"]
+            )),
+            "rescued_chain_count": int(sum(
+                row["rescued_by_corridor"] for row in audited_chains
+                if row["corridor_id"] == corridor["corridor_id"]
+            )),
+        })
     return retained.astype(np.uint8), rejected.astype(np.uint8), {
         "relative_component_count": max(0, int(component_count - 1)),
-        "relative_retained_component_count": int(retained_components),
-        "relative_rejected_component_count": int(rejected_components),
+        "relative_retained_component_count": int(len(retained_component_ids)),
+        "relative_rejected_component_count": int(len(rejected_component_ids)),
         "relative_skeleton_before_structure_filter": int(np.count_nonzero(skeleton_before)),
         "relative_skeleton_after_structure_filter": int(np.count_nonzero(retained)),
-        "relative_chain_count": int(chain_count),
+        "relative_chain_count": int(len(grouping["chains"])),
+        "micro_chain_count": int(len(grouping["chains"])),
+        "too_short_micro_chain_count": int(sum(
+            row["length"] < min_length for row in grouping["chains"]
+        )),
+        "corridor_count": int(len(grouping["corridors"])),
+        "corridor_pairing_count": int(grouping["pairing_count"]),
+        "corridor_ambiguous_junction_count": int(grouping["ambiguous_junction_count"]),
+        "corridor_rescued_chain_count": int(rescued_count),
+        "corridor_rescued_length": float(rescued_length),
+        "structure_rescued_chain_count": int(rescued_count),
+        "structure_rescued_length": float(rescued_length),
+        "isolated_short_rejected_count": int(isolated_short_count),
         "relative_chain_geometry_pass": int(geometry_pass_count),
         "relative_structure_reject_reason_counts": dict(sorted(reject_counts.items())),
         "relative_skeleton_total_length": int(np.count_nonzero(retained)),
+        "relative_micro_chains": audited_chains,
+        "relative_corridors": audited_corridors,
+        "_relative_chain_labels": grouping["chain_labels"],
+        "_relative_corridor_labels": grouping["corridor_labels"],
     }
 
 
@@ -1341,6 +1661,8 @@ def compute_relative_roadness(
             "relative_skeleton_normalized": np.zeros(road.shape, dtype=np.uint8),
             "relative_skeleton": np.zeros(road.shape, dtype=np.uint8),
             "relative_rejected_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "relative_chain_labels": np.zeros(road.shape, dtype=np.int32),
+            "relative_corridor_labels": np.zeros(road.shape, dtype=np.int32),
             "junction_zone_mask": np.zeros(road.shape, dtype=np.uint8),
             "pruned_spur_mask": np.zeros(road.shape, dtype=np.uint8),
             "collapsed_zone_mask": np.zeros(road.shape, dtype=np.uint8),
@@ -1401,9 +1723,13 @@ def compute_relative_roadness(
         distance_scale=distance_scale,
         relative_score=relative_score,
         scene_rank=scene_rank,
+        scale_agreement=scale_agreement,
         relative_weak_threshold=threshold_summary.get("relative_weak_threshold", 0.0),
         input_skeleton=normalized_relative_skeleton,
+        junction_zone_labels=normalization["junction_zone_labels"],
     )
+    relative_chain_labels = structure_summary.pop("_relative_chain_labels")
+    relative_corridor_labels = structure_summary.pop("_relative_corridor_labels")
     high_threshold, _low_threshold, profile_name = resolve_road_thresholds(config)
     close_size = max(1, int(round(_config_value(config, "WEAK_BOOTSTRAP_CLOSE_KERNEL", 3))))
     absolute_skeleton = skeletonize_road_mask(
@@ -1453,6 +1779,8 @@ def compute_relative_roadness(
         "relative_skeleton_normalized": normalized_relative_skeleton.astype(np.uint8),
         "relative_skeleton": relative_skeleton.astype(np.uint8),
         "relative_rejected_skeleton": relative_rejected_skeleton.astype(np.uint8),
+        "relative_chain_labels": relative_chain_labels.astype(np.int32),
+        "relative_corridor_labels": relative_corridor_labels.astype(np.int32),
         "junction_zone_mask": normalization["junction_zone_mask"].astype(np.uint8),
         "pruned_spur_mask": normalization["pruned_spur_mask"].astype(np.uint8),
         "collapsed_zone_mask": normalization["collapsed_zone_mask"].astype(np.uint8),
@@ -1720,6 +2048,13 @@ def bootstrap_weak_road_network(
             np.column_stack((rr, cc)).astype(np.int32), relative_context
         )["relative_fraction"] >= 0.25:
             relative_topology_candidates += 1
+    # Selected TopoNet edges are themselves evaluated topology candidates.
+    # Some recovery-only callers do not retain the pre-threshold candidate
+    # arrays, so keep the audit invariant instead of reporting 0 candidates
+    # alongside a positive selected count.
+    relative_topology_candidates = max(
+        int(relative_topology_candidates), int(relative_topology_selected)
+    )
     summary = {
         "threshold_profile": profile_name,
         "bootstrap_candidate_count": 0,
@@ -1750,6 +2085,9 @@ def bootstrap_weak_road_network(
         else np.zeros(road.shape, dtype=np.uint8)
     )
     relative_skeleton = np.zeros(road.shape, dtype=bool)
+    relative_corridor_labels = np.zeros(road.shape, dtype=np.int32)
+    relative_corridors = {}
+    relative_endpoint_corridors = defaultdict(set)
     if relative_context is not None:
         # Acceptance uses the calibration-invariant structured skeleton. Actual
         # graph overlap is handled below; suppressing by raw HIGH probability
@@ -1757,6 +2095,32 @@ def bootstrap_weak_road_network(
         skeleton_value = np.asarray(relative_context.get("relative_skeleton", []))
         if skeleton_value.shape == road.shape:
             relative_skeleton = skeleton_value > 0
+        corridor_value = np.asarray(
+            relative_context.get("relative_corridor_labels", []), dtype=np.int32
+        )
+        if corridor_value.shape == road.shape:
+            relative_corridor_labels = corridor_value
+        relative_corridors = {
+            int(row["corridor_id"]): row
+            for row in relative_context.get("diagnostics", {}).get(
+                "relative_corridors", []
+            )
+        }
+        for row in relative_context.get("diagnostics", {}).get(
+            "relative_micro_chains", []
+        ):
+            corridor_value = int(row.get("corridor_id", 0))
+            if corridor_value <= 0:
+                continue
+            for endpoint in (row.get("start"), row.get("end")):
+                if endpoint is not None and len(endpoint) == 2:
+                    relative_endpoint_corridors[tuple(map(int, endpoint))].add(
+                        corridor_value
+                    )
+    ambiguous_relative_endpoints = {
+        point for point, corridor_ids in relative_endpoint_corridors.items()
+        if len(corridor_ids) > 1
+    }
     if close_size > 1:
         kernel = np.ones((close_size, close_size), dtype=np.uint8)
         absolute_low_mask = cv2.morphologyEx(absolute_low_mask, cv2.MORPH_CLOSE, kernel)
@@ -1818,6 +2182,25 @@ def bootstrap_weak_road_network(
         path_length = geometry["path_length"]
         direct_distance = geometry["direct_distance"]
         tortuosity = geometry["tortuosity"]
+        corridor_id = 0
+        corridor = None
+        if direct_relative_chain:
+            corridor_values = relative_corridor_labels[path[:, 0], path[:, 1]]
+            corridor_values = corridor_values[corridor_values > 0]
+            if len(corridor_values):
+                corridor_id = int(np.bincount(corridor_values).argmax())
+                corridor = relative_corridors.get(corridor_id)
+        corridor_total_length = float(
+            corridor.get("total_length", path_length) if corridor else path_length
+        )
+        rescued_by_corridor = bool(
+            direct_relative_chain
+            and path_length < parameters["min_length"]
+            and corridor_total_length >= parameters["min_length"]
+        )
+        structural_length = (
+            corridor_total_length if rescued_by_corridor else path_length
+        )
         if direct_relative_chain:
             summary["relative_graph_point_count"] += max(
                 2, int(math.ceil(path_length / parameters["sample_step"])) + 1
@@ -1862,11 +2245,23 @@ def bootstrap_weak_road_network(
             "reject_reason": "",
             "review_reason": "",
             "candidate_source": candidate_source,
+            "corridor_id": int(corridor_id),
+            "micro_chain_length": float(path_length),
+            "corridor_total_length": float(corridor_total_length),
+            "rescued_by_corridor": bool(rescued_by_corridor),
+            "short_chain_classification": (
+                "corridor_supported_short" if rescued_by_corridor
+                else "isolated_short" if path_length < parameters["min_length"]
+                else "not_short"
+            ),
             "path": path.astype(int).tolist() if relative_branch_candidate else [],
             **{key: value for key, value in relative_evidence.items() if key != "relative_supported"},
         }
-        if path_length < parameters["min_length"]:
-            reject_candidate(audit_row, "too_short")
+        if path_length < parameters["min_length"] and not rescued_by_corridor:
+            reject_candidate(
+                audit_row,
+                "isolated_short" if direct_relative_chain else "too_short",
+            )
             continue
         evidence = _recovery_path_evidence(
             path, road, low_threshold, surface, parameters
@@ -1906,18 +2301,33 @@ def bootstrap_weak_road_network(
             reject_candidate(audit_row, "duplicate_or_suppressed")
             continue
         recovery_gap_limit = float(_config_value(config, "WEAK_RECOVERY_MAX_GAP_PX", 64.0)) * scale
-        delegated_gap = connection_count == 2 and path_length <= recovery_gap_limit
+        delegated_gap = bool(
+            not direct_relative_chain
+            and connection_count == 2
+            and path_length <= recovery_gap_limit
+        )
         geometry_supported = bool(
             tortuosity <= parameters["max_tortuosity"]
             or (relative_branch_candidate and geometry["locally_smooth"])
         )
-        relative_supported = bool(relative_evidence["relative_supported"])
+        diagnostics = relative_context.get("diagnostics", {}) if relative_context else {}
+        relative_weak_threshold = float(diagnostics.get("relative_weak_threshold", 0.0))
+        corridor_relative_supported = bool(
+            rescued_by_corridor
+            and corridor is not None
+            and float(corridor.get("relative_score_q25", 0.0))
+                >= max(relative_weak_threshold - 1e-6, 0.0)
+            and float(corridor.get("scene_rank_q25", 0.0)) >= 0.50
+        )
+        relative_supported = bool(
+            relative_evidence["relative_supported"] or corridor_relative_supported
+        )
         independent_supported = (
             connection_count > 0
             or evidence["surface_supported"]
             or relative_supported
             or (
-                path_length >= parameters["min_length"] * parameters["independent_length_factor"]
+                structural_length >= parameters["min_length"] * parameters["independent_length_factor"]
                 and evidence["center_conf"] >= parameters["min_mean"] + 0.01
                 and evidence["probability_contrast"] >= parameters["min_contrast"] + 0.02
             )
@@ -1952,7 +2362,7 @@ def bootstrap_weak_road_network(
                 + 0.18 * relative_evidence["relative_score_q25"]
                 + 0.16 * relative_evidence["scene_rank_mean"]
                 + 0.12 * relative_evidence["normalized_contrast_mean"]
-                + 0.12 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
+                + 0.12 * min(1.0, structural_length / max(parameters["min_length"] * 2.0, 1e-6))
                 + 0.08 * directness
                 + 0.06 * proximity
             )
@@ -1961,23 +2371,33 @@ def bootstrap_weak_road_network(
                 0.24 * min(1.0, evidence["center_conf"] / max(high_threshold, 1e-6))
                 + 0.18 * min(1.0, evidence["center_q25"] / max(low_threshold, 1e-6))
                 + 0.22 * min(1.0, evidence["probability_contrast"] / max(parameters["min_contrast"] * 2.0, 1e-6))
-                + 0.14 * min(1.0, path_length / max(parameters["min_length"] * 2.0, 1e-6))
+                + 0.14 * min(1.0, structural_length / max(parameters["min_length"] * 2.0, 1e-6))
                 + 0.10 * directness
                 + 0.06 * proximity
                 + 0.06 * evidence["surface_conf"]
             )
         if relative_branch_candidate:
-            diagnostics = relative_context.get("diagnostics", {}) if relative_context else {}
-            relative_weak_threshold = float(diagnostics.get("relative_weak_threshold", 0.0))
+            acceptance_score_q25 = float(
+                corridor.get("relative_score_q25", 0.0)
+                if corridor_relative_supported else relative_evidence["relative_score_q25"]
+            )
+            acceptance_scene_rank = float(
+                corridor.get("scene_rank_mean", 0.0)
+                if corridor_relative_supported else relative_evidence["scene_rank_mean"]
+            )
+            acceptance_scale_q25 = float(
+                corridor.get("scale_agreement_q25", 0.0)
+                if corridor_relative_supported else relative_evidence["scale_agreement_q25"]
+            )
             stable_relative = bool(
                 relative_supported
-                and relative_evidence["relative_fraction"] >= 0.75
-                and relative_evidence["relative_score_q25"] >= max(relative_weak_threshold - 1e-6, 0.0)
-                and relative_evidence["scene_rank_mean"] >= 0.75
+                and (relative_evidence["relative_fraction"] >= 0.75 or rescued_by_corridor)
+                and acceptance_score_q25 >= max(relative_weak_threshold - 1e-6, 0.0)
+                and acceptance_scene_rank >= 0.75
                 and relative_evidence["normalized_contrast_mean"] > 0.0
             )
             multiscale_supported = bool(
-                relative_evidence["scale_agreement_q25"] >= (2.0 / 3.0)
+                acceptance_scale_q25 >= (2.0 / 3.0)
             )
             topology_supported = bool(topology_support_fraction >= 0.25)
             graph_connected = bool(
@@ -1985,13 +2405,17 @@ def bootstrap_weak_road_network(
                 and (endpoint_alignment >= 0.50 or absolute_proximity_fraction >= 0.10)
             )
             long_independent = bool(
-                path_length >= parameters["min_length"] * parameters["independent_length_factor"]
+                structural_length >= parameters["min_length"] * parameters["independent_length_factor"]
                 and geometry["locally_smooth"]
                 and multiscale_supported
             )
-            supporting_evidence = graph_connected or topology_supported or multiscale_supported
+            supporting_evidence = (
+                graph_connected or topology_supported or multiscale_supported
+                or rescued_by_corridor
+            )
             if stable_relative and geometry_supported and supporting_evidence and (
                 graph_connected or topology_supported or long_independent
+                or rescued_by_corridor
             ):
                 qa_state = "auto"
                 relative_tier = "A" if (graph_connected or topology_supported) else "B"
@@ -2035,7 +2459,21 @@ def bootstrap_weak_road_network(
                 nearest_distance, nearest_index = node_tree.query(point[np.newaxis, :], k=1)
                 if float(nearest_distance[0, 0]) <= parameters["connection_radius"]:
                     node_idx = int(nearest_index[0, 0])
-            key = tuple(np.rint(point).astype(np.int32).tolist())
+            coordinate = tuple(np.rint(point).astype(np.int32).tolist())
+            split_unconfirmed_crossing = bool(
+                direct_relative_chain
+                and corridor_id > 0
+                and coordinate in ambiguous_relative_endpoints
+                and not topology_mask[
+                    np.clip(coordinate[0], 0, road.shape[0] - 1),
+                    np.clip(coordinate[1], 0, road.shape[1] - 1),
+                ]
+            )
+            key = (
+                (coordinate[0], coordinate[1], corridor_id)
+                if split_unconfirmed_crossing and node_idx is None
+                else coordinate
+            )
             if node_idx is None:
                 node_idx = coordinate_nodes.get(key)
             if node_idx is None:
@@ -2072,6 +2510,10 @@ def bootstrap_weak_road_network(
                 "absolute_proximity_fraction": absolute_proximity_fraction,
                 "topology_candidate_support_fraction": topology_support_fraction,
                 "topology_candidate_score_mean": topology_score_mean,
+                "corridor_id": int(corridor_id),
+                "micro_chain_length": float(path_length),
+                "corridor_total_length": float(corridor_total_length),
+                "rescued_by_corridor": bool(rescued_by_corridor),
                 **relative_evidence,
             })
             added_count += 1
@@ -3079,6 +3521,38 @@ def postprocess_weak_road_network(
             relative_context.get("diagnostics", {}).get("relative_chain_count", 0)
             if relative_context else 0
         ),
+        "micro_chain_count": int(
+            relative_context.get("diagnostics", {}).get("micro_chain_count", 0)
+            if relative_context else 0
+        ),
+        "too_short_micro_chain_count": int(
+            relative_context.get("diagnostics", {}).get("too_short_micro_chain_count", 0)
+            if relative_context else 0
+        ),
+        "corridor_count": int(
+            relative_context.get("diagnostics", {}).get("corridor_count", 0)
+            if relative_context else 0
+        ),
+        "corridor_rescued_chain_count": int(
+            relative_context.get("diagnostics", {}).get("corridor_rescued_chain_count", 0)
+            if relative_context else 0
+        ),
+        "corridor_rescued_length": float(
+            relative_context.get("diagnostics", {}).get("corridor_rescued_length", 0.0)
+            if relative_context else 0.0
+        ),
+        "isolated_short_rejected_count": int(
+            relative_context.get("diagnostics", {}).get("isolated_short_rejected_count", 0)
+            if relative_context else 0
+        ),
+        "complex_junction_zone_count": int(
+            relative_context.get("diagnostics", {}).get("complex_junction_zone_count", 0)
+            if relative_context else 0
+        ),
+        "complex_zone_skipped_collapse_count": int(
+            relative_context.get("diagnostics", {}).get("complex_zone_skipped_collapse_count", 0)
+            if relative_context else 0
+        ),
         "raw_chain_count": int(
             relative_context.get("diagnostics", {}).get("raw_chain_count", 0)
             if relative_context else 0
@@ -3138,7 +3612,9 @@ def postprocess_weak_road_network(
             {
                 key: value
                 for key, value in relative_context.get("diagnostics", {}).items()
-                if key != "junction_zones"
+                if key not in {
+                    "junction_zones", "relative_micro_chains", "relative_corridors"
+                }
             }
             if relative_context else {}
         ),

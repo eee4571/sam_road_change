@@ -95,14 +95,19 @@ class RelativeRoadnessTests(unittest.TestCase):
     def test_ladder_junction_zone_becomes_one_long_corridor(self):
         cfg = relative_config()
         cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
-        result = self._normalize_synthetic(self._ladder_skeleton(), cfg)
+        skeleton = self._ladder_skeleton()
+        result = self._normalize_synthetic(skeleton, cfg)
         diagnostics = result["diagnostics"]
         self.assertEqual(diagnostics["raw_chain_count"], 38)
         self.assertEqual(diagnostics["raw_short_chain_count"], 38)
-        self.assertEqual(diagnostics["normalized_chain_count"], 1)
-        self.assertEqual(diagnostics["normalized_short_chain_count"], 0)
-        self.assertGreater(diagnostics["normalized_max_chain_length"], 200.0)
-        self.assertEqual(diagnostics["collapsed_zone_count"], 1)
+        self.assertTrue(np.array_equal(result["normalized_skeleton"] > 0, skeleton > 0))
+        self.assertEqual(diagnostics["collapsed_zone_count"], 0)
+        self.assertGreaterEqual(diagnostics["complex_zone_skipped_collapse_count"], 1)
+        grouping = graph_extraction.build_relative_chain_corridors(
+            skeleton,
+            candidate_mask=cv2.dilate(skeleton, np.ones((3, 3), dtype=np.uint8)),
+        )
+        self.assertGreater(max(row["total_length"] for row in grouping["corridors"]), 200.0)
         zone = diagnostics["junction_zones"][0]
         self.assertEqual(len(zone["branch_lengths"]), zone["incident_branch_count"])
         self.assertEqual(len(zone["branch_tangents"]), zone["incident_branch_count"])
@@ -110,10 +115,129 @@ class RelativeRoadnessTests(unittest.TestCase):
     def test_dense_ladder_keeps_real_branch_that_leaves_zone(self):
         cfg = relative_config()
         cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
-        result = self._normalize_synthetic(self._ladder_skeleton(with_branch=True), cfg)
+        skeleton = self._ladder_skeleton(with_branch=True)
+        result = self._normalize_synthetic(skeleton, cfg)
         normalized = result["normalized_skeleton"] > 0
         self.assertGreater(np.count_nonzero(normalized[65:101, 118:123]), 30)
-        self.assertEqual(result["diagnostics"]["junction_zones"][0]["preserved_branch_count"], 1)
+        self.assertTrue(np.array_equal(normalized, skeleton > 0))
+        self.assertEqual(result["diagnostics"]["collapsed_zone_count"], 0)
+
+    def test_logical_corridor_rescues_split_sub48_chains(self):
+        skeleton = np.zeros((96, 160), dtype=np.uint8)
+        cv2.line(skeleton, (15, 48), (145, 48), 1, 1)
+        for col in (41, 67, 93, 119):
+            cv2.line(skeleton, (col, 48), (col, 43), 1, 1)
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        evidence = skeleton.astype(np.float32)
+        retained, _rejected, summary = graph_extraction.extract_relative_skeleton(
+            skeleton,
+            cfg,
+            input_skeleton=skeleton,
+            relative_score=evidence,
+            scene_rank=evidence,
+            scale_agreement=evidence,
+            relative_weak_threshold=0.5,
+        )
+        horizontal_records = [
+            row for row in summary["relative_micro_chains"]
+            if abs(row["start"][0] - row["end"][0]) <= 1
+        ]
+        self.assertTrue(horizontal_records)
+        self.assertTrue(all(row["micro_chain_length"] < 48.0 for row in horizontal_records))
+        self.assertTrue(all(row["rescued_by_corridor"] for row in horizontal_records))
+        self.assertGreaterEqual(summary["corridor_rescued_chain_count"], len(horizontal_records))
+        self.assertGreater(np.count_nonzero(retained[47:50, 15:146]), 120)
+
+    def test_logical_corridor_preserves_t_three_branches(self):
+        skeleton = np.zeros((180, 180), dtype=np.uint8)
+        cv2.line(skeleton, (15, 80), (165, 80), 1, 1)
+        cv2.line(skeleton, (90, 80), (90, 155), 1, 1)
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        evidence = skeleton.astype(np.float32)
+        retained, _rejected, summary = graph_extraction.extract_relative_skeleton(
+            skeleton,
+            cfg,
+            input_skeleton=skeleton,
+            relative_score=evidence,
+            scene_rank=evidence,
+            scale_agreement=evidence,
+            relative_weak_threshold=0.5,
+        )
+        self.assertGreater(np.count_nonzero(retained[78:83, 15:166]), 140)
+        self.assertGreater(np.count_nonzero(retained[80:156, 88:93]), 65)
+        self.assertEqual(summary["corridor_count"], 2)
+
+    def test_logical_corridor_keeps_parallel_roads_separate(self):
+        skeleton = np.zeros((100, 180), dtype=np.uint8)
+        cv2.line(skeleton, (15, 35), (165, 35), 1, 1)
+        cv2.line(skeleton, (15, 65), (165, 65), 1, 1)
+        grouping = graph_extraction.build_relative_chain_corridors(
+            skeleton, candidate_mask=skeleton
+        )
+        self.assertEqual(len(grouping["corridors"]), 2)
+        self.assertEqual({row["chain_count"] for row in grouping["corridors"]}, {1})
+        self.assertNotEqual(
+            grouping["corridor_labels"][35, 90],
+            grouping["corridor_labels"][65, 90],
+        )
+
+    def test_logical_corridor_crossing_has_no_triangle_or_shortcut(self):
+        skeleton = np.zeros((200, 200), dtype=np.uint8)
+        cv2.line(skeleton, (10, 100), (190, 100), 1, 1)
+        cv2.line(skeleton, (100, 10), (100, 190), 1, 1)
+        cfg = relative_config()
+        cfg["RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX"] = 48.0
+        cfg["WEAK_BOOTSTRAP_MIN_LENGTH_PX"] = 48.0
+        evidence = skeleton.astype(np.float32)
+        retained, _rejected, summary = graph_extraction.extract_relative_skeleton(
+            skeleton,
+            cfg,
+            input_skeleton=skeleton,
+            relative_score=evidence,
+            scene_rank=evidence,
+            scale_agreement=evidence,
+            relative_weak_threshold=0.5,
+        )
+        chain_labels = summary.pop("_relative_chain_labels")
+        corridor_labels = summary.pop("_relative_corridor_labels")
+        self.assertEqual(summary["corridor_count"], 2)
+        context = {
+            "relative_score": evidence,
+            "scene_rank": evidence,
+            "local_background": np.zeros_like(evidence),
+            "local_contrast": evidence,
+            "normalized_contrast": evidence,
+            "scale_agreement_fraction": evidence,
+            "relative_skeleton": retained,
+            "relative_only_skeleton": retained,
+            "relative_chain_labels": chain_labels,
+            "relative_corridor_labels": corridor_labels,
+            "diagnostics": {"relative_weak_threshold": 0.5, **summary},
+        }
+        nodes, edges, _metadata, _bootstrap = graph_extraction.bootstrap_weak_road_network(
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+            np.full(skeleton.shape, 0.07, dtype=np.float32),
+            cfg,
+            relative_context=context,
+            include_absolute_candidates=False,
+        )
+        self.assertGreater(len(edges), 0)
+        for src_idx, dst_idx in edges:
+            delta = np.abs(nodes[int(dst_idx)] - nodes[int(src_idx)])
+            self.assertTrue(delta[0] < 1e-6 or delta[1] < 1e-6)
+        adjacency = {index: set() for index in range(len(nodes))}
+        for src_idx, dst_idx in edges:
+            adjacency[int(src_idx)].add(int(dst_idx))
+            adjacency[int(dst_idx)].add(int(src_idx))
+        triangle_count = sum(
+            len(adjacency[first] & adjacency[second])
+            for first, neighbors in adjacency.items()
+            for second in neighbors if first < second
+        ) // 3
+        self.assertEqual(triangle_count, 0)
 
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
