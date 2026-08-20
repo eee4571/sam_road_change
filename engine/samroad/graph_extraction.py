@@ -1472,6 +1472,175 @@ def build_relative_candidate_mask(relative_score, config, *, scene_state="normal
     }
 
 
+def extract_relative_ridge_centerline(
+    relative_score,
+    relative_candidate_mask,
+    *,
+    min_chain_length=48.0,
+):
+    """Extract a narrow centerline by NMS across local score-ridge normals.
+
+    A structure tensor estimates the dominant cross-ridge (normal) direction
+    from the continuous Relative Roadness field.  Non-maximum suppression is
+    then applied only along that normal.  The binary candidate remains a
+    spatial support mask; its width and boundary do not define the centerline.
+    """
+    score = np.asarray(relative_score, dtype=np.float32)
+    candidate = np.asarray(relative_candidate_mask, dtype=np.uint8) > 0
+    if score.ndim != 2 or candidate.shape != score.shape:
+        raise ValueError("relative_score and relative_candidate_mask must be aligned 2D arrays")
+    binary_skeleton = skeletonize(candidate).astype(np.uint8)
+    if score.size == 0 or not np.any(candidate):
+        empty_float = np.zeros(score.shape, dtype=np.float32)
+        return {
+            "relative_ridge_mask": np.zeros(score.shape, dtype=np.uint8),
+            "ridge_orientation": empty_float,
+            "ridge_strength": empty_float.copy(),
+            "binary_skeleton": binary_skeleton,
+            "diagnostics": {
+                "candidate_pixel_count": int(np.count_nonzero(candidate)),
+                "old_binary_skeleton_length": int(np.count_nonzero(binary_skeleton)),
+                "ridge_skeleton_length": 0,
+                "old_junction_pixel_count": 0,
+                "ridge_junction_pixel_count": 0,
+                "old_micro_chain_count": 0,
+                "ridge_micro_chain_count": 0,
+                "old_too_short_count": 0,
+                "ridge_too_short_count": 0,
+                "ridge_fallback_used": False,
+            },
+        }
+
+    smooth = cv2.GaussianBlur(
+        score, (0, 0), sigmaX=1.2, sigmaY=1.2,
+        borderType=cv2.BORDER_REFLECT_101,
+    ).astype(np.float32)
+    gradient_col = cv2.Sobel(
+        smooth, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REFLECT_101
+    )
+    gradient_row = cv2.Sobel(
+        smooth, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REFLECT_101
+    )
+    tensor_xy = cv2.GaussianBlur(
+        gradient_col * gradient_row, (0, 0), 2.0,
+        borderType=cv2.BORDER_REFLECT_101,
+    )
+    tensor_xx = cv2.GaussianBlur(
+        gradient_col * gradient_col, (0, 0), 2.0,
+        borderType=cv2.BORDER_REFLECT_101,
+    )
+    tensor_yy = cv2.GaussianBlur(
+        gradient_row * gradient_row, (0, 0), 2.0,
+        borderType=cv2.BORDER_REFLECT_101,
+    )
+    del gradient_col, gradient_row
+
+    # Dominant tensor eigenvector = local ridge normal. Orientation output is
+    # the perpendicular road tangent, modulo pi.
+    normal_orientation = 0.5 * np.arctan2(
+        2.0 * tensor_xy, tensor_xx - tensor_yy
+    ).astype(np.float32)
+    ridge_orientation = np.mod(
+        normal_orientation + np.float32(math.pi / 2.0), np.float32(math.pi)
+    ).astype(np.float32)
+    tensor_anisotropy = np.sqrt(
+        (tensor_xx - tensor_yy) ** 2 + 4.0 * tensor_xy ** 2
+    ).astype(np.float32)
+    tensor_coherence = (
+        tensor_anisotropy / (tensor_xx + tensor_yy + 1e-12)
+    ).astype(np.float32)
+    del tensor_xx, tensor_yy, tensor_xy
+
+    # Sample the continuous normal direction with bilinear interpolation.
+    # Processing row strips keeps full-scene memory bounded while avoiding the
+    # one-pixel discontinuities caused by quantizing orientations into bins.
+    ridge_nms = np.zeros(score.shape, dtype=bool)
+    ridge_strength = np.zeros(score.shape, dtype=np.float32)
+    height, width = score.shape
+    base_cols = np.arange(width, dtype=np.float32)[None, :]
+    strip_height = 256
+    for row0 in range(1, max(height - 1, 1), strip_height):
+        row1 = min(row0 + strip_height, height - 1)
+        if row1 <= row0:
+            continue
+        normal = normal_orientation[row0:row1]
+        normal_col = np.cos(normal).astype(np.float32)
+        normal_row = np.sin(normal).astype(np.float32)
+        base_rows = np.arange(row0, row1, dtype=np.float32)[:, None]
+        forward = cv2.remap(
+            smooth,
+            base_cols + normal_col,
+            base_rows + normal_row,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        backward = cv2.remap(
+            smooth,
+            base_cols - normal_col,
+            base_rows - normal_row,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        center = smooth[row0:row1]
+        cross_section_drop = center - 0.5 * (forward + backward)
+        keep = (
+            candidate[row0:row1]
+            & (center >= forward)
+            & (center > backward)
+            & (cross_section_drop > np.finfo(np.float32).eps)
+            & (tensor_coherence[row0:row1] >= (1.0 / 3.0))
+        )
+        keep[:, 0] = False
+        keep[:, -1] = False
+        ridge_nms[row0:row1][keep] = True
+        ridge_strength[row0:row1][keep] = (
+            cross_section_drop[keep]
+            * tensor_coherence[row0:row1][keep]
+        )
+    del normal_orientation, tensor_anisotropy, tensor_coherence
+
+    narrow_ridge_support = cv2.dilate(
+        ridge_nms.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1
+    ) > 0
+    ridge_skeleton = skeletonize(narrow_ridge_support & candidate).astype(np.uint8)
+    fallback_used = not np.any(ridge_skeleton) and np.any(binary_skeleton)
+    if fallback_used:
+        ridge_skeleton = binary_skeleton.copy()
+    ridge_strength *= ridge_skeleton.astype(np.float32)
+
+    old_chains, _old_lengths, old_summary = _skeleton_chain_summary(
+        binary_skeleton > 0, float(min_chain_length)
+    )
+    ridge_chains, _ridge_lengths, ridge_summary = _skeleton_chain_summary(
+        ridge_skeleton > 0, float(min_chain_length)
+    )
+    old_adjacency = _skeleton_adjacency(binary_skeleton > 0)
+    ridge_adjacency = _skeleton_adjacency(ridge_skeleton > 0)
+    diagnostics = {
+        "candidate_pixel_count": int(np.count_nonzero(candidate)),
+        "old_binary_skeleton_length": int(np.count_nonzero(binary_skeleton)),
+        "ridge_skeleton_length": int(np.count_nonzero(ridge_skeleton)),
+        "old_junction_pixel_count": int(sum(
+            len(neighbors) >= 3 for neighbors in old_adjacency.values()
+        )),
+        "ridge_junction_pixel_count": int(sum(
+            len(neighbors) >= 3 for neighbors in ridge_adjacency.values()
+        )),
+        "old_micro_chain_count": int(len(old_chains)),
+        "ridge_micro_chain_count": int(len(ridge_chains)),
+        "old_too_short_count": int(old_summary["short_chain_count"]),
+        "ridge_too_short_count": int(ridge_summary["short_chain_count"]),
+        "ridge_fallback_used": bool(fallback_used),
+    }
+    return {
+        "relative_ridge_mask": ridge_skeleton,
+        "ridge_orientation": ridge_orientation,
+        "ridge_strength": ridge_strength,
+        "binary_skeleton": binary_skeleton,
+        "diagnostics": diagnostics,
+    }
+
+
 def extract_relative_skeleton(
     candidate_mask,
     config,
@@ -1657,6 +1826,10 @@ def compute_relative_roadness(
             "scale_support_count": np.zeros(road.shape, dtype=np.uint8),
             "scale_agreement_fraction": empty.copy(),
             "relative_candidate_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_binary_skeleton": np.zeros(road.shape, dtype=np.uint8),
+            "relative_ridge_mask": np.zeros(road.shape, dtype=np.uint8),
+            "ridge_orientation": empty.copy(),
+            "ridge_strength": empty.copy(),
             "relative_skeleton_raw": np.zeros(road.shape, dtype=np.uint8),
             "relative_skeleton_normalized": np.zeros(road.shape, dtype=np.uint8),
             "relative_skeleton": np.zeros(road.shape, dtype=np.uint8),
@@ -1707,7 +1880,18 @@ def compute_relative_roadness(
     candidate, threshold_summary = build_relative_candidate_mask(
         relative_score, config, scene_state=scene_state
     )
-    raw_relative_skeleton = skeletonize(candidate.astype(bool)).astype(np.uint8)
+    # Release multi-scale temporaries before allocating full-scene tensor maps.
+    del backgrounds, per_scale_contrast
+    min_chain_length = float(_config_value(
+        config, "RELATIVE_ROADNESS_MIN_CHAIN_LENGTH_PX", 48.0
+    )) * max(float(distance_scale), 1e-6)
+    ridge_result = extract_relative_ridge_centerline(
+        relative_score,
+        candidate,
+        min_chain_length=min_chain_length,
+    )
+    binary_relative_skeleton = ridge_result["binary_skeleton"]
+    raw_relative_skeleton = ridge_result["relative_ridge_mask"]
     normalization = normalize_relative_skeleton(
         raw_relative_skeleton,
         candidate,
@@ -1763,6 +1947,7 @@ def compute_relative_roadness(
         "relative_only_skeleton_total_length": int(np.count_nonzero(relative_only)),
         "combined_skeleton_total_length": int(np.count_nonzero(combined)),
         **threshold_summary,
+        **ridge_result["diagnostics"],
         **normalization["diagnostics"],
         **structure_summary,
     }
@@ -1775,6 +1960,10 @@ def compute_relative_roadness(
         "scale_support_count": scale_support_count,
         "scale_agreement_fraction": scale_agreement.astype(np.float32),
         "relative_candidate_mask": candidate.astype(np.uint8),
+        "relative_binary_skeleton": binary_relative_skeleton.astype(np.uint8),
+        "relative_ridge_mask": raw_relative_skeleton.astype(np.uint8),
+        "ridge_orientation": ridge_result["ridge_orientation"].astype(np.float32),
+        "ridge_strength": ridge_result["ridge_strength"].astype(np.float32),
         "relative_skeleton_raw": raw_relative_skeleton.astype(np.uint8),
         "relative_skeleton_normalized": normalized_relative_skeleton.astype(np.uint8),
         "relative_skeleton": relative_skeleton.astype(np.uint8),

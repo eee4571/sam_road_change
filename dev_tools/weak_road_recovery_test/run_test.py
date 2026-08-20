@@ -611,6 +611,14 @@ def write_relative_roadness_diagnostic(
         context["relative_skeleton_raw"].astype(np.uint8) * 255,
     )
     _save_png(
+        run_dir / "relative_binary_skeleton.png",
+        context["relative_binary_skeleton"].astype(np.uint8) * 255,
+    )
+    _save_png(
+        run_dir / "relative_ridge_centerline.png",
+        context["relative_ridge_mask"].astype(np.uint8) * 255,
+    )
+    _save_png(
         run_dir / "relative_skeleton_normalized.png",
         context["relative_skeleton_normalized"].astype(np.uint8) * 255,
     )
@@ -691,7 +699,13 @@ def write_relative_roadness_diagnostic(
         ], axis=0),
     )
     _save_png(run_dir / "relative_acceptance_overlay.png", acceptance_overlay)
-    _write_json(run_dir / "relative_roadness_summary.json", context["diagnostics"])
+    _write_json(
+        run_dir / "relative_roadness_summary.json",
+        {
+            key: value for key, value in context["diagnostics"].items()
+            if key not in {"relative_micro_chains", "relative_corridors"}
+        },
+    )
     height, width = image_rgb.shape[:2]
     requested_roi = (1513, 3079, 2130, 3557)
     if width >= requested_roi[2] and height >= requested_roi[3]:
@@ -707,6 +721,10 @@ def write_relative_roadness_diagnostic(
     ).astype(np.uint8)
     raw_panel = image_rgb[crop].copy()
     raw_panel[context["relative_skeleton_raw"][crop] > 0] = (255, 0, 0)
+    binary_panel = candidate_panel.copy()
+    binary_panel[context["relative_binary_skeleton"][crop] > 0] = (255, 0, 0)
+    ridge_panel = image_rgb[crop].copy()
+    ridge_panel[context["relative_ridge_mask"][crop] > 0] = (0, 255, 0)
     zone_panel = image_rgb[crop].copy()
     zone_panel[context["junction_zone_mask"][crop] > 0] = (0, 128, 255)
     zone_panel[context["collapsed_zone_mask"][crop] > 0] = (180, 0, 255)
@@ -754,6 +772,9 @@ def write_relative_roadness_diagnostic(
         ]
         return panel, chains, lengths
 
+    binary_chain_panel, binary_crop_chains, binary_crop_lengths = chain_panel(
+        "relative_binary_skeleton"
+    )
     raw_chain_panel, raw_crop_chains, raw_crop_lengths = chain_panel("relative_skeleton_raw")
     normalized_chain_panel, normalized_crop_chains, normalized_crop_lengths = chain_panel(
         "relative_skeleton_normalized"
@@ -769,7 +790,36 @@ def write_relative_roadness_diagnostic(
     )
     _save_png(
         run_dir / "relative_chain_debug.png",
-        np.concatenate([raw_chain_panel, normalized_chain_panel], axis=1),
+        np.concatenate([
+            _labeled_preview(binary_chain_panel, "Old binary-skeleton chains", max_width=1200),
+            raw_chain_panel,
+            normalized_chain_panel,
+        ], axis=1),
+    )
+
+    ridge_score_panel = cv2.cvtColor(
+        cv2.applyColorMap(relative_u8[crop], cv2.COLORMAP_VIRIDIS),
+        cv2.COLOR_BGR2RGB,
+    )
+    ridge_debug_panels = [
+        _labeled_preview(image_rgb[crop], "1 Original", max_width=900),
+        _labeled_preview(ridge_score_panel, "2 Relative score", max_width=900),
+        _labeled_preview(binary_panel, "3 Candidate + old skeleton", max_width=900),
+        _labeled_preview(ridge_panel, "4 Ridge centerline", max_width=900),
+        _labeled_preview(final_overlay[crop], "5 Final vector", max_width=900),
+    ]
+    ridge_debug_height = min(panel.shape[0] for panel in ridge_debug_panels)
+    ridge_debug_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * ridge_debug_height / panel.shape[0]))), ridge_debug_height),
+        )
+        if panel.shape[0] != ridge_debug_height else panel
+        for panel in ridge_debug_panels
+    ]
+    _save_png(
+        run_dir / "relative_ridge_debug.png",
+        np.concatenate(ridge_debug_panels, axis=1),
     )
 
     def labeled_structure_panel(label_name, title):
@@ -830,6 +880,9 @@ def write_relative_roadness_diagnostic(
                 if key not in {"relative_micro_chains", "relative_corridors"}
             },
             "problem_crop_xyxy": [x0, y0, x1, y1],
+            "problem_crop_old_binary": crop_chain_stats(
+                binary_crop_chains, binary_crop_lengths
+            ),
             "problem_crop_raw": crop_chain_stats(raw_crop_chains, raw_crop_lengths),
             "problem_crop_normalized": crop_chain_stats(
                 normalized_crop_chains, normalized_crop_lengths
@@ -839,6 +892,28 @@ def write_relative_roadness_diagnostic(
     _write_json(
         run_dir / "relative_acceptance_funnel.json",
         recovery_summary.get("relative_acceptance_funnel", {}),
+    )
+    ridge_audit_keys = (
+        "candidate_pixel_count", "old_binary_skeleton_length",
+        "ridge_skeleton_length", "old_junction_pixel_count",
+        "ridge_junction_pixel_count", "old_micro_chain_count",
+        "ridge_micro_chain_count", "old_too_short_count",
+        "ridge_too_short_count", "corridor_count",
+    )
+    _write_json(
+        run_dir / "relative_ridge_audit.json",
+        {
+            **{
+                key: context["diagnostics"].get(key, 0)
+                for key in ridge_audit_keys
+            },
+            "final_relative_length": float(
+                recovery_summary.get("relative_final_length_px", 0.0)
+            ),
+            "final_total_graph_length": float(
+                recovery_summary.get("final_total_centerline_length_px", 0.0)
+            ),
+        },
     )
     corridor_keys = (
         "micro_chain_count", "too_short_micro_chain_count", "corridor_count",

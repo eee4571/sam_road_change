@@ -239,6 +239,58 @@ class RelativeRoadnessTests(unittest.TestCase):
         ) // 3
         self.assertEqual(triangle_count, 0)
 
+    def test_relative_ridge_wide_straight_line_rejects_edge_fishbones(self):
+        rows, cols = np.indices((96, 176), dtype=np.float32)
+        score = np.zeros((96, 176), dtype=np.float32)
+        score[:, 12:164] = np.exp(-0.5 * ((rows[:, 12:164] - 48.0) / 3.0) ** 2)
+        candidate = np.zeros_like(score, dtype=np.uint8)
+        candidate[41:56, 12:164] = 1
+        for col in range(28, 157, 16):
+            candidate[34:42, col - 1:col + 2] = 1
+        result = graph_extraction.extract_relative_ridge_centerline(score, candidate)
+        ridge = result["relative_ridge_mask"] > 0
+        diagnostics = result["diagnostics"]
+        self.assertGreater(np.count_nonzero(ridge[47:50, 12:164]), 135)
+        self.assertLess(np.count_nonzero(ridge[:44]), 8)
+        self.assertLess(
+            diagnostics["ridge_junction_pixel_count"],
+            diagnostics["old_junction_pixel_count"],
+        )
+
+    def test_relative_ridge_smooth_curve_keeps_ramp_geometry(self):
+        rows, cols = np.indices((112, 112), dtype=np.float32)
+        centerline = 30.0 + 0.0065 * (cols - 56.0) ** 2
+        active = (cols >= 10) & (cols <= 102)
+        score = np.exp(-0.5 * ((rows - centerline) / 2.8) ** 2) * active
+        candidate = ((np.abs(rows - centerline) <= 6.0) & active).astype(np.uint8)
+        ridge = graph_extraction.extract_relative_ridge_centerline(
+            score.astype(np.float32), candidate
+        )["relative_ridge_mask"] > 0
+        points = np.column_stack(np.where(ridge))
+        expected_rows = 30.0 + 0.0065 * (points[:, 1] - 56.0) ** 2
+        self.assertGreater(len(np.unique(points[:, 1])), 80)
+        self.assertLess(float(np.median(np.abs(points[:, 0] - expected_rows))), 1.5)
+        middle_row = float(np.median(points[np.abs(points[:, 1] - 56) <= 2, 0]))
+        end_rows = points[(points[:, 1] <= 14) | (points[:, 1] >= 98), 0]
+        self.assertGreater(float(np.median(end_rows)) - middle_row, 8.0)
+
+    def test_relative_ridge_crossing_keeps_axes_without_diagonal_shortcut(self):
+        rows, cols = np.indices((112, 112), dtype=np.float32)
+        horizontal = np.exp(-0.5 * ((rows - 56.0) / 2.5) ** 2)
+        vertical = np.exp(-0.5 * ((cols - 56.0) / 2.5) ** 2)
+        active = (rows >= 10) & (rows <= 102) & (cols >= 10) & (cols <= 102)
+        score = np.maximum(horizontal, vertical) * active
+        candidate = (
+            active & ((np.abs(rows - 56.0) <= 6.0) | (np.abs(cols - 56.0) <= 6.0))
+        ).astype(np.uint8)
+        ridge = graph_extraction.extract_relative_ridge_centerline(
+            score.astype(np.float32), candidate
+        )["relative_ridge_mask"] > 0
+        self.assertGreater(np.count_nonzero(ridge[55:58, 10:103]), 80)
+        self.assertGreater(np.count_nonzero(ridge[10:103, 55:58]), 80)
+        off_axis = ridge & (np.abs(rows - 56.0) > 2) & (np.abs(cols - 56.0) > 2)
+        self.assertEqual(np.count_nonzero(off_axis), 0)
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)
