@@ -1,0 +1,22 @@
+{
+  "distance_transform_seconds": 8.787108100019395,
+  "hole_fill_seconds": 31.836742100073025,
+  "smoothing_seconds": 10.79379250004422,
+  "candidate_regularization_seconds": 47.48309449991211,
+  "candidate_pixel_count_before": 1647179,
+  "candidate_pixel_count_after": 1649023,
+  "hole_filled_count": 471,
+  "noise_component_removed_count": 0,
+  "skeletonize_seconds": 0.5623977000359446,
+  "spur_pruning_seconds": 1.5206136999186128,
+  "junction_collapse_seconds": 130.33720910002012,
+  "vector_simplification_seconds": 0.812116099987179,
+  "total_seconds": 180.7408644000534,
+  "skeleton_length_before_pruning": 85752,
+  "skeleton_length_after_pruning": 64878,
+  "final_skeleton_length": 65747,
+  "spur_removed_count": 1482,
+  "spur_removed_length": 25041.402651035776,
+  "junction_pixel_count_before": 800,
+  "junction_cluster_count_after": 524
+}

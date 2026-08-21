@@ -600,6 +600,120 @@ class RelativeRoadnessTests(unittest.TestCase):
             3,
         )
 
+    def test_regularized_skeleton_a_jagged_straight_road_has_one_trunk(self):
+        candidate = np.zeros((128, 270), dtype=np.uint8)
+        candidate[52:76, 15:255] = 1
+        for index, col in enumerate(range(28, 245, 24)):
+            depth = 2 + index % 4
+            candidate[52 - depth:52, col:col + 4] = 1
+            candidate[76:76 + depth, col + 9:col + 13] = 1
+            candidate[52:52 + min(depth, 4), col + 15:col + 18] = 0
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        skeleton = result["final_skeleton"] > 0
+        adjacency = graph_extraction._skeleton_adjacency(skeleton)
+        self.assertEqual(cv2.connectedComponents(skeleton.astype(np.uint8), 8)[0] - 1, 1)
+        self.assertGreater(len(np.unique(np.where(skeleton)[1])), 225)
+        self.assertLessEqual(sum(len(items) >= 3 for items in adjacency.values()), 2)
+
+    def test_regularized_skeleton_b_small_holes_do_not_create_loops(self):
+        candidate = np.zeros((130, 260), dtype=np.uint8)
+        candidate[48:78, 12:248] = 1
+        holes = [(70, 61, 2), (118, 64, 3), (175, 59, 2), (218, 66, 3)]
+        for col, row, radius in holes:
+            cv2.circle(candidate, (col, row), radius, 0, -1)
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        regularized = result["regularized_candidate"] > 0
+        skeleton = result["final_skeleton"] > 0
+        for col, row, _radius in holes:
+            self.assertTrue(regularized[row, col])
+        adjacency = graph_extraction._skeleton_adjacency(skeleton)
+        self.assertEqual(sum(len(items) == 1 for items in adjacency.values()), 2)
+        self.assertEqual(sum(len(items) >= 3 for items in adjacency.values()), 0)
+
+    def test_regularized_skeleton_c_keeps_t_and_removes_boundary_spurs(self):
+        candidate = np.zeros((210, 300), dtype=np.uint8)
+        candidate[82:102, 18:282] = 1
+        candidate[92:195, 140:160] = 1
+        for col in (45, 82, 205, 244):
+            candidate[77:82, col:col + 4] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        skeleton = result["final_skeleton"] > 0
+        self.assertGreater(np.count_nonzero(skeleton[78:106, 18:282]), 230)
+        self.assertGreater(np.count_nonzero(skeleton[92:195, 136:164]), 85)
+        adjacency = graph_extraction._skeleton_adjacency(skeleton)
+        self.assertEqual(sum(len(items) == 1 for items in adjacency.values()), 3)
+        self.assertGreaterEqual(result["performance"]["junction_cluster_count_after"], 1)
+
+    def test_regularized_skeleton_d_preserves_y_junction(self):
+        candidate = np.zeros((220, 260), dtype=np.uint8)
+        cv2.line(candidate, (130, 190), (130, 105), 1, 18)
+        cv2.line(candidate, (130, 105), (45, 28), 1, 18)
+        cv2.line(candidate, (130, 105), (215, 28), 1, 18)
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        skeleton = result["final_skeleton"] > 0
+        adjacency = graph_extraction._skeleton_adjacency(skeleton)
+        self.assertEqual(sum(len(items) == 1 for items in adjacency.values()), 3)
+        self.assertGreater(np.count_nonzero(skeleton[150:200, 122:138]), 35)
+        self.assertGreater(np.count_nonzero(skeleton[20:75, 35:95]), 35)
+        self.assertGreater(np.count_nonzero(skeleton[20:75, 165:225]), 35)
+
+    def test_regularized_skeleton_e_keeps_close_parallel_roads_separate(self):
+        candidate = np.zeros((130, 270), dtype=np.uint8)
+        candidate[42:56, 12:258] = 1
+        candidate[61:75, 12:258] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        regularized = result["regularized_candidate"] > 0
+        skeleton = result["final_skeleton"] > 0
+        self.assertEqual(cv2.connectedComponents(regularized.astype(np.uint8), 8)[0] - 1, 2)
+        self.assertEqual(cv2.connectedComponents(skeleton.astype(np.uint8), 8)[0] - 1, 2)
+        self.assertEqual(np.count_nonzero(regularized[57:60]), 0)
+
+    def test_regularized_skeleton_f_collapses_complex_junction_cluster(self):
+        candidate = np.zeros((240, 280), dtype=np.uint8)
+        candidate[100:126, 18:262] = 1
+        candidate[20:220, 126:152] = 1
+        candidate[91:136, 112:166] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        raw = result["raw_skeleton"] > 0
+        final = result["final_skeleton"] > 0
+        raw_adjacency = graph_extraction._skeleton_adjacency(raw)
+        final_adjacency = graph_extraction._skeleton_adjacency(final)
+        self.assertEqual(sum(len(items) == 1 for items in final_adjacency.values()), 4)
+        self.assertLessEqual(
+            sum(len(items) >= 3 for items in final_adjacency.values()),
+            sum(len(items) >= 3 for items in raw_adjacency.values()),
+        )
+        self.assertGreaterEqual(result["performance"]["junction_cluster_count_after"], 1)
+
+    def test_regularized_skeleton_g_does_not_bridge_real_gap(self):
+        candidate = np.zeros((110, 280), dtype=np.uint8)
+        candidate[46:66, 12:128] = 1
+        candidate[46:66, 150:268] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        regularized = result["regularized_candidate"] > 0
+        self.assertEqual(cv2.connectedComponents(regularized.astype(np.uint8), 8)[0] - 1, 2)
+        self.assertEqual(np.count_nonzero(regularized[:, 132:146]), 0)
+
+    def test_regularized_skeleton_small_benchmark_has_complete_audit(self):
+        candidate = np.zeros((512, 512), dtype=np.uint8)
+        for row in range(70, 470, 80):
+            candidate[row:row + 18, 20:492] = 1
+        candidate[40:490, 245:265] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        audit = result["performance"]
+        for key in (
+            "candidate_regularization_seconds", "distance_transform_seconds",
+            "hole_fill_seconds", "smoothing_seconds", "skeletonize_seconds",
+            "spur_pruning_seconds", "junction_collapse_seconds",
+            "vector_simplification_seconds", "total_seconds",
+            "candidate_pixel_count_before", "candidate_pixel_count_after",
+            "skeleton_length_before_pruning", "skeleton_length_after_pruning",
+            "spur_removed_count", "spur_removed_length",
+            "junction_pixel_count_before", "junction_cluster_count_after",
+        ):
+            self.assertIn(key, audit)
+        self.assertLess(audit["total_seconds"], 3.0)
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)

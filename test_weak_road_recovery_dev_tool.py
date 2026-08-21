@@ -186,7 +186,7 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             self.assertTrue(recovery["recovered_edges"])
             self.assertEqual(
                 {row["line_source"] for row in recovery["recovered_edges"]},
-                {"relative_continuous_trace"},
+                {"relative_regularized_skeleton"},
             )
             self.assertGreater(summary["relative_recovered_edge_count"], 0)
             for name in (
@@ -197,7 +197,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "relative_acceptance_overlay.png", "relative_acceptance_funnel.json",
                 "relative_review_candidates.csv",
                 "relative_skeleton_normalization.json", "relative_junction_debug.png",
-                "relative_chain_debug.png",
+                "relative_chain_debug.png", "relative_regularized_skeleton_comparison.png",
+                "relative_skeleton_performance_audit.json",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
             self.assertEqual(
@@ -210,18 +211,18 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 .read_text(encoding="utf-8-sig").splitlines()[0].split(","),
                 list(run_test.BOOTSTRAP_CANDIDATE_FIELDS),
             )
-            continuous_audit = json.loads(
-                (run_dir / "relative_continuous_trace_audit.json").read_text(
+            performance_audit = json.loads(
+                (run_dir / "relative_skeleton_performance_audit.json").read_text(
                     encoding="utf-8"
                 )
             )
             for key in (
-                "seed_count", "seed_suppressed_existing_trace_count",
-                "parallel_duplicate_rejected_count",
-                "parallel_duplicate_rejected_length", "true_branch_count",
-                "collision_terminated_count", "junction_supported_merge_count",
+                "candidate_regularization_seconds", "distance_transform_seconds",
+                "hole_fill_seconds", "smoothing_seconds", "skeletonize_seconds",
+                "spur_pruning_seconds", "junction_collapse_seconds",
+                "vector_simplification_seconds", "total_seconds",
             ):
-                self.assertIn(key, continuous_audit)
+                self.assertIn(key, performance_audit)
 
     def test_recovery_only_reuses_immutable_original_cache(self):
         with tempfile.TemporaryDirectory() as raw:

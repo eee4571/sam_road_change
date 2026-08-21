@@ -632,6 +632,76 @@ def write_relative_roadness_diagnostic(
         run_dir / "relative_skeleton_normalized.png",
         context["relative_skeleton_normalized"].astype(np.uint8) * 255,
     )
+    if context.get("diagnostics", {}).get(
+        "regularized_skeleton_experimental_active", False
+    ):
+        original_candidate = context["relative_candidate_mask"] > 0
+        regularized_candidate = context["relative_regularized_candidate"] > 0
+        raw_skeleton = context["relative_regularized_raw_skeleton"] > 0
+        pruned_skeleton = context["relative_regularized_pruned_skeleton"] > 0
+        final_skeleton = context["relative_regularized_final_skeleton"] > 0
+
+        def mask_panel(mask, label, color):
+            panel = (0.45 * image_rgb.astype(np.float32)).astype(np.uint8)
+            panel[mask] = (
+                0.25 * panel[mask] + 0.75 * np.asarray(color, dtype=np.float32)
+            ).astype(np.uint8)
+            return _labeled_preview(panel, label, max_width=900)
+
+        vector_panel = image_rgb.copy()
+        for path in context.get("relative_regularized_vector_paths", []):
+            points = np.asarray(path, dtype=np.float32)
+            if len(points) < 2:
+                continue
+            cv2.polylines(
+                vector_panel,
+                [np.rint(points[:, ::-1]).astype(np.int32).reshape(-1, 1, 2)],
+                False,
+                (255, 60, 60),
+                2,
+                cv2.LINE_AA,
+            )
+        panels = [
+            _labeled_preview(image_rgb, "1 Original Image", max_width=900),
+            mask_panel(original_candidate, "2 Original Relative Candidate", (255, 180, 0)),
+            mask_panel(regularized_candidate, "3 Regularized Candidate", (0, 210, 255)),
+            mask_panel(raw_skeleton, "4 Raw Skeleton", (255, 80, 80)),
+            mask_panel(pruned_skeleton, "5 Width-aware Pruned Skeleton", (80, 255, 80)),
+            _labeled_preview(vector_panel, "6 Final Simplified Vector", max_width=900),
+        ]
+        row_height = min(panel.shape[0] for panel in panels)
+        panels = [
+            cv2.resize(
+                panel,
+                (max(1, int(round(panel.shape[1] * row_height / panel.shape[0]))), row_height),
+            ) if panel.shape[0] != row_height else panel
+            for panel in panels
+        ]
+        first_row = np.concatenate(panels[:3], axis=1)
+        second_row = np.concatenate(panels[3:], axis=1)
+        target_width = min(first_row.shape[1], second_row.shape[1])
+        first_row = cv2.resize(first_row, (target_width, first_row.shape[0]))
+        second_row = cv2.resize(second_row, (target_width, second_row.shape[0]))
+        _save_png(
+            run_dir / "relative_regularized_skeleton_comparison.png",
+            np.concatenate((first_row, second_row), axis=0),
+        )
+        _save_png(
+            run_dir / "relative_regularized_candidate.png",
+            regularized_candidate.astype(np.uint8) * 255,
+        )
+        _save_png(
+            run_dir / "relative_width_pruned_skeleton.png",
+            pruned_skeleton.astype(np.uint8) * 255,
+        )
+        _save_png(
+            run_dir / "relative_regularized_final_skeleton.png",
+            final_skeleton.astype(np.uint8) * 255,
+        )
+        _write_json(
+            run_dir / "relative_skeleton_performance_audit.json",
+            context.get("relative_skeleton_performance_audit", {}),
+        )
     _save_png(
         run_dir / "relative_junction_zones.png",
         context["junction_zone_mask"].astype(np.uint8) * 255,
@@ -1311,9 +1381,10 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.recovery_only and arguments.batch_size is None and cached.get("batch_size"):
         config.INFER_BATCH_SIZE = int(cached["batch_size"])
     _apply_overrides(config, arguments)
-    # This tool is the isolated experiment harness.  Normal inference keeps
-    # the production Backbone baseline unless this explicit runtime flag is set.
-    config.RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL = True
+    # The experiment harness now defaults to the simple regularized-skeleton
+    # baseline. Continuous Trace remains available only for historical tests.
+    config.RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL = False
+    config.RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL = True
     requested_device = arguments.device or cached.get("device") or "auto"
     if arguments.recovery_only:
         device_name, device = str(requested_device), None

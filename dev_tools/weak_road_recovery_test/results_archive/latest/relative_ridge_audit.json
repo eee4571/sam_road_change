@@ -1,0 +1,14 @@
+{
+  "candidate_pixel_count": 0,
+  "old_binary_skeleton_length": 0,
+  "ridge_skeleton_length": 0,
+  "old_junction_pixel_count": 0,
+  "ridge_junction_pixel_count": 0,
+  "old_micro_chain_count": 0,
+  "ridge_micro_chain_count": 0,
+  "old_too_short_count": 0,
+  "ridge_too_short_count": 0,
+  "corridor_count": 1144,
+  "final_relative_length": 65743.4453125,
+  "final_total_graph_length": 78525.96875
+}
