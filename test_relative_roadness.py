@@ -431,6 +431,104 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertEqual(np.count_nonzero(centerline[46:56]), 0)
         self.assertEqual(result["diagnostics"]["ribbon_component_count"], 2)
 
+    def test_continuous_trace_handles_repeated_width_changes_without_fishbones(self):
+        candidate = np.zeros((128, 230), dtype=np.uint8)
+        widths = (8, 18, 11, 22, 9)
+        for col in range(12, 218):
+            width = widths[min(4, (col - 12) // 42)]
+            candidate[64 - width // 2:65 + width // 2, col] = 1
+        score = candidate.astype(np.float32) * 0.65
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (12, 64), (217, 64), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score, candidate, np.zeros_like(score),
+            ridge_mask=ridge, ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        self.assertEqual(result["diagnostics"]["continuous_centerline_component_count"], 1)
+        self.assertGreater(np.count_nonzero(centerline[61:68, 12:218]), 195)
+        self.assertEqual(np.count_nonzero(centerline[:58]), 0)
+        self.assertEqual(result["diagnostics"]["continuous_junction_count"], 0)
+
+    def test_continuous_trace_survives_flat_top_and_local_orientation_noise(self):
+        candidate = np.zeros((112, 212), dtype=np.uint8)
+        candidate[51:59, 12:200] = 1
+        score = np.zeros(candidate.shape, dtype=np.float32)
+        score[51:59, 12:200] = np.asarray(
+            [0.20, 0.30, 0.32, 0.32, 0.31, 0.28, 0.24, 0.20],
+            dtype=np.float32,
+        )[:, None]
+        orientation = np.zeros(candidate.shape, dtype=np.float32)
+        orientation[49:61, 82:118] = np.float32(np.pi / 2.0)
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (12, 55), (199, 55), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score, candidate, orientation,
+            ridge_mask=ridge, ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        self.assertEqual(result["diagnostics"]["continuous_centerline_component_count"], 1)
+        self.assertGreater(len(np.unique(np.where(centerline)[1])), 180)
+
+    def test_continuous_trace_follows_smooth_curved_ribbon(self):
+        candidate = np.zeros((220, 220), dtype=np.uint8)
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.ellipse(candidate, (110, 110), (72, 72), 0, 20, 160, 1, 11)
+        cv2.ellipse(ridge, (110, 110), (72, 72), 0, 20, 160, 1, 1)
+        score = candidate.astype(np.float32) * 0.68
+        rows, cols = np.indices(candidate.shape, dtype=np.float32)
+        phase = np.arctan2(rows - 110.0, cols - 110.0)
+        orientation = np.mod(phase + np.float32(np.pi / 2.0), np.float32(np.pi))
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score, candidate, orientation,
+            ridge_mask=ridge, ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        ridge_neighborhood = cv2.dilate(ridge, np.ones((5, 5), dtype=np.uint8)) > 0
+        self.assertEqual(result["diagnostics"]["continuous_centerline_component_count"], 1)
+        self.assertGreater(result["diagnostics"]["continuous_centerline_length"], 150.0)
+        self.assertGreater(np.mean(ridge_neighborhood[centerline]), 0.85)
+
+    def test_continuous_trace_keeps_t_branch_and_rejects_short_spur(self):
+        candidate = np.zeros((190, 230), dtype=np.uint8)
+        candidate[70:81, 15:215] = 1
+        candidate[75:176, 105:116] = 1
+        candidate[57:75, 105:116] = 1
+        score = candidate.astype(np.float32) * 0.70
+        orientation = np.zeros(candidate.shape, dtype=np.float32)
+        orientation[55:178, 103:118] = np.float32(np.pi / 2.0)
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (15, 75), (214, 75), 1, 1)
+        cv2.line(ridge, (110, 57), (110, 175), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score, candidate, orientation,
+            ridge_mask=ridge, ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        self.assertGreater(np.count_nonzero(centerline[72:79, 15:215]), 185)
+        self.assertGreater(np.count_nonzero(centerline[75:176, 107:114]), 85)
+        self.assertLess(np.count_nonzero(centerline[55:69, 107:114]), 5)
+        self.assertGreaterEqual(result["diagnostics"]["confirmed_branch_count"], 1)
+        self.assertGreaterEqual(result["diagnostics"]["rejected_spur_count"], 1)
+
+    def test_continuous_trace_keeps_nearby_parallel_ribbons_independent(self):
+        candidate = np.zeros((126, 220), dtype=np.uint8)
+        candidate[35:46, 12:208] = 1
+        candidate[58:69, 12:208] = 1
+        score = candidate.astype(np.float32) * 0.66
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (12, 40), (207, 40), 1, 1)
+        cv2.line(ridge, (12, 63), (207, 63), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score, candidate, np.zeros_like(score),
+            ridge_mask=ridge, ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        self.assertEqual(result["diagnostics"]["continuous_centerline_component_count"], 2)
+        self.assertGreater(np.count_nonzero(centerline[37:44]), 185)
+        self.assertGreater(np.count_nonzero(centerline[60:67]), 185)
+        self.assertEqual(np.count_nonzero(centerline[47:57]), 0)
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)

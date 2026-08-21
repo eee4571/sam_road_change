@@ -627,6 +627,10 @@ def write_relative_roadness_diagnostic(
         context["relative_ribbon_centerline"].astype(np.uint8) * 255,
     )
     _save_png(
+        run_dir / "relative_continuous_centerline.png",
+        context["relative_continuous_centerline"].astype(np.uint8) * 255,
+    )
+    _save_png(
         run_dir / "relative_skeleton_normalized.png",
         context["relative_skeleton_normalized"].astype(np.uint8) * 255,
     )
@@ -651,6 +655,7 @@ def write_relative_roadness_diagnostic(
         ("relative_backbone_extension", (255, 165, 0), 4),
         ("relative_backbone_branch", (255, 64, 255), 4),
         ("relative_ribbon_centerline", (0, 255, 0), 4),
+        ("relative_continuous_trace", (0, 255, 0), 4),
         ("weak_recovered", (0, 255, 255), 5),
         ("weak_bootstrap", (255, 0, 255), 5),
         ("relative_bootstrap", (255, 64, 255), 5),
@@ -711,7 +716,10 @@ def write_relative_roadness_diagnostic(
             np.concatenate(panels[3:], axis=1),
         ], axis=0),
     )
-    _save_png(run_dir / "relative_acceptance_overlay.png", acceptance_overlay)
+    _save_png(
+        run_dir / "relative_acceptance_overlay.png",
+        _labeled_preview(acceptance_overlay, "Continuous Trace acceptance", max_width=2400),
+    )
     _write_json(
         run_dir / "relative_roadness_summary.json",
         {
@@ -945,6 +953,96 @@ def write_relative_roadness_diagnostic(
         np.concatenate(ribbon_crop_panels, axis=1),
     )
 
+    trace_ids = np.asarray(context.get("relative_trace_id_map", []), dtype=np.int32)
+
+    def colored_trace_panel(base_image, region=None):
+        panel = base_image.copy()
+        labels = trace_ids if region is None else trace_ids[region]
+        if labels.shape != panel.shape[:2] or not np.any(labels > 0):
+            return panel
+        maximum_id = int(np.max(labels))
+        hsv = np.zeros((maximum_id + 1, 1, 3), dtype=np.uint8)
+        hsv[:, 0, 0] = (np.arange(maximum_id + 1) * 47) % 180
+        hsv[:, 0, 1] = 220
+        hsv[:, 0, 2] = 255
+        palette = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)[:, 0]
+        mask = labels > 0
+        panel[mask] = palette[labels[mask]]
+        marker_specs = (
+            ("relative_continuous_seed_mask", (255, 255, 255), 1),
+            ("relative_continuous_junction_mask", (255, 220, 0), 1),
+            ("relative_continuous_branch_mask", (255, 0, 255), 1),
+            ("relative_continuous_rejected_spur_mask", (255, 0, 0), 1),
+        )
+        for name, color, iterations in marker_specs:
+            marker = np.asarray(context.get(name, []), dtype=np.uint8)
+            if marker.shape != image_rgb.shape[:2]:
+                continue
+            marker = marker if region is None else marker[region]
+            visible = cv2.dilate(
+                (marker > 0).astype(np.uint8), np.ones((3, 3), dtype=np.uint8),
+                iterations=iterations,
+            ) > 0
+            panel[visible] = color
+        return panel
+
+    continuous_panel = colored_trace_panel(image_rgb)
+    continuous_debug_panels = [
+        _labeled_preview(image_rgb, "1 Original", max_width=650),
+        _labeled_preview(
+            cv2.cvtColor(
+                cv2.applyColorMap(relative_u8, cv2.COLORMAP_VIRIDIS),
+                cv2.COLOR_BGR2RGB,
+            ),
+            "2 Relative Score",
+            max_width=650,
+        ),
+        _labeled_preview(candidate_full_panel, "3 Candidate Ribbon", max_width=650),
+        _labeled_preview(preference_rgb, "4 Center Preference", max_width=650),
+        _labeled_preview(
+            continuous_panel,
+            "5 Continuous Traces / seed white / branch magenta / spur red",
+            max_width=650,
+        ),
+        _labeled_preview(final_overlay, "6 Final Vector", max_width=650),
+    ]
+    continuous_height = min(panel.shape[0] for panel in continuous_debug_panels)
+    continuous_debug_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * continuous_height / panel.shape[0]))), continuous_height),
+        )
+        if panel.shape[0] != continuous_height else panel
+        for panel in continuous_debug_panels
+    ]
+    _save_png(
+        run_dir / "relative_continuous_trace_debug.png",
+        np.concatenate(continuous_debug_panels, axis=1),
+    )
+
+    continuous_crop_panel = colored_trace_panel(image_rgb[crop], crop)
+    continuous_crop_panels = [
+        _labeled_preview(image_rgb[crop], "1 Original", max_width=800),
+        _labeled_preview(candidate_panel, "2 Candidate", max_width=800),
+        _labeled_preview(binary_panel, "3 Binary Skeleton", max_width=800),
+        _labeled_preview(crop_ribbon_panel, "4 Old Ribbon", max_width=800),
+        _labeled_preview(continuous_crop_panel, "5 Continuous Trace", max_width=800),
+        _labeled_preview(final_overlay[crop], "6 Final Vector", max_width=800),
+    ]
+    continuous_crop_height = min(panel.shape[0] for panel in continuous_crop_panels)
+    continuous_crop_panels = [
+        cv2.resize(
+            panel,
+            (max(1, int(round(panel.shape[1] * continuous_crop_height / panel.shape[0]))), continuous_crop_height),
+        )
+        if panel.shape[0] != continuous_crop_height else panel
+        for panel in continuous_crop_panels
+    ]
+    _save_png(
+        run_dir / "relative_continuous_trace_crop.png",
+        np.concatenate(continuous_crop_panels, axis=1),
+    )
+
     def labeled_structure_panel(label_name, title):
         panel = image_rgb[crop].copy()
         labels = np.asarray(context.get(label_name, []), dtype=np.int32)
@@ -1070,6 +1168,43 @@ def write_relative_roadness_diagnostic(
         ),
     }
     _write_json(run_dir / "relative_ribbon_audit.json", ribbon_audit)
+    continuous_audit_keys = (
+        "continuous_trace_count", "continuous_centerline_component_count",
+        "continuous_centerline_length", "mean_trace_length",
+        "median_trace_length", "long_trace_count", "continuous_junction_count",
+        "confirmed_branch_count", "rejected_spur_count", "rejected_spur_length",
+    )
+    _write_json(
+        run_dir / "relative_continuous_trace_audit.json",
+        {
+            "candidate_component_count": int(
+                context["diagnostics"].get("relative_component_count", 0)
+            ),
+            "old_ribbon_component_count": int(
+                context["diagnostics"].get("ribbon_component_count", 0)
+            ),
+            **{
+                ("junction_count" if key == "continuous_junction_count" else key):
+                    context["diagnostics"].get(key, 0)
+                for key in continuous_audit_keys
+            },
+            "final_relative_length": float(
+                recovery_summary.get("relative_final_length_px", 0.0)
+            ),
+            "final_total_graph_length": float(
+                recovery_summary.get("final_total_centerline_length_px", 0.0)
+            ),
+            "raw_centerline_to_final_retention": float(
+                recovery_summary.get("raw_centerline_to_final_retention", 0.0)
+            ),
+            "effective_centerline_to_final_retention": float(
+                recovery_summary.get("effective_centerline_to_final_retention", 0.0)
+            ),
+            "retained_by_existing_graph_length": float(
+                recovery_summary.get("retained_by_existing_graph_length", 0.0)
+            ),
+        },
+    )
     _write_json(
         run_dir / "relative_centerline_loss_audit.json",
         recovery_summary.get("relative_centerline_loss_audit", {}),
@@ -1174,6 +1309,9 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.recovery_only and arguments.batch_size is None and cached.get("batch_size"):
         config.INFER_BATCH_SIZE = int(cached["batch_size"])
     _apply_overrides(config, arguments)
+    # This tool is the isolated experiment harness.  Normal inference keeps
+    # the production Backbone baseline unless this explicit runtime flag is set.
+    config.RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL = True
     requested_device = arguments.device or cached.get("device") or "auto"
     if arguments.recovery_only:
         device_name, device = str(requested_device), None

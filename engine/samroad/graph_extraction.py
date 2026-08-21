@@ -8,7 +8,7 @@ from collections import Counter, defaultdict, deque
 from sklearn.neighbors import KDTree
 from skimage.draw import line
 from skimage.morphology import skeletonize
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, maximum_position
 import networkx as nx
 from graph_utils import nms_points
 
@@ -450,6 +450,9 @@ def _relative_path_evidence(path, relative_context):
             "relative_fraction": 0.0,
             "relative_only_fraction": 0.0,
             "ribbon_fraction": 0.0,
+            "continuous_trace_fraction": 0.0,
+            "trace_id": 0,
+            "trace_total_length": 0.0,
             "relative_supported": False,
             "backbone_line_source": "",
             "backbone_reason": "",
@@ -476,6 +479,19 @@ def _relative_path_evidence(path, relative_context):
     relative_structure = sampled("relative_skeleton") > 0
     relative_only = sampled("relative_only_skeleton") > 0
     ribbon_structure = sampled("relative_ribbon_centerline") > 0
+    continuous_structure = sampled("relative_continuous_centerline") > 0
+    sampled_trace_ids = sampled("relative_trace_id_map").astype(np.int32)
+    positive_trace_ids = sampled_trace_ids[sampled_trace_ids > 0]
+    dominant_trace_id = (
+        int(np.bincount(positive_trace_ids).argmax())
+        if len(positive_trace_ids) else 0
+    )
+    trace_lengths = {
+        int(row.get("trace_id", 0)): float(row.get("length", 0.0))
+        for row in relative_context.get("diagnostics", {}).get(
+            "relative_trace_summaries", []
+        )
+    }
     source_value = relative_context.get("relative_backbone_source_labels")
     source_array = np.asarray(source_value, dtype=np.uint8) if source_value is not None else None
     source_codes = (
@@ -492,7 +508,11 @@ def _relative_path_evidence(path, relative_context):
         dominant_source, ("", "")
     )
     ribbon_fraction = float(np.mean(ribbon_structure)) if values.size else 0.0
-    if ribbon_fraction >= 0.50:
+    continuous_fraction = float(np.mean(continuous_structure)) if values.size else 0.0
+    if continuous_fraction >= 0.50:
+        backbone_source = "relative_continuous_trace"
+        backbone_reason = "continuous_ribbon_trace"
+    elif ribbon_fraction >= 0.50:
         backbone_source = "relative_ribbon_centerline"
         backbone_reason = "regularized_ribbon_centerline"
     diagnostics = relative_context.get("diagnostics", {})
@@ -512,6 +532,9 @@ def _relative_path_evidence(path, relative_context):
         "relative_fraction": fraction,
         "relative_only_fraction": relative_only_fraction,
         "ribbon_fraction": ribbon_fraction,
+        "continuous_trace_fraction": continuous_fraction,
+        "trace_id": int(dominant_trace_id),
+        "trace_total_length": float(trace_lengths.get(dominant_trace_id, 0.0)),
         "relative_supported": bool(
             fraction >= 0.50
             and q25 >= max(weak_threshold - 1e-6, 0.0)
@@ -2015,6 +2038,507 @@ def extract_relative_ribbon_centerline(
     }
 
 
+def _bilinear_samples(array, points):
+    """Sample one aligned 2D map at subpixel row/column positions."""
+    value = np.asarray(array, dtype=np.float32)
+    locations = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    rows = np.clip(locations[:, 0], 0.0, float(value.shape[0] - 1))
+    cols = np.clip(locations[:, 1], 0.0, float(value.shape[1] - 1))
+    row0 = np.floor(rows).astype(np.int32)
+    col0 = np.floor(cols).astype(np.int32)
+    row1 = np.minimum(row0 + 1, value.shape[0] - 1)
+    col1 = np.minimum(col0 + 1, value.shape[1] - 1)
+    row_fraction = rows - row0
+    col_fraction = cols - col0
+    return (
+        value[row0, col0] * (1.0 - row_fraction) * (1.0 - col_fraction)
+        + value[row1, col0] * row_fraction * (1.0 - col_fraction)
+        + value[row0, col1] * (1.0 - row_fraction) * col_fraction
+        + value[row1, col1] * row_fraction * col_fraction
+    ).astype(np.float32)
+
+
+def _continuous_cross_section_center(
+    predicted,
+    tangent,
+    candidate,
+    center_weight,
+    distance_support,
+    *,
+    radius,
+):
+    """Recenter one prediction inside its nearest contiguous ribbon interval."""
+    point = np.asarray(predicted, dtype=np.float32)
+    direction = np.asarray(tangent, dtype=np.float32)
+    direction /= max(float(np.linalg.norm(direction)), 1e-6)
+    normal = np.asarray([direction[1], -direction[0]], dtype=np.float32)
+    offsets = np.arange(-float(radius), float(radius) + 0.25, 0.5, dtype=np.float32)
+    samples = point[None, :] + offsets[:, None] * normal[None, :]
+    rounded = np.rint(samples).astype(np.int32)
+    inside = (
+        (rounded[:, 0] >= 0) & (rounded[:, 0] < candidate.shape[0])
+        & (rounded[:, 1] >= 0) & (rounded[:, 1] < candidate.shape[1])
+    )
+    supported = np.zeros(len(samples), dtype=bool)
+    valid_indices = np.where(inside)[0]
+    supported[valid_indices] = candidate[
+        rounded[valid_indices, 0], rounded[valid_indices, 1]
+    ]
+    if not np.any(supported):
+        return None
+
+    transitions = np.diff(np.pad(supported.astype(np.int8), (1, 1)))
+    starts = np.where(transitions == 1)[0]
+    stops = np.where(transitions == -1)[0]
+    center_index = int(np.argmin(np.abs(offsets)))
+    intervals = list(zip(starts.tolist(), stops.tolist()))
+    containing = [item for item in intervals if item[0] <= center_index < item[1]]
+    if containing:
+        interval = containing[0]
+    else:
+        interval = min(
+            intervals,
+            key=lambda item: float(np.min(np.abs(offsets[item[0]:item[1]]))),
+        )
+        lateral_distance = float(np.min(np.abs(offsets[interval[0]:interval[1]])))
+        if lateral_distance > min(6.0, float(radius) * 0.5):
+            return None
+    selected = slice(interval[0], interval[1])
+    selected_points = samples[selected]
+    selected_offsets = offsets[selected]
+    weights = np.maximum(_bilinear_samples(center_weight, selected_points), 0.0)
+    if float(np.sum(weights)) <= 1e-8:
+        weights = np.maximum(
+            _bilinear_samples(distance_support, selected_points), 0.0
+        )
+    if float(np.sum(weights)) <= 1e-8:
+        weights = np.ones(len(selected_points), dtype=np.float32)
+    center_offset = float(np.sum(weights * selected_offsets) / np.sum(weights))
+    center = point + center_offset * normal
+    return {
+        "point": center.astype(np.float32),
+        "weight": float(_bilinear_samples(center_weight, center[None, :])[0]),
+        "distance": float(_bilinear_samples(distance_support, center[None, :])[0]),
+        "interval_width": float(selected_offsets[-1] - selected_offsets[0] + 0.5),
+    }
+
+
+def _continuous_local_tangent(orientation, point, reference):
+    """Return the modulo-pi local tangent with sign aligned to the trace."""
+    location = np.asarray(point, dtype=np.float32).reshape(1, 2)
+    cosine = float(_bilinear_samples(np.cos(2.0 * orientation), location)[0])
+    sine = float(_bilinear_samples(np.sin(2.0 * orientation), location)[0])
+    angle = 0.5 * math.atan2(sine, cosine)
+    tangent = np.asarray([math.sin(angle), math.cos(angle)], dtype=np.float32)
+    reference = np.asarray(reference, dtype=np.float32)
+    if float(np.dot(tangent, reference)) < 0.0:
+        tangent *= -1.0
+    clarity = float(min(1.0, math.hypot(cosine, sine)))
+    return tangent, clarity
+
+
+def trace_relative_ribbon_centerlines(
+    relative_score,
+    relative_candidate_mask,
+    ridge_orientation,
+    *,
+    ridge_mask=None,
+    ridge_strength=None,
+    scale_agreement=None,
+    distance_transform=None,
+    center_preference=None,
+    step_size=2.0,
+    cross_section_radius=16,
+    branch_persistence_length=24.0,
+    long_trace_length=48.0,
+):
+    """Trace subpixel ribbon centers forward and backward from sparse seeds.
+
+    Geometry is generated directly from continuous trajectories.  The
+    previous trajectory direction predicts the next cross-section, whose
+    nearest connected candidate interval is recentered by Relative-score x
+    distance support.  No center mask is skeletonized and no global endpoint
+    shortcut is drawn.
+    """
+    score = np.asarray(relative_score, dtype=np.float32)
+    candidate = np.asarray(relative_candidate_mask, dtype=np.uint8) > 0
+    orientation = np.asarray(ridge_orientation, dtype=np.float32)
+    if score.ndim != 2 or candidate.shape != score.shape or orientation.shape != score.shape:
+        raise ValueError("Continuous tracing inputs must be aligned 2D arrays")
+    agreement = (
+        np.ones(score.shape, dtype=np.float32)
+        if scale_agreement is None else np.asarray(scale_agreement, dtype=np.float32)
+    )
+    if agreement.shape != score.shape:
+        raise ValueError("scale_agreement must align with relative_score")
+    distance = (
+        distance_transform_edt(candidate).astype(np.float32)
+        if distance_transform is None
+        else np.asarray(distance_transform, dtype=np.float32)
+    )
+    if distance.shape != score.shape:
+        raise ValueError("distance_transform must align with relative_score")
+    ridge = (
+        np.zeros(score.shape, dtype=np.uint8)
+        if ridge_mask is None else (np.asarray(ridge_mask, dtype=np.uint8) > 0).astype(np.uint8)
+    )
+    strength = (
+        ridge.astype(np.float32)
+        if ridge_strength is None else np.asarray(ridge_strength, dtype=np.float32)
+    )
+    if ridge.shape != score.shape or strength.shape != score.shape:
+        raise ValueError("ridge_mask and ridge_strength must align with relative_score")
+
+    empty_u8 = np.zeros(score.shape, dtype=np.uint8)
+    empty_i32 = np.zeros(score.shape, dtype=np.int32)
+    if score.size == 0 or not np.any(candidate):
+        return {
+            "continuous_centerline_mask": empty_u8,
+            "trace_id_map": empty_i32,
+            "seed_mask": empty_u8.copy(),
+            "junction_mask": empty_u8.copy(),
+            "confirmed_branch_mask": empty_u8.copy(),
+            "rejected_spur_mask": empty_u8.copy(),
+            "traces": [],
+            "diagnostics": {
+                "continuous_trace_count": 0,
+                "continuous_centerline_component_count": 0,
+                "continuous_centerline_length": 0.0,
+                "mean_trace_length": 0.0,
+                "median_trace_length": 0.0,
+                "long_trace_count": 0,
+                "continuous_junction_count": 0,
+                "confirmed_branch_count": 0,
+                "rejected_spur_count": 0,
+                "rejected_spur_length": 0.0,
+                "continuous_termination_reason_counts": {},
+                "relative_trace_summaries": [],
+            },
+        }
+
+    smooth_score = cv2.GaussianBlur(
+        score, (0, 0), 0.8, borderType=cv2.BORDER_REFLECT_101
+    ).astype(np.float32)
+    center_weight = smooth_score * np.maximum(distance, 0.0)
+    center_weight *= 0.5 + 0.5 * np.clip(agreement, 0.0, 1.0)
+    positive = center_weight[candidate]
+    weight_scale = float(np.percentile(positive, 95.0)) if positive.size else 0.0
+    normalized_weight = (
+        np.clip(center_weight / weight_scale, 0.0, 1.0).astype(np.float32)
+        if weight_scale > 1e-8 else np.zeros(score.shape, dtype=np.float32)
+    )
+    if center_preference is not None:
+        preference = np.asarray(center_preference, dtype=np.float32)
+        if preference.shape != score.shape:
+            raise ValueError("center_preference must align with relative_score")
+        normalized_weight = np.maximum(normalized_weight, 0.5 * np.clip(preference, 0.0, 1.0))
+    normalized_weight[~candidate] = 0.0
+
+    seed_rows = []
+    ridge_chains = _trace_skeleton_chains(ridge > 0)
+    strength_positive = strength[strength > 0]
+    strength_scale = float(np.percentile(strength_positive, 95.0)) if strength_positive.size else 1.0
+    seed_priority_map = normalized_weight + np.clip(strength / max(strength_scale, 1e-8), 0.0, 1.0)
+    for path in ridge_chains:
+        values = seed_priority_map[path[:, 0], path[:, 1]]
+        best_value = float(np.max(values))
+        best_indices = np.where(values >= best_value - 1e-6)[0]
+        index = int(best_indices[len(best_indices) // 2])
+        point = tuple(map(int, path[index]))
+        chain_length = float(_relative_chain_geometry(path)["path_length"])
+        seed_rows.append((
+            best_value + 1.0 + min(chain_length / 48.0, 2.0),
+            point,
+            "ridge_chain",
+        ))
+
+    candidate_count, candidate_labels = cv2.connectedComponents(
+        candidate.astype(np.uint8), 8
+    )
+    if candidate_count > 1:
+        positions = maximum_position(
+            normalized_weight,
+            labels=candidate_labels,
+            index=np.arange(1, candidate_count, dtype=np.int32),
+        )
+        if candidate_count == 2 and isinstance(positions, tuple):
+            positions = [positions]
+        for point in positions:
+            row, col = map(int, point)
+            seed_rows.append((float(normalized_weight[row, col]), (row, col), "component_preference"))
+    seed_rows.sort(key=lambda item: (-item[0], item[1][0], item[1][1], item[2]))
+
+    centerline = np.zeros(score.shape, dtype=np.uint8)
+    trace_ids = np.zeros(score.shape, dtype=np.int32)
+    trace_tangent_angle = np.zeros(score.shape, dtype=np.float32)
+    claimed_neighborhood = np.zeros(score.shape, dtype=np.uint8)
+    seed_mask = np.zeros(score.shape, dtype=np.uint8)
+    confirmed_branch_mask = np.zeros(score.shape, dtype=np.uint8)
+    rejected_spur_mask = np.zeros(score.shape, dtype=np.uint8)
+    traces = []
+    rejected_spur_lengths = []
+    step = max(1.0, float(step_size))
+    radius = max(3, int(cross_section_radius))
+    maximum_steps = max(64, int(2.5 * sum(score.shape) / step))
+
+    def trace_one_direction(seed, initial_tangent, trace_id):
+        points = [np.asarray(seed, dtype=np.float32)]
+        tangent = np.asarray(initial_tangent, dtype=np.float32)
+        tangent /= max(float(np.linalg.norm(tangent)), 1e-6)
+        local_pixels = {tuple(np.rint(points[0]).astype(np.int32).tolist()): 0}
+        parent_ids = set()
+        reason = "candidate_end"
+        preferences = []
+        distances = []
+        for step_index in range(maximum_steps):
+            centered = None
+            used_lookahead = 0
+            for lookahead in (1, 2, 3):
+                predicted = points[-1] + float(lookahead) * step * tangent
+                if not (
+                    0.0 <= predicted[0] < score.shape[0]
+                    and 0.0 <= predicted[1] < score.shape[1]
+                ):
+                    continue
+                proposal = _continuous_cross_section_center(
+                    predicted,
+                    tangent,
+                    candidate,
+                    normalized_weight,
+                    distance,
+                    radius=radius,
+                )
+                if proposal is None:
+                    continue
+                first = np.rint(points[-1]).astype(np.int32)
+                second = np.rint(proposal["point"]).astype(np.int32)
+                rr, cc = line(int(first[0]), int(first[1]), int(second[0]), int(second[1]))
+                rr = np.clip(rr, 0, score.shape[0] - 1)
+                cc = np.clip(cc, 0, score.shape[1] - 1)
+                support_fraction = float(np.mean(candidate[rr, cc])) if len(rr) else 0.0
+                if support_fraction < (0.70 if lookahead == 1 else 0.50):
+                    continue
+                centered = proposal
+                used_lookahead = lookahead
+                break
+            if centered is None:
+                reason = "candidate_or_center_support_lost"
+                break
+
+            next_point = centered["point"]
+            actual = next_point - points[-1]
+            actual_norm = float(np.linalg.norm(actual))
+            if actual_norm <= 0.5:
+                reason = "no_forward_progress"
+                break
+            actual /= actual_norm
+            history_start = points[max(0, len(points) - 5)]
+            history = next_point - history_start
+            history /= max(float(np.linalg.norm(history)), 1e-6)
+            if float(np.dot(history, tangent)) < 0.0:
+                history *= -1.0
+            local_tangent, clarity = _continuous_local_tangent(
+                orientation, next_point, tangent
+            )
+            updated = (
+                0.55 * tangent + 0.25 * history
+                + 0.15 * actual + 0.05 * clarity * local_tangent
+            )
+            updated /= max(float(np.linalg.norm(updated)), 1e-6)
+            if float(np.dot(updated, tangent)) < 0.60:
+                reason = "unreasonable_turn"
+                break
+
+            rounded = tuple(np.rint(next_point).astype(np.int32).tolist())
+            previous_visit = local_pixels.get(rounded)
+            if previous_visit is not None and step_index - previous_visit > 8:
+                points.append(next_point)
+                reason = "loop_closed"
+                break
+
+            row, col = rounded
+            row0, row1 = max(0, row - 2), min(score.shape[0], row + 3)
+            col0, col1 = max(0, col - 2), min(score.shape[1], col + 3)
+            nearby_ids = trace_ids[row0:row1, col0:col1]
+            existing_ids = np.unique(nearby_ids[nearby_ids > 0])
+            merge_id = 0
+            crossing_id = 0
+            for existing_id in existing_ids.tolist():
+                existing_points = np.column_stack(np.where(nearby_ids == existing_id))
+                existing_local = existing_points[0] + np.asarray([row0, col0])
+                existing_angle = float(trace_tangent_angle[tuple(existing_local)])
+                existing_tangent = np.asarray(
+                    [math.sin(existing_angle), math.cos(existing_angle)], dtype=np.float32
+                )
+                alignment = abs(float(np.dot(existing_tangent, updated)))
+                parent_ids.add(int(existing_id))
+                if alignment >= 0.72:
+                    merge_id = int(existing_id)
+                    next_point = existing_local.astype(np.float32)
+                    rounded = tuple(map(int, existing_local))
+                    break
+                crossing_id = int(existing_id)
+                next_point = existing_local.astype(np.float32)
+                rounded = tuple(map(int, existing_local))
+                break
+
+            points.append(next_point.astype(np.float32))
+            preferences.append(float(centered["weight"]))
+            distances.append(float(centered["distance"]))
+            local_pixels[rounded] = step_index
+            tangent = updated
+            if merge_id:
+                reason = "merged_existing_trace"
+                break
+            if crossing_id:
+                reason = "perpendicular_existing_trace"
+                break
+            if used_lookahead > 1:
+                reason = "local_lookahead"
+        else:
+            reason = "maximum_steps"
+        return points, tangent, reason, parent_ids, preferences, distances
+
+    for _priority, seed_rc, seed_source in seed_rows:
+        seed_row, seed_col = seed_rc
+        if claimed_neighborhood[seed_row, seed_col] or not candidate[seed_row, seed_col]:
+            continue
+        initial = np.asarray(
+            [math.sin(float(orientation[seed_row, seed_col])),
+             math.cos(float(orientation[seed_row, seed_col]))],
+            dtype=np.float32,
+        )
+        seed_center = _continuous_cross_section_center(
+            np.asarray(seed_rc, dtype=np.float32),
+            initial,
+            candidate,
+            normalized_weight,
+            distance,
+            radius=radius,
+        )
+        if seed_center is None:
+            continue
+        seed = seed_center["point"]
+        next_trace_id = len(traces) + 1
+        forward, forward_tangent, forward_reason, forward_parents, forward_pref, forward_dist = (
+            trace_one_direction(seed, initial, next_trace_id)
+        )
+        backward, backward_tangent, backward_reason, backward_parents, backward_pref, backward_dist = (
+            trace_one_direction(seed, -initial, next_trace_id)
+        )
+        points = np.asarray(backward[:0:-1] + forward, dtype=np.float32)
+        if len(points) < 2:
+            continue
+        segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        trace_length = float(np.sum(segment_lengths))
+        rounded_points = np.rint(points).astype(np.int32)
+        rounded_points[:, 0] = np.clip(rounded_points[:, 0], 0, score.shape[0] - 1)
+        rounded_points[:, 1] = np.clip(rounded_points[:, 1], 0, score.shape[1] - 1)
+        parent_ids = sorted(forward_parents | backward_parents)
+        is_persistent = trace_length >= float(branch_persistence_length)
+        if not is_persistent:
+            if trace_length > 0.0:
+                cv2.polylines(
+                    rejected_spur_mask,
+                    [rounded_points[:, ::-1].reshape(-1, 1, 2)],
+                    False, 1, 1, cv2.LINE_8,
+                )
+                rejected_spur_lengths.append(trace_length)
+            continue
+
+        trace_mask = np.zeros(score.shape, dtype=np.uint8)
+        cv2.polylines(
+            trace_mask,
+            [rounded_points[:, ::-1].reshape(-1, 1, 2)],
+            False, 1, 1, cv2.LINE_8,
+        )
+        new_pixel_count = int(np.count_nonzero((trace_mask > 0) & (centerline == 0)))
+        if new_pixel_count < 2:
+            if trace_length > 0.0 and new_pixel_count > 0:
+                rejected_spur_mask[trace_mask > 0] = 1
+                rejected_spur_lengths.append(trace_length)
+            continue
+
+        trace_id = len(traces) + 1
+        seed_pixel = np.rint(seed).astype(np.int32)
+        seed_mask[seed_pixel[0], seed_pixel[1]] = 1
+        new_pixels = (trace_mask > 0) & (trace_ids == 0)
+        centerline[trace_mask > 0] = 1
+        trace_ids[new_pixels] = trace_id
+        if len(points) >= 2:
+            point_tangents = np.gradient(points, axis=0)
+            angles = np.arctan2(point_tangents[:, 0], point_tangents[:, 1])
+            for point, angle in zip(rounded_points, angles):
+                trace_tangent_angle[int(point[0]), int(point[1])] = float(angle)
+        cv2.polylines(
+            claimed_neighborhood,
+            [rounded_points[:, ::-1].reshape(-1, 1, 2)],
+            False, 1, 7, cv2.LINE_8,
+        )
+        branch_parent = int(parent_ids[0]) if parent_ids else 0
+        if branch_parent:
+            confirmed_branch_mask[new_pixels] = 1
+        all_preferences = forward_pref + backward_pref
+        all_distances = forward_dist + backward_dist
+        rows = rounded_points[:, 0]
+        cols = rounded_points[:, 1]
+        traces.append({
+            "trace_id": trace_id,
+            "length": trace_length,
+            "seed_source": seed_source,
+            "mean_relative_score": float(np.mean(score[rows, cols])),
+            "mean_center_preference": float(np.mean(all_preferences)) if all_preferences else 0.0,
+            "mean_distance_support": float(np.mean(all_distances)) if all_distances else 0.0,
+            "branch_parent": branch_parent,
+            "termination_reason": f"backward:{backward_reason};forward:{forward_reason}",
+        })
+
+    component_count = (
+        int(cv2.connectedComponents(centerline, 8)[0] - 1) if np.any(centerline) else 0
+    )
+    adjacency = _skeleton_adjacency(centerline > 0)
+    junction_mask = np.zeros(score.shape, dtype=np.uint8)
+    for point, neighbors in adjacency.items():
+        if len(neighbors) >= 3:
+            junction_mask[point] = 1
+    centerline_chains = _trace_skeleton_chains(centerline > 0)
+    centerline_length = float(sum(
+        _relative_chain_geometry(path)["path_length"] for path in centerline_chains
+    ))
+    trace_lengths = [float(row["length"]) for row in traces]
+    termination_counts = Counter()
+    for row in traces:
+        for reason in str(row["termination_reason"]).split(";"):
+            termination_counts[reason.split(":", 1)[-1]] += 1
+    return {
+        "continuous_centerline_mask": centerline,
+        "trace_id_map": trace_ids,
+        "seed_mask": seed_mask,
+        "junction_mask": junction_mask,
+        "confirmed_branch_mask": confirmed_branch_mask,
+        "rejected_spur_mask": rejected_spur_mask,
+        "traces": traces,
+        "diagnostics": {
+            "continuous_trace_count": int(len(traces)),
+            "continuous_centerline_component_count": int(component_count),
+            "continuous_centerline_length": centerline_length,
+            "mean_trace_length": float(np.mean(trace_lengths)) if trace_lengths else 0.0,
+            "median_trace_length": float(np.median(trace_lengths)) if trace_lengths else 0.0,
+            "long_trace_count": int(sum(
+                length >= float(long_trace_length) for length in trace_lengths
+            )),
+            "continuous_junction_count": int(np.count_nonzero(junction_mask)),
+            "confirmed_branch_count": int(sum(
+                int(row["branch_parent"]) > 0 for row in traces
+            )),
+            "rejected_spur_count": int(len(rejected_spur_lengths)),
+            "rejected_spur_length": float(sum(rejected_spur_lengths)),
+            "continuous_termination_reason_counts": dict(termination_counts),
+            "relative_trace_summaries": traces,
+        },
+    }
+
+
 _RELATIVE_BACKBONE_SOURCES = {
     1: ("relative_ridge_seed", "ridge_seed"),
     2: ("relative_backbone_bridge", "ridge_to_ridge_bridge"),
@@ -2502,6 +3026,12 @@ def compute_relative_roadness(
             "relative_ribbon_centerline": np.zeros(road.shape, dtype=np.uint8),
             "relative_ribbon_component_labels": np.zeros(road.shape, dtype=np.int32),
             "relative_ribbon_structure_labels": np.zeros(road.shape, dtype=np.int32),
+            "relative_continuous_centerline": np.zeros(road.shape, dtype=np.uint8),
+            "relative_trace_id_map": np.zeros(road.shape, dtype=np.int32),
+            "relative_continuous_seed_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_continuous_junction_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_continuous_branch_mask": np.zeros(road.shape, dtype=np.uint8),
+            "relative_continuous_rejected_spur_mask": np.zeros(road.shape, dtype=np.uint8),
             "relative_ribbon_center_orientation": empty.copy(),
             "relative_ribbon_center_confidence": empty.copy(),
             "relative_ribbon_orientation_clarity": empty.copy(),
@@ -2594,7 +3124,53 @@ def compute_relative_roadness(
         ridge_result["ridge_orientation"],
         scale_agreement=scale_agreement,
     )
-    relative_skeleton = ribbon_result["ribbon_centerline_mask"]
+    ribbon_skeleton = ribbon_result["ribbon_centerline_mask"]
+    continuous_enabled = bool(_config_value(
+        config, "RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL", False
+    ))
+    if continuous_enabled:
+        continuous_result = trace_relative_ribbon_centerlines(
+            relative_score,
+            candidate,
+            ridge_result["ridge_orientation"],
+            ridge_mask=raw_relative_skeleton,
+            ridge_strength=ridge_result["ridge_strength"],
+            scale_agreement=scale_agreement,
+            distance_transform=ribbon_result["distance_transform"],
+            center_preference=ribbon_result["center_preference"],
+            long_trace_length=min_chain_length,
+        )
+    else:
+        empty_u8 = np.zeros(road.shape, dtype=np.uint8)
+        continuous_result = {
+            "continuous_centerline_mask": empty_u8,
+            "trace_id_map": np.zeros(road.shape, dtype=np.int32),
+            "seed_mask": empty_u8.copy(),
+            "junction_mask": empty_u8.copy(),
+            "confirmed_branch_mask": empty_u8.copy(),
+            "rejected_spur_mask": empty_u8.copy(),
+            "traces": [],
+            "diagnostics": {
+                "continuous_trace_count": 0,
+                "continuous_centerline_component_count": 0,
+                "continuous_centerline_length": 0.0,
+                "mean_trace_length": 0.0,
+                "median_trace_length": 0.0,
+                "long_trace_count": 0,
+                "continuous_junction_count": 0,
+                "confirmed_branch_count": 0,
+                "rejected_spur_count": 0,
+                "rejected_spur_length": 0.0,
+                "continuous_termination_reason_counts": {},
+                "relative_trace_summaries": [],
+            },
+        }
+    # Production keeps the proven Backbone baseline.  The dev recovery tool
+    # explicitly enables Continuous Tracing for this isolated experiment.
+    relative_skeleton = (
+        continuous_result["continuous_centerline_mask"]
+        if continuous_enabled else backbone_skeleton
+    )
     ribbon_grouping = build_relative_chain_corridors(
         relative_skeleton,
         relative_score=relative_score,
@@ -2605,7 +3181,7 @@ def compute_relative_roadness(
     relative_chain_labels = ribbon_grouping["chain_labels"]
     relative_corridor_labels = ribbon_grouping["corridor_labels"]
     ribbon_component_count, ribbon_component_labels = cv2.connectedComponents(
-        relative_skeleton.astype(np.uint8), 8
+        ribbon_skeleton.astype(np.uint8), 8
     )
     ribbon_component_count = max(0, int(ribbon_component_count - 1))
     if np.any(candidate):
@@ -2624,11 +3200,11 @@ def compute_relative_roadness(
         cv2.connectedComponents(raw_relative_skeleton.astype(np.uint8), 8)[0] - 1
         if np.any(raw_relative_skeleton) else 0
     )
-    ribbon_neighborhood = cv2.dilate(
+    selected_neighborhood = cv2.dilate(
         relative_skeleton.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
     ) > 0
     relative_rejected_skeleton = (
-        (binary_relative_skeleton > 0) & ~ribbon_neighborhood
+        (binary_relative_skeleton > 0) & ~selected_neighborhood
     ).astype(np.uint8)
     corridors_by_id = {
         int(row["corridor_id"]): row for row in ribbon_grouping["corridors"]
@@ -2644,8 +3220,14 @@ def compute_relative_roadness(
             "corridor_total_length": float(corridor["total_length"]),
             "accepted": True,
             "reject_reason": "",
-            "line_source": "relative_ribbon_centerline",
-            "backbone_reason": "regularized_ribbon_centerline",
+            "line_source": (
+                "relative_continuous_trace" if continuous_enabled
+                else "relative_backbone"
+            ),
+            "backbone_reason": (
+                "continuous_ribbon_trace" if continuous_enabled
+                else "backbone_baseline"
+            ),
         })
     structure_summary = {
         "relative_component_count": int(candidate_components),
@@ -2673,6 +3255,8 @@ def compute_relative_roadness(
         "relative_corridors": ribbon_grouping["corridors"],
         **backbone_result["diagnostics"],
         **ribbon_result["diagnostics"],
+        **continuous_result["diagnostics"],
+        "continuous_tracing_experimental_active": bool(continuous_enabled),
         "binary_component_count": int(binary_component_count),
         "ridge_component_count": int(ridge_component_count),
         "binary_junction_count": int(ridge_result["diagnostics"]["old_junction_pixel_count"]),
@@ -2733,9 +3317,15 @@ def compute_relative_roadness(
         "relative_ridge_mask": raw_relative_skeleton.astype(np.uint8),
         "relative_backbone_mask": backbone_skeleton.astype(np.uint8),
         "relative_backbone_source_labels": source_labels.astype(np.uint8),
-        "relative_ribbon_centerline": relative_skeleton.astype(np.uint8),
+        "relative_ribbon_centerline": ribbon_skeleton.astype(np.uint8),
         "relative_ribbon_component_labels": ribbon_component_labels.astype(np.int32),
         "relative_ribbon_structure_labels": ribbon_structure_labels.astype(np.int32),
+        "relative_continuous_centerline": continuous_result["continuous_centerline_mask"].astype(np.uint8),
+        "relative_trace_id_map": continuous_result["trace_id_map"].astype(np.int32),
+        "relative_continuous_seed_mask": continuous_result["seed_mask"].astype(np.uint8),
+        "relative_continuous_junction_mask": continuous_result["junction_mask"].astype(np.uint8),
+        "relative_continuous_branch_mask": continuous_result["confirmed_branch_mask"].astype(np.uint8),
+        "relative_continuous_rejected_spur_mask": continuous_result["rejected_spur_mask"].astype(np.uint8),
         "relative_ribbon_center_orientation": ribbon_result["center_orientation"].astype(np.float32),
         "relative_ribbon_center_confidence": ribbon_result["center_confidence"].astype(np.float32),
         "relative_ribbon_orientation_clarity": ribbon_result["orientation_clarity"].astype(np.float32),
@@ -2749,7 +3339,10 @@ def compute_relative_roadness(
         "relative_rejected_skeleton": relative_rejected_skeleton.astype(np.uint8),
         "relative_chain_labels": relative_chain_labels.astype(np.int32),
         "relative_corridor_labels": relative_corridor_labels.astype(np.int32),
-        "junction_zone_mask": ribbon_result["junction_zone_mask"].astype(np.uint8),
+        "junction_zone_mask": (
+            continuous_result["junction_mask"]
+            if continuous_enabled else ribbon_result["junction_zone_mask"]
+        ).astype(np.uint8),
         "pruned_spur_mask": np.zeros(road.shape, dtype=np.uint8),
         "collapsed_zone_mask": np.zeros(road.shape, dtype=np.uint8),
         "absolute_skeleton": absolute_skeleton.astype(np.uint8),
@@ -3068,6 +3661,8 @@ def bootstrap_weak_road_network(
     ribbon_component_lengths = np.zeros(1, dtype=np.float32)
     ribbon_structure_labels = np.zeros(road.shape, dtype=np.int32)
     ribbon_structure_lengths = np.zeros(1, dtype=np.float32)
+    continuous_trace_ids = np.zeros(road.shape, dtype=np.int32)
+    continuous_trace_lengths = {}
     relative_corridor_labels = np.zeros(road.shape, dtype=np.int32)
     relative_corridors = {}
     relative_endpoint_corridors = defaultdict(set)
@@ -3097,6 +3692,17 @@ def bootstrap_weak_road_network(
                 ribbon_structure_labels.ravel(),
                 weights=relative_skeleton.astype(np.float32).ravel(),
             ).astype(np.float32)
+        continuous_id_value = np.asarray(
+            relative_context.get("relative_trace_id_map", []), dtype=np.int32
+        )
+        if continuous_id_value.shape == road.shape:
+            continuous_trace_ids = continuous_id_value
+        continuous_trace_lengths = {
+            int(row.get("trace_id", 0)): float(row.get("length", 0.0))
+            for row in relative_context.get("diagnostics", {}).get(
+                "relative_trace_summaries", []
+            )
+        }
         corridor_value = np.asarray(
             relative_context.get("relative_corridor_labels", []), dtype=np.int32
         )
@@ -3223,6 +3829,20 @@ def bootstrap_weak_road_network(
             and max(ribbon_component_length, ribbon_structure_length)
                 >= parameters["min_length"]
         )
+        path_trace_values = continuous_trace_ids[path[:, 0], path[:, 1]]
+        path_trace_values = path_trace_values[path_trace_values > 0]
+        continuous_trace_id = (
+            int(np.bincount(path_trace_values).argmax())
+            if len(path_trace_values) else 0
+        )
+        continuous_trace_length = float(
+            continuous_trace_lengths.get(continuous_trace_id, 0.0)
+        )
+        continuous_trace_supported = bool(
+            direct_relative_chain
+            and continuous_trace_id > 0
+            and continuous_trace_length >= parameters["min_length"]
+        )
         rescued_by_corridor = bool(
             direct_relative_chain
             and path_length < parameters["min_length"]
@@ -3233,6 +3853,7 @@ def bootstrap_weak_road_network(
             float(corridor_total_length) if rescued_by_corridor else 0.0,
             max(float(ribbon_component_length), float(ribbon_structure_length))
                 if ribbon_structure_supported else 0.0,
+            float(continuous_trace_length) if continuous_trace_supported else 0.0,
         )
         if direct_relative_chain:
             summary["relative_graph_point_count"] += max(
@@ -3288,8 +3909,12 @@ def bootstrap_weak_road_network(
             "ribbon_structure_id": int(ribbon_structure_id),
             "ribbon_structure_length": float(ribbon_structure_length),
             "ribbon_structure_supported": bool(ribbon_structure_supported),
+            "trace_id": int(continuous_trace_id),
+            "trace_total_length": float(continuous_trace_length),
+            "continuous_trace_supported": bool(continuous_trace_supported),
             "short_chain_classification": (
-                "ribbon_supported_short" if ribbon_structure_supported
+                "continuous_trace_supported_short" if continuous_trace_supported
+                else "ribbon_supported_short" if ribbon_structure_supported
                 else "corridor_supported_short" if rescued_by_corridor
                 else "isolated_short" if path_length < parameters["min_length"]
                 else "not_short"
@@ -3301,6 +3926,7 @@ def bootstrap_weak_road_network(
             path_length < parameters["min_length"]
             and not rescued_by_corridor
             and not ribbon_structure_supported
+            and not continuous_trace_supported
         ):
             reject_candidate(
                 audit_row,
@@ -3370,10 +3996,18 @@ def bootstrap_weak_road_network(
                 >= max(relative_weak_threshold - 1e-6, 0.0)
             and relative_evidence["scene_rank_mean"] >= 0.50
         )
+        continuous_relative_supported = bool(
+            continuous_trace_supported
+            and relative_evidence.get("continuous_trace_fraction", 0.0) >= 0.50
+            and relative_evidence["relative_score_q25"]
+                >= max(relative_weak_threshold - 1e-6, 0.0)
+            and relative_evidence["scene_rank_mean"] >= 0.50
+        )
         relative_supported = bool(
             relative_evidence["relative_supported"]
             or corridor_relative_supported
             or ribbon_relative_supported
+            or continuous_relative_supported
         )
         independent_supported = (
             connection_count > 0
@@ -3448,6 +4082,7 @@ def bootstrap_weak_road_network(
                     relative_evidence["relative_fraction"] >= 0.75
                     or rescued_by_corridor
                     or ribbon_structure_supported
+                    or continuous_trace_supported
                 )
                 and acceptance_score_q25 >= max(relative_weak_threshold - 1e-6, 0.0)
                 and acceptance_scene_rank >= 0.75
@@ -3466,6 +4101,7 @@ def bootstrap_weak_road_network(
                 float(corridor_total_length) if rescued_by_corridor else 0.0,
                 float(ribbon_component_length)
                     if ribbon_component_length >= parameters["min_length"] else 0.0,
+                float(continuous_trace_length) if continuous_trace_supported else 0.0,
             )
             long_independent = bool(
                 independent_length
@@ -3475,11 +4111,11 @@ def bootstrap_weak_road_network(
             )
             supporting_evidence = (
                 graph_connected or topology_supported or multiscale_supported
-                or rescued_by_corridor
+                or rescued_by_corridor or continuous_trace_supported
             )
             if stable_relative and geometry_supported and supporting_evidence and (
                 graph_connected or topology_supported or long_independent
-                or rescued_by_corridor
+                or rescued_by_corridor or continuous_trace_supported
             ):
                 qa_state = "auto"
                 relative_tier = "A" if (graph_connected or topology_supported) else "B"
@@ -3588,6 +4224,8 @@ def bootstrap_weak_road_network(
                 "micro_chain_length": float(path_length),
                 "corridor_total_length": float(corridor_total_length),
                 "rescued_by_corridor": bool(rescued_by_corridor),
+                "trace_id": int(continuous_trace_id),
+                "trace_total_length": float(continuous_trace_length),
                 **relative_evidence,
             })
             added_count += 1
@@ -4576,6 +5214,11 @@ def postprocess_weak_road_network(
         for (src_idx, dst_idx), row in zip(final_edges.tolist(), final_metadata)
         if row.get("line_source") == "relative_ribbon_centerline"
     ))
+    continuous_final_length = float(sum(
+        np.linalg.norm(final_nodes_array[int(dst_idx)] - final_nodes_array[int(src_idx)])
+        for (src_idx, dst_idx), row in zip(final_edges.tolist(), final_metadata)
+        if row.get("line_source") == "relative_continuous_trace"
+    ))
     final_total_length = float(sum(
         np.linalg.norm(final_nodes_array[int(dst_idx)] - final_nodes_array[int(src_idx)])
         for src_idx, dst_idx in final_edges.tolist()
@@ -4583,11 +5226,61 @@ def postprocess_weak_road_network(
     centerline_diagnostics = (
         relative_context.get("diagnostics", {}) if relative_context else {}
     )
+    continuous_active = bool(centerline_diagnostics.get(
+        "continuous_tracing_experimental_active", False
+    ))
     generated_centerline_length = float(
-        centerline_diagnostics.get("ribbon_centerline_total_length", 0.0)
+        centerline_diagnostics.get("continuous_centerline_length", 0.0)
+        if continuous_active
+        else centerline_diagnostics.get("ribbon_centerline_total_length", 0.0)
+    )
+    selected_final_length = (
+        continuous_final_length if continuous_active else ribbon_final_length
     )
     retention_ratio = float(
-        ribbon_final_length / generated_centerline_length
+        selected_final_length / generated_centerline_length
+        if generated_centerline_length > 1e-6 else 0.0
+    )
+
+    retained_by_existing_graph = 0.0
+    if continuous_active and relative_context is not None:
+        continuous_mask = np.asarray(
+            relative_context.get("relative_continuous_centerline", []), dtype=np.uint8
+        )
+        if continuous_mask.shape == np.asarray(road_probability).shape:
+            original_strong_mask = _graph_raster_mask(
+                nodes_rc, original_edges, continuous_mask.shape
+            )
+            overlap_radius = max(0, int(round(
+                float(_config_value(
+                    config, "RELATIVE_ROADNESS_ABSOLUTE_SUPPRESSION_PX", 3.0
+                )) * max(float(distance_scale), 1e-6)
+            )))
+            if overlap_radius > 0 and np.any(original_strong_mask):
+                overlap_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (overlap_radius * 2 + 1, overlap_radius * 2 + 1),
+                )
+                original_strong_mask = cv2.dilate(
+                    original_strong_mask, overlap_kernel
+                )
+            supported = original_strong_mask > 0
+            adjacency = _skeleton_adjacency(continuous_mask > 0)
+            for point, neighbors in adjacency.items():
+                for neighbor in neighbors:
+                    if neighbor <= point:
+                        continue
+                    if supported[point] and supported[neighbor]:
+                        retained_by_existing_graph += float(np.linalg.norm(
+                            np.asarray(neighbor, dtype=np.float32)
+                            - np.asarray(point, dtype=np.float32)
+                        ))
+    effective_retained_length = min(
+        generated_centerline_length,
+        selected_final_length + retained_by_existing_graph,
+    )
+    effective_retention_ratio = float(
+        effective_retained_length / generated_centerline_length
         if generated_centerline_length > 1e-6 else 0.0
     )
     required_loss_reasons = (
@@ -4623,7 +5316,11 @@ def postprocess_weak_road_network(
         "rejected_length": rejected_total,
         "rejected_length_by_reason": rejected_by_reason,
         "ribbon_final_length": ribbon_final_length,
+        "continuous_final_length": continuous_final_length,
         "centerline_to_final_retention_ratio": retention_ratio,
+        "raw_centerline_to_final_retention": retention_ratio,
+        "effective_centerline_to_final_retention": effective_retention_ratio,
+        "retained_by_existing_graph_length": retained_by_existing_graph,
     }
     funnel = {
         **centerline_loss_audit,
@@ -4655,8 +5352,12 @@ def postprocess_weak_road_network(
         "relative_total_edge_count": int(relative_total_edge_count),
         "relative_final_length_px": relative_final_length,
         "relative_ribbon_final_length_px": ribbon_final_length,
+        "relative_continuous_final_length_px": continuous_final_length,
         "final_total_centerline_length_px": final_total_length,
         "centerline_to_final_retention_ratio": retention_ratio,
+        "raw_centerline_to_final_retention": retention_ratio,
+        "effective_centerline_to_final_retention": effective_retention_ratio,
+        "retained_by_existing_graph_length": retained_by_existing_graph,
         "relative_centerline_loss_audit": centerline_loss_audit,
         "relative_acceptance_funnel": funnel,
         "relative_chain_candidate_count": int(
