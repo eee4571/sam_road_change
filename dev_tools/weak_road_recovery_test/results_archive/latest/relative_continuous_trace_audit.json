@@ -1,0 +1,19 @@
+{
+  "candidate_component_count": 148,
+  "old_ribbon_component_count": 2490,
+  "continuous_trace_count": 1266,
+  "continuous_centerline_component_count": 89,
+  "continuous_centerline_length": 111375.14985382557,
+  "mean_trace_length": 83.67071245142257,
+  "median_trace_length": 43.64520263671875,
+  "long_trace_count": 514,
+  "junction_count": 3674,
+  "confirmed_branch_count": 1171,
+  "rejected_spur_count": 1186,
+  "rejected_spur_length": 14946.686701714993,
+  "final_relative_length": 71399.8828125,
+  "final_total_graph_length": 90880.1171875,
+  "raw_centerline_to_final_retention": 0.6221878553335098,
+  "effective_centerline_to_final_retention": 0.7097283468517638,
+  "retained_by_existing_graph_length": 9749.835361123085
+}
