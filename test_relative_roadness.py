@@ -529,6 +529,77 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(centerline[60:67]), 185)
         self.assertEqual(np.count_nonzero(centerline[47:57]), 0)
 
+    def test_continuous_trace_suppresses_parallel_fragment_seeds_in_one_ribbon(self):
+        candidate = np.zeros((130, 260), dtype=np.uint8)
+        candidate[50:74, 10:250] = 1
+        score = candidate.astype(np.float32) * 0.68
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (10, 56), (95, 56), 1, 1)
+        cv2.line(ridge, (75, 62), (180, 62), 1, 1)
+        cv2.line(ridge, (150, 68), (249, 68), 1, 1)
+        cv2.line(ridge, (20, 65), (120, 65), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score,
+            candidate,
+            np.zeros_like(score),
+            ridge_mask=ridge,
+            ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["continuous_trace_count"], 1)
+        self.assertGreaterEqual(
+            diagnostics["seed_suppressed_existing_trace_count"], 3
+        )
+        self.assertEqual(diagnostics["confirmed_branch_count"], 0)
+        self.assertEqual(diagnostics["continuous_junction_count"], 0)
+        self.assertGreater(np.count_nonzero(centerline[58:66, 10:250]), 225)
+        self.assertLessEqual(
+            sum(np.count_nonzero(centerline[row]) > 80 for row in range(48, 76)),
+            2,
+        )
+
+    def test_continuous_trace_wide_junction_keeps_branch_without_fishbone(self):
+        candidate = np.zeros((230, 380), dtype=np.uint8)
+        candidate[96:116, 15:365] = 1
+        candidate[105:205, 188:202] = 1
+        candidate[82:96, 310:321] = 1
+        score = candidate.astype(np.float32) * 0.70
+        orientation = np.zeros(candidate.shape, dtype=np.float32)
+        orientation[103:208, 185:205] = np.float32(np.pi / 2.0)
+        orientation[94:118, 10:370] = 0.0
+        ridge = np.zeros(candidate.shape, dtype=np.uint8)
+        cv2.line(ridge, (15, 105), (230, 105), 1, 1)
+        cv2.line(ridge, (235, 101), (300, 101), 1, 1)
+        cv2.line(ridge, (305, 110), (364, 110), 1, 1)
+        cv2.line(ridge, (195, 105), (195, 204), 1, 1)
+        cv2.line(ridge, (315, 82), (315, 95), 1, 1)
+        result = graph_extraction.trace_relative_ribbon_centerlines(
+            score,
+            candidate,
+            orientation,
+            ridge_mask=ridge,
+            ridge_strength=ridge.astype(np.float32),
+        )
+        centerline = result["continuous_centerline_mask"] > 0
+        diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["continuous_centerline_component_count"], 1)
+        self.assertLessEqual(diagnostics["continuous_trace_count"], 3)
+        self.assertEqual(diagnostics["true_branch_count"], 1)
+        self.assertEqual(diagnostics["confirmed_branch_count"], 1)
+        self.assertEqual(diagnostics["continuous_junction_count"], 1)
+        self.assertGreaterEqual(diagnostics["rejected_spur_count"], 1)
+        self.assertGreaterEqual(
+            diagnostics["seed_suppressed_existing_trace_count"], 2
+        )
+        self.assertGreater(np.count_nonzero(centerline[92:120, 15:365]), 330)
+        self.assertGreater(np.count_nonzero(centerline[105:205, 184:206]), 85)
+        self.assertLess(np.count_nonzero(centerline[80:95, 306:324]), 5)
+        self.assertLessEqual(
+            sum(np.count_nonzero(centerline[row]) > 80 for row in range(90, 121)),
+            3,
+        )
+
     def test_compact_t_and_x_junctions_are_unchanged(self):
         for branch_start in (70, 20):
             skeleton = np.zeros((140, 180), dtype=np.uint8)

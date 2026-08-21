@@ -585,16 +585,14 @@ def write_relative_roadness_diagnostic(
     image_rgb: np.ndarray,
     road_probability: np.ndarray,
     config,
-    scene_state: str,
     recovered_nodes: np.ndarray,
     recovered_edges: np.ndarray,
     metadata: list[dict],
     candidate_audit: list[dict],
     recovery_summary: dict,
+    relative_context: dict,
 ) -> None:
-    context = graph_extraction.compute_relative_roadness(
-        road_probability, config, scene_state=scene_state
-    )
+    context = relative_context
     probability_u8 = np.clip(np.rint(road_probability * 255.0), 0, 255).astype(np.uint8)
     relative_u8 = np.clip(np.rint(context["relative_score"] * 255.0), 0, 255).astype(np.uint8)
     relative_candidate = context["relative_candidate_mask"].astype(np.uint8) * 255
@@ -1173,6 +1171,10 @@ def write_relative_roadness_diagnostic(
         "continuous_centerline_length", "mean_trace_length",
         "median_trace_length", "long_trace_count", "continuous_junction_count",
         "confirmed_branch_count", "rejected_spur_count", "rejected_spur_length",
+        "seed_count", "seed_suppressed_existing_trace_count",
+        "parallel_duplicate_rejected_count", "parallel_duplicate_rejected_length",
+        "true_branch_count", "collision_terminated_count",
+        "junction_supported_merge_count",
     )
     _write_json(
         run_dir / "relative_continuous_trace_audit.json",
@@ -1378,7 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
     weak_candidate_audit = []
     bootstrap_candidate_audit = []
     endpoint_segment_candidate_audit = []
-    recovered_nodes, recovered_edges, metadata, recovery_summary = (
+    recovered_nodes, recovered_edges, metadata, recovery_summary, relative_context = (
         graph_extraction.postprocess_weak_road_network(
             original_nodes,
             original_edges,
@@ -1388,6 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
             weak_candidate_audit=weak_candidate_audit,
             bootstrap_candidate_audit=bootstrap_candidate_audit,
             endpoint_segment_candidate_audit=endpoint_segment_candidate_audit,
+            return_relative_context=True,
         )
     )
     timing["weak_recovery_seconds"] = time.perf_counter() - recovery_started
@@ -1435,12 +1438,12 @@ def main(argv: list[str] | None = None) -> int:
         image_rgb,
         road_probability,
         config,
-        recovery_summary.get("scene_confidence_state", "normal"),
         recovered_nodes,
         recovered_edges,
         metadata,
         bootstrap_candidate_audit,
         recovery_summary,
+        relative_context,
     )
     write_endpoint_segment_candidate_visualizations(
         run_dir,

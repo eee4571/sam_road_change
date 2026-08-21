@@ -6,6 +6,7 @@ import json
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import cv2
@@ -166,11 +167,17 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(run_test.main([
-                "--recovery-only", "--run-dir", str(run_dir),
-                "--threshold-profile", "default", "--enable-bootstrap",
-                "--bootstrap-min-length", "30",
-            ]), 0)
+            with patch.object(
+                run_test.graph_extraction,
+                "compute_relative_roadness",
+                wraps=run_test.graph_extraction.compute_relative_roadness,
+            ) as compute_relative:
+                self.assertEqual(run_test.main([
+                    "--recovery-only", "--run-dir", str(run_dir),
+                    "--threshold-profile", "default", "--enable-bootstrap",
+                    "--bootstrap-min-length", "30",
+                ]), 0)
+            self.assertEqual(compute_relative.call_count, 1)
 
             recovery = json.loads((run_dir / "weak_recovery.json").read_text(encoding="utf-8"))
             summary = recovery["summary"]
@@ -179,7 +186,7 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             self.assertTrue(recovery["recovered_edges"])
             self.assertEqual(
                 {row["line_source"] for row in recovery["recovered_edges"]},
-                {"relative_roadness"},
+                {"relative_continuous_trace"},
             )
             self.assertGreater(summary["relative_recovered_edge_count"], 0)
             for name in (
@@ -203,6 +210,18 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 .read_text(encoding="utf-8-sig").splitlines()[0].split(","),
                 list(run_test.BOOTSTRAP_CANDIDATE_FIELDS),
             )
+            continuous_audit = json.loads(
+                (run_dir / "relative_continuous_trace_audit.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for key in (
+                "seed_count", "seed_suppressed_existing_trace_count",
+                "parallel_duplicate_rejected_count",
+                "parallel_duplicate_rejected_length", "true_branch_count",
+                "collision_terminated_count", "junction_supported_merge_count",
+            ):
+                self.assertIn(key, continuous_audit)
 
     def test_recovery_only_reuses_immutable_original_cache(self):
         with tempfile.TemporaryDirectory() as raw:
