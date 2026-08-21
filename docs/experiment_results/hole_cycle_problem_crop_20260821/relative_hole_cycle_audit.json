@@ -1,0 +1,28 @@
+{
+  "hole_count": 146,
+  "hole_filled_count": 122,
+  "hole_preserved_count": 24,
+  "narrow_hole_count": 13,
+  "narrow_hole_filled_count": 13,
+  "raw_cycle_count": 27,
+  "small_cycle_count": 23,
+  "removed_cycle_count": 23,
+  "preserved_cycle_count": 4,
+  "final_cycle_count": 4,
+  "cycle_near_detected_hole_fraction": 0.9804469273743017,
+  "cycle_near_filled_hole_fraction": 0.6766759776536313,
+  "hole_filled_by_size_count": 119,
+  "hole_filled_by_narrow_width_count": 13,
+  "problem_crop_xyxy": [
+    0,
+    0,
+    761,
+    1301
+  ],
+  "problem_crop_raw_chain_count": 643,
+  "problem_crop_final_chain_count": 81,
+  "problem_crop_raw_cycle_count": 27,
+  "problem_crop_final_cycle_count": 4,
+  "problem_crop_raw_junction_count": 317,
+  "problem_crop_final_junction_count": 26
+}

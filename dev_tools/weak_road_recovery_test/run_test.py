@@ -593,6 +593,13 @@ def write_relative_roadness_diagnostic(
     relative_context: dict,
 ) -> None:
     context = relative_context
+    height, width = image_rgb.shape[:2]
+    requested_roi = (2418, 1421, 3179, 2722)
+    if width >= requested_roi[2] and height >= requested_roi[3]:
+        x0, y0, x1, y1 = requested_roi
+    else:
+        x0, y0, x1, y1 = 0, 0, width, height
+    crop = np.s_[y0:y1, x0:x1]
     probability_u8 = np.clip(np.rint(road_probability * 255.0), 0, 255).astype(np.uint8)
     relative_u8 = np.clip(np.rint(context["relative_score"] * 255.0), 0, 255).astype(np.uint8)
     relative_candidate = context["relative_candidate_mask"].astype(np.uint8) * 255
@@ -639,7 +646,14 @@ def write_relative_roadness_diagnostic(
         regularized_candidate = context["relative_regularized_candidate"] > 0
         raw_skeleton = context["relative_regularized_raw_skeleton"] > 0
         pruned_skeleton = context["relative_regularized_pruned_skeleton"] > 0
+        cycle_cleaned = context["relative_regularized_cycle_cleaned_skeleton"] > 0
         final_skeleton = context["relative_regularized_final_skeleton"] > 0
+        detected_holes = context["relative_detected_hole_mask"] > 0
+        filled_holes = context["relative_filled_hole_mask"] > 0
+        preserved_holes = context["relative_preserved_hole_mask"] > 0
+        narrow_holes = context["relative_narrow_hole_mask"] > 0
+        detected_cycles = context["relative_detected_cycle_mask"] > 0
+        removed_cycles = context["relative_removed_cycle_mask"] > 0
 
         def mask_panel(mask, label, color):
             panel = (0.45 * image_rgb.astype(np.float32)).astype(np.uint8)
@@ -695,12 +709,100 @@ def write_relative_roadness_diagnostic(
             pruned_skeleton.astype(np.uint8) * 255,
         )
         _save_png(
+            run_dir / "relative_cycle_cleaned_skeleton.png",
+            cycle_cleaned.astype(np.uint8) * 255,
+        )
+        _save_png(
             run_dir / "relative_regularized_final_skeleton.png",
             final_skeleton.astype(np.uint8) * 255,
         )
         _write_json(
             run_dir / "relative_skeleton_performance_audit.json",
             context.get("relative_skeleton_performance_audit", {}),
+        )
+        hole_panel = (0.45 * image_rgb[crop].astype(np.float32)).astype(np.uint8)
+        hole_panel[detected_holes[crop]] = (0, 210, 255)
+        hole_panel[narrow_holes[crop]] = (255, 180, 0)
+        hole_panel[preserved_holes[crop]] = (80, 120, 255)
+        cycle_panel = (0.45 * image_rgb[crop].astype(np.float32)).astype(np.uint8)
+        cycle_panel[detected_cycles[crop]] = (255, 0, 255)
+        cycle_panel[removed_cycles[crop]] = (255, 80, 80)
+        final_panel = image_rgb[crop].copy()
+        final_panel[final_skeleton[crop]] = (80, 255, 80)
+        raw_candidate_panel = (0.45 * image_rgb[crop].astype(np.float32)).astype(np.uint8)
+        raw_candidate_panel[original_candidate[crop]] = (255, 180, 0)
+        regularized_panel = (0.45 * image_rgb[crop].astype(np.float32)).astype(np.uint8)
+        regularized_panel[regularized_candidate[crop]] = (0, 210, 255)
+        raw_skeleton_panel = image_rgb[crop].copy()
+        raw_skeleton_panel[raw_skeleton[crop]] = (255, 80, 80)
+        hole_cycle_panels = [
+            _labeled_preview(image_rgb[crop], "1 RGB / Background", max_width=800),
+            _labeled_preview(raw_candidate_panel, "2 Raw Candidate", max_width=800),
+            _labeled_preview(regularized_panel, "3 Regularized Candidate", max_width=800),
+            _labeled_preview(hole_panel, "4 Holes cyan / Cracks yellow / Preserved blue", max_width=800),
+            _labeled_preview(raw_skeleton_panel, "5 Raw Skeleton", max_width=800),
+            _labeled_preview(cycle_panel, "6 Cycles magenta / Removed red", max_width=800),
+            _labeled_preview(final_panel, "7 Final Skeleton", max_width=800),
+        ]
+        panel_height = min(panel.shape[0] for panel in hole_cycle_panels)
+        hole_cycle_panels = [
+            cv2.resize(
+                panel,
+                (max(1, int(round(panel.shape[1] * panel_height / panel.shape[0]))), panel_height),
+            ) if panel.shape[0] != panel_height else panel
+            for panel in hole_cycle_panels
+        ]
+        top = np.concatenate(hole_cycle_panels[:4], axis=1)
+        bottom = np.concatenate(hole_cycle_panels[4:], axis=1)
+        target_width = min(top.shape[1], bottom.shape[1])
+        top = cv2.resize(top, (target_width, top.shape[0]))
+        bottom = cv2.resize(bottom, (target_width, bottom.shape[0]))
+        _save_png(
+            run_dir / "relative_hole_cycle_debug.png",
+            np.concatenate((top, bottom), axis=0),
+        )
+        raw_crop_skeleton = raw_skeleton[crop]
+        final_crop_skeleton = final_skeleton[crop]
+        _raw_chains, _raw_endpoints, raw_crop_cycles = (
+            graph_extraction._chain_level_cycles(raw_crop_skeleton)
+        )
+        _final_chains, _final_endpoints, final_crop_cycles = (
+            graph_extraction._chain_level_cycles(final_crop_skeleton)
+        )
+        raw_crop_adjacency = graph_extraction._skeleton_adjacency(raw_crop_skeleton)
+        final_crop_adjacency = graph_extraction._skeleton_adjacency(final_crop_skeleton)
+        performance = context.get("relative_skeleton_performance_audit", {})
+        _write_json(
+            run_dir / "relative_hole_cycle_audit.json",
+            {
+                key: performance.get(key, 0)
+                for key in (
+                    "hole_count", "hole_filled_count", "hole_preserved_count",
+                    "narrow_hole_count", "narrow_hole_filled_count",
+                    "raw_cycle_count", "small_cycle_count", "removed_cycle_count",
+                    "preserved_cycle_count", "final_cycle_count",
+                    "cycle_near_detected_hole_fraction",
+                    "cycle_near_filled_hole_fraction",
+                    "hole_filled_by_size_count",
+                    "hole_filled_by_narrow_width_count",
+                )
+            } | {
+                "problem_crop_xyxy": [x0, y0, x1, y1],
+                "problem_crop_raw_chain_count": len(
+                    graph_extraction._trace_skeleton_chains(raw_crop_skeleton)
+                ),
+                "problem_crop_final_chain_count": len(
+                    graph_extraction._trace_skeleton_chains(final_crop_skeleton)
+                ),
+                "problem_crop_raw_cycle_count": len(raw_crop_cycles),
+                "problem_crop_final_cycle_count": len(final_crop_cycles),
+                "problem_crop_raw_junction_count": sum(
+                    len(items) >= 3 for items in raw_crop_adjacency.values()
+                ),
+                "problem_crop_final_junction_count": sum(
+                    len(items) >= 3 for items in final_crop_adjacency.values()
+                ),
+            },
         )
     _save_png(
         run_dir / "relative_junction_zones.png",
@@ -795,14 +897,6 @@ def write_relative_roadness_diagnostic(
             if key not in {"relative_micro_chains", "relative_corridors"}
         },
     )
-    height, width = image_rgb.shape[:2]
-    requested_roi = (1513, 3079, 2130, 3557)
-    if width >= requested_roi[2] and height >= requested_roi[3]:
-        x0, y0, x1, y1 = requested_roi
-    else:
-        x0, y0, x1, y1 = 0, 0, width, height
-    crop = np.s_[y0:y1, x0:x1]
-
     candidate_panel = image_rgb[crop].copy()
     candidate_panel[context["relative_candidate_mask"][crop] > 0] = (
         0.55 * candidate_panel[context["relative_candidate_mask"][crop] > 0]
@@ -1385,6 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
     # baseline. Continuous Trace remains available only for historical tests.
     config.RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL = False
     config.RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL = True
+    config.RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL = False
     requested_device = arguments.device or cached.get("device") or "auto"
     if arguments.recovery_only:
         device_name, device = str(requested_device), None

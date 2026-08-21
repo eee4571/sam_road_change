@@ -199,6 +199,8 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
                 "relative_skeleton_normalization.json", "relative_junction_debug.png",
                 "relative_chain_debug.png", "relative_regularized_skeleton_comparison.png",
                 "relative_skeleton_performance_audit.json",
+                "relative_hole_cycle_debug.png", "relative_hole_cycle_audit.json",
+                "relative_cycle_cleaned_skeleton.png",
             ):
                 self.assertTrue((run_dir / name).is_file(), name)
             self.assertEqual(
@@ -218,8 +220,10 @@ class WeakRoadRecoveryDevToolTests(unittest.TestCase):
             )
             for key in (
                 "candidate_regularization_seconds", "distance_transform_seconds",
+                "hole_detection_seconds", "narrow_hole_analysis_seconds",
                 "hole_fill_seconds", "smoothing_seconds", "skeletonize_seconds",
-                "spur_pruning_seconds", "junction_collapse_seconds",
+                "spur_pruning_seconds", "cycle_detection_seconds",
+                "cycle_cleanup_seconds", "junction_collapse_seconds",
                 "vector_simplification_seconds", "total_seconds",
             ):
                 self.assertIn(key, performance_audit)

@@ -1,0 +1,22 @@
+{
+  "A_junction_collapse_off": {
+    "final_skeleton_length": 5577,
+    "raw_cycle_count": 27,
+    "final_cycle_count": 4,
+    "junction_pixel_count": 26,
+    "junction_cluster_count": 0,
+    "junction_collapse_seconds": 0.0113,
+    "pipeline_total_seconds": 0.6614
+  },
+  "B_junction_collapse_on": {
+    "final_skeleton_length": 5582,
+    "raw_cycle_count": 27,
+    "final_cycle_count": 4,
+    "junction_pixel_count": 26,
+    "junction_cluster_count": 23,
+    "junction_collapse_seconds": 0.0267,
+    "pipeline_total_seconds": 0.6693
+  },
+  "default": "A_junction_collapse_off",
+  "reason": "Junction collapse changed five pixels but did not reduce cycle count."
+}

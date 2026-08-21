@@ -642,7 +642,7 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(skeleton[92:195, 136:164]), 85)
         adjacency = graph_extraction._skeleton_adjacency(skeleton)
         self.assertEqual(sum(len(items) == 1 for items in adjacency.values()), 3)
-        self.assertGreaterEqual(result["performance"]["junction_cluster_count_after"], 1)
+        self.assertFalse(result["performance"]["junction_collapse_active"])
 
     def test_regularized_skeleton_d_preserves_y_junction(self):
         candidate = np.zeros((220, 260), dtype=np.uint8)
@@ -673,7 +673,9 @@ class RelativeRoadnessTests(unittest.TestCase):
         candidate[100:126, 18:262] = 1
         candidate[20:220, 126:152] = 1
         candidate[91:136, 112:166] = 1
-        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        result = graph_extraction.extract_regularized_relative_centerline(
+            candidate, junction_collapse=True
+        )
         raw = result["raw_skeleton"] > 0
         final = result["final_skeleton"] > 0
         raw_adjacency = graph_extraction._skeleton_adjacency(raw)
@@ -694,6 +696,80 @@ class RelativeRoadnessTests(unittest.TestCase):
         self.assertEqual(cv2.connectedComponents(regularized.astype(np.uint8), 8)[0] - 1, 2)
         self.assertEqual(np.count_nonzero(regularized[:, 132:146]), 0)
 
+    def test_regularized_skeleton_h_fills_long_narrow_crack(self):
+        candidate = np.zeros((130, 280), dtype=np.uint8)
+        candidate[40:90, 10:270] = 1
+        candidate[62:67, 50:230] = 0
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        audit = result["performance"]
+        self.assertTrue(np.all(result["regularized_candidate"][62:67, 50:230] > 0))
+        self.assertEqual(audit["narrow_hole_count"], 1)
+        self.assertEqual(audit["hole_filled_by_narrow_width_count"], 1)
+        self.assertEqual(audit["final_cycle_count"], 0)
+
+    def test_regularized_skeleton_i_fills_repeated_narrow_holes(self):
+        candidate = np.zeros((150, 340), dtype=np.uint8)
+        candidate[42:102, 10:330] = 1
+        for start in (45, 130, 215):
+            candidate[67:72, start:start + 65] = 0
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        self.assertEqual(result["performance"]["narrow_hole_filled_count"], 3)
+        self.assertEqual(result["performance"]["final_cycle_count"], 0)
+
+    def test_regularized_skeleton_j_preserves_x_junction(self):
+        candidate = np.zeros((190, 240), dtype=np.uint8)
+        candidate[84:106, 15:225] = 1
+        candidate[15:175, 109:131] = 1
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        skeleton = result["final_skeleton"] > 0
+        adjacency = graph_extraction._skeleton_adjacency(skeleton)
+        self.assertEqual(sum(len(items) == 1 for items in adjacency.values()), 4)
+        self.assertEqual(result["performance"]["removed_cycle_count"], 0)
+
+    def test_regularized_skeleton_k_preserves_true_central_median(self):
+        candidate = np.zeros((140, 300), dtype=np.uint8)
+        candidate[25:115, 10:290] = 1
+        candidate[52:88, 40:260] = 0
+        result = graph_extraction.extract_regularized_relative_centerline(candidate)
+        regularized = result["regularized_candidate"] > 0
+        self.assertFalse(regularized[70, 150])
+        self.assertGreaterEqual(result["performance"]["hole_preserved_count"], 1)
+        self.assertEqual(result["performance"]["narrow_hole_filled_count"], 0)
+
+    def test_regularized_skeleton_l_removes_small_fake_cycle_locally(self):
+        skeleton = np.zeros((120, 180), dtype=np.uint8)
+        cv2.line(skeleton, (10, 55), (170, 55), 1, 1)
+        cv2.rectangle(skeleton, (75, 45), (95, 65), 1, 1)
+        result = graph_extraction.remove_width_scale_small_cycles(
+            skeleton, np.full(skeleton.shape, 10.0, dtype=np.float32)
+        )
+        self.assertGreaterEqual(result["raw_cycle_count"], 1)
+        self.assertGreaterEqual(result["removed_cycle_count"], 1)
+        self.assertEqual(result["final_cycle_count"], 0)
+        self.assertTrue(result["cleaned_skeleton"][55, 15])
+        self.assertTrue(result["cleaned_skeleton"][55, 165])
+
+    def test_regularized_skeleton_m_preserves_large_roundabout(self):
+        skeleton = np.zeros((180, 180), dtype=np.uint8)
+        cv2.circle(skeleton, (90, 90), 50, 1, 1)
+        result = graph_extraction.remove_width_scale_small_cycles(
+            skeleton, np.full(skeleton.shape, 5.0, dtype=np.float32)
+        )
+        self.assertEqual(result["raw_cycle_count"], 1)
+        self.assertEqual(result["removed_cycle_count"], 0)
+        self.assertEqual(result["final_cycle_count"], 1)
+
+    def test_regularized_skeleton_n_preserves_curved_ramp_loop(self):
+        skeleton = np.zeros((220, 260), dtype=np.uint8)
+        cv2.ellipse(skeleton, (145, 105), (62, 48), 0, 0, 360, 1, 1)
+        cv2.line(skeleton, (15, 105), (83, 105), 1, 1)
+        result = graph_extraction.remove_width_scale_small_cycles(
+            skeleton, np.full(skeleton.shape, 6.0, dtype=np.float32)
+        )
+        self.assertGreaterEqual(result["raw_cycle_count"], 1)
+        self.assertEqual(result["removed_cycle_count"], 0)
+        self.assertGreaterEqual(result["final_cycle_count"], 1)
+
     def test_regularized_skeleton_small_benchmark_has_complete_audit(self):
         candidate = np.zeros((512, 512), dtype=np.uint8)
         for row in range(70, 470, 80):
@@ -704,11 +780,18 @@ class RelativeRoadnessTests(unittest.TestCase):
         for key in (
             "candidate_regularization_seconds", "distance_transform_seconds",
             "hole_fill_seconds", "smoothing_seconds", "skeletonize_seconds",
-            "spur_pruning_seconds", "junction_collapse_seconds",
+            "hole_detection_seconds", "narrow_hole_analysis_seconds",
+            "spur_pruning_seconds", "cycle_detection_seconds",
+            "cycle_cleanup_seconds", "junction_collapse_seconds",
             "vector_simplification_seconds", "total_seconds",
             "candidate_pixel_count_before", "candidate_pixel_count_after",
             "skeleton_length_before_pruning", "skeleton_length_after_pruning",
             "spur_removed_count", "spur_removed_length",
+            "raw_cycle_count", "small_cycle_count", "removed_cycle_count",
+            "preserved_cycle_count", "hole_filled_by_size_count",
+            "hole_filled_by_narrow_width_count",
+            "cycle_near_detected_hole_fraction",
+            "cycle_near_filled_hole_fraction",
             "junction_pixel_count_before", "junction_cluster_count_after",
         ):
             self.assertIn(key, audit)

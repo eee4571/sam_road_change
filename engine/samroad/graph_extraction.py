@@ -2914,6 +2914,8 @@ def regularize_relative_candidate(
     sigma_factor=0.20,
     sigma_min=0.8,
     sigma_max=2.5,
+    hole_width_ratio=0.45,
+    hole_size_ratio=0.75,
 ):
     """Regularize road ribbons with component-scale signed-distance smoothing."""
     started = time.perf_counter()
@@ -2921,6 +2923,8 @@ def regularize_relative_candidate(
     before_count = int(np.count_nonzero(candidate))
     performance = {
         "distance_transform_seconds": 0.0,
+        "hole_detection_seconds": 0.0,
+        "narrow_hole_analysis_seconds": 0.0,
         "hole_fill_seconds": 0.0,
         "smoothing_seconds": 0.0,
     }
@@ -2931,12 +2935,22 @@ def regularize_relative_candidate(
             "candidate_pixel_count_before": before_count,
             "candidate_pixel_count_after": 0,
             "hole_filled_count": 0,
+            "hole_count": 0,
+            "hole_preserved_count": 0,
+            "narrow_hole_count": 0,
+            "narrow_hole_filled_count": 0,
+            "hole_filled_by_size_count": 0,
+            "hole_filled_by_narrow_width_count": 0,
             "noise_component_removed_count": 0,
         })
         return {
             "regularized_candidate": empty,
             "distance_transform": np.zeros(candidate.shape, dtype=np.float32),
             "component_half_widths": {},
+            "detected_hole_mask": empty.copy(),
+            "filled_hole_mask": empty.copy(),
+            "preserved_hole_mask": empty.copy(),
+            "narrow_hole_mask": empty.copy(),
             "performance": performance,
         }
 
@@ -2956,7 +2970,9 @@ def regularize_relative_candidate(
         elongation = float(max(width, height) / max(1, min(width, height)))
         small_area = float(area) < max(4.0, 3.0 * half_width * half_width)
         if small_area and elongation < 2.5:
-            cleaned[labels == label_id] = False
+            local_labels = labels[row:row + height, col:col + width]
+            local_cleaned = cleaned[row:row + height, col:col + width]
+            local_cleaned[local_labels == label_id] = False
             removed_noise += 1
 
     hole_started = time.perf_counter()
@@ -2967,6 +2983,7 @@ def regularize_relative_candidate(
     distance = distance_transform_edt(cleaned).astype(np.float32)
     performance["distance_transform_seconds"] += time.perf_counter() - distance_started
     half_widths = _component_half_widths(labels, stats, distance)
+    hole_detection_started = time.perf_counter()
     background_count, background_labels, background_stats, _ = cv2.connectedComponentsWithStats(
         (~cleaned).astype(np.uint8), 8
     )
@@ -2974,25 +2991,84 @@ def regularize_relative_candidate(
         background_labels[0], background_labels[-1],
         background_labels[:, 0], background_labels[:, -1],
     ))).tolist())
+    performance["hole_detection_seconds"] = time.perf_counter() - hole_detection_started
+    detected_holes = np.zeros(candidate.shape, dtype=np.uint8)
+    filled_holes = np.zeros(candidate.shape, dtype=np.uint8)
+    preserved_holes = np.zeros(candidate.shape, dtype=np.uint8)
+    narrow_holes = np.zeros(candidate.shape, dtype=np.uint8)
+    hole_count = 0
     hole_filled_count = 0
+    narrow_hole_count = 0
+    narrow_hole_filled_count = 0
+    filled_by_size_count = 0
+    filled_by_narrow_count = 0
+    narrow_started = time.perf_counter()
     for hole_id in range(1, background_count):
         if hole_id in border_labels:
             continue
-        area = int(background_stats[hole_id, cv2.CC_STAT_AREA])
+        col, row, width, height, area = map(int, background_stats[hole_id])
         if area <= 0:
             continue
-        hole = background_labels == hole_id
-        boundary = cv2.dilate(hole.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
-        neighbor_ids = labels[boundary & cleaned]
+        hole_count += 1
+        padding = 1
+        row0, row1 = max(0, row - padding), min(candidate.shape[0], row + height + padding)
+        col0, col1 = max(0, col - padding), min(candidate.shape[1], col + width + padding)
+        local_background_labels = background_labels[row0:row1, col0:col1]
+        local_hole = local_background_labels == hole_id
+        detected_holes[row0:row1, col0:col1][local_hole] = 1
+        local_cleaned = cleaned[row0:row1, col0:col1]
+        boundary = (
+            cv2.dilate(local_hole.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0
+        ) & ~local_hole
+        local_labels = labels[row0:row1, col0:col1]
+        neighbor_ids = local_labels[boundary & local_cleaned]
         neighbor_ids = neighbor_ids[neighbor_ids > 0]
         if not neighbor_ids.size:
+            preserved_holes[row0:row1, col0:col1][local_hole] = 1
             continue
         host_id = int(np.bincount(neighbor_ids).argmax())
-        road_width = 2.0 * half_widths.get(host_id, 1.0)
+        host_half_width = half_widths.get(host_id, 1.0)
+        scale_padding = max(3, int(math.ceil(2.5 * host_half_width)))
+        sample_row0 = max(0, row - scale_padding)
+        sample_row1 = min(candidate.shape[0], row + height + scale_padding)
+        sample_col0 = max(0, col - scale_padding)
+        sample_col1 = min(candidate.shape[1], col + width + scale_padding)
+        sample_labels = labels[sample_row0:sample_row1, sample_col0:sample_col1]
+        sample_distance = distance[sample_row0:sample_row1, sample_col0:sample_col1]
+        local_host_values = sample_distance[sample_labels == host_id]
+        local_half_width = (
+            float(np.percentile(local_host_values, 90.0))
+            if local_host_values.size else float(host_half_width)
+        )
+        road_width = 2.0 * max(1.0, local_half_width)
+        hole_dt = distance_transform_edt(local_hole).astype(np.float32)
+        hole_values = hole_dt[local_hole]
+        hole_half_width = (
+            float(np.percentile(hole_values, 95.0)) if hole_values.size else 0.0
+        )
+        actual_hole_width = 2.0 * hole_half_width
+        width_ratio = actual_hole_width / max(road_width, 1e-6)
+        aspect_ratio = float(max(width, height) / max(1, min(width, height)))
         equivalent_diameter = 2.0 * math.sqrt(float(area) / math.pi)
-        if equivalent_diameter < 0.75 * road_width:
-            cleaned[hole] = True
+        fill_by_size = equivalent_diameter < float(hole_size_ratio) * road_width
+        fill_by_narrow_width = (
+            aspect_ratio >= 2.0 and width_ratio < float(hole_width_ratio)
+        )
+        if fill_by_narrow_width:
+            narrow_holes[row0:row1, col0:col1][local_hole] = 1
+            narrow_hole_count += 1
+        if fill_by_size or fill_by_narrow_width:
+            local_cleaned[local_hole] = True
+            filled_holes[row0:row1, col0:col1][local_hole] = 1
             hole_filled_count += 1
+            if fill_by_size:
+                filled_by_size_count += 1
+            if fill_by_narrow_width:
+                filled_by_narrow_count += 1
+                narrow_hole_filled_count += 1
+        else:
+            preserved_holes[row0:row1, col0:col1][local_hole] = 1
+    performance["narrow_hole_analysis_seconds"] = time.perf_counter() - narrow_started
     performance["hole_fill_seconds"] = time.perf_counter() - hole_started
 
     smoothing_started = time.perf_counter()
@@ -3026,15 +3102,19 @@ def regularize_relative_candidate(
 
     # A regularizer must never connect distinct input components. If two
     # independently smoothed ribbons touch, restore their original pixels.
-    output_count, output_labels = cv2.connectedComponents(
+    output_count, output_labels, output_stats, _ = cv2.connectedComponentsWithStats(
         regularized.astype(np.uint8), 8
     )
     for output_id in range(1, output_count):
-        output_region = output_labels == output_id
-        source_ids = np.unique(labels[output_region & (labels > 0)])
+        col, row, width, height, _area = map(int, output_stats[output_id])
+        local_output_labels = output_labels[row:row + height, col:col + width]
+        output_region = local_output_labels == output_id
+        local_source_labels = labels[row:row + height, col:col + width]
+        source_ids = np.unique(local_source_labels[output_region & (local_source_labels > 0)])
         if len(source_ids) > 1:
-            regularized[output_region] = False
-            regularized[np.isin(labels, source_ids)] = True
+            local_regularized = regularized[row:row + height, col:col + width]
+            local_regularized[output_region] = False
+            local_regularized[np.isin(local_source_labels, source_ids)] = True
     performance["smoothing_seconds"] = time.perf_counter() - smoothing_started
 
     distance_started = time.perf_counter()
@@ -3048,13 +3128,23 @@ def regularize_relative_candidate(
         "candidate_regularization_seconds": time.perf_counter() - started,
         "candidate_pixel_count_before": before_count,
         "candidate_pixel_count_after": int(np.count_nonzero(regularized)),
+        "hole_count": int(hole_count),
         "hole_filled_count": int(hole_filled_count),
+        "hole_preserved_count": int(hole_count - hole_filled_count),
+        "narrow_hole_count": int(narrow_hole_count),
+        "narrow_hole_filled_count": int(narrow_hole_filled_count),
+        "hole_filled_by_size_count": int(filled_by_size_count),
+        "hole_filled_by_narrow_width_count": int(filled_by_narrow_count),
         "noise_component_removed_count": int(removed_noise),
     })
     return {
         "regularized_candidate": regularized.astype(np.uint8),
         "distance_transform": final_distance,
         "component_half_widths": final_widths,
+        "detected_hole_mask": detected_holes,
+        "filled_hole_mask": filled_holes,
+        "preserved_hole_mask": preserved_holes,
+        "narrow_hole_mask": narrow_holes,
         "performance": performance,
     }
 
@@ -3111,6 +3201,215 @@ def prune_width_aware_spurs(skeleton, distance_transform, *, spur_ratio=2.25, ma
     }
 
 
+def _chain_level_cycles(skeleton):
+    """Return a fundamental cycle basis over topology-bounded skeleton chains."""
+    chains = _trace_skeleton_chains(np.asarray(skeleton, dtype=np.uint8) > 0)
+    endpoints = [
+        (tuple(map(int, path[0])), tuple(map(int, path[-1]))) for path in chains
+    ]
+    parent = {}
+    tree = defaultdict(list)
+    cycles = []
+
+    def find(node):
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def tree_path(start, goal):
+        queue = deque([start])
+        previous = {start: (None, None)}
+        while queue:
+            node = queue.popleft()
+            if node == goal:
+                break
+            for neighbor, edge_id in tree[node]:
+                if neighbor not in previous:
+                    previous[neighbor] = (node, edge_id)
+                    queue.append(neighbor)
+        if goal not in previous:
+            return []
+        result = []
+        node = goal
+        while previous[node][0] is not None:
+            node, edge_id = previous[node]
+            result.append(int(edge_id))
+        result.reverse()
+        return result
+
+    for edge_id, (first, second) in enumerate(endpoints):
+        if first == second:
+            cycles.append([edge_id])
+            continue
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+            tree[first].append((second, edge_id))
+            tree[second].append((first, edge_id))
+        else:
+            path_edges = tree_path(first, second)
+            if path_edges:
+                cycles.append(path_edges + [edge_id])
+    return chains, endpoints, cycles
+
+
+def remove_width_scale_small_cycles(
+    skeleton,
+    distance_transform,
+    *,
+    relative_score=None,
+    max_span_ratio=4.5,
+    max_area_ratio=8.0,
+    max_perimeter_ratio=13.0,
+):
+    """Open only road-width-scale cycles by removing their weaker local chain."""
+    started = time.perf_counter()
+    value = np.asarray(skeleton, dtype=np.uint8) > 0
+    distance = np.asarray(distance_transform, dtype=np.float32)
+    score = (
+        np.asarray(relative_score, dtype=np.float32)
+        if relative_score is not None else np.zeros(value.shape, dtype=np.float32)
+    )
+    detection_started = time.perf_counter()
+    chains, endpoints, cycles = _chain_level_cycles(value)
+    detection_seconds = time.perf_counter() - detection_started
+    detected_mask = np.zeros(value.shape, dtype=np.uint8)
+    removed_mask = np.zeros(value.shape, dtype=np.uint8)
+    edge_removed = set()
+    cycle_records = []
+    small_cycle_count = 0
+    removed_cycle_count = 0
+
+    edge_graph = defaultdict(list)
+    for edge_id, (first, second) in enumerate(endpoints):
+        if first != second:
+            edge_graph[first].append((second, edge_id))
+            edge_graph[second].append((first, edge_id))
+
+    def has_alternate_path(start, goal, excluded_edge):
+        queue = deque([start])
+        visited = {start}
+        while queue:
+            node = queue.popleft()
+            if node == goal:
+                return True
+            for neighbor, edge_id in edge_graph[node]:
+                if edge_id == excluded_edge or edge_id in edge_removed:
+                    continue
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        return False
+
+    cleanup_started = time.perf_counter()
+    for cycle_edge_ids in cycles:
+        points = np.concatenate([chains[index] for index in cycle_edge_ids], axis=0)
+        unique_points = np.unique(points, axis=0)
+        rows, cols = unique_points[:, 0], unique_points[:, 1]
+        local_half_width = max(1.0, float(np.median(distance[rows, cols])))
+        road_width = 2.0 * local_half_width
+        bbox_width = int(cols.max() - cols.min() + 1)
+        bbox_height = int(rows.max() - rows.min() + 1)
+        span = float(max(bbox_width, bbox_height))
+        hull = cv2.convexHull(unique_points[:, ::-1].astype(np.float32))
+        area = float(abs(cv2.contourArea(hull))) if len(hull) >= 3 else 0.0
+        perimeter = float(sum(
+            _relative_chain_geometry(chains[index])["path_length"]
+            for index in cycle_edge_ids
+        ))
+        span_ratio = span / max(road_width, 1e-6)
+        area_ratio = area / max(road_width * road_width, 1e-6)
+        perimeter_ratio = perimeter / max(road_width, 1e-6)
+        is_small = (
+            span_ratio <= float(max_span_ratio)
+            and area_ratio <= float(max_area_ratio)
+            and perimeter_ratio <= float(max_perimeter_ratio)
+        )
+        record = {
+            "edge_count": int(len(cycle_edge_ids)),
+            "perimeter": float(perimeter),
+            "bbox_width": int(bbox_width),
+            "bbox_height": int(bbox_height),
+            "cycle_span": float(span),
+            "cycle_area": float(area),
+            "local_road_width": float(road_width),
+            "cycle_span_ratio": float(span_ratio),
+            "cycle_area_ratio": float(area_ratio),
+            "cycle_perimeter_ratio": float(perimeter_ratio),
+            "small_cycle": bool(is_small),
+            "removed": False,
+        }
+        cycle_records.append(record)
+        if not is_small:
+            continue
+        small_cycle_count += 1
+        detected_mask[rows, cols] = 1
+        if len(cycle_edge_ids) == 1:
+            edge_id = cycle_edge_ids[0]
+            path = chains[edge_id]
+            first, second = endpoints[edge_id]
+            if first == second and len(path) > 5:
+                unique_path = path[:-1]
+                path_scores = distance[unique_path[:, 0], unique_path[:, 1]]
+                path_scores = path_scores + 0.15 * score[
+                    unique_path[:, 0], unique_path[:, 1]
+                ]
+                cut_index = int(np.argmin(path_scores))
+                cut_indices = [
+                    (cut_index + offset) % len(unique_path) for offset in (-1, 0, 1)
+                ]
+                cut_points = unique_path[np.asarray(cut_indices, dtype=np.int32)]
+                value[cut_points[:, 0], cut_points[:, 1]] = False
+                removed_mask[cut_points[:, 0], cut_points[:, 1]] = 1
+                edge_removed.add(edge_id)
+                removed_cycle_count += 1
+                record["removed"] = True
+                continue
+        removable = []
+        for edge_id in cycle_edge_ids:
+            path = chains[edge_id]
+            first, second = endpoints[edge_id]
+            if first == second or len(path) <= 2 or edge_id in edge_removed:
+                continue
+            path_rows, path_cols = path[:, 0], path[:, 1]
+            edge_score = float(np.mean(distance[path_rows, path_cols]))
+            edge_score += 0.15 * float(np.mean(score[path_rows, path_cols]))
+            removable.append((edge_score, len(path), edge_id))
+        removable.sort()
+        for _edge_score, _length, edge_id in removable:
+            first, second = endpoints[edge_id]
+            if not has_alternate_path(first, second, edge_id):
+                continue
+            path = chains[edge_id]
+            interior = path[1:-1]
+            value[interior[:, 0], interior[:, 1]] = False
+            removed_mask[interior[:, 0], interior[:, 1]] = 1
+            edge_removed.add(edge_id)
+            removed_cycle_count += 1
+            record["removed"] = True
+            break
+    cleanup_seconds = time.perf_counter() - cleanup_started
+    final_detection_started = time.perf_counter()
+    _final_chains, _final_endpoints, final_cycles = _chain_level_cycles(value)
+    detection_seconds += time.perf_counter() - final_detection_started
+    return {
+        "cleaned_skeleton": value.astype(np.uint8),
+        "detected_cycle_mask": detected_mask,
+        "removed_cycle_mask": removed_mask,
+        "cycle_detection_seconds": float(detection_seconds),
+        "cycle_cleanup_seconds": float(cleanup_seconds),
+        "raw_cycle_count": int(len(cycles)),
+        "small_cycle_count": int(small_cycle_count),
+        "removed_cycle_count": int(removed_cycle_count),
+        "preserved_cycle_count": int(len(cycles) - removed_cycle_count),
+        "final_cycle_count": int(len(final_cycles)),
+        "cycle_records": cycle_records,
+        "total_seconds": float(time.perf_counter() - started),
+    }
+
+
 def collapse_width_aware_junction_clusters(skeleton, candidate_mask, distance_transform):
     """Collapse nearby junction pixels while retaining every external port."""
     value = np.asarray(skeleton, dtype=np.uint8) > 0
@@ -3143,33 +3442,45 @@ def collapse_width_aware_junction_clusters(skeleton, candidate_mask, distance_tr
         if np.any(members):
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
             expanded |= cv2.dilate(members, kernel)
-    cluster_count, cluster_labels = cv2.connectedComponents(expanded, 8)
+    cluster_count, cluster_labels, cluster_stats, _ = cv2.connectedComponentsWithStats(
+        expanded, 8
+    )
     collapsed = value.copy()
     collapsed_zones = np.zeros(value.shape, dtype=np.uint8)
     logical_junctions = np.zeros(value.shape, dtype=np.uint8)
     accepted_clusters = 0
     for cluster_id in range(1, cluster_count):
-        zone = cluster_labels == cluster_id
-        inside = zone & collapsed
+        col, row, width, height, _area = map(int, cluster_stats[cluster_id])
+        row0, row1 = max(0, row - 1), min(value.shape[0], row + height + 1)
+        col0, col1 = max(0, col - 1), min(value.shape[1], col + width + 1)
+        local_cluster_labels = cluster_labels[row0:row1, col0:col1]
+        zone = local_cluster_labels == cluster_id
+        local_collapsed = collapsed[row0:row1, col0:col1]
+        inside = zone & local_collapsed
         if np.count_nonzero(inside) < 2:
             continue
         ring = (cv2.dilate(zone.astype(np.uint8), np.ones((3, 3), dtype=np.uint8)) > 0) & ~zone
-        ports = ring & collapsed
+        ports = ring & local_collapsed
         port_count, port_labels = cv2.connectedComponents(ports.astype(np.uint8), 8)
         if port_count - 1 < 3:
             continue
         inside_points = np.column_stack(np.where(inside))
         centroid = np.mean(inside_points.astype(np.float32), axis=0)
         center_scores = np.linalg.norm(inside_points - centroid[None, :], axis=1)
-        center_scores -= 0.20 * distance[inside_points[:, 0], inside_points[:, 1]]
-        center = inside_points[int(np.argmin(center_scores))]
+        global_inside = inside_points + np.asarray([row0, col0], dtype=np.int32)
+        center_scores -= 0.20 * distance[global_inside[:, 0], global_inside[:, 1]]
+        center_local = inside_points[int(np.argmin(center_scores))]
+        center = center_local + np.asarray([row0, col0], dtype=np.int32)
         connections = []
         valid = True
         for port_id in range(1, port_count):
             port_points = np.column_stack(np.where(port_labels == port_id))
             if not len(port_points):
                 continue
-            port = port_points[int(np.argmin(np.linalg.norm(port_points - center[None, :], axis=1)))]
+            port_local = port_points[int(np.argmin(
+                np.linalg.norm(port_points - center_local[None, :], axis=1)
+            ))]
+            port = port_local + np.asarray([row0, col0], dtype=np.int32)
             rr, cc = line(int(center[0]), int(center[1]), int(port[0]), int(port[1]))
             if float(np.mean(candidate[rr, cc])) < 0.90:
                 valid = False
@@ -3177,11 +3488,12 @@ def collapse_width_aware_junction_clusters(skeleton, candidate_mask, distance_tr
             connections.append((rr, cc))
         if not valid or len(connections) < 3:
             continue
-        collapsed[inside] = False
+        local_collapsed[inside] = False
         collapsed[int(center[0]), int(center[1])] = True
         for rr, cc in connections:
             collapsed[rr, cc] = True
-        collapsed_zones[zone] = 1
+        local_collapsed_zones = collapsed_zones[row0:row1, col0:col1]
+        local_collapsed_zones[zone] = 1
         logical_junctions[int(center[0]), int(center[1])] = 1
         accepted_clusters += 1
     return {
@@ -3205,8 +3517,13 @@ def simplify_skeleton_polylines(skeleton, *, epsilon=0.75):
     return simplified
 
 
-def extract_regularized_relative_centerline(candidate_mask):
-    """Run the simple candidate -> skeleton -> pruning -> junction pipeline."""
+def extract_regularized_relative_centerline(
+    candidate_mask,
+    *,
+    relative_score=None,
+    junction_collapse=False,
+):
+    """Run regularization, one skeletonization, local cleanup, and simplification."""
     started = time.perf_counter()
     regularized = regularize_relative_candidate(candidate_mask)
     candidate = regularized["regularized_candidate"]
@@ -3218,19 +3535,54 @@ def extract_regularized_relative_centerline(candidate_mask):
         raw_skeleton, regularized["distance_transform"]
     )
     spur_pruning_seconds = time.perf_counter() - pruning_started
-    collapse_started = time.perf_counter()
-    collapsed = collapse_width_aware_junction_clusters(
-        pruning["pruned_skeleton"], candidate, regularized["distance_transform"]
+    cycle_result = remove_width_scale_small_cycles(
+        pruning["pruned_skeleton"],
+        regularized["distance_transform"],
+        relative_score=relative_score,
     )
+    collapse_started = time.perf_counter()
+    if junction_collapse:
+        collapsed = collapse_width_aware_junction_clusters(
+            cycle_result["cleaned_skeleton"], candidate, regularized["distance_transform"]
+        )
+    else:
+        cycle_skeleton = cycle_result["cleaned_skeleton"].astype(np.uint8)
+        adjacency = _skeleton_adjacency(cycle_skeleton > 0)
+        junction_mask = np.zeros(cycle_skeleton.shape, dtype=np.uint8)
+        for point, neighbors in adjacency.items():
+            if len(neighbors) >= 3:
+                junction_mask[point] = 1
+        collapsed = {
+            "collapsed_skeleton": cycle_skeleton,
+            "junction_mask": junction_mask,
+            "collapsed_zone_mask": np.zeros(cycle_skeleton.shape, dtype=np.uint8),
+            "junction_pixel_count_before": int(np.count_nonzero(junction_mask)),
+            "junction_cluster_count_after": 0,
+        }
     junction_collapse_seconds = time.perf_counter() - collapse_started
     simplify_started = time.perf_counter()
     vector_paths = simplify_skeleton_polylines(collapsed["collapsed_skeleton"])
     vector_simplification_seconds = time.perf_counter() - simplify_started
+    cycle_pixels = cycle_result["detected_cycle_mask"] > 0
+
+    def cycle_hole_proximity(mask):
+        hole_mask = np.asarray(mask, dtype=np.uint8) > 0
+        if not np.any(cycle_pixels) or not np.any(hole_mask):
+            return 0.0
+        nearest_hole = distance_transform_edt(~hole_mask).astype(np.float32)
+        local_scale = regularized["distance_transform"][cycle_pixels]
+        return float(np.mean(
+            nearest_hole[cycle_pixels] <= (2.0 * np.maximum(local_scale, 1.0) + 2.0)
+        ))
+
     audit = {
         **regularized["performance"],
         "skeletonize_seconds": float(skeletonize_seconds),
         "spur_pruning_seconds": float(spur_pruning_seconds),
+        "cycle_detection_seconds": float(cycle_result["cycle_detection_seconds"]),
+        "cycle_cleanup_seconds": float(cycle_result["cycle_cleanup_seconds"]),
         "junction_collapse_seconds": float(junction_collapse_seconds),
+        "junction_collapse_active": bool(junction_collapse),
         "vector_simplification_seconds": float(vector_simplification_seconds),
         "total_seconds": float(time.perf_counter() - started),
         "skeleton_length_before_pruning": int(np.count_nonzero(raw_skeleton)),
@@ -3238,6 +3590,17 @@ def extract_regularized_relative_centerline(candidate_mask):
         "final_skeleton_length": int(np.count_nonzero(collapsed["collapsed_skeleton"])),
         "spur_removed_count": int(pruning["spur_removed_count"]),
         "spur_removed_length": float(pruning["spur_removed_length"]),
+        "raw_cycle_count": int(cycle_result["raw_cycle_count"]),
+        "small_cycle_count": int(cycle_result["small_cycle_count"]),
+        "removed_cycle_count": int(cycle_result["removed_cycle_count"]),
+        "preserved_cycle_count": int(cycle_result["preserved_cycle_count"]),
+        "final_cycle_count": int(cycle_result["final_cycle_count"]),
+        "cycle_near_detected_hole_fraction": cycle_hole_proximity(
+            regularized["detected_hole_mask"]
+        ),
+        "cycle_near_filled_hole_fraction": cycle_hole_proximity(
+            regularized["filled_hole_mask"]
+        ),
         "junction_pixel_count_before": int(collapsed["junction_pixel_count_before"]),
         "junction_cluster_count_after": int(collapsed["junction_cluster_count_after"]),
     }
@@ -3246,8 +3609,16 @@ def extract_regularized_relative_centerline(candidate_mask):
         "distance_transform": regularized["distance_transform"],
         "raw_skeleton": raw_skeleton,
         "pruned_skeleton": pruning["pruned_skeleton"],
+        "cycle_cleaned_skeleton": cycle_result["cleaned_skeleton"],
         "final_skeleton": collapsed["collapsed_skeleton"],
         "removed_spur_mask": pruning["removed_spur_mask"],
+        "detected_hole_mask": regularized["detected_hole_mask"],
+        "filled_hole_mask": regularized["filled_hole_mask"],
+        "preserved_hole_mask": regularized["preserved_hole_mask"],
+        "narrow_hole_mask": regularized["narrow_hole_mask"],
+        "detected_cycle_mask": cycle_result["detected_cycle_mask"],
+        "removed_cycle_mask": cycle_result["removed_cycle_mask"],
+        "cycle_records": cycle_result["cycle_records"],
         "junction_mask": collapsed["junction_mask"],
         "collapsed_zone_mask": collapsed["collapsed_zone_mask"],
         "vector_paths": vector_paths,
@@ -3729,7 +4100,14 @@ def _regularized_relative_context(
     distance_scale,
 ):
     """Build the Relative context from the regularized-skeleton experiment."""
-    result = extract_regularized_relative_centerline(candidate)
+    junction_collapse_active = bool(
+        _config_value(config, "RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL", False)
+    )
+    result = extract_regularized_relative_centerline(
+        candidate,
+        relative_score=relative_score,
+        junction_collapse=junction_collapse_active,
+    )
     regularized_candidate = result["regularized_candidate"]
     raw_skeleton = result["raw_skeleton"]
     pruned_skeleton = result["pruned_skeleton"]
@@ -3834,6 +4212,7 @@ def _regularized_relative_context(
         "regularized_centerline_length": centerline_length,
         "continuous_tracing_experimental_active": False,
         "regularized_skeleton_experimental_active": True,
+        "relative_junction_collapse_experimental_active": junction_collapse_active,
         "continuous_trace_count": 0,
         "continuous_centerline_component_count": 0,
         "continuous_centerline_length": 0.0,
@@ -3863,7 +4242,16 @@ def _regularized_relative_context(
         "relative_regularized_candidate": regularized_candidate.astype(np.uint8),
         "relative_regularized_raw_skeleton": raw_skeleton.astype(np.uint8),
         "relative_regularized_pruned_skeleton": pruned_skeleton.astype(np.uint8),
+        "relative_regularized_cycle_cleaned_skeleton": result[
+            "cycle_cleaned_skeleton"
+        ].astype(np.uint8),
         "relative_regularized_final_skeleton": relative_skeleton.astype(np.uint8),
+        "relative_detected_hole_mask": result["detected_hole_mask"].astype(np.uint8),
+        "relative_filled_hole_mask": result["filled_hole_mask"].astype(np.uint8),
+        "relative_preserved_hole_mask": result["preserved_hole_mask"].astype(np.uint8),
+        "relative_narrow_hole_mask": result["narrow_hole_mask"].astype(np.uint8),
+        "relative_detected_cycle_mask": result["detected_cycle_mask"].astype(np.uint8),
+        "relative_removed_cycle_mask": result["removed_cycle_mask"].astype(np.uint8),
         "relative_regularized_vector_paths": result["vector_paths"],
         "relative_skeleton_performance_audit": performance,
         "relative_binary_skeleton": raw_skeleton.astype(np.uint8),
