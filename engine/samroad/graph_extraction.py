@@ -4683,7 +4683,17 @@ def embed_relative_roadness_context(context, shape):
     for name, value in context.items():
         if name == "diagnostics":
             continue
-        array = np.asarray(value)
+        # Only image-shaped arrays need padding.  Regularized Skeleton also
+        # carries variable-length vector paths and dictionary audits; their
+        # coordinates remain valid because padding is added only at the bottom
+        # and right edges, so preserve those non-raster values unchanged.
+        if not isinstance(value, np.ndarray) or value.ndim != 2:
+            result[name] = value
+            continue
+        array = value
+        if array.shape == (height, width):
+            result[name] = array
+            continue
         canvas = np.zeros((height, width), dtype=array.dtype)
         copy_height = min(height, array.shape[0])
         copy_width = min(width, array.shape[1])

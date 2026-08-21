@@ -1,0 +1,18 @@
+{
+  "probability_shape": [
+    4096,
+    4096
+  ],
+  "effective_profile": "weak_sensor",
+  "relative_centerline_method": "regularized_skeleton",
+  "vector_path_count": 659,
+  "vector_path_lengths_min_max": [
+    2,
+    253
+  ],
+  "context_compute_seconds": 49.69380040001124,
+  "context_embed_seconds": 7.660000119358301e-05,
+  "same_shape_arrays_reused": true,
+  "final_skeleton_pixels": 55784,
+  "result_image": "C:\\Users\\zhoum\\geesing\\sam_road_change\\docs\\experiment_results\\relative_context_embed_fix_20260821\\relative_context_embed_4096_result.png"
+}

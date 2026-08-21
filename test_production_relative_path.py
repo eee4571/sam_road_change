@@ -25,6 +25,35 @@ from utils import load_config  # noqa: E402
 
 
 class ProductionRelativePathTests(unittest.TestCase):
+    def test_padding_context_preserves_variable_length_vector_paths(self):
+        vector_paths = [
+            np.asarray([[1, 2], [1, 3]], dtype=np.int32),
+            np.asarray([[4, 5], [5, 5], [6, 5]], dtype=np.int32),
+        ]
+        audit = {"total_seconds": 0.01}
+        context = {
+            "relative_score": np.ones((8, 10), dtype=np.float32),
+            "relative_regularized_final_skeleton": np.ones((8, 10), dtype=np.uint8),
+            "relative_regularized_vector_paths": vector_paths,
+            "relative_skeleton_performance_audit": audit,
+            "diagnostics": {"regularized_skeleton_experimental_active": True},
+        }
+
+        embedded = graph_extraction.embed_relative_roadness_context(context, (12, 16))
+
+        self.assertEqual(embedded["relative_score"].shape, (12, 16))
+        self.assertEqual(embedded["relative_regularized_final_skeleton"].shape, (12, 16))
+        self.assertIs(embedded["relative_regularized_vector_paths"], vector_paths)
+        self.assertIs(embedded["relative_skeleton_performance_audit"], audit)
+        self.assertEqual(embedded["valid_shape"], (8, 10))
+
+        same_shape = graph_extraction.embed_relative_roadness_context(context, (8, 10))
+        self.assertIs(same_shape["relative_score"], context["relative_score"])
+        self.assertIs(
+            same_shape["relative_regularized_final_skeleton"],
+            context["relative_regularized_final_skeleton"],
+        )
+
     def test_production_yaml_selects_validated_relative_path(self):
         config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
         self.assertIs(config["RELATIVE_ROADNESS_ENABLED"], True)

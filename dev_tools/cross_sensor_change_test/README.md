@@ -37,3 +37,36 @@ Outputs include `cross_sensor_report.json`, `cross_sensor_report.md`,
 
 The official layers contain only `qa_state=auto`. Orange review candidates remain
 separate and never become formal Added/Removed changes.
+
+## 3. Full production pipeline no-change regression bench
+
+`run_full_pipeline_pair_test.py` is the reusable end-to-end bench. It discovers
+the newest existing no-change `A_original.tif` / `B_degraded.tif` pair, verifies
+identical shape/CRS/transform/bounds, then invokes the production CLI only:
+
+`user_pipeline.py prepare -> extract -> change`
+
+Run both complete extractions and change detection from clean workspaces:
+
+```powershell
+python dev_tools/cross_sensor_change_test/run_full_pipeline_pair_test.py --device cuda --fresh
+```
+
+Reuse complete A/B extraction results and rerun only formal change detection:
+
+```powershell
+python dev_tools/cross_sensor_change_test/run_full_pipeline_pair_test.py --change-only
+```
+
+Explicit inputs take priority over discovery. Existing extraction results may
+also seed the stable cache with `--before-result` and `--after-result`.
+
+The default output is `outputs/full_pipeline_pair_test/`. It contains seven PNG
+diagnostics, per-feature line/surface and width CSV audits, false-change JSON,
+and `full_pipeline_report.json/.md`. Observed surface means the independent
+`*_molra_clean_mask.png` (falling back to the source SAM-MoLRA mask); the final
+Buffer-derived `road_surfaces.shp` is reported separately as product surface.
+
+Exit semantics: `PASS` has no auto changes or major width disagreement; `WARN`
+has review/suppressed or diagnostic width disagreements but no auto change;
+`FAIL` contains at least one official auto Added/Removed/Widened/Narrowed.
