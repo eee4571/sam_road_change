@@ -6566,6 +6566,14 @@ def postprocess_weak_road_network(
     regularized_active = bool(centerline_diagnostics.get(
         "regularized_skeleton_experimental_active", False
     ))
+    junction_collapse_active = bool(centerline_diagnostics.get(
+        "relative_junction_collapse_experimental_active", False
+    ))
+    relative_centerline_method = (
+        "regularized_skeleton" if regularized_active
+        else "continuous_trace" if continuous_active
+        else "ribbon"
+    )
     generated_centerline_length = float(
         centerline_diagnostics.get("regularized_centerline_length", 0.0)
         if regularized_active
@@ -6702,6 +6710,14 @@ def postprocess_weak_road_network(
         "relative_continuous_final_length_px": continuous_final_length,
         "relative_regularized_final_length_px": regularized_final_length,
         "final_total_centerline_length_px": final_total_length,
+        "relative_roadness_enabled": bool(relative_enabled),
+        "relative_centerline_method": relative_centerline_method,
+        "regularized_skeleton_active": regularized_active,
+        "continuous_tracing_active": continuous_active,
+        "junction_collapse_active": junction_collapse_active,
+        "endpoint_segment_recovery_active": bool(_config_value(
+            config, "WEAK_SEGMENT_RECOVERY_ENABLED", False
+        )),
         "centerline_to_final_retention_ratio": retention_ratio,
         "raw_centerline_to_final_retention": retention_ratio,
         "effective_centerline_to_final_retention": effective_retention_ratio,

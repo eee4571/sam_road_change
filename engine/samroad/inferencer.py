@@ -536,6 +536,31 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     )
     recovery_report = {
         'tile_count': len(recovery_summaries),
+        'relative_roadness_enabled': bool(config.get('RELATIVE_ROADNESS_ENABLED', False)),
+        'relative_centerline_method': (
+            'regularized_skeleton'
+            if config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
+            else 'continuous_trace'
+            if config.get('RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL', False)
+            else 'ribbon'
+        ),
+        'regularized_skeleton_active': bool(
+            config.get('RELATIVE_ROADNESS_ENABLED', False)
+            and config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
+        ),
+        'continuous_tracing_active': bool(
+            config.get('RELATIVE_ROADNESS_ENABLED', False)
+            and not config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
+            and config.get('RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL', False)
+        ),
+        'junction_collapse_active': bool(
+            config.get('RELATIVE_ROADNESS_ENABLED', False)
+            and config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
+            and config.get('RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL', False)
+        ),
+        'endpoint_segment_recovery_active': bool(
+            config.get('WEAK_SEGMENT_RECOVERY_ENABLED', False)
+        ),
         **{name: int(sum(row.get(name, 0) for row in recovery_summaries)) for name in total_fields},
         'recovery_reason_counts': {
             reason: int(sum(
@@ -967,6 +992,15 @@ if __name__ == "__main__":
         base_output_dir = create_output_dir_and_save_config(output_dir_prefix, config)
 
     requested_profile = str(config.get('ROAD_THRESHOLD_PROFILE', 'default'))
+    regularized_skeleton_active = bool(
+        config.get('RELATIVE_ROADNESS_ENABLED', False)
+        and config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
+    )
+    continuous_tracing_active = bool(
+        config.get('RELATIVE_ROADNESS_ENABLED', False)
+        and not regularized_skeleton_active
+        and config.get('RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL', False)
+    )
     with open(os.path.join(base_output_dir, 'inference_metadata.json'), 'w', encoding='utf-8') as file:
         json.dump(
             {
@@ -986,6 +1020,23 @@ if __name__ == "__main__":
                 'weak_bootstrap_enabled': bool(config.get('WEAK_BOOTSTRAP_ENABLED', True)),
                 'weak_bootstrap_only_if_low_confidence': bool(
                     config.get('WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE', True)
+                ),
+                'relative_roadness_enabled': bool(
+                    config.get('RELATIVE_ROADNESS_ENABLED', False)
+                ),
+                'relative_centerline_method': (
+                    'regularized_skeleton' if regularized_skeleton_active
+                    else 'continuous_trace' if continuous_tracing_active
+                    else 'ribbon'
+                ),
+                'regularized_skeleton_active': regularized_skeleton_active,
+                'continuous_tracing_active': continuous_tracing_active,
+                'junction_collapse_active': bool(
+                    regularized_skeleton_active
+                    and config.get('RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL', False)
+                ),
+                'endpoint_segment_recovery_active': bool(
+                    config.get('WEAK_SEGMENT_RECOVERY_ENABLED', False)
                 ),
                 'branch_aware_road_nms': True,
             },

@@ -253,6 +253,23 @@ def _ensure_extract_manifest_fields(result: dict | None) -> dict:
     ):
         if not payload.get(key) and products is not None and (products / name).is_file():
             payload[key] = str((products / name).resolve())
+    inference_metadata = (
+        run_root / "inference" / "road_graphs" / "inference_metadata.json"
+        if run_root is not None else None
+    )
+    if inference_metadata is not None and inference_metadata.is_file():
+        metadata = read_json(inference_metadata)
+        for key in (
+            "relative_roadness_enabled",
+            "relative_centerline_method",
+            "regularized_skeleton_active",
+            "continuous_tracing_active",
+            "junction_collapse_active",
+            "endpoint_segment_recovery_active",
+        ):
+            if key in metadata:
+                payload[key] = metadata[key]
+        payload["inference_metadata"] = str(inference_metadata.resolve())
     return payload
 
 

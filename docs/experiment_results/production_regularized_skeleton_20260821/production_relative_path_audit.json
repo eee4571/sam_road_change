@@ -1,0 +1,27 @@
+{
+  "config": "C:\\Users\\zhoum\\geesing\\sam_road_change\\config\\samroad_inference.yaml",
+  "requested_threshold_profile": "auto",
+  "effective_threshold_profile": "weak_sensor",
+  "relative_roadness_enabled": true,
+  "relative_centerline_method": "regularized_skeleton",
+  "regularized_skeleton_active": true,
+  "continuous_tracing_active": false,
+  "junction_collapse_active": false,
+  "endpoint_segment_recovery_active": false,
+  "hole_crack_fill_active": true,
+  "width_aware_spur_pruning_active": true,
+  "small_cycle_cleanup_active": true,
+  "candidate_pixel_count_before": 3354,
+  "candidate_pixel_count_after": 3371,
+  "filled_hole_count": 1,
+  "removed_spur_count": 0,
+  "removed_cycle_count": 0,
+  "final_skeleton_length": 268,
+  "timing_seconds": {
+    "hole_fill_seconds": 0.00201039994135499,
+    "spur_pruning_seconds": 0.0009612999856472015,
+    "cycle_cleanup_seconds": 3.00002284348011e-07,
+    "total_seconds": 0.012740200036205351
+  },
+  "result_image": "C:\\Users\\zhoum\\geesing\\sam_road_change\\docs\\experiment_results\\production_regularized_skeleton_20260821\\production_relative_path_result.png"
+}

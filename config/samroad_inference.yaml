@@ -93,6 +93,13 @@ RELATIVE_ROADNESS_MAX_TORTUOSITY: 1.5
 RELATIVE_ROADNESS_ABSOLUTE_SUPPRESSION_PX: 3.0
 RELATIVE_ROADNESS_CLOSE_KERNEL: 3
 
+# Production Relative centerline path validated by weak-road recovery experiments.
+RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL: true
+# Historical Continuous Trace path; intentionally disabled in production.
+RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL: false
+# Junction collapse currently provides little production benefit.
+RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL: false
+
 # ===== Conservative weak-road recovery =====
 WEAK_RECOVERY_ENABLED: true
 WEAK_RECOVERY_MAX_GAP_PX: 64.0
