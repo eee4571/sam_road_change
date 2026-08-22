@@ -82,6 +82,9 @@ TOPO_CANDIDATE_THRESHOLD: 0.2
 # response with a multi-scale local background. Percentiles are relative-score
 # ranks, not alternate raw road-probability thresholds.
 RELATIVE_ROADNESS_ENABLED: true
+# Keep Relative Roadness as a post-TopoNet supplemental branch. Injecting its
+# skeleton points into TopoNet can greatly increase graph-query cost.
+RELATIVE_INJECT_INTO_TOPONET: false
 RELATIVE_ROADNESS_BACKGROUND_SCALES_PX: [9, 21, 41]
 RELATIVE_ROADNESS_NORMAL_WEAK_PERCENTILE: 45.0
 RELATIVE_ROADNESS_NORMAL_STRONG_PERCENTILE: 95.0

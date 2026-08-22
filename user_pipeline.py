@@ -261,6 +261,7 @@ def _ensure_extract_manifest_fields(result: dict | None) -> dict:
         metadata = read_json(inference_metadata)
         for key in (
             "relative_roadness_enabled",
+            "relative_injected_into_toponet",
             "relative_centerline_method",
             "regularized_skeleton_active",
             "continuous_tracing_active",

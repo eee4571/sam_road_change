@@ -161,6 +161,37 @@ def gather_inference_inputs(input_dir="", input_txt_dir=""):
     return batches
 
 
+def _synchronize_cuda_for_timing():
+    """Synchronize only at coarse per-image timing boundaries."""
+    if str(args.device).lower().startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def resolve_relative_context_for_postprocess(
+    road_mask,
+    config,
+    *,
+    scene_state,
+    distance_scale=1.0,
+    precomputed_context=None,
+):
+    """Return a shape-compatible Relative context and the actual call count."""
+    expected_shape = np.asarray(road_mask).shape
+    if precomputed_context is not None:
+        relative_score = np.asarray(precomputed_context.get("relative_score", []))
+        if relative_score.shape == expected_shape:
+            return precomputed_context, 0
+    return (
+        graph_extraction.compute_relative_roadness(
+            road_mask,
+            config,
+            scene_state=scene_state,
+            distance_scale=distance_scale,
+        ),
+        1,
+    )
+
+
 def run_inference_on_images(net, config, input_img_paths, output_dir, input_label):
     total_inference_seconds = 0.0
     recovery_summaries = []
@@ -206,7 +237,7 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
         elif infer_height > config.PATCH_SIZE or infer_width > config.PATCH_SIZE:
             print('  Input image is larger than patch size; running sliding-window inference.')
 
-        start_seconds = time.time()
+        image_start_seconds = time.perf_counter()
         (
             pred_nodes,
             pred_edges,
@@ -216,11 +247,12 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             itsc_mask,
             road_mask,
             profile_decision,
+            precomputed_relative_context,
+            performance_summary,
         ) = infer_one_img(
             net, padded_img, image_config,
             diagnostic_shape=(infer_height, infer_width),
         )
-        total_inference_seconds += (time.time() - start_seconds)
 
         itsc_mask = itsc_mask[:infer_height, :infer_width]
         road_mask = road_mask[:infer_height, :infer_width]
@@ -243,16 +275,26 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             )
 
         postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
-        relative_context = graph_extraction.compute_relative_roadness(
+        relative_start_seconds = time.perf_counter()
+        relative_context, additional_relative_calls = resolve_relative_context_for_postprocess(
             road_mask,
             image_config,
             scene_state=profile_decision["scene_confidence_state"],
             distance_scale=postprocess_distance_scale,
+            precomputed_context=precomputed_relative_context,
         )
-        relative_context["diagnostics"]["relative_graph_point_count"] = int(
-            profile_decision.get("relative_graph_point_count", 0)
+        performance_summary["relative_roadness_seconds"] += float(
+            time.perf_counter() - relative_start_seconds
         )
+        performance_summary["relative_compute_call_count"] += int(additional_relative_calls)
+        relative_context["diagnostics"].update({
+            "relative_injected_into_toponet": performance_summary[
+                "relative_injected_into_toponet"
+            ],
+        })
+        profile_decision.update(relative_context.get("diagnostics", {}))
         bootstrap_candidate_audit = []
+        weak_start_seconds = time.perf_counter()
         pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
             pred_nodes,
             pred_edges,
@@ -266,6 +308,26 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             topology_candidate_edges=candidate_edges,
             topology_candidate_scores=candidate_confidences,
         )
+        performance_summary["weak_postprocess_seconds"] = float(
+            time.perf_counter() - weak_start_seconds
+        )
+        performance_summary.update({
+            "relative_graph_point_count": int(
+                recovery_summary.get("relative_graph_point_count", 0)
+            ),
+            "toponet_candidate_edge_count": int(candidate_edges.shape[0]),
+            "toponet_pred_edge_count": int(sum(
+                float(score) > float(image_config.TOPO_THRESHOLD)
+                for score in candidate_confidences.tolist()
+            )),
+            "relative_final_centerline_length": float(
+                recovery_summary.get("relative_final_length_px", 0.0)
+            ),
+        })
+        performance_summary["total_image_seconds"] = float(
+            time.perf_counter() - image_start_seconds
+        )
+        total_inference_seconds += performance_summary["total_image_seconds"]
         edge_confidences = np.asarray(
             [row["topology_probability"] for row in edge_metadata], dtype=np.float32
         )
@@ -275,6 +337,7 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             "tile": img_id,
             **profile_decision,
             **recovery_summary,
+            **performance_summary,
             "requested_profile": profile_decision["requested_profile"],
             "effective_profile": profile_decision["effective_profile"],
         }
@@ -533,10 +596,22 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
         'relative_candidate_count', 'relative_accepted_candidate_count',
         'relative_recovered_edge_count', 'relative_auto_count',
         'relative_review_count', 'relative_rejected_count',
+        'relative_compute_call_count', 'native_graph_point_count',
+        'relative_graph_point_count', 'toponet_graph_point_count',
+        'toponet_candidate_edge_count', 'toponet_pred_edge_count',
+    )
+    timing_fields = (
+        'mask_inference_seconds', 'native_graph_and_toponet_seconds',
+        'relative_roadness_seconds', 'weak_postprocess_seconds',
+        'total_image_seconds', 'relative_final_centerline_length',
     )
     recovery_report = {
         'tile_count': len(recovery_summaries),
         'relative_roadness_enabled': bool(config.get('RELATIVE_ROADNESS_ENABLED', False)),
+        'relative_injected_into_toponet': bool(
+            config.get('RELATIVE_ROADNESS_ENABLED', False)
+            and config.get('RELATIVE_INJECT_INTO_TOPONET', False)
+        ),
         'relative_centerline_method': (
             'regularized_skeleton'
             if config.get('RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL', False)
@@ -562,6 +637,10 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             config.get('WEAK_SEGMENT_RECOVERY_ENABLED', False)
         ),
         **{name: int(sum(row.get(name, 0) for row in recovery_summaries)) for name in total_fields},
+        **{
+            name: float(sum(float(row.get(name, 0.0)) for row in recovery_summaries))
+            for name in timing_fields
+        },
         'recovery_reason_counts': {
             reason: int(sum(
                 row.get('recovery_reason_counts', {}).get(reason, 0)
@@ -760,6 +839,8 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     # list of [B, D, h, w], len=batch_num
     img_features = list()
     img_mask = list()
+    _synchronize_cuda_for_timing()
+    mask_start_seconds = time.perf_counter()
     for batch_index in range(batch_num):
         offset = batch_index * batch_size
         batch_patch_info = all_patch_info[offset : offset + batch_size]
@@ -797,6 +878,8 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     # range 0-1 -> 0-255
     fused_keypoint_mask = (fused_keypoint_mask * 255).to(torch.uint8).cpu().numpy()
     fused_road_mask = (fused_road_mask * 255).to(torch.uint8).cpu().numpy()
+    _synchronize_cuda_for_timing()
+    mask_inference_seconds = float(time.perf_counter() - mask_start_seconds)
 
     print(fused_road_mask.shape)
     diagnostic_probability = fused_road_mask
@@ -807,37 +890,78 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         diagnostic_probability, config
     )
     config.ROAD_THRESHOLD_PROFILE = profile_decision["effective_profile"]
-    relative_context_unpadded = graph_extraction.compute_relative_roadness(
-        diagnostic_probability,
-        config,
-        scene_state=profile_decision["scene_confidence_state"],
+    relative_injected = bool(
+        config.get("RELATIVE_ROADNESS_ENABLED", False)
+        and config.get("RELATIVE_INJECT_INTO_TOPONET", False)
     )
-    relative_context = graph_extraction.embed_relative_roadness_context(
-        relative_context_unpadded, fused_road_mask.shape
-    )
-    profile_decision.update(relative_context_unpadded.get("diagnostics", {}))
-    graph_points = graph_extraction.extract_graph_points(
+    relative_context_unpadded = None
+    relative_context = None
+    relative_roadness_seconds = 0.0
+    relative_compute_call_count = 0
+    if relative_injected:
+        relative_start_seconds = time.perf_counter()
+        relative_context_unpadded = graph_extraction.compute_relative_roadness(
+            diagnostic_probability,
+            config,
+            scene_state=profile_decision["scene_confidence_state"],
+        )
+        relative_roadness_seconds = float(
+            time.perf_counter() - relative_start_seconds
+        )
+        relative_compute_call_count = 1
+        relative_context = graph_extraction.embed_relative_roadness_context(
+            relative_context_unpadded, fused_road_mask.shape
+        )
+
+    native_graph_start_seconds = time.perf_counter()
+    native_graph_points = graph_extraction.extract_graph_points(
         fused_keypoint_mask,
         fused_road_mask,
         config,
-        relative_context=relative_context,
+        relative_context=None,
     )
-    relative_graph_point_count = 0
-    if len(graph_points):
-        relative_skeleton = np.asarray(relative_context.get('relative_only_skeleton', []))
-        if relative_skeleton.shape == fused_road_mask.shape:
-            point_cols = np.clip(np.rint(graph_points[:, 0]).astype(np.int32), 0, relative_skeleton.shape[1] - 1)
-            point_rows = np.clip(np.rint(graph_points[:, 1]).astype(np.int32), 0, relative_skeleton.shape[0] - 1)
-            relative_graph_point_count = int(np.count_nonzero(relative_skeleton[point_rows, point_cols]))
-    profile_decision['relative_graph_point_count'] = relative_graph_point_count
+    graph_points = native_graph_points
+    if relative_injected:
+        graph_points = graph_extraction.extract_graph_points(
+            fused_keypoint_mask,
+            fused_road_mask,
+            config,
+            relative_context=relative_context,
+        )
+    performance_summary = {
+        "mask_inference_seconds": mask_inference_seconds,
+        "native_graph_and_toponet_seconds": 0.0,
+        "relative_roadness_seconds": relative_roadness_seconds,
+        "weak_postprocess_seconds": 0.0,
+        "total_image_seconds": 0.0,
+        "relative_injected_into_toponet": relative_injected,
+        "relative_compute_call_count": relative_compute_call_count,
+        "native_graph_point_count": int(native_graph_points.shape[0]),
+        "relative_graph_point_count": 0,
+        "toponet_graph_point_count": int(graph_points.shape[0]),
+        "toponet_candidate_edge_count": 0,
+        "toponet_pred_edge_count": 0,
+        "relative_final_centerline_length": 0.0,
+    }
+    profile_decision.update({
+        "relative_injected_into_toponet": relative_injected,
+        "native_graph_point_count": performance_summary["native_graph_point_count"],
+        "toponet_graph_point_count": performance_summary["toponet_graph_point_count"],
+    })
+    if relative_context_unpadded is not None:
+        profile_decision.update(relative_context_unpadded.get("diagnostics", {}))
     if graph_points.shape[0] == 0:
         print(1)
         print(graph_points)
         empty_edges = np.zeros((0, 2), dtype=np.int32)
         empty_scores = np.zeros((0,), dtype=np.float32)
+        performance_summary["native_graph_and_toponet_seconds"] = float(
+            time.perf_counter() - native_graph_start_seconds
+        )
         return (
             graph_points, empty_edges, empty_scores, empty_edges, empty_scores,
             fused_keypoint_mask, fused_road_mask, profile_decision,
+            relative_context_unpadded, performance_summary,
         )
     # for box query
     graph_rtree = rtree.index.Index()
@@ -945,6 +1069,12 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     candidate_edges = np.asarray(candidate_edges, dtype=np.int32).reshape(-1, 2)
     candidate_edge_scores = np.asarray(candidate_edge_scores, dtype=np.float32)
     pred_nodes = graph_points[:, ::-1]  # to rc
+    _synchronize_cuda_for_timing()
+    performance_summary["native_graph_and_toponet_seconds"] = float(
+        time.perf_counter() - native_graph_start_seconds
+    )
+    performance_summary["toponet_candidate_edge_count"] = int(candidate_edges.shape[0])
+    performance_summary["toponet_pred_edge_count"] = int(pred_edges.shape[0])
 
     return (
         pred_nodes,
@@ -955,6 +1085,8 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         fused_keypoint_mask,
         fused_road_mask,
         profile_decision,
+        relative_context_unpadded,
+        performance_summary,
     )
 
 if __name__ == "__main__":
@@ -1023,6 +1155,10 @@ if __name__ == "__main__":
                 ),
                 'relative_roadness_enabled': bool(
                     config.get('RELATIVE_ROADNESS_ENABLED', False)
+                ),
+                'relative_injected_into_toponet': bool(
+                    config.get('RELATIVE_ROADNESS_ENABLED', False)
+                    and config.get('RELATIVE_INJECT_INTO_TOPONET', False)
                 ),
                 'relative_centerline_method': (
                     'regularized_skeleton' if regularized_skeleton_active

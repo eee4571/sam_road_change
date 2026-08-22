@@ -57,10 +57,15 @@ class ProductionRelativePathTests(unittest.TestCase):
     def test_production_yaml_selects_validated_relative_path(self):
         config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
         self.assertIs(config["RELATIVE_ROADNESS_ENABLED"], True)
+        self.assertIs(config["RELATIVE_INJECT_INTO_TOPONET"], False)
         self.assertIs(config["RELATIVE_REGULARIZED_SKELETON_EXPERIMENTAL"], True)
         self.assertIs(config["RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL"], False)
         self.assertIs(config["RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL"], False)
+        self.assertIs(config["WEAK_RECOVERY_ENABLED"], True)
+        self.assertIs(config["WEAK_BOOTSTRAP_ENABLED"], True)
         self.assertIs(config["WEAK_SEGMENT_RECOVERY_ENABLED"], False)
+        self.assertEqual(config["MAX_NEIGHBOR_QUERIES"], 16)
+        self.assertEqual(config["TOPO_SAMPLE_NUM"], 512)
 
     def test_production_config_runs_regularized_skeleton_centerline(self):
         config = load_config(CONFIG_PATH)
@@ -146,6 +151,7 @@ class ProductionRelativePathTests(unittest.TestCase):
             metadata_path.parent.mkdir(parents=True)
             user_pipeline.write_json(metadata_path, {
                 "relative_roadness_enabled": True,
+                "relative_injected_into_toponet": False,
                 "relative_centerline_method": "regularized_skeleton",
                 "regularized_skeleton_active": True,
                 "continuous_tracing_active": False,
@@ -158,6 +164,7 @@ class ProductionRelativePathTests(unittest.TestCase):
             })
 
         self.assertEqual(manifest["relative_centerline_method"], "regularized_skeleton")
+        self.assertIs(manifest["relative_injected_into_toponet"], False)
         self.assertIs(manifest["regularized_skeleton_active"], True)
         self.assertIs(manifest["continuous_tracing_active"], False)
         self.assertIs(manifest["junction_collapse_active"], False)

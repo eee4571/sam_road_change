@@ -6875,9 +6875,11 @@ def extract_graph_points(keypoint_mask, road_mask, config, *, relative_context=N
         kps_0 = nms_points(kps_0, np.ones(kps_0.shape[0]), config.ROAD_NMS_RADIUS)
     road_skel_mask = skeletonize_road_mask(road_mask, high_threshold * 255)
     relative_score = None
-    if relative_context is not None and bool(
+    relative_injected = bool(
         _config_value(config, "RELATIVE_ROADNESS_ENABLED", False)
-    ):
+        and _config_value(config, "RELATIVE_INJECT_INTO_TOPONET", False)
+    )
+    if relative_context is not None and relative_injected:
         combined = np.asarray(relative_context.get("combined_skeleton", []))
         if combined.shape == road_skel_mask.shape:
             road_skel_mask = np.maximum(
