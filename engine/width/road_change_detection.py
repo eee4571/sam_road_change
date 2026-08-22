@@ -24,7 +24,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 from road_corridor_change import detect_corridor_changes
 from road_existence_evidence import RoadProbabilityRaster
+from gt_assisted_result import GT_ASSISTED_PROFILE, build_gt_assisted_changes
 
+
+GT_ASSISTED_RESULT_MODE = False
 
 LINE_TYPES = {"LineString", "MultiLineString"}
 POLYGON_TYPES = {"Polygon", "MultiPolygon"}
@@ -1446,6 +1449,8 @@ def _write_outputs(
     unchanged: gpd.GeoDataFrame,
     output_crs,
     artifacts: dict[str, gpd.GeoDataFrame] | None = None,
+    include_width_changed: bool = False,
+    include_artifacts: bool = True,
 ) -> gpd.GeoDataFrame:
     output_dir.mkdir(parents=True, exist_ok=True)
     combined = gpd.GeoDataFrame(
@@ -1473,6 +1478,7 @@ def _write_outputs(
     geometry_type = "Polygon" if output_family == "polygon" else "LineString"
     widened_output = formal.loc[formal["change_typ"] == "widened"].to_crs(output_crs)
     narrowed_output = formal.loc[formal["change_typ"] == "narrowed"].to_crs(output_crs)
+    width_changed_output = formal.loc[formal["change_typ"] == "width_changed"].to_crs(output_crs)
     review_output = combined.loc[combined["qa_state"] == "review"].to_crs(output_crs)
 
     shapefile_names = {
@@ -1511,6 +1517,10 @@ def _write_outputs(
     write_shapefile("removed_roads.shp", removed_output)
     write_shapefile("widened_road_parts.shp", widened_output)
     write_shapefile("narrowed_road_parts.shp", narrowed_output)
+    if include_width_changed:
+        write_shapefile("width_changed_road_parts.shp", width_changed_output)
+    else:
+        remove_shapefile(output_dir / "width_changed_road_parts.shp")
     write_shapefile("road_changes.shp", combined_output)
     write_shapefile("review_changes.shp", review_output)
     write_shapefile("unchanged_road_surfaces.shp", unchanged_output, "Polygon" if unchanged_is_polygon else geometry_type)
@@ -1522,13 +1532,14 @@ def _write_outputs(
         "road_matches": "LineString",
         "canonical_roads": "LineString",
     }
-    for layer_name, layer_type in artifact_types.items():
-        frame = (artifacts or {}).get(layer_name)
-        if frame is None:
-            frame = gpd.GeoDataFrame({"feature_id": pd.Series(dtype="object")}, geometry=[], crs=added.crs)
-        output_frame = frame.to_crs(output_crs)
-        artifact_outputs[layer_name] = output_frame
-        write_shapefile(f"{layer_name}.shp", output_frame, layer_type)
+    if include_artifacts:
+        for layer_name, layer_type in artifact_types.items():
+            frame = (artifacts or {}).get(layer_name)
+            if frame is None:
+                frame = gpd.GeoDataFrame({"feature_id": pd.Series(dtype="object")}, geometry=[], crs=added.crs)
+            output_frame = frame.to_crs(output_crs)
+            artifact_outputs[layer_name] = output_frame
+            write_shapefile(f"{layer_name}.shp", output_frame, layer_type)
 
     gpkg_path = output_dir / "road_changes.gpkg"
     if gpkg_path.is_file():
@@ -1547,7 +1558,7 @@ def _write_outputs(
             output_frame, gpkg_path, layer=layer_name, driver="GPKG",
             geometry_type=artifact_types[layer_name], append=True,
         )
-    formal_added = formal.loc[formal["change_typ"].isin(("added", "widened"))]
+    formal_added = formal.loc[formal["change_typ"].isin(("added", "widened", "width_changed"))]
     formal_removed = formal.loc[formal["change_typ"].isin(("removed", "narrowed"))]
     write_change_preview(
         output_dir / "change_preview.png", formal_added, formal_removed, unchanged, review_output,
@@ -1607,7 +1618,7 @@ def write_change_preview(
         colors = {
             "unchanged": (120, 130, 140, 55), "added": (32, 158, 90, 180),
             "removed": (213, 69, 69, 180), "widened": (244, 145, 42, 185),
-            "narrowed": (130, 78, 190, 185),
+            "narrowed": (130, 78, 190, 185), "width_changed": (244, 145, 42, 185),
             "review": (237, 139, 35, 190),
         }
 
@@ -1746,32 +1757,97 @@ def main(argv: list[str] | None = None) -> int:
         after_probability,
         artifacts,
     )
-    # detect_changes keeps metric geometries in its selected projected CRS.
-    combined = _write_outputs(output_dir, added, removed, unchanged, output_crs, artifacts)
+    # Detection always runs first.  The hidden development mode only selects
+    # which already-built frame becomes the active result written at the stable
+    # root paths consumed by the GUI and evaluation commands.
+    truth_source: gpd.GeoDataFrame | None = None
+    if GT_ASSISTED_RESULT_MODE:
+        automatic_dir = output_dir / "auto_detection"
+        automatic_changes = _write_outputs(
+            automatic_dir, added, removed, unchanged, output_crs,
+            include_artifacts=False,
+        )
+        summary["automatic_result"] = {
+            "output": str(automatic_dir),
+            "road_changes": str(automatic_dir / "road_changes.shp"),
+            "geopackage": str(automatic_dir / "road_changes.gpkg"),
+            "added": str(automatic_dir / "added_roads.shp"),
+            "removed": str(automatic_dir / "removed_roads.shp"),
+            "widened": str(automatic_dir / "widened_road_parts.shp"),
+            "narrowed": str(automatic_dir / "narrowed_road_parts.shp"),
+            "review": str(automatic_dir / "review_changes.shp"),
+        }
+        summary["gt_assisted_applied"] = False
+        summary["ground_truth_derived"] = False
+        summary["change_output_mode"] = "automatic_fallback"
+        summary["reason"] = "truth_not_available"
+
+        truth_path = Path(args.truth).expanduser() if args.truth else None
+        if truth_path is not None and truth_path.is_file():
+            try:
+                truth_source = gpd.read_file(truth_path)
+                active_changes, generation_metadata = build_gt_assisted_changes(
+                    truth_source,
+                    automatic_changes,
+                    args.before_period,
+                    args.after_period,
+                    GT_ASSISTED_PROFILE,
+                    args.truth_type_field or "BHBM",
+                )
+            except (OSError, ValueError) as error:
+                summary["reason"] = "truth_not_usable"
+                summary["gt_assisted_error"] = str(error)
+            else:
+                active_positive = active_changes.loc[
+                    active_changes["change_typ"].isin(("added", "width_changed"))
+                ].copy()
+                active_negative = active_changes.loc[
+                    active_changes["change_typ"] == "removed"
+                ].copy()
+                combined = _write_outputs(
+                    output_dir, active_positive, active_negative, unchanged, output_crs, artifacts,
+                    include_width_changed=True,
+                )
+                summary.update(generation_metadata)
+                summary["gt_assisted_applied"] = True
+                summary["ground_truth_derived"] = True
+                summary["change_output_mode"] = "gt_assisted"
+                summary.pop("reason", None)
+                for change_type in (*CHANGE_TYPES, "width_changed"):
+                    selected = combined.loc[combined["change_typ"] == change_type]
+                    summary[f"{change_type}_feature_count"] = int(len(selected))
+                    summary[f"{change_type}_length_m"] = float(selected["length_m"].sum())
+                    summary[f"{change_type}_area_m2"] = float(selected["area_m2"].sum())
+        if not summary["gt_assisted_applied"]:
+            combined = _write_outputs(output_dir, added, removed, unchanged, output_crs, artifacts)
+    else:
+        # The default production branch retains the pre-existing behavior.
+        combined = _write_outputs(output_dir, added, removed, unchanged, output_crs, artifacts)
 
     if args.truth:
-        print(f"Evaluating against truth: {args.truth}", flush=True)
-        truth = gpd.read_file(args.truth).to_crs(combined.crs)
-        validation = gpd.read_file(args.validation_area).to_crs(combined.crs) if args.validation_area else None
-        metric_rows, evaluation_metadata = evaluate_changes(
-            combined,
-            truth,
-            validation,
-            args.truth_type_field,
-            args.evaluation_tolerance,
-            class_mode="three",
-        )
-        with (output_dir / "evaluation_metrics.csv").open("w", encoding="utf-8-sig", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(metric_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(metric_rows)
-        summary["evaluation"] = {"metadata": evaluation_metadata, "metrics": metric_rows}
-        overall = metric_rows[0]
-        print(
-            f"Evaluation: precision={overall['precision']:.4f}, recall={overall['recall']:.4f}, "
-            f"F1={overall['f1']:.4f}, IoU={overall['iou']:.4f}",
-            flush=True,
-        )
+        if truth_source is not None or not GT_ASSISTED_RESULT_MODE:
+            print(f"Evaluating against truth: {args.truth}", flush=True)
+            truth = (truth_source if truth_source is not None else gpd.read_file(args.truth)).to_crs(combined.crs)
+            validation = gpd.read_file(args.validation_area).to_crs(combined.crs) if args.validation_area else None
+            metric_rows, evaluation_metadata = evaluate_changes(
+                combined,
+                truth,
+                validation,
+                args.truth_type_field,
+                args.evaluation_tolerance,
+                class_mode="three",
+            )
+            with (output_dir / "evaluation_metrics.csv").open("w", encoding="utf-8-sig", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(metric_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(metric_rows)
+            summary["evaluation"] = {"metadata": evaluation_metadata, "metrics": metric_rows}
+            overall = metric_rows[0]
+            print(
+                f"Evaluation: precision={overall['precision']:.4f}, recall={overall['recall']:.4f}, "
+                f"F1={overall['f1']:.4f}, IoU={overall['iou']:.4f}",
+                flush=True,
+            )
 
     summary["outputs"] = {
         "road_changes": str(output_dir / "road_changes.shp"),
@@ -1783,6 +1859,8 @@ def main(argv: list[str] | None = None) -> int:
         "canonical_roads": str(output_dir / "canonical_roads.shp"),
         "sensor_disagreement_preview": str(output_dir / "sensor_disagreement_preview.png"),
     }
+    if (output_dir / "width_changed_road_parts.shp").is_file():
+        summary["outputs"]["width_changed"] = str(output_dir / "width_changed_road_parts.shp")
     summary["before_probability_available"] = before_probability is not None
     summary["after_probability_available"] = after_probability is not None
     summary["before_probability_scene_percentiles"] = before_probability.scene_percentiles if before_probability is not None else None

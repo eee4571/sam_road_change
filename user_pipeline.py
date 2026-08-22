@@ -291,6 +291,7 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
             ("changes", "road_changes.shp"), ("review", "review_changes.shp"),
             ("added", "added_roads.shp"), ("removed", "removed_roads.shp"),
             ("widened", "widened_road_parts.shp"), ("narrowed", "narrowed_road_parts.shp"),
+            ("width_changed", "width_changed_road_parts.shp"),
             ("width_segments", "road_width_segments.shp"), ("corridors", "road_corridors.shp"),
             ("matches", "road_matches.shp"), ("canonical_roads", "canonical_roads.shp"),
         ):
@@ -2236,6 +2237,11 @@ def change(args: argparse.Namespace) -> dict:
         "canonical_roads": str(output / "canonical_roads.shp"),
         "evaluation_metrics": str(output / "evaluation_metrics.csv") if (output / "evaluation_metrics.csv").is_file() else None,
     }, output)
+    if summary.is_file():
+        summary_payload = read_json(summary)
+        for key in ("automatic_result", "change_output_mode", "ground_truth_derived"):
+            if key in summary_payload:
+                result[key] = summary_payload[key]
     result["stage_timings"] = [timing] if isinstance(timing, dict) else []
     result["elapsed_seconds"] = elapsed_seconds(started)
     result["completed_at"] = now_text()
@@ -2384,7 +2390,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         summary_probe = read_json(summary_path) if summary_path.is_file() else {}
         detected_count = sum(
             int(summary_probe.get(f"{change_type}_feature_count", 0) or 0)
-            for change_type in ("added", "removed", "widened", "narrowed")
+            for change_type in ("added", "removed", "widened", "narrowed", "width_changed")
         )
         if detected_count:
             raise FileNotFoundError(f"变化摘要记录了 {detected_count} 个对象，但成果 GPKG 不存在：{gpkg}")

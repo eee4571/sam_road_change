@@ -30,6 +30,7 @@ CONF_FIELDS = ("confidence", "conf", "center_p", "gap_score")
 STATUS_CODES = {"present": "P", "absent": "A", "uncertain": "U", "no_data": "N"}
 EVENT_CODES = {
     "added": "A", "removed": "R", "widened": "W", "narrowed": "N",
+    "width_changed": "C",
     "uncertain": "U",
 }
 
@@ -475,7 +476,10 @@ def _event_parts(
 ) -> list[dict]:
     reference_geometries = [item["geometry"] for item in references]
     tree = STRtree(np.asarray(reference_geometries, dtype=object)) if reference_geometries else None
-    event_lookup = {(item["road_id"], item["from_per"], item["to_per"], item["event_typ"]): item["event_id"] for item in events}
+    event_lookup = {
+        (item["road_id"], item["from_per"], item["to_per"], item["event_typ"]): item
+        for item in events
+    }
     rows = []
     for entry in change_entries:
         path = Path(str(entry.get("output", ""))) / "road_changes.shp"
@@ -506,9 +510,37 @@ def _event_parts(
                 _support, _distance, ref_index = max(ranked)
                 road_id = references[ref_index]["road_id"]
             event_type = str(source.get("change_typ", ""))
+            event_key = (road_id, before_period, after_period, event_type)
+            if event_type == "width_changed" and event_key not in event_lookup and road_id:
+                # The pair result intentionally carries no widened/narrowed direction.
+                # If temporal widths produced a directional event, replace that label
+                # with the authoritative generic class instead of inferring a direction.
+                directional = next((
+                    item for item in events
+                    if item["road_id"] == road_id
+                    and item["from_per"] == before_period
+                    and item["to_per"] == after_period
+                    and item["event_typ"] in {"widened", "narrowed"}
+                ), None)
+                if directional is not None:
+                    old_key = (road_id, before_period, after_period, directional["event_typ"])
+                    event_lookup.pop(old_key, None)
+                    directional["event_typ"] = "width_changed"
+                    event_lookup[event_key] = directional
+                else:
+                    event = {
+                        "event_id": f"EV{len(events) + 1:08d}", "road_id": road_id,
+                        "from_per": before_period, "to_per": after_period,
+                        "event_typ": "width_changed", "before_st": "present", "after_st": "present",
+                        "before_w": np.nan, "after_w": np.nan, "width_diff": np.nan,
+                        "event_cf": 0.0, "evidence": "pair_change_only",
+                        "qa_state": "auto", "geometry": references[ref_index]["geometry"],
+                    }
+                    events.append(event)
+                    event_lookup[event_key] = event
             for part_index, part in enumerate(_polygon_parts(geometry)):
                 rows.append({
-                    "event_id": event_lookup.get((road_id, before_period, after_period, event_type), ""),
+                    "event_id": event_lookup.get(event_key, {}).get("event_id", ""),
                     "road_id": road_id, "from_per": before_period, "to_per": after_period,
                     "event_typ": event_type,
                     "source_id": f"{source.get('change_id', source_index)}:{part_index}",
