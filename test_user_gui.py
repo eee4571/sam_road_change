@@ -500,6 +500,32 @@ class UserGuiArtifactTests(unittest.TestCase):
             }, root)
             self.assertEqual([item["category"] for item in items], ["融合", "重新测宽"])
 
+    def test_change_and_review_previews_are_separate_gui_items(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            formal = root / "change_preview.png"
+            review = root / "review_preview.png"
+            formal.touch()
+            review.touch()
+            manifest = {"period_results": [], "change_results": [{
+                "grid": "g", "before_period": "2021", "after_period": "2022",
+                "previews": {"change": str(formal), "review_change": str(review)},
+            }]}
+
+            items = gui.collect_preview_items(manifest, root)
+            tree = gui.collect_result_tree_items(manifest, root)
+
+            self.assertEqual(
+                [item["category"] for item in items],
+                ["最终变化结果", "待复核变化"],
+            )
+            preview_nodes = {
+                item["label"]: item for item in tree
+                if item["label"] in {"最终变化结果", "待复核变化"}
+            }
+            self.assertEqual(preview_nodes["最终变化结果"]["path"], str(formal.resolve()))
+            self.assertEqual(preview_nodes["待复核变化"]["path"], str(review.resolve()))
+
     def test_collects_temporal_life_shp_for_attribute_table(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

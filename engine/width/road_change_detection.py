@@ -1479,7 +1479,8 @@ def _write_outputs(
     widened_output = formal.loc[formal["change_typ"] == "widened"].to_crs(output_crs)
     narrowed_output = formal.loc[formal["change_typ"] == "narrowed"].to_crs(output_crs)
     width_changed_output = formal.loc[formal["change_typ"] == "width_changed"].to_crs(output_crs)
-    review_output = combined.loc[combined["qa_state"] == "review"].to_crs(output_crs)
+    review = combined.loc[combined["qa_state"] == "review"]
+    review_output = review.to_crs(output_crs)
 
     shapefile_names = {
         "audit_reason": "audit_reas", "before_state": "bef_state", "after_state": "aft_state",
@@ -1558,14 +1559,31 @@ def _write_outputs(
             output_frame, gpkg_path, layer=layer_name, driver="GPKG",
             geometry_type=artifact_types[layer_name], append=True,
         )
-    formal_added = formal.loc[formal["change_typ"].isin(("added", "widened", "width_changed"))]
-    formal_removed = formal.loc[formal["change_typ"].isin(("removed", "narrowed"))]
-    write_change_preview(
-        output_dir / "change_preview.png", formal_added, formal_removed, unchanged, review_output,
+    render_change_preview(
+        output_dir / "change_preview.png",
+        formal,
+        unchanged,
+        title="Final Auto-Confirmed Road Changes",
+        empty_message="No auto-confirmed road changes",
     )
-    write_change_preview(
+    render_change_preview(
+        output_dir / "review_preview.png",
+        review,
+        unchanged,
+        title="Road Change Review Candidates",
+        empty_message="No review candidates",
+        review_mode=True,
+    )
+    # Retain this historical diagnostic filename for downstream compatibility.
+    # It deliberately uses the same review-only data rather than mixing review
+    # candidates back into the formal change preview.
+    render_change_preview(
         output_dir / "sensor_disagreement_preview.png",
-        formal_added.iloc[0:0], formal_removed.iloc[0:0], unchanged, review_output,
+        review,
+        unchanged,
+        title="Sensor / Extraction Disagreement Review",
+        empty_message="No sensor or extraction disagreement candidates",
+        review_mode=True,
     )
     return formal
 
@@ -1588,71 +1606,151 @@ def write_change_preview(
     unchanged: gpd.GeoDataFrame,
     review: gpd.GeoDataFrame | None = None,
 ) -> None:
-    """Write a self-contained PNG map for change QA, including empty detections."""
+    """Write the formal auto-confirmed preview (legacy call signature).
+
+    ``review`` is retained for source compatibility only.  Review candidates
+    must never be drawn into the formal preview; use ``render_change_preview``
+    with ``review_mode=True`` for those features.
+    """
+    del review
+    changes = gpd.GeoDataFrame(
+        pd.concat([added, removed], ignore_index=True),
+        geometry="geometry",
+        crs=added.crs,
+    )
+    if "qa_state" in changes.columns:
+        changes = changes.loc[changes["qa_state"].fillna("auto") == "auto"]
+    render_change_preview(
+        path,
+        changes,
+        unchanged,
+        title="Final Auto-Confirmed Road Changes",
+        empty_message="No auto-confirmed road changes",
+    )
+
+
+def render_change_preview(
+    path: Path,
+    changes: gpd.GeoDataFrame,
+    reference: gpd.GeoDataFrame,
+    *,
+    title: str,
+    empty_message: str,
+    review_mode: bool = False,
+) -> None:
+    """Render one formal or review-only change map using shared drawing code."""
     path.parent.mkdir(parents=True, exist_ok=True)
     width, height, margin = 1100, 760, 58
+    plot_top, footer_height = 76, 88
     image = Image.new("RGBA", (width, height), (250, 252, 253, 255))
     draw = ImageDraw.Draw(image, "RGBA")
     font = ImageFont.load_default()
-    frames = (("unchanged", unchanged), ("changes", added), ("changes", removed), ("review", review))
+    frames = (reference, changes)
     geometries = [
-        geometry for _name, frame in frames if frame is not None
+        geometry for frame in frames if frame is not None
         for geometry in frame.geometry if geometry is not None and not geometry.is_empty
     ]
-    if not geometries:
-        draw.text((margin, margin), "Road change preview", fill=(20, 45, 60, 255), font=font)
-        draw.text((margin, margin + 34), "No detected road changes", fill=(75, 90, 105, 255), font=font)
-    else:
+    draw.text((margin, 18), title, fill=(20, 45, 60, 255), font=font)
+    if changes.empty:
+        draw.text((margin, 40), empty_message, fill=(75, 90, 105, 255), font=font)
+
+    colors = {
+        "unchanged": (120, 130, 140), "added": (32, 158, 90),
+        "removed": (213, 69, 69), "widened": (244, 145, 42),
+        "narrowed": (130, 78, 190), "width_changed": (244, 145, 42),
+    }
+    review_outline = (230, 126, 34, 255)
+
+    def normalized_type(value: object, fallback: str = "unchanged") -> str:
+        change_type = str(value or fallback).strip().lower()
+        return change_type if change_type in colors else fallback
+
+    present_types: list[str] = []
+    if "change_typ" in changes.columns:
+        for value in changes["change_typ"]:
+            change_type = normalized_type(value, "added")
+            if change_type not in present_types:
+                present_types.append(change_type)
+
+    if review_mode and present_types:
+        labels = {
+            "added": "Suspected Added", "removed": "Suspected Removed",
+            "widened": "Suspected Widened", "width_changed": "Suspected Widened",
+            "narrowed": "Suspected Narrowed",
+        }
+        counts = [
+            f"{labels[change_type]}: {int(sum(normalized_type(value, 'added') == change_type for value in changes['change_typ']))}"
+            for change_type in present_types if change_type in labels
+        ]
+        if counts:
+            draw.text((margin, 40), " | ".join(counts), fill=(75, 90, 105, 255), font=font)
+
+    if geometries:
         minx = min(geometry.bounds[0] for geometry in geometries)
         miny = min(geometry.bounds[1] for geometry in geometries)
         maxx = max(geometry.bounds[2] for geometry in geometries)
         maxy = max(geometry.bounds[3] for geometry in geometries)
         span_x, span_y = max(maxx - minx, 1e-9), max(maxy - miny, 1e-9)
-        scale = min((width - 2 * margin) / span_x, (height - 2 * margin - 52) / span_y)
+        plot_height = height - plot_top - footer_height
+        scale = min((width - 2 * margin) / span_x, plot_height / span_y)
         offset_x = margin + ((width - 2 * margin) - span_x * scale) / 2
-        offset_y = margin + 52 + ((height - 2 * margin - 52) - span_y * scale) / 2
+        offset_y = plot_top + (plot_height - span_y * scale) / 2
 
         def pixels(coords):
             return [(offset_x + (x - minx) * scale, offset_y + (maxy - y) * scale) for x, y in coords]
 
-        colors = {
-            "unchanged": (120, 130, 140, 55), "added": (32, 158, 90, 180),
-            "removed": (213, 69, 69, 180), "widened": (244, 145, 42, 185),
-            "narrowed": (130, 78, 190, 185), "width_changed": (244, 145, 42, 185),
-            "review": (237, 139, 35, 190),
-        }
-
-        def render(frame: gpd.GeoDataFrame, default_type: str) -> None:
+        def render(frame: gpd.GeoDataFrame, default_type: str, as_review: bool = False) -> None:
             for _, row in frame.iterrows():
-                change_type = str(row.get("change_typ", default_type)).lower()
-                color = colors.get(change_type, colors[default_type])
+                change_type = normalized_type(row.get("change_typ", default_type), default_type)
+                base = colors[change_type]
                 geometry = row.geometry
                 for part in _preview_parts(geometry):
                     if part.geom_type == "Polygon":
-                        draw.polygon(pixels(part.exterior.coords), fill=color, outline=color[:3] + (255,))
+                        if as_review:
+                            pale = tuple(round(channel + (255 - channel) * 0.35) for channel in base)
+                            coords = pixels(part.exterior.coords)
+                            draw.polygon(coords, fill=pale + (165,))
+                            draw.line(coords, fill=review_outline, width=5, joint="curve")
+                            draw.line(coords, fill=base + (255,), width=2, joint="curve")
+                        else:
+                            alpha = 55 if change_type == "unchanged" else 185
+                            draw.polygon(pixels(part.exterior.coords), fill=base + (alpha,), outline=base + (255,))
                     else:
-                        draw.line(pixels(part.coords), fill=color[:3] + (255,), width=4)
+                        if as_review:
+                            coords = pixels(part.coords)
+                            draw.line(coords, fill=review_outline, width=8)
+                            draw.line(coords, fill=base + (255,), width=4)
+                        else:
+                            draw.line(pixels(part.coords), fill=base + (255,), width=4)
 
-        render(unchanged, "unchanged")
-        render(added, "added")
-        render(removed, "removed")
-        if review is not None:
-            for _, row in review.iterrows():
-                geometry = row.geometry
-                color = colors["review"]
-                for part in _preview_parts(geometry):
-                    if part.geom_type == "Polygon":
-                        draw.polygon(pixels(part.exterior.coords), fill=color, outline=color[:3] + (255,))
-                    else:
-                        draw.line(pixels(part.coords), fill=color[:3] + (255,), width=4)
-        draw.text((margin, 18), "Road change preview", fill=(20, 45, 60, 255), font=font)
+        render(reference, "unchanged")
+        render(changes, "added", as_review=review_mode)
 
-    legend = (("Added", (32, 158, 90)), ("Removed", (213, 69, 69)), ("Review", (237, 139, 35)), ("Unchanged", (120, 130, 140)))
-    x = margin
-    for label_text, color in legend:
-        draw.rectangle((x, height - 32, x + 16, height - 16), fill=color + (255,))
-        draw.text((x + 22, height - 32), label_text, fill=(40, 52, 64, 255), font=font)
-        x += 120
+    formal_labels = {
+        "added": "Added", "removed": "Removed", "widened": "Widened",
+        "narrowed": "Narrowed", "width_changed": "Width Changed",
+    }
+    review_labels = {
+        "added": "Review - Suspected Added", "removed": "Review - Suspected Removed",
+        "widened": "Review - Suspected Widened", "width_changed": "Review - Suspected Widened",
+        "narrowed": "Review - Suspected Narrowed",
+    }
+    labels = review_labels if review_mode else formal_labels
+    legend = [(labels[value], colors[value], review_mode) for value in present_types if value in labels]
+    if not reference.empty:
+        legend.append(("Road reference / Unchanged", colors["unchanged"], False))
+    x, y = margin, height - 54
+    for label_text, color, outlined in legend:
+        item_width = 54 + len(label_text) * 7
+        if x + item_width > width - margin:
+            x, y = margin, y + 28
+        fill = color if not outlined else tuple(round(channel + (255 - channel) * 0.35) for channel in color)
+        draw.rectangle(
+            (x, y, x + 16, y + 16), fill=fill + (255,),
+            outline=review_outline if outlined else color + (255,), width=2,
+        )
+        draw.text((x + 22, y), label_text, fill=(40, 52, 64, 255), font=font)
+        x += item_width
     image.convert("RGB").save(path, format="PNG")
 
 

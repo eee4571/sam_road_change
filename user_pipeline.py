@@ -143,8 +143,20 @@ def discover_preview_paths(run_root: Path) -> dict[str, str | None]:
 
 def discover_change_preview(output: Path) -> str | None:
     """Return ``change_preview.png`` only when the change stage created it."""
-    path = Path(output).expanduser() / "change_preview.png"
-    return str(path.resolve()) if path.is_file() else None
+    return discover_change_previews(output)["change"]
+
+
+def discover_change_previews(output: Path) -> dict[str, str | None]:
+    """Discover separate formal and review previews with legacy-safe keys."""
+    root = Path(output).expanduser()
+    paths = {
+        "change": root / "change_preview.png",
+        "review_change": root / "review_preview.png",
+    }
+    return {
+        key: str(path.resolve()) if path.is_file() else None
+        for key, path in paths.items()
+    }
 
 
 def _manual_review_item_count(review_dir: Path) -> int:
@@ -279,11 +291,11 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
     target = output or (Path(payload["output"]).expanduser() if payload.get("output") else None)
     previews = dict(payload.get("previews")) if isinstance(payload.get("previews"), dict) else {}
     if target is not None:
-        preview = discover_change_preview(target)
-        if preview is not None:
-            previews["change"] = preview
-        else:
-            previews.pop("change", None)
+        for key, preview in discover_change_previews(target).items():
+            if preview is not None:
+                previews[key] = preview
+            else:
+                previews.pop(key, None)
     payload["previews"] = previews
     if target is not None:
         layers = dict(payload.get("layers")) if isinstance(payload.get("layers"), dict) else {}

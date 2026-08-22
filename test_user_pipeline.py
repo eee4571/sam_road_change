@@ -934,6 +934,27 @@ class ManifestMetadataTests(unittest.TestCase):
             preview.touch()
             self.assertEqual(user_pipeline.discover_change_preview(output), str(preview.resolve()))
 
+    def test_change_manifest_records_formal_and_review_previews(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw)
+            formal = output / "change_preview.png"
+            review = output / "review_preview.png"
+            formal.touch()
+            review.touch()
+
+            payload = user_pipeline._ensure_change_manifest_fields(
+                {"output": str(output), "previews": {"legacy": "kept"}}, output,
+            )
+
+            self.assertEqual(payload["previews"]["change"], str(formal.resolve()))
+            self.assertEqual(payload["previews"]["review_change"], str(review.resolve()))
+            self.assertEqual(payload["previews"]["legacy"], "kept")
+
+            review.unlink()
+            legacy_payload = user_pipeline._ensure_change_manifest_fields(payload, output)
+            self.assertEqual(legacy_payload["previews"]["change"], str(formal.resolve()))
+            self.assertNotIn("review_change", legacy_payload["previews"])
+
     def test_fusion_metadata_reports_automatic_and_manual_changes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_root = Path(raw)

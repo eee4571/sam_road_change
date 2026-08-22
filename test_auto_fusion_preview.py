@@ -6,6 +6,7 @@ import unittest
 import csv
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import geopandas as gpd
 import cv2
@@ -732,9 +733,69 @@ class ChangePreviewTests(unittest.TestCase):
             detected = Path(tmp) / "detected"
             change._write_outputs(detected, added, removed, unchanged, crs)
             self.assertTrue((detected / "change_preview.png").is_file())
+            self.assertTrue((detected / "review_preview.png").is_file())
             detected_empty = Path(tmp) / "detected_empty"
             change._write_outputs(detected_empty, added.iloc[0:0], removed.iloc[0:0], unchanged.iloc[0:0], crs)
             self.assertTrue((detected_empty / "change_preview.png").is_file())
+            self.assertTrue((detected_empty / "review_preview.png").is_file())
+            self.assertGreater((detected_empty / "review_preview.png").stat().st_size, 100)
+
+    def test_only_review_rows_are_sent_exclusively_to_review_preview(self) -> None:
+        crs = "EPSG:3857"
+        added = gpd.GeoDataFrame(
+            {"change_typ": ["added"], "qa_state": ["review"]},
+            geometry=[Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])], crs=crs,
+        )
+        removed = gpd.GeoDataFrame(
+            {"change_typ": ["removed"], "qa_state": ["review"]},
+            geometry=[Polygon([(3, 0), (5, 0), (5, 2), (3, 2)])], crs=crs,
+        )
+        unchanged = gpd.GeoDataFrame(geometry=[], crs=crs)
+        captured: dict[str, list[str]] = {}
+
+        def capture(path, rows, _reference, **_kwargs):
+            captured[Path(path).name] = list(rows["change_typ"])
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(change, "render_change_preview", side_effect=capture), \
+                patch.object(change.pyogrio, "write_dataframe"), \
+                patch.object(gpd.GeoDataFrame, "to_file"):
+            change._write_outputs(
+                Path(tmp), added, removed, unchanged, crs, include_artifacts=False,
+            )
+
+        self.assertEqual(captured["change_preview.png"], [])
+        self.assertCountEqual(captured["review_preview.png"], ["added", "removed"])
+
+    def test_formal_and_review_rows_are_sent_to_separate_previews(self) -> None:
+        crs = "EPSG:3857"
+        added = gpd.GeoDataFrame(
+            {"change_typ": ["added", "widened"], "qa_state": ["auto", "auto"]},
+            geometry=[
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(3, 0), (5, 0), (5, 2), (3, 2)]),
+            ], crs=crs,
+        )
+        removed = gpd.GeoDataFrame(
+            {"change_typ": ["removed"], "qa_state": ["review"]},
+            geometry=[Polygon([(6, 0), (8, 0), (8, 2), (6, 2)])], crs=crs,
+        )
+        unchanged = gpd.GeoDataFrame(geometry=[], crs=crs)
+        captured: dict[str, list[str]] = {}
+
+        def capture(path, rows, _reference, **_kwargs):
+            captured[Path(path).name] = list(rows["change_typ"])
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(change, "render_change_preview", side_effect=capture), \
+                patch.object(change.pyogrio, "write_dataframe"), \
+                patch.object(gpd.GeoDataFrame, "to_file"):
+            change._write_outputs(
+                Path(tmp), added, removed, unchanged, crs, include_artifacts=False,
+            )
+
+        self.assertCountEqual(captured["change_preview.png"], ["added", "widened"])
+        self.assertEqual(captured["review_preview.png"], ["removed"])
 
 
 class FusionComparisonTests(unittest.TestCase):

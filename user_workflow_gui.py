@@ -37,7 +37,8 @@ PREVIEW_LABELS = {
     "surface": "路面提取",
     "fusion": "融合",
     "width": "重新测宽",
-    "change": "变化检测",
+    "change": "最终变化结果",
+    "review_change": "待复核变化",
 }
 
 WORKFLOW_STEPS = (
@@ -187,7 +188,7 @@ def _display_scope(entry: dict, change: bool = False) -> tuple[str, str]:
 
 
 def collect_preview_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
-    """Collect only formal final-result previews from the manifest contract.
+    """Collect final-result and clearly separated review previews.
 
     Old manifests simply yield an empty list; callers can then explain that the
     task must be rerun to populate the new ``previews`` fields.
@@ -232,16 +233,17 @@ def collect_preview_items(manifest: dict, base_dir: Path | None = None) -> list[
         previews = raw_entry.get("previews")
         if not isinstance(previews, dict):
             continue
-        path = _manifest_path(previews.get("change"), base_dir)
-        if path is None or not path.is_file():
-            continue
-        items.append({
-            "label": f"{grid} · {scope} · {PREVIEW_LABELS['change']}",
-            "category": PREVIEW_LABELS["change"],
-            "grid": grid,
-            "scope": scope,
-            "path": str(path),
-        })
+        for key in ("change", "review_change"):
+            path = _manifest_path(previews.get(key), base_dir)
+            if path is None or not path.is_file():
+                continue
+            items.append({
+                "label": f"{grid} · {scope} · {PREVIEW_LABELS[key]}",
+                "category": PREVIEW_LABELS[key],
+                "grid": grid,
+                "scope": scope,
+                "path": str(path),
+            })
     return items
 
 
@@ -656,7 +658,10 @@ def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> l
         before, after = str(entry.get("before_period") or "前期"), str(entry.get("after_period") or "后期")
         pair_id = f"{parent}:change:{before}:{after}:{index}"
         items.append({"id": pair_id, "parent": parent, "label": f"{before} → {after}", "path": "", "status": str(entry.get("status") or "")})
-        add(f"{pair_id}:result", pair_id, "变化检测结果", entry.get("gpkg") or entry.get("summary") or entry.get("output"))
+        add(f"{pair_id}:result", pair_id, "变化检测数据", entry.get("gpkg") or entry.get("summary") or entry.get("output"))
+        previews = entry.get("previews") if isinstance(entry.get("previews"), dict) else {}
+        add(f"{pair_id}:formal-preview", pair_id, "最终变化结果", previews.get("change"))
+        add(f"{pair_id}:review-preview", pair_id, "待复核变化", previews.get("review_change"))
     temporal_by_area = {
         str(entry.get("grid") or "validation"): entry
         for entry in (manifest.get("temporal_results", []) or []) if isinstance(entry, dict)
