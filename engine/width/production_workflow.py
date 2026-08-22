@@ -6,6 +6,8 @@ import heapq
 import json
 import pickle
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -18,6 +20,7 @@ from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, reproject
 from shapely.geometry import LineString, Point, Polygon, box, shape
 from shapely.ops import linemerge, snap, substring, unary_union
+from shapely.strtree import STRtree
 
 
 FINAL_CENTERLINE_GEOMETRY_POLICY = (
@@ -886,11 +889,80 @@ def _merge_global_gap_surfaces(road_surface, centerlines: list[dict], pixel_size
     return merged, len(connectors), max(0.0, float(merged.area) - original_area)
 
 
+def _stable_strtree_candidate_indices(
+    tree: STRtree,
+    query_geometry,
+    source_geometries: list,
+    identity_indices: dict[int, list[int]],
+    wkb_indices: dict[bytes, list[int]],
+) -> list[int] | None:
+    """Return source-order STRtree hits across Shapely 1.x and 2.x APIs."""
+    try:
+        hits = tree.query(query_geometry)
+    except Exception:
+        return None
+    hit_array = np.asarray(hits)
+    if hit_array.size == 0:
+        return []
+    if np.issubdtype(hit_array.dtype, np.integer):
+        return sorted({int(index) for index in hit_array.tolist()})
+    indices: list[int] = []
+    for geometry in list(hits):
+        matched = identity_indices.get(id(geometry))
+        if matched is None:
+            try:
+                matched = wkb_indices.get(geometry.wkb)
+            except Exception:
+                return None
+        if matched is None:
+            return None
+        indices.extend(matched)
+    return sorted(set(indices))
+
+
+def _strict_grid_window(source_transform, source_shape, target_transform, target_shape):
+    """Prove exact pixel-grid alignment and return destination slices."""
+    source_coefficients = np.asarray(
+        [source_transform.a, source_transform.b, source_transform.d, source_transform.e],
+        dtype=np.float64,
+    )
+    target_coefficients = np.asarray(
+        [target_transform.a, target_transform.b, target_transform.d, target_transform.e],
+        dtype=np.float64,
+    )
+    tolerance = max(float(np.max(np.abs(target_coefficients))), 1.0) * 1e-9
+    if not np.allclose(source_coefficients, target_coefficients, rtol=0.0, atol=tolerance):
+        return None
+    try:
+        column_offset, row_offset = (~target_transform) * (source_transform.c, source_transform.f)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    rounded_column, rounded_row = int(round(column_offset)), int(round(row_offset))
+    if not np.isclose(column_offset, rounded_column, rtol=0.0, atol=1e-7):
+        return None
+    if not np.isclose(row_offset, rounded_row, rtol=0.0, atol=1e-7):
+        return None
+    source_height, source_width = (int(source_shape[0]), int(source_shape[1]))
+    target_height, target_width = (int(target_shape[0]), int(target_shape[1]))
+    if (
+        rounded_row < 0 or rounded_column < 0
+        or rounded_row + source_height > target_height
+        or rounded_column + source_width > target_width
+    ):
+        return None
+    return (
+        slice(rounded_row, rounded_row + source_height),
+        slice(rounded_column, rounded_column + source_width),
+    )
+
+
 def _fuse_centerline_records(
     centerlines: list[dict],
     source_contexts: dict[str, dict],
     canonical_network=None,
     match_tolerance: float = 1.5,
+    *,
+    use_spatial_index: bool = True,
 ) -> list[dict]:
     """Conflate duplicate tile lines onto one network and arbitrate width attributes."""
     source_parts = [
@@ -916,6 +988,14 @@ def _fuse_centerline_records(
     manual_sources = {"manual_boundary_measurement"}
     fused: list[dict] = []
     tolerance = max(float(match_tolerance), 1e-6)
+    source_geometries = [row["geometry"] for row in source_parts]
+    source_tree = STRtree(source_geometries) if use_spatial_index else None
+    identity_indices: dict[int, list[int]] = defaultdict(list)
+    wkb_indices: dict[bytes, list[int]] = defaultdict(list)
+    if source_tree is not None:
+        for source_index, geometry in enumerate(source_geometries):
+            identity_indices[id(geometry)].append(source_index)
+            wkb_indices[geometry.wkb].append(source_index)
 
     for global_id, part in enumerate(fused_parts):
         if part.length <= 1e-6:
@@ -925,7 +1005,19 @@ def _fuse_centerline_records(
         part_direction = _line_direction(part)
         observations = []
         provenance = []
-        for row in source_parts:
+        candidate_indices = None
+        if source_tree is not None:
+            candidate_indices = _stable_strtree_candidate_indices(
+                source_tree,
+                part.buffer(tolerance),
+                source_geometries,
+                identity_indices,
+                wkb_indices,
+            )
+        if candidate_indices is None:
+            candidate_indices = range(len(source_parts))
+        for source_index in candidate_indices:
+            row = source_parts[source_index]
             geometry = row["geometry"]
             if geometry.distance(part) > tolerance:
                 continue
@@ -1038,6 +1130,8 @@ def _fuse_surface_masks(
     crs,
     feather_pixels: float = 256.0,
     continuous: bool = False,
+    *,
+    allow_direct_placement: bool = True,
 ):
     """Blend georeferenced binary masks or continuous probabilities."""
     if not surface_sources:
@@ -1074,22 +1168,29 @@ def _fuse_surface_masks(
         warped_mask = np.zeros((height, width), dtype=np.float32)
         warped_weight = np.zeros((height, width), dtype=np.float32)
         warped_coverage = np.zeros((height, width), dtype=np.float32)
+        placement = (
+            _strict_grid_window(source["transform"], mask.shape, transform, (height, width))
+            if allow_direct_placement else None
+        )
         for source_array, destination, resampling in (
             (mask, warped_mask, Resampling.bilinear),
             (weight, warped_weight, Resampling.bilinear),
             (coverage, warped_coverage, Resampling.nearest),
         ):
-            reproject(
-                source=source_array,
-                destination=destination,
-                src_transform=source["transform"],
-                src_crs=crs,
-                dst_transform=transform,
-                dst_crs=crs,
-                resampling=resampling,
-                src_nodata=None,
-                dst_nodata=0,
-            )
+            if placement is not None:
+                destination[placement] = source_array
+            else:
+                reproject(
+                    source=source_array,
+                    destination=destination,
+                    src_transform=source["transform"],
+                    src_crs=crs,
+                    dst_transform=transform,
+                    dst_crs=crs,
+                    resampling=resampling,
+                    src_nodata=None,
+                    dst_nodata=0,
+                )
         effective_weight = warped_weight * (warped_coverage > 0.5)
         numerator += warped_mask * effective_weight
         denominator += effective_weight
@@ -1210,6 +1311,7 @@ def export_final_products(
     surface_shp: Path | None = None,
     stitched_centerlines: Path | None = None,
 ) -> dict:
+    export_started = time.perf_counter()
     centerlines: list[dict] = []
     road_surfaces: list[dict] = []
     surface_sources: list[dict] = []
@@ -1404,7 +1506,10 @@ def export_final_products(
                 canonical_is_authoritative = stitched_layer == "edited_centerlines"
     pixel_sizes = [context["feather_distance"] / 256.0 for context in source_contexts.values()]
     match_tolerance = max(1.5 * float(np.median(pixel_sizes)), 1e-6) if pixel_sizes else 1.5
+    centerline_fusion_started = time.perf_counter()
     fused_centerlines = _fuse_centerline_records(centerlines, source_contexts, canonical_network, match_tolerance)
+    centerline_fusion_seconds = time.perf_counter() - centerline_fusion_started
+    surface_fusion_started = time.perf_counter()
     fused_surface_mask, fused_surface_transform, _ = _fuse_surface_masks(surface_sources, crs)
     fused_centerline_probability, fused_centerline_transform, _ = _fuse_surface_masks(
         centerline_probability_sources,
@@ -1443,6 +1548,7 @@ def export_final_products(
     )
     fused_surfaces = ([{"source": "sammolra_feathered_surface_fusion_with_global_gap_buffers", "geometry": fused_surface_geometry}]
                       if fused_surface_geometry is not None and not fused_surface_geometry.is_empty else [])
+    surface_fusion_seconds = time.perf_counter() - surface_fusion_started
 
     exported_centerlines = []
     for row in fused_centerlines:
@@ -1497,6 +1603,7 @@ def export_final_products(
     if centerline_shp is None and surface_shp is None and output is None:
         raise ValueError("At least one SHP output or GeoPackage output is required")
 
+    vector_writing_started = time.perf_counter()
     if centerline_shp is not None:
         centerline_shp.parent.mkdir(parents=True, exist_ok=True)
         fused_centerline_frame.to_file(centerline_shp, driver="ESRI Shapefile")
@@ -1519,6 +1626,7 @@ def export_final_products(
         for layer, rows in layers.items():
             if rows:
                 gpd.GeoDataFrame(rows, geometry="geometry", crs=crs).to_file(output, layer=layer, driver="GPKG")
+    vector_writing_seconds = time.perf_counter() - vector_writing_started
 
     report_dir = (
         centerline_shp.parent if centerline_shp is not None
@@ -1526,7 +1634,9 @@ def export_final_products(
         else output.parent
     )
     visualization = visualization or report_dir / "road_width_overview.png"
+    visualization_started = time.perf_counter()
     visualization_report = _write_final_visualization(layers, crs, visualization, background_images)
+    visualization_seconds = time.perf_counter() - visualization_started
     report = {
         "geopackage": str(output) if output is not None else "",
         "centerline_shp": str(centerline_shp) if centerline_shp is not None else "",
@@ -1534,6 +1644,13 @@ def export_final_products(
         "width_segments_shp": str(width_segment_shp),
         "corridors_shp": str(corridor_shp),
         "visualization": visualization_report,
+        "profiling": {
+            "centerline_fusion_seconds": float(centerline_fusion_seconds),
+            "surface_fusion_seconds": float(surface_fusion_seconds),
+            "vector_writing_seconds": float(vector_writing_seconds),
+            "visualization_seconds": float(visualization_seconds),
+            "total_seconds": float(time.perf_counter() - export_started),
+        },
         "fusion": {
             "canonical_network": str(stitched_centerlines) if stitched_centerlines is not None else "",
             "canonical_network_authoritative": canonical_is_authoritative,

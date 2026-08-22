@@ -311,6 +311,18 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
         performance_summary["weak_postprocess_seconds"] = float(
             time.perf_counter() - weak_start_seconds
         )
+        weak_phase_timing = recovery_summary.get("timing", {})
+        for phase_name, output_name in {
+            "diagnosis_seconds": "weak_diagnosis_seconds",
+            "relative_context_seconds": "weak_relative_context_seconds",
+            "bootstrap_seconds": "weak_bootstrap_seconds",
+            "weak_endpoint_recovery_seconds": "weak_endpoint_recovery_seconds",
+            "endpoint_to_segment_recovery_seconds": "endpoint_to_segment_recovery_seconds",
+            "connectivity_statistics_seconds": "weak_connectivity_statistics_seconds",
+        }.items():
+            performance_summary[output_name] = float(
+                weak_phase_timing.get(phase_name, 0.0)
+            )
         performance_summary.update({
             "relative_graph_point_count": int(
                 recovery_summary.get("relative_graph_point_count", 0)
@@ -603,6 +615,10 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
     timing_fields = (
         'mask_inference_seconds', 'native_graph_and_toponet_seconds',
         'relative_roadness_seconds', 'weak_postprocess_seconds',
+        'weak_diagnosis_seconds', 'weak_relative_context_seconds',
+        'weak_bootstrap_seconds', 'weak_endpoint_recovery_seconds',
+        'endpoint_to_segment_recovery_seconds',
+        'weak_connectivity_statistics_seconds',
         'total_image_seconds', 'relative_final_centerline_length',
     )
     recovery_report = {

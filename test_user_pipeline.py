@@ -661,6 +661,85 @@ class ValidationInputTests(unittest.TestCase):
             marker = user_pipeline.read_json(root / "normalized" / "normalization_complete.json")
             self.assertEqual(marker["coverage"]["2022"]["missing_pixels"], 4)
 
+    def test_probability_mosaic_direct_placement_matches_reproject_pixel_for_pixel(self) -> None:
+        import numpy as np
+        import rasterio
+        from PIL import Image
+        from rasterio.transform import from_origin
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            images, probabilities = root / "images", root / "probabilities"
+            images.mkdir(); probabilities.mkdir()
+            rng = np.random.default_rng(20260822)
+            for index, left in enumerate((0, 6)):
+                image_path = images / f"tile_{index}.tif"
+                with rasterio.open(
+                    image_path, "w", driver="GTiff", width=6, height=5, count=1,
+                    dtype="uint8", crs="EPSG:3857", transform=from_origin(left, 5, 1, 1),
+                ) as dataset:
+                    dataset.write(np.ones((1, 5, 6), dtype=np.uint8))
+                    mask = np.full((5, 6), 255, dtype=np.uint8)
+                    mask[2, 2] = 0
+                    dataset.write_mask(mask)
+                probability = rng.integers(0, 256, size=(5, 6), dtype=np.uint8)
+                Image.fromarray(probability).save(
+                    probabilities / f"tile_{index}_centerline_probability.png"
+                )
+
+            fast_path = root / "fast.tif"
+            baseline_path = root / "baseline.tif"
+            user_pipeline._write_probability_mosaic(images, probabilities, fast_path)
+            user_pipeline._write_probability_mosaic(
+                images, probabilities, baseline_path, allow_direct_placement=False,
+            )
+
+            with rasterio.open(fast_path) as fast, rasterio.open(baseline_path) as baseline:
+                self.assertEqual(fast.transform, baseline.transform)
+                np.testing.assert_array_equal(fast.read(1), baseline.read(1))
+                np.testing.assert_array_equal(fast.dataset_mask(), baseline.dataset_mask())
+
+    def test_valid_observation_cache_preserves_nodata_hole_and_skips_raster_scan(self) -> None:
+        import geopandas as gpd
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            images = root / "images"; images.mkdir()
+            image_path = images / "tile.tif"
+            with rasterio.open(
+                image_path, "w", driver="GTiff", width=6, height=6, count=1,
+                dtype="uint8", crs="EPSG:3857", transform=from_origin(0, 6, 1, 1),
+            ) as dataset:
+                dataset.write(np.ones((1, 6, 6), dtype=np.uint8))
+                mask = np.full((6, 6), 255, dtype=np.uint8)
+                mask[2:4, 2:4] = 0
+                dataset.write_mask(mask)
+
+            cache = root / "cache" / "valid_observation.shp"
+            copied = root / "products" / "valid_observation.shp"
+            user_pipeline._write_valid_observation_area(images, cache)
+            with patch.object(
+                user_pipeline, "listed_rasters",
+                side_effect=AssertionError("cache hit must not scan rasters"),
+            ):
+                result = user_pipeline._write_valid_observation_area(
+                    root / "unused", copied, cached_observation=cache,
+                )
+
+            self.assertEqual(result, str(copied.resolve()))
+            cached_frame = gpd.read_file(cache)
+            copied_frame = gpd.read_file(copied)
+            self.assertAlmostEqual(float(cached_frame.geometry.area.sum()), 32.0)
+            self.assertAlmostEqual(
+                float(cached_frame.geometry.union_all().symmetric_difference(
+                    copied_frame.geometry.union_all()
+                ).area),
+                0.0,
+            )
+
 
 class OneClickPipelineTests(unittest.TestCase):
     def test_extracts_each_period_and_compares_adjacent_periods(self) -> None:

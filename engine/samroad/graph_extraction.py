@@ -6433,8 +6433,10 @@ def postprocess_weak_road_network(
     ``return_relative_context`` exposes the exact computed context to callers
     that need diagnostics without rerunning Relative Roadness or tracing.
     """
+    postprocess_started = time.perf_counter()
     original_edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
     connectivity_before = graph_connectivity_stats(nodes_rc, original_edges)
+    diagnosis_started = time.perf_counter()
     diagnosis = diagnose_scene_confidence(
         road_probability,
         nodes_rc,
@@ -6442,6 +6444,8 @@ def postprocess_weak_road_network(
         config,
         distance_scale=distance_scale,
     )
+    diagnosis_seconds = time.perf_counter() - diagnosis_started
+    relative_context_started = time.perf_counter()
     if relative_context is None:
         relative_context = compute_relative_roadness(
             road_probability,
@@ -6449,6 +6453,7 @@ def postprocess_weak_road_network(
             scene_state=diagnosis["scene_confidence_state"],
             distance_scale=distance_scale,
         )
+    relative_context_seconds = time.perf_counter() - relative_context_started
     relative_enabled = bool(
         relative_context
         and relative_context.get("diagnostics", {}).get("relative_roadness_enabled", False)
@@ -6459,6 +6464,7 @@ def postprocess_weak_road_network(
         not only_low or diagnosis["scene_confidence_state"] in {"low_confidence", "very_low_confidence"}
     )
     should_bootstrap = bootstrap_enabled and (absolute_bootstrap or relative_enabled)
+    bootstrap_started = time.perf_counter()
     if should_bootstrap:
         bootstrap_nodes, bootstrap_edges, bootstrap_metadata, bootstrap_summary = (
             bootstrap_weak_road_network(
@@ -6500,6 +6506,7 @@ def postprocess_weak_road_network(
             "relative_topology_selected_edge_count": 0,
             "relative_graph_point_count": 0,
         }
+    bootstrap_seconds = time.perf_counter() - bootstrap_started
     if bootstrap_metadata:
         combined_scores = np.asarray(
             [row.get("topology_probability", np.nan) for row in bootstrap_metadata],
@@ -6507,6 +6514,7 @@ def postprocess_weak_road_network(
         )
     else:
         combined_scores = edge_scores
+    weak_endpoint_started = time.perf_counter()
     final_nodes, final_edges, final_metadata, recovery_summary = recover_weak_road_edges(
         bootstrap_nodes,
         bootstrap_edges,
@@ -6517,8 +6525,10 @@ def postprocess_weak_road_network(
         distance_scale=distance_scale,
         candidate_audit=weak_candidate_audit,
     )
+    weak_endpoint_recovery_seconds = time.perf_counter() - weak_endpoint_started
     if bootstrap_metadata:
         final_metadata[:len(bootstrap_metadata)] = bootstrap_metadata
+    endpoint_segment_started = time.perf_counter()
     final_nodes, final_edges, final_metadata, segment_summary = (
         recover_endpoint_to_segment_connections(
             final_nodes,
@@ -6531,6 +6541,8 @@ def postprocess_weak_road_network(
             candidate_audit=endpoint_segment_candidate_audit,
         )
     )
+    endpoint_to_segment_recovery_seconds = time.perf_counter() - endpoint_segment_started
+    connectivity_statistics_started = time.perf_counter()
     connectivity_after = graph_connectivity_stats(final_nodes, final_edges)
     relative_topology_edge_count = sum(
         str(row.get("line_source", "")).startswith("relative")
@@ -6775,6 +6787,17 @@ def postprocess_weak_road_network(
             0,
             connectivity_before["component_count"] - connectivity_after["component_count"],
         ),
+    }
+    summary["timing"] = {
+        "diagnosis_seconds": float(diagnosis_seconds),
+        "relative_context_seconds": float(relative_context_seconds),
+        "bootstrap_seconds": float(bootstrap_seconds),
+        "weak_endpoint_recovery_seconds": float(weak_endpoint_recovery_seconds),
+        "endpoint_to_segment_recovery_seconds": float(endpoint_to_segment_recovery_seconds),
+        "connectivity_statistics_seconds": float(
+            time.perf_counter() - connectivity_statistics_started
+        ),
+        "total_seconds": float(time.perf_counter() - postprocess_started),
     }
     result = (final_nodes, final_edges, final_metadata, summary)
     if return_relative_context:

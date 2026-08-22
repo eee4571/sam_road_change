@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import pickle
+import time
 from pathlib import Path
 
 import cv2
@@ -768,6 +769,7 @@ def finalize_one(
     decisions: dict[tuple[str, str, str], dict],
     decisions_path: Path,
 ) -> dict:
+    finalize_started = time.perf_counter()
     with open(summary_path, "r", encoding="utf-8") as file:
         summary = json.load(file)
     stem = summary_path.name.removesuffix("_summary.json")
@@ -799,6 +801,7 @@ def finalize_one(
     original_nodes = [(int(round(r)), int(round(c))) for r, c in nodes_np.tolist()]
     final_nodes = list(original_nodes)
 
+    candidate_analysis_started = time.perf_counter()
     edge_width_rows = read_csv(exact_file(output_dir, stem, "edge_widths.csv"))
     candidate_rows = [] if geometry_edited else read_csv(exact_file(output_dir, stem, "candidate_centerlines.csv"))
     surface_rows = read_csv(exact_file(output_dir, stem, "surface_only_regions.csv"))
@@ -1057,6 +1060,8 @@ def finalize_one(
 
     if active_edge_id != len(final_edges):
         raise RuntimeError(f"Final edge-table mismatch: active_rows={active_edge_id}, graph_edges={len(final_edges)}")
+    candidate_analysis_seconds = time.perf_counter() - candidate_analysis_started
+    final_width_measurement_started = time.perf_counter()
     pixel_size = as_float(summary, "pixel_size", 1.0)
     for row in edge_records:
         row["optimized_width_units"] = as_float(row, "optimized_width_px") * pixel_size
@@ -1141,7 +1146,9 @@ def finalize_one(
     )
     final_width_samples = width_result.samples
     final_width_segments = width_result.segments
+    final_width_measurement_seconds = time.perf_counter() - final_width_measurement_started
 
+    surface_reconstruction_started = time.perf_counter()
     width_surface = None
     if clean_mask is not None and len(final_edges_np):
         width_surface = reconstruct_surface_from_widths(
@@ -1201,6 +1208,7 @@ def finalize_one(
             clean_mask[manual_surface_add > 0] = 1
         if manual_surface_remove is not None and manual_surface_remove.shape == clean_mask.shape:
             clean_mask[manual_surface_remove > 0] = 0
+    surface_reconstruction_seconds = time.perf_counter() - surface_reconstruction_started
 
     sample_fields = list(final_width_samples[0].keys()) if final_width_samples else []
     write_csv(final_dir / f"{stem}_optimized_width_samples.csv", final_width_samples, sample_fields)
@@ -1377,6 +1385,15 @@ def finalize_one(
         "manual_surface_removed_px": int(np.count_nonzero(manual_surface_remove)) if manual_surface_remove is not None else 0,
         "width_calculator": width_result.algorithm,
         "width_calculator_metadata": width_result.metadata,
+        "profiling": {
+            "junction_cleanup_seconds": float(
+                (summary.get("profiling") or {}).get("junction_cleanup_seconds", 0.0)
+            ),
+            "candidate_analysis_seconds": float(candidate_analysis_seconds),
+            "final_width_measurement_seconds": float(final_width_measurement_seconds),
+            "surface_reconstruction_seconds": float(surface_reconstruction_seconds),
+            "total_seconds": float(time.perf_counter() - finalize_started),
+        },
         "final_surface_stage": "regular_buffer_surface",
         "width_surface_metadata": width_surface.metadata if width_surface is not None else {"status": "not_built"},
         "unresolved_review_width_count": 0,

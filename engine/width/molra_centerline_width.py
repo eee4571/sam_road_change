@@ -6,6 +6,7 @@ import heapq
 import json
 import pickle
 import sys
+import time
 from collections import deque
 from pathlib import Path
 
@@ -163,6 +164,19 @@ def prune_low_evidence_spurs(
     return compact_nodes, compact_edges, audit_rows
 
 
+def build_graph_adjacency(
+    nodes_rc: np.ndarray,
+    edges: np.ndarray,
+) -> list[list[tuple[int, int, float]]]:
+    """Build stable neighbor/edge/length adjacency once for repeated queries."""
+    adjacency: list[list[tuple[int, int, float]]] = [[] for _ in range(nodes_rc.shape[0])]
+    for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+        length = float(np.linalg.norm(nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]))
+        adjacency[int(src_idx)].append((int(dst_idx), edge_id, length))
+        adjacency[int(dst_idx)].append((int(src_idx), edge_id, length))
+    return adjacency
+
+
 def shortest_graph_path_length_excluding_edge(
     nodes_rc: np.ndarray,
     edges: np.ndarray,
@@ -170,14 +184,10 @@ def shortest_graph_path_length_excluding_edge(
     end_idx: int,
     excluded_edge_id: int,
     max_length_px: float,
+    adjacency: list[list[tuple[int, int, float]]] | None = None,
 ) -> tuple[float, list[int]]:
-    adjacency: list[list[tuple[int, int, float]]] = [[] for _ in range(nodes_rc.shape[0])]
-    for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
-        if edge_id == excluded_edge_id:
-            continue
-        length = float(np.linalg.norm(nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]))
-        adjacency[int(src_idx)].append((int(dst_idx), edge_id, length))
-        adjacency[int(dst_idx)].append((int(src_idx), edge_id, length))
+    if adjacency is None:
+        adjacency = build_graph_adjacency(nodes_rc, edges)
     distances = {int(start_idx): 0.0}
     parents: dict[int, tuple[int, int]] = {}
     queue = [(0.0, int(start_idx))]
@@ -194,6 +204,8 @@ def shortest_graph_path_length_excluding_edge(
                 current_idx = previous_idx
             return distance, path_edges
         for neighbor_idx, edge_id, length in adjacency[node_idx]:
+            if edge_id == excluded_edge_id:
+                continue
             new_distance = distance + length
             if new_distance < distances.get(neighbor_idx, float("inf")) and new_distance <= max_length_px:
                 distances[neighbor_idx] = new_distance
@@ -227,24 +239,22 @@ def cleanup_junction_conflicts(
 
     # A short junction loop is usually several mutually exclusive TopoNet links.
     # Break it only when one edge is clearly weaker than every alternative.
-    degrees, _ = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
+    degrees, node_edges = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
+    adjacency = build_graph_adjacency(nodes_rc, edges)
     cycle_candidates = []
     for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
-        edge_length = float(np.linalg.norm(nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]))
-        alternative, alternative_edge_ids = shortest_graph_path_length_excluding_edge(
-            nodes_rc, edges, int(src_idx), int(dst_idx), edge_id, max_cycle_length_px - edge_length
-        )
-        cycle_length = edge_length + alternative
+        src_idx, dst_idx = int(src_idx), int(dst_idx)
         probability = float(probabilities[edge_id])
-        if not np.isfinite(probability) or not np.isfinite(alternative) or not min_cycle_length_px <= cycle_length <= max_cycle_length_px:
+        if not np.isfinite(probability):
             continue
-        if min(int(degrees[int(src_idx)]), int(degrees[int(dst_idx)])) < 3:
+        if min(int(degrees[src_idx]), int(degrees[dst_idx])) < 3:
             continue
+        edge_length = float(np.linalg.norm(nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]))
         edge_direction = (nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]) / max(edge_length, 1e-6)
         endpoint_continuities = []
         for node_idx, incoming_direction in ((int(src_idx), -edge_direction), (int(dst_idx), edge_direction)):
             continuities = []
-            for incident_edge_id in np.where(np.any(edges == node_idx, axis=1))[0].tolist():
+            for incident_edge_id in node_edges[node_idx]:
                 if incident_edge_id == edge_id:
                     continue
                 edge_src, edge_dst = (int(value) for value in edges[incident_edge_id])
@@ -256,6 +266,13 @@ def cleanup_junction_conflicts(
             endpoint_continuities.append(max(continuities, default=-1.0))
         continuity = min(endpoint_continuities)
         if continuity > max_cycle_continuity_cosine:
+            continue
+        alternative, alternative_edge_ids = shortest_graph_path_length_excluding_edge(
+            nodes_rc, edges, src_idx, dst_idx, edge_id,
+            max_cycle_length_px - edge_length, adjacency=adjacency,
+        )
+        cycle_length = edge_length + alternative
+        if not np.isfinite(alternative) or not min_cycle_length_px <= cycle_length <= max_cycle_length_px:
             continue
         cycle_candidates.append(
             (probability, edge_id, edge_length, cycle_length, int(src_idx), int(dst_idx), alternative_edge_ids, continuity)
@@ -289,6 +306,7 @@ def cleanup_junction_conflicts(
         dtype=np.float32,
     )
     degrees, node_edges = graph_degrees(remaining_edges.shape[0], nodes_rc.shape[0], remaining_edges)
+    remaining_adjacency = build_graph_adjacency(nodes_rc, remaining_edges)
     fan_removed: set[int] = set()
     for node_idx in np.where(degrees >= fan_min_degree)[0].tolist():
         incident = []
@@ -316,15 +334,7 @@ def cleanup_junction_conflicts(
         for candidate in incident:
             if candidate[0] in paired or not np.isfinite(candidate[4]):
                 continue
-            alternative, _ = shortest_graph_path_length_excluding_edge(
-                nodes_rc,
-                remaining_edges,
-                node_idx,
-                candidate[1],
-                candidate[0],
-                max_length_px=260.0,
-            )
-            if not np.isfinite(alternative):
+            if candidate[3] > fan_max_edge_length_px or candidate[4] > max_weak_probability:
                 continue
             same_side_competitors = [
                 other
@@ -338,11 +348,18 @@ def cleanup_junction_conflicts(
                 (float(np.dot(candidate[2], other[2])) for other in same_side_competitors),
                 default=-1.0,
             )
-            if (
-                candidate[3] <= fan_max_edge_length_px
-                and candidate[4] <= max_weak_probability
-                and same_side >= fan_min_same_side_cosine
-            ):
+            if same_side < fan_min_same_side_cosine:
+                continue
+            alternative, _ = shortest_graph_path_length_excluding_edge(
+                nodes_rc,
+                remaining_edges,
+                node_idx,
+                candidate[1],
+                candidate[0],
+                max_length_px=260.0,
+                adjacency=remaining_adjacency,
+            )
+            if np.isfinite(alternative):
                 unpaired.append((candidate[4], candidate, same_side))
         if not unpaired:
             continue
@@ -3766,6 +3783,7 @@ def process_one(
     output_dir: Path,
     device: torch.device,
 ) -> dict:
+    process_started = time.perf_counter()
     original_nodes_rc, original_edges = load_graph(graph_path)
 
     if mask_path is not None:
@@ -3868,6 +3886,7 @@ def process_one(
             max_target_parallel_cosine=args.junction_repair_max_parallel_cosine,
         )
     junction_cleanup_rows: list[dict] = []
+    junction_cleanup_started = time.perf_counter()
     if args.cleanup_junction_conflicts:
         cleanup_probabilities, _ = load_edge_topology_probabilities(graph_path, nodes_rc, edges)
         nodes_rc, edges, junction_cleanup_rows = cleanup_junction_conflicts(
@@ -3878,6 +3897,7 @@ def process_one(
             max_weak_probability=args.junction_cleanup_max_weak_probability,
             min_probability_margin=args.junction_cleanup_min_probability_margin,
         )
+    junction_cleanup_seconds = time.perf_counter() - junction_cleanup_started
     divided_junction_rows: list[dict] = []
     if args.restore_divided_junction_corridors:
         nodes_rc, edges, divided_junction_rows = restore_divided_corridors_through_junctions(
@@ -4316,6 +4336,10 @@ def process_one(
         "centerline_probability_type": center_probability_type,
         "topology_probability_source": topology_probability_source,
         "prepared_topology_probability_source": prepared_topology_probability_source,
+        "profiling": {
+            "junction_cleanup_seconds": float(junction_cleanup_seconds),
+            "total_seconds": float(time.perf_counter() - process_started),
+        },
         "sample_step_px": args.sample_step_px,
         "normal_step_px": args.normal_step_px,
         "max_search_px": args.max_search_px,

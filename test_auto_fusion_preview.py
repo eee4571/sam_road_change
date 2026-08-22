@@ -368,6 +368,35 @@ class AutoFusionTests(unittest.TestCase):
         self.assertEqual("MultiLineString", geometry.geom_type)
         self.assertAlmostEqual(first.length + nearby.length, geometry.length)
 
+    def test_strtree_centerline_fusion_matches_stable_full_scan(self) -> None:
+        rows = [
+            {
+                "tile_stem": "a", "geometry": LineString([(0.0, 0.0), (20.0, 0.0)]),
+                "width_map": 4.0, "quality_grade": "A", "width_source": "automatic",
+            },
+            {
+                "tile_stem": "b", "geometry": LineString([(0.0, 0.2), (20.0, 0.2)]),
+                "width_map": 6.0, "quality_grade": "B", "width_source": "automatic",
+            },
+            {
+                "tile_stem": "far", "geometry": LineString([(100.0, 0.0), (120.0, 0.0)]),
+                "width_map": 8.0, "quality_grade": "A", "width_source": "automatic",
+            },
+        ]
+
+        indexed = workflow._fuse_centerline_records(rows, {}, match_tolerance=1.0)
+        baseline = workflow._fuse_centerline_records(
+            rows, {}, match_tolerance=1.0, use_spatial_index=False,
+        )
+
+        self.assertEqual(len(indexed), len(baseline))
+        for indexed_row, baseline_row in zip(indexed, baseline):
+            self.assertTrue(indexed_row["geometry"].equals_exact(baseline_row["geometry"], 0.0))
+            self.assertEqual(
+                {key: value for key, value in indexed_row.items() if key != "geometry"},
+                {key: value for key, value in baseline_row.items() if key != "geometry"},
+            )
+
     def test_global_surface_gap_repairs_only_unique_facing_cross_component_seam(self) -> None:
         left = LineString([(0.0, 0.0), (10.0, 0.0)])
         right = LineString([(20.0, 0.0), (30.0, 0.0)])
@@ -501,6 +530,59 @@ class AutoFusionTests(unittest.TestCase):
         self.assertAlmostEqual(0.02, float(fused[8, 15]), places=4)
         self.assertAlmostEqual(0.02, float(fused[8, 16]), places=4)
         self.assertEqual(first_transform, transform)
+
+    def test_aligned_surface_direct_placement_is_pixel_identical_to_reproject(self) -> None:
+        rng = np.random.default_rng(20260822)
+        first = rng.random((12, 16), dtype=np.float32)
+        second = rng.random((12, 16), dtype=np.float32)
+        sources = [
+            {
+                "mask": first, "shape": first.shape,
+                "transform": rasterio.Affine(1, 0, 0, 0, -1, 12),
+            },
+            {
+                "mask": second, "shape": second.shape,
+                "transform": rasterio.Affine(1, 0, 16, 0, -1, 12),
+            },
+        ]
+
+        fast = workflow._fuse_surface_masks(
+            sources, "EPSG:3857", feather_pixels=5.0, continuous=True,
+        )
+        baseline = workflow._fuse_surface_masks(
+            sources, "EPSG:3857", feather_pixels=5.0, continuous=True,
+            allow_direct_placement=False,
+        )
+
+        self.assertEqual(fast[1], baseline[1])
+        np.testing.assert_array_equal(fast[0], baseline[0])
+        np.testing.assert_array_equal(fast[2], baseline[2])
+
+    def test_cached_junction_adjacency_preserves_paths_and_cleanup(self) -> None:
+        nodes = np.asarray(
+            [[0, 0], [0, 30], [20, 15], [20, 0], [20, 30]], dtype=np.float32,
+        )
+        edges = np.asarray([[0, 1], [0, 2], [2, 1], [0, 3], [1, 4]], dtype=np.int32)
+        adjacency = fusion.build_graph_adjacency(nodes, edges)
+        for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+            baseline = fusion.shortest_graph_path_length_excluding_edge(
+                nodes, edges, src_idx, dst_idx, edge_id, 200.0,
+            )
+            cached = fusion.shortest_graph_path_length_excluding_edge(
+                nodes, edges, src_idx, dst_idx, edge_id, 200.0, adjacency=adjacency,
+            )
+            self.assertEqual(baseline, cached)
+
+        cleaned_nodes, cleaned_edges, audit = fusion.cleanup_junction_conflicts(
+            nodes,
+            edges,
+            np.asarray([0.1, 0.9, 0.9, 0.9, 0.9], dtype=np.float32),
+            min_cycle_length_px=0.0,
+            max_cycle_length_px=120.0,
+        )
+        self.assertEqual([row["edge_id"] for row in audit], [0])
+        self.assertEqual(cleaned_nodes.shape[0], nodes.shape[0])
+        self.assertEqual(cleaned_edges.shape[0], edges.shape[0] - 1)
 
     def test_global_surface_gap_rejects_missing_surface_wrong_direction_same_component_and_ambiguity(self) -> None:
         left = {"tile_stem": "left", "geometry": LineString([(0.0, 0.0), (10.0, 0.0)]), "width_map": 4.0, "quality_grade": "A"}

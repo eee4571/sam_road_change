@@ -1544,9 +1544,19 @@ def normalize_validation_sources(
             "coverage_ratio": float(coverage_ratio),
             "partial_coverage": bool(missing_pixel_count),
         }
+        try:
+            valid_observation_cache = _write_valid_observation_area(
+                period_dir,
+                period_dir / "valid_observation.shp",
+            )
+        except (OSError, ValueError, RuntimeError):
+            # The cache is optional.  Extraction keeps the historical raster
+            # scan fallback for old workspaces and cache-generation failures.
+            valid_observation_cache = None
         state.update({
             "status": "complete", "directory": str(period_dir),
             "tile_count": tile_index, **coverage_reports[period],
+            "valid_observation_cache": valid_observation_cache,
             "completed_at": now_text(),
         })
         write_json(state_path, state)
@@ -1867,8 +1877,20 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
     return False
 
 
-def _write_valid_observation_area(image_dir: Path, output: Path) -> str | None:
+def _write_valid_observation_area(
+    image_dir: Path,
+    output: Path,
+    cached_observation: Path | None = None,
+) -> str | None:
     """Vectorize the true per-pixel observation mask without loading a mosaic."""
+    if cached_observation is not None and _shapefile_complete(cached_observation):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+            source = cached_observation.with_suffix(suffix)
+            target = output.with_suffix(suffix)
+            if source.is_file() and source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+        return str(output.resolve()) if _shapefile_complete(output) else None
     import geopandas as gpd
     import numpy as np
     import rasterio
@@ -1918,11 +1940,51 @@ def _write_valid_observation_area(image_dir: Path, output: Path) -> str | None:
     return str(output.resolve())
 
 
+def _strict_grid_window(source_transform, source_shape, target_transform, target_shape):
+    """Return destination slices only when two raster grids provably align."""
+    import numpy as np
+
+    source_coefficients = np.asarray(
+        [source_transform.a, source_transform.b, source_transform.d, source_transform.e],
+        dtype=np.float64,
+    )
+    target_coefficients = np.asarray(
+        [target_transform.a, target_transform.b, target_transform.d, target_transform.e],
+        dtype=np.float64,
+    )
+    tolerance = max(float(np.max(np.abs(target_coefficients))), 1.0) * 1e-9
+    if not np.allclose(source_coefficients, target_coefficients, rtol=0.0, atol=tolerance):
+        return None
+    try:
+        column_offset, row_offset = (~target_transform) * (source_transform.c, source_transform.f)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    rounded_column, rounded_row = int(round(column_offset)), int(round(row_offset))
+    if not np.isclose(column_offset, rounded_column, rtol=0.0, atol=1e-7):
+        return None
+    if not np.isclose(row_offset, rounded_row, rtol=0.0, atol=1e-7):
+        return None
+    source_height, source_width = (int(source_shape[0]), int(source_shape[1]))
+    target_height, target_width = (int(target_shape[0]), int(target_shape[1]))
+    if (
+        rounded_row < 0 or rounded_column < 0
+        or rounded_row + source_height > target_height
+        or rounded_column + source_width > target_width
+    ):
+        return None
+    return (
+        slice(rounded_row, rounded_row + source_height),
+        slice(rounded_column, rounded_column + source_width),
+    )
+
+
 def _write_probability_mosaic(
     image_dir: Path,
     probability_dir: Path,
     output: Path,
     suffix: str = "_centerline_probability.png",
+    *,
+    allow_direct_placement: bool = True,
 ) -> str | None:
     """Georeference already-produced SAMRoad probability PNGs without inference."""
     import numpy as np
@@ -1970,18 +2032,29 @@ def _write_probability_mosaic(
     mosaic = np.zeros((height, width), dtype=np.uint8)
     valid = np.zeros((height, width), dtype=np.uint8)
     for source in compatible:
-        reproject(
-            source["probability"], mosaic,
-            src_transform=source["transform"], src_crs=source["crs"],
-            dst_transform=transform, dst_crs=target_crs,
-            resampling=Resampling.bilinear, init_dest_nodata=False,
+        placement = (
+            _strict_grid_window(
+                source["transform"], source["probability"].shape,
+                transform, mosaic.shape,
+            )
+            if allow_direct_placement and source["crs"] == target_crs else None
         )
-        reproject(
-            source["valid"].astype(np.uint8) * 255, valid,
-            src_transform=source["transform"], src_crs=source["crs"],
-            dst_transform=transform, dst_crs=target_crs,
-            resampling=Resampling.nearest, init_dest_nodata=False,
-        )
+        if placement is not None:
+            mosaic[placement] = source["probability"]
+            valid[placement] = source["valid"].astype(np.uint8) * 255
+        else:
+            reproject(
+                source["probability"], mosaic,
+                src_transform=source["transform"], src_crs=source["crs"],
+                dst_transform=transform, dst_crs=target_crs,
+                resampling=Resampling.bilinear, init_dest_nodata=False,
+            )
+            reproject(
+                source["valid"].astype(np.uint8) * 255, valid,
+                src_transform=source["transform"], src_crs=source["crs"],
+                dst_transform=transform, dst_crs=target_crs,
+                resampling=Resampling.nearest, init_dest_nodata=False,
+            )
     output.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
         output, "w", driver="GTiff", width=width, height=height, count=1,
@@ -2166,7 +2239,16 @@ def extract(args: argparse.Namespace) -> dict:
         "updated_at": now_text(),
     })
     write_json(period_state_path, period_state)
-    valid_observation = _write_valid_observation_area(images, products / "valid_observation.shp")
+    normalized_source = Path(str(manifest.get("source") or "")).expanduser()
+    cached_observation = (
+        normalized_source / "valid_observation.shp"
+        if normalized_source.is_dir() else None
+    )
+    valid_observation = _write_valid_observation_area(
+        images,
+        products / "valid_observation.shp",
+        cached_observation=cached_observation,
+    )
     road_probability = _write_probability_mosaic(
         images, width_dir, products / "road_probability.tif",
     )

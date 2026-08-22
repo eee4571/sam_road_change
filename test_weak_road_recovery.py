@@ -304,6 +304,15 @@ class WeakRoadRecoveryTests(unittest.TestCase):
         self.assertFalse(summary["bootstrap_ran"])
         self.assertEqual(summary["bootstrap_recovered_edge_count"], 0)
         self.assertEqual(metadata[0]["line_source"], "samroad")
+        self.assertEqual(
+            set(summary["timing"]),
+            {
+                "diagnosis_seconds", "relative_context_seconds", "bootstrap_seconds",
+                "weak_endpoint_recovery_seconds", "endpoint_to_segment_recovery_seconds",
+                "connectivity_statistics_seconds", "total_seconds",
+            },
+        )
+        self.assertTrue(all(value >= 0.0 for value in summary["timing"].values()))
 
     def test_bootstrap_case_b_low_confidence_scene_recovers_long_weak_road(self):
         config = recovery_config()
