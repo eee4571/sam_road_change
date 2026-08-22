@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from chain_width_calculator import build_road_chains
+from chain_width_calculator import apply_manual_width_constraints
 from final_width_calculator import (
     FinalWidthConfig,
     FinalWidthRequest,
@@ -54,14 +54,6 @@ def as_int(row: dict, key: str, default: int = 0) -> int:
         return default
 
 
-def _point_segment_projection(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, float]:
-    vector = end - start
-    denominator = float(np.dot(vector, vector))
-    ratio = 0.0 if denominator <= 1e-9 else float(np.clip(np.dot(point - start, vector) / denominator, 0.0, 1.0))
-    projection = start + vector * ratio
-    return projection, float(np.linalg.norm(point - projection))
-
-
 def apply_manual_width_overrides(
     nodes: np.ndarray,
     edges: np.ndarray,
@@ -69,8 +61,10 @@ def apply_manual_width_overrides(
     edge_widths: list[dict],
     manual_width_path: Path | None,
     pixel_size: float,
+    samples: list[dict] | None = None,
+    segments: list[dict] | None = None,
 ) -> int:
-    """Apply boundary-to-boundary measurements to the complete target road chain."""
+    """Apply local point anchors and strict intervals on road-chain positions."""
     if manual_width_path is None or not manual_width_path.is_file() or not len(edges):
         return 0
     try:
@@ -80,43 +74,9 @@ def apply_manual_width_overrides(
     measurements = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
     if not measurements:
         return 0
-    edge_to_chain: dict[int, list[int]] = {}
-    for chain in build_road_chains(nodes, edges):
-        for edge_id in chain.edge_ids:
-            edge_to_chain[int(edge_id)] = [int(value) for value in chain.edge_ids]
-    overrides: dict[int, list[float]] = {}
-    for measurement in measurements:
-        try:
-            point = np.asarray(
-                [float(measurement["target_row"]), float(measurement["target_col"])], dtype=np.float32,
-            )
-            width_px = float(measurement["width_px"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not np.isfinite(width_px) or width_px <= 0:
-            continue
-        best_edge, best_distance = None, float("inf")
-        for edge_id, (src, dst) in enumerate(edges.tolist()):
-            _projection, distance = _point_segment_projection(point, nodes[int(src)], nodes[int(dst)])
-            if distance < best_distance:
-                best_edge, best_distance = edge_id, distance
-        if best_edge is None or best_distance > max(24.0, width_px):
-            continue
-        for edge_id in edge_to_chain.get(best_edge, [best_edge]):
-            overrides.setdefault(edge_id, []).append(width_px)
-    for edge_id, values in overrides.items():
-        width_px = float(np.median(np.asarray(values, dtype=np.float32)))
-        edge_records[edge_id]["optimized_width_px"] = width_px
-        edge_records[edge_id]["optimized_width_units"] = width_px * pixel_size
-        edge_records[edge_id]["optimized_width_source"] = "manual_boundary_measurement"
-        edge_records[edge_id]["optimized_quality_grade"] = "A"
-        edge_records[edge_id]["final_status"] = "manual_width_override"
-        edge_widths[edge_id]["width_px"] = width_px
-        edge_widths[edge_id]["width_units"] = width_px * pixel_size
-        edge_widths[edge_id]["source"] = "manual_boundary_measurement"
-        edge_widths[edge_id]["quality_grade"] = "A"
-        edge_widths[edge_id]["status"] = "manual_width_override"
-    return len(overrides)
+    return apply_manual_width_constraints(
+        nodes, edges, edge_records, edge_widths, measurements, pixel_size, samples, segments,
+    )
 
 
 def candidate_points(candidate: dict) -> list[tuple[float, float]]:
@@ -1142,7 +1102,7 @@ def finalize_one(
     # after automatic corridor regularisation, immediately before surface rebuild.
     manual_width_edge_count = apply_manual_width_overrides(
         final_nodes_np, final_edges_np, active_records, width_result.edge_widths,
-        manual_width_path, pixel_size,
+        manual_width_path, pixel_size, width_result.samples, width_result.segments,
     )
     final_width_samples = width_result.samples
     final_width_segments = width_result.segments
@@ -1190,7 +1150,10 @@ def finalize_one(
                 active_records[edge_id]["optimized_width_units"] = width_value * pixel_size
                 width_result.edge_widths[edge_id]["width_px"] = width_value
                 width_result.edge_widths[edge_id]["width_units"] = width_value * pixel_size
-                if str(active_records[edge_id].get("optimized_quality_grade", "")).upper() == "C":
+                if (
+                    str(active_records[edge_id].get("optimized_quality_grade", "")).upper() == "C"
+                    and not str(active_records[edge_id].get("optimized_width_source", "")).startswith("manual_")
+                ):
                     active_records[edge_id]["optimized_width_source"] = "junction_aware_surface_fallback"
         write_image(final_dir / f"{stem}_width_surface_added.png", width_surface.added.astype(np.uint8) * 255)
         write_image(final_dir / f"{stem}_width_surface_removed.png", width_surface.removed.astype(np.uint8) * 255)

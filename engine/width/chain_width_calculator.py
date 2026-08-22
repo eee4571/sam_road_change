@@ -18,6 +18,16 @@ class RoadChain:
     edge_ids: list[int]
 
 
+@dataclass
+class ChainProjection:
+    chain_id: int
+    edge_id: int
+    chain_position: float
+    point: np.ndarray
+    distance: float
+    tangent: np.ndarray
+
+
 def build_road_chains(nodes: np.ndarray, edges: np.ndarray) -> list[RoadChain]:
     """Merge degree-2 micro-edges into endpoint/junction-to-endpoint/junction chains."""
     adjacency: list[list[tuple[int, int]]] = [[] for _ in range(len(nodes))]
@@ -78,6 +88,251 @@ def _tangent_at(points: np.ndarray, cumulative: np.ndarray, distance: float, rad
     if norm <= 1e-6:
         return np.asarray([0.0, 1.0], dtype=np.float32)
     return vector / norm
+
+
+def project_point_to_road_chain(
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    point_rc: np.ndarray | tuple[float, float],
+    *,
+    chain_id: int | None = None,
+    tangent_radius: float = 12.0,
+) -> ChainProjection | None:
+    """Project a pixel point onto a stable degree-2 road chain."""
+    nodes = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
+    edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    point = np.asarray(point_rc, dtype=np.float32).reshape(2)
+    best: ChainProjection | None = None
+    for chain in build_road_chains(nodes, edges):
+        if chain_id is not None and int(chain.chain_id) != int(chain_id):
+            continue
+        points, cumulative = _chain_geometry(chain, nodes)
+        for offset, edge_id in enumerate(chain.edge_ids):
+            start, end = points[offset], points[offset + 1]
+            vector = end - start
+            denominator = float(np.dot(vector, vector))
+            ratio = 0.0 if denominator <= 1e-9 else float(
+                np.clip(np.dot(point - start, vector) / denominator, 0.0, 1.0)
+            )
+            projection = start + vector * ratio
+            distance = float(np.linalg.norm(point - projection))
+            position = float(cumulative[offset] + ratio * (cumulative[offset + 1] - cumulative[offset]))
+            candidate = ChainProjection(
+                chain_id=int(chain.chain_id), edge_id=int(edge_id),
+                chain_position=position, point=projection.astype(np.float32),
+                distance=distance,
+                tangent=_tangent_at(points, cumulative, position, max(1.0, float(tangent_radius))),
+            )
+            if best is None or candidate.distance < best.distance:
+                best = candidate
+    return best
+
+
+def normalize_manual_width_measurements(
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    measurements: list[dict],
+) -> list[dict]:
+    """Backfill chain metadata while retaining the compatible JSON contract."""
+    normalized: list[dict] = []
+    for order, original in enumerate(measurements):
+        if not isinstance(original, dict):
+            continue
+        row = dict(original)
+        try:
+            target = (float(row["target_row"]), float(row["target_col"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        projection = project_point_to_road_chain(nodes, edges, target)
+        if projection is None:
+            continue
+        row.update({
+            "measurement_id": str(row.get("measurement_id") or f"MW{order + 1:05d}"),
+            "target_chain_id": int(projection.chain_id),
+            "target_edge_id": int(projection.edge_id),
+            "chain_position": float(projection.chain_position),
+            "target_row": float(projection.point[0]),
+            "target_col": float(projection.point[1]),
+            "edit_order": int(row.get("edit_order", order)),
+            "quality_grade": "A",
+        })
+        if str(row.get("source", "")) == "manual_interval_width":
+            interval_positions: list[float] = []
+            valid_interval = True
+            for prefix in ("range_start", "range_end"):
+                try:
+                    endpoint = (float(row[f"{prefix}_row"]), float(row[f"{prefix}_col"]))
+                except (KeyError, TypeError, ValueError):
+                    valid_interval = False
+                    break
+                endpoint_projection = project_point_to_road_chain(
+                    nodes, edges, endpoint, chain_id=projection.chain_id,
+                )
+                if endpoint_projection is None:
+                    valid_interval = False
+                    break
+                row[f"{prefix}_row"] = float(endpoint_projection.point[0])
+                row[f"{prefix}_col"] = float(endpoint_projection.point[1])
+                interval_positions.append(float(endpoint_projection.chain_position))
+            if valid_interval:
+                row["range_start_position"] = float(min(interval_positions))
+                row["range_end_position"] = float(max(interval_positions))
+            else:
+                continue
+        normalized.append(row)
+    normalized.sort(key=lambda item: int(item.get("edit_order", 0)))
+    return normalized
+
+
+def apply_manual_width_constraints(
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    edge_records: list[dict],
+    edge_widths: list[dict],
+    measurements: list[dict],
+    pixel_size: float,
+    samples: list[dict] | None = None,
+    segments: list[dict] | None = None,
+) -> int:
+    """Apply finite chain-position anchors and strict same-chain intervals."""
+    nodes = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
+    edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    normalized = normalize_manual_width_measurements(nodes, edges, measurements)
+    if not normalized:
+        return 0
+    chains = {chain.chain_id: chain for chain in build_road_chains(nodes, edges)}
+    edge_positions: dict[int, tuple[int, float, float, float]] = {}
+    for chain in chains.values():
+        _points, cumulative = _chain_geometry(chain, nodes)
+        for offset, edge_id in enumerate(chain.edge_ids):
+            start = float(cumulative[offset])
+            end = float(cumulative[offset + 1])
+            edge_positions[int(edge_id)] = (int(chain.chain_id), start, end, 0.5 * (start + end))
+
+    affected: set[int] = set()
+
+    def set_sample(sample: dict, value: float, source: str, measurement_id: str) -> None:
+        half = 0.5 * value
+        sample.update({
+            "width_px": value, "width_units": value * pixel_size,
+            "left_px": half, "right_px": half,
+            "quality_grade": "A", "width_source": source,
+            "manual_measurement_id": measurement_id,
+        })
+        try:
+            row = float(sample["row_used"] if "row_used" in sample else sample["row"])
+            col = float(sample["col_used"] if "col_used" in sample else sample["col"])
+            normal_row = float(sample["normal_row"])
+            normal_col = float(sample["normal_col"])
+        except (KeyError, TypeError, ValueError):
+            return
+        sample.update({
+            "left_boundary_row": row - normal_row * half,
+            "left_boundary_col": col - normal_col * half,
+            "right_boundary_row": row + normal_row * half,
+            "right_boundary_col": col + normal_col * half,
+        })
+
+    def set_edge(edge_id: int, width: float, source: str, grade: str, weight: float = 1.0) -> None:
+        current = float(edge_widths[edge_id].get("width_px", 0.0) or 0.0)
+        value = float(width if weight >= 1.0 else current * (1.0 - weight) + width * weight)
+        edge_records[edge_id].update({
+            "optimized_width_px": value,
+            "optimized_width_units": value * pixel_size,
+            "optimized_width_source": source,
+            "optimized_quality_grade": grade,
+            "final_status": "manual_width_override",
+        })
+        edge_widths[edge_id].update({
+            "width_px": value, "width_units": value * pixel_size,
+            "source": source, "quality_grade": grade,
+            "status": "manual_width_override",
+        })
+        affected.add(edge_id)
+
+    for measurement in normalized:
+        try:
+            chain_id = int(measurement["target_chain_id"])
+            width = float(measurement["width_px"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if chain_id not in chains or not np.isfinite(width) or width <= 0:
+            continue
+        source = str(measurement.get("source", "manual_boundary_measurement"))
+        if source == "manual_interval_width":
+            lo = float(measurement["range_start_position"])
+            hi = float(measurement["range_end_position"])
+            for edge_id in chains[chain_id].edge_ids:
+                _cid, start, end, midpoint = edge_positions[int(edge_id)]
+                if lo - 1e-6 <= midpoint <= hi + 1e-6 or (lo <= start and end <= hi):
+                    set_edge(int(edge_id), width, "manual_interval_width", "A")
+            if samples is not None:
+                for sample in samples:
+                    if int(sample.get("chain_id", -1)) != chain_id:
+                        continue
+                    position = float(sample.get("chain_distance_px", -1.0))
+                    if lo - 1e-6 <= position <= hi + 1e-6:
+                        set_sample(
+                            sample, width, "manual_interval_width",
+                            str(measurement["measurement_id"]),
+                        )
+            if segments is not None:
+                segments.append({
+                    "width_segment_id": len(segments), "chain_id": chain_id,
+                    "start_sample_index": -1, "end_sample_index": -1, "sample_count": 0,
+                    "start_distance_px": lo, "end_distance_px": hi,
+                    "start_row": float(measurement["range_start_row"]),
+                    "start_col": float(measurement["range_start_col"]),
+                    "end_row": float(measurement["range_end_row"]),
+                    "end_col": float(measurement["range_end_col"]),
+                    "median_width_px": width, "mean_width_px": width,
+                    "median_width_units": width * pixel_size, "width_cv": 0.0,
+                    "edge_ids_json": json.dumps([
+                        int(edge_id) for edge_id in chains[chain_id].edge_ids
+                        if lo - 1e-6 <= edge_positions[int(edge_id)][3] <= hi + 1e-6
+                    ], separators=(",", ":")),
+                    "quality_grade": "A", "width_source": "manual_interval_width",
+                    "manual_measurement_id": str(measurement["measurement_id"]),
+                })
+            continue
+
+        anchor = float(measurement["chain_position"])
+        radius = float(measurement.get("influence_radius_px", max(20.0, min(60.0, width * 3.0))))
+        target_edge = int(measurement["target_edge_id"])
+        for edge_id in chains[chain_id].edge_ids:
+            _cid, _start, _end, midpoint = edge_positions[int(edge_id)]
+            distance = abs(midpoint - anchor)
+            spatial = max(0.0, 1.0 - distance / max(radius, 1.0)) ** 2
+            if int(edge_id) == target_edge:
+                spatial = 1.0
+            if spatial <= 0:
+                continue
+            auto_grade = str(edge_widths[int(edge_id)].get("quality_grade", "C")).upper()
+            grade_factor = 0.55 if auto_grade == "A" else (0.75 if auto_grade == "B" else 1.0)
+            weight = 1.0 if int(edge_id) == target_edge else spatial * grade_factor
+            set_edge(
+                int(edge_id), width,
+                "manual_boundary_measurement" if int(edge_id) == target_edge else "manual_anchor_adjusted",
+                "A" if int(edge_id) == target_edge else auto_grade,
+                weight,
+            )
+        if samples is not None:
+            for sample in samples:
+                if int(sample.get("chain_id", -1)) != chain_id:
+                    continue
+                position = float(sample.get("chain_distance_px", -1.0))
+                distance = abs(position - anchor)
+                weight = max(0.0, 1.0 - distance / max(radius, 1.0)) ** 2
+                if weight <= 0:
+                    continue
+                current = float(sample.get("width_px", 0.0) or 0.0)
+                value = width if distance <= 1e-6 else current * (1.0 - weight) + width * weight
+                set_sample(
+                    sample, value,
+                    "manual_boundary_measurement" if distance <= 1e-6 else "manual_anchor_adjusted",
+                    str(measurement["measurement_id"]),
+                )
+    return len(affected)
 
 
 def _endpoint_direction(

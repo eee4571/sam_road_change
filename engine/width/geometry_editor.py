@@ -31,7 +31,11 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 from finalize_review_results import load_graph, save_graph  # noqa: E402
-from chain_width_calculator import build_road_chains  # noqa: E402
+from chain_width_calculator import (  # noqa: E402
+    build_road_chains,
+    normalize_manual_width_measurements,
+    project_point_to_road_chain,
+)
 from global_edit_utils import _graph_from_world_lines, _project_manual_widths  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
 
@@ -160,6 +164,110 @@ def point_segment_projection(point: np.ndarray, start: np.ndarray, end: np.ndarr
     return projection, float(np.linalg.norm(point - projection))
 
 
+def _next_measurement_id(measurements: list[dict]) -> str:
+    used = {str(row.get("measurement_id", "")) for row in measurements}
+    index = len(measurements) + 1
+    while f"MW{index:05d}" in used:
+        index += 1
+    return f"MW{index:05d}"
+
+
+def create_normal_width_measurement(
+    document: "GeometryDocument",
+    start_rc: tuple[float, float],
+    end_rc: tuple[float, float],
+    *,
+    max_centerline_distance: float = 24.0,
+    minimum_normal_cosine: float = 0.5,
+) -> tuple[dict | None, str]:
+    """Turn a rough mouse drag into a chain-normal boundary measurement."""
+    start = np.asarray(start_rc, dtype=np.float32)
+    end = np.asarray(end_rc, dtype=np.float32)
+    drag = end - start
+    drag_length = float(np.linalg.norm(drag))
+    if drag_length < 1.0:
+        return None, "测宽线过短，请跨道路两侧拖动。"
+    midpoint = 0.5 * (start + end)
+    projection = project_point_to_road_chain(document.nodes, document.edges, midpoint)
+    if projection is None or projection.distance > max_centerline_distance:
+        return None, "测宽线中点没有落在中心线附近，请跨道路两侧拖动。"
+    tangent = projection.tangent / max(float(np.linalg.norm(projection.tangent)), 1e-6)
+    normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32)
+    normal_cosine = abs(float(np.dot(drag / drag_length, normal)))
+    if normal_cosine < minimum_normal_cosine:
+        return None, "请跨道路两侧拖动测宽线。"
+    start_offset = float(np.dot(start - projection.point, normal))
+    end_offset = float(np.dot(end - projection.point, normal))
+    if start_offset * end_offset > 0:
+        return None, "请从道路一侧拖到另一侧。"
+    corrected_start = projection.point + normal * start_offset
+    corrected_end = projection.point + normal * end_offset
+    width_px = abs(end_offset - start_offset)
+    if width_px < 1.0:
+        return None, "测宽线过短，请跨道路两侧拖动。"
+    transform = getattr(document, "global_transform", None)
+    if transform is None:
+        transform = getattr(document, "raster_transform", None)
+    if transform is not None:
+        start_xy = transform * (float(corrected_start[1]), float(corrected_start[0]))
+        end_xy = transform * (float(corrected_end[1]), float(corrected_end[0]))
+        width_units = float(math.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1]))
+    else:
+        width_units = width_px * float(getattr(document, "pixel_size", 1.0))
+    measurement = {
+        "measurement_id": _next_measurement_id(document.manual_widths),
+        "target_chain_id": int(projection.chain_id),
+        "chain_position": float(projection.chain_position),
+        "target_edge_id": int(projection.edge_id),
+        "target_row": float(projection.point[0]), "target_col": float(projection.point[1]),
+        "start_row": float(corrected_start[0]), "start_col": float(corrected_start[1]),
+        "end_row": float(corrected_end[0]), "end_col": float(corrected_end[1]),
+        "width_px": float(width_px), "width_units": float(width_units),
+        "target_distance_px": float(projection.distance),
+        "source": "manual_boundary_measurement", "quality_grade": "A",
+        "edit_order": len(document.manual_widths),
+    }
+    return measurement, ""
+
+
+def create_interval_width_measurement(
+    document: "GeometryDocument",
+    measurement: dict,
+    start_rc: tuple[float, float],
+    end_rc: tuple[float, float],
+    *,
+    max_centerline_distance: float = 24.0,
+) -> tuple[dict | None, str]:
+    """Convert one point anchor to a strict interval on the same road chain."""
+    try:
+        chain_id = int(measurement["target_chain_id"])
+    except (KeyError, TypeError, ValueError):
+        return None, "请先完成一次人工测宽。"
+    nearest_start = project_point_to_road_chain(document.nodes, document.edges, start_rc)
+    nearest_end = project_point_to_road_chain(document.nodes, document.edges, end_rc)
+    start = project_point_to_road_chain(document.nodes, document.edges, start_rc, chain_id=chain_id)
+    end = project_point_to_road_chain(document.nodes, document.edges, end_rc, chain_id=chain_id)
+    if (
+        start is None or end is None or nearest_start is None or nearest_end is None
+        or start.distance > max_centerline_distance or end.distance > max_centerline_distance
+    ):
+        return None, "区间端点必须落在道路中心线上。"
+    if (
+        start.distance > nearest_start.distance + 2.0
+        or end.distance > nearest_end.distance + 2.0
+    ):
+        return None, "区间终点必须位于同一连续道路链上。"
+    result = dict(measurement)
+    result.update({
+        "source": "manual_interval_width", "quality_grade": "A",
+        "range_start_position": float(min(start.chain_position, end.chain_position)),
+        "range_end_position": float(max(start.chain_position, end.chain_position)),
+        "range_start_row": float(start.point[0]), "range_start_col": float(start.point[1]),
+        "range_end_row": float(end.point[0]), "range_end_col": float(end.point[1]),
+    })
+    return result, ""
+
+
 @dataclass
 class EditorSnapshot:
     nodes: np.ndarray
@@ -193,7 +301,9 @@ class GeometryDocument:
         self.mask = (np.asarray(mask) > 0).astype(np.uint8)
         self.candidates = copy.deepcopy(candidates or {})
         self.applied_surface_region_ids = set(applied_surface_region_ids or set())
-        self.manual_widths = copy.deepcopy(manual_widths or [])
+        self.manual_widths = normalize_manual_width_measurements(
+            self.nodes, self.edges, copy.deepcopy(manual_widths or []),
+        )
         self.surface_additions = (
             (np.asarray(surface_additions) > 0).astype(np.uint8)
             if surface_additions is not None else np.zeros_like(self.mask)
@@ -416,6 +526,9 @@ class GeometryDocument:
         mapping = {old: new for new, old in enumerate(used)}
         self.nodes = self.nodes[np.asarray(used, dtype=np.int32)]
         self.edges = np.asarray([(mapping[src], mapping[dst]) for src, dst in unique_edges], dtype=np.int32).reshape(-1, 2)
+        self.manual_widths = normalize_manual_width_measurements(
+            self.nodes, self.edges, self.manual_widths,
+        )
 
     def node_intersections(self) -> None:
         """Split exact line crossings into shared graph nodes before saving."""
@@ -845,6 +958,12 @@ def load_documents(
             )
             for region_id in accepted_surface_region_polylines(stem, surface_only, candidates, decisions):
                 document.applied_surface_region_ids.add(region_id)
+        try:
+            with rasterio.open(Path(summary["image"])) as dataset:
+                document.raster_transform = dataset.transform
+                document.pixel_size = max(abs(float(dataset.transform.a)), abs(float(dataset.transform.e)))
+        except (OSError, rasterio.errors.RasterioError, KeyError):
+            document.pixel_size = float(summary.get("pixel_size", 1.0) or 1.0)
         documents.append(document)
     if not documents:
         raise FileNotFoundError(f"No review summaries under {review_dir}")
@@ -894,6 +1013,19 @@ def _global_change_geometry(document: GeometryDocument, edited_lines: list[LineS
         except (KeyError, TypeError, ValueError):
             continue
         parts.append(Point(x, y).buffer(max(document.global_overview_scale * 3.0, 0.01)))
+        if str(measurement.get("source", "")) == "manual_interval_width":
+            try:
+                interval = LineString([
+                    document.global_transform * (
+                        float(measurement["range_start_col"]), float(measurement["range_start_row"]),
+                    ),
+                    document.global_transform * (
+                        float(measurement["range_end_col"]), float(measurement["range_end_row"]),
+                    ),
+                ])
+            except (KeyError, TypeError, ValueError):
+                continue
+            parts.append(interval.buffer(max(document.global_overview_scale * 3.0, 0.01)))
     if not parts:
         return None
     return unary_union(parts).buffer(max(document.global_overview_scale * 2.0, 0.01))
@@ -1013,6 +1145,10 @@ class GeometryEditorApp:
         self.lasso: list[tuple[float, float]] = []
         self.selected_edge_ids: set[int] = set()
         self.width_draft: list[tuple[float, float]] = []
+        self.width_drag_start: tuple[float, float] | None = None
+        self.width_drag_current: tuple[float, float] | None = None
+        self.interval_draft: list[tuple[float, float]] = []
+        self.interval_measurement_id: str | None = None
         self.surface_radius = tk.IntVar(value=12)
         self.surface_stroke_active = False
         self.lasso_canvas_item = None
@@ -1108,6 +1244,10 @@ class GeometryEditorApp:
         self.context_cancel = ttk.Button(self.context_frame, text="取消  Esc", style="Tool.TButton", command=self.cancel_drawing)
         self.context_delete = ttk.Button(self.context_frame, text="删除所选中心线", style="Primary.TButton", command=self.delete_selected_edges)
         self.context_clear = ttk.Button(self.context_frame, text="取消选择  Esc", style="Tool.TButton", command=self.clear_selection)
+        self.context_interval = ttk.Button(
+            self.context_frame, text="应用到道路区间", style="Primary.TButton",
+            command=self.begin_width_interval,
+        )
 
         workspace = ttk.Frame(self.root, padding=(12, 0, 12, 0), style="Editor.TFrame")
         workspace.pack(fill="both", expand=True)
@@ -1161,7 +1301,10 @@ class GeometryEditorApp:
 
         legend_panel = ttk.LabelFrame(right_panel, text="图层与图例", style="Panel.TLabelframe")
         legend_panel.pack(fill="x", pady=(10, 0))
-        for text, color in (("━━  最终中心线", "#22C55E"), ("━━  已选中心线", "#F97316")):
+        for text, color in (
+            ("━━  最终中心线", "#22C55E"), ("━━  已选中心线", "#F97316"),
+            ("●━●  人工法向测宽", "#38BDF8"), ("━━━━  人工定宽区间", "#FACC15"),
+        ):
             ttk.Label(legend_panel, text=text, foreground=color, background=palette["card"]).pack(anchor="w", pady=3)
 
         status = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel")
@@ -1181,9 +1324,17 @@ class GeometryEditorApp:
         self._mode_changed()
 
     def _mode_changed(self) -> None:
-        for widget in (self.context_finish, self.context_cancel, self.context_delete, self.context_clear):
+        for widget in (
+            self.context_finish, self.context_cancel, self.context_delete,
+            self.context_clear, self.context_interval,
+        ):
             widget.pack_forget()
         mode = self.mode.get()
+        if mode != "measure_width":
+            self.width_drag_start = None
+            self.width_drag_current = None
+            self.interval_draft = []
+            self.interval_measurement_id = None
         if mode == "draw":
             self.context_text.set("绘制中心线：在影像上依次单击添加节点。")
             self.context_cancel.pack(side="right", padx=4)
@@ -1195,8 +1346,9 @@ class GeometryEditorApp:
         elif mode == "delete":
             self.context_text.set("删除中心线：单击需要删除的线段。")
         elif mode == "measure_width":
-            self.context_text.set("手动测宽：依次点击道路两侧边界；测线中点须靠近目标中心线，保存后覆盖该连续路段的自动宽度。")
+            self.context_text.set("手动测宽：按住左键从道路一侧拖到另一侧；松开后自动校正为道路法线。")
             self.context_cancel.pack(side="right", padx=4)
+            self.context_interval.pack(side="right")
         elif mode == "surface_add":
             self.context_text.set("补画道路面：按住左键涂画遗漏路面；绿色为最终面，蓝色为本次补画。")
         elif mode == "surface_remove":
@@ -1263,17 +1415,67 @@ class GeometryEditorApp:
             canvas = cv2.addWeighted(shade, 0.16, canvas, 0.84, 0)
             cv2.polylines(canvas, [pts], True, (0, 220, 255), 2, cv2.LINE_AA)
         for measurement in self.doc.manual_widths:
+            if str(measurement.get("source", "")) == "manual_interval_width":
+                try:
+                    chain_id = int(measurement["target_chain_id"])
+                    lo = float(measurement["range_start_position"])
+                    hi = float(measurement["range_end_position"])
+                except (KeyError, TypeError, ValueError):
+                    chain_id = -1
+                    lo = hi = -1.0
+                for chain in build_road_chains(self.doc.nodes, self.doc.edges):
+                    if chain.chain_id != chain_id:
+                        continue
+                    points = self.doc.nodes[np.asarray(chain.node_ids, dtype=np.int32)]
+                    cumulative = np.concatenate((
+                        [0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)),
+                    ))
+                    for offset, edge_id in enumerate(chain.edge_ids):
+                        midpoint = 0.5 * float(cumulative[offset] + cumulative[offset + 1])
+                        if lo - 1e-6 <= midpoint <= hi + 1e-6:
+                            src, dst = self.doc.edges[int(edge_id)]
+                            cv2.line(
+                                canvas,
+                                (int(round(self.doc.nodes[src, 1])), int(round(self.doc.nodes[src, 0]))),
+                                (int(round(self.doc.nodes[dst, 1])), int(round(self.doc.nodes[dst, 0]))),
+                                (0, 210, 255), 4, cv2.LINE_AA,
+                            )
             try:
                 p0 = (int(round(float(measurement["start_col"]))), int(round(float(measurement["start_row"]))))
                 p1 = (int(round(float(measurement["end_col"]))), int(round(float(measurement["end_row"]))))
+                target = (
+                    int(round(float(measurement["target_col"]))),
+                    int(round(float(measurement["target_row"]))),
+                )
             except (KeyError, TypeError, ValueError):
                 continue
-            cv2.line(canvas, p0, p1, (255, 180, 0), 3, cv2.LINE_AA)
+            cv2.line(canvas, p0, p1, (255, 180, 0), 2, cv2.LINE_AA)
             cv2.circle(canvas, p0, 4, (255, 220, 80), -1)
             cv2.circle(canvas, p1, 4, (255, 220, 80), -1)
-        if self.width_draft:
-            p0 = (int(round(self.width_draft[0][1])), int(round(self.width_draft[0][0])))
-            cv2.circle(canvas, p0, 5, (255, 0, 255), -1)
+            cv2.circle(canvas, target, 3, (0, 255, 255), -1)
+            width_units = float(measurement.get("width_units", measurement.get("width_px", 0.0)))
+            cv2.putText(
+                canvas, f"{width_units:.2f} m", (target[0] + 6, target[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 240, 120), 1, cv2.LINE_AA,
+            )
+        if self.width_drag_start is not None and self.width_drag_current is not None:
+            raw0 = (int(round(self.width_drag_start[1])), int(round(self.width_drag_start[0])))
+            raw1 = (int(round(self.width_drag_current[1])), int(round(self.width_drag_current[0])))
+            cv2.line(canvas, raw0, raw1, (255, 0, 255), 1, cv2.LINE_AA)
+            preview, _error = create_normal_width_measurement(
+                self.doc, self.width_drag_start, self.width_drag_current,
+                max_centerline_distance=max(12.0, 24.0 / self.zoom),
+            )
+            if preview is not None:
+                p0 = (int(round(preview["start_col"])), int(round(preview["start_row"])))
+                p1 = (int(round(preview["end_col"])), int(round(preview["end_row"])))
+                cv2.line(canvas, p0, p1, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(
+                    canvas, f"{float(preview['width_units']):.2f} m", p1,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA,
+                )
+        for row, col in self.interval_draft:
+            cv2.circle(canvas, (int(round(col)), int(round(row))), 5, (0, 210, 255), -1)
         return canvas
 
     def refresh(self) -> None:
@@ -1320,10 +1522,16 @@ class GeometryEditorApp:
                 self.doc.delete_edge_at(row, col, tolerance)
                 self.refresh()
         elif mode == "measure_width":
-            self.width_draft.append((row, col))
-            if len(self.width_draft) == 2:
-                self.finish_width_measurement()
+            if self.interval_measurement_id is not None:
+                self.interval_draft.append((row, col))
+                if len(self.interval_draft) == 2:
+                    self.finish_width_interval()
+                else:
+                    self.context_text.set("区间定宽：已选择起点，请在同一连续道路链上选择终点。")
+                    self.refresh()
             else:
+                self.width_drag_start = (row, col)
+                self.width_drag_current = (row, col)
                 self.refresh()
         elif mode in {"surface_add", "surface_remove"}:
             self.doc.checkpoint()
@@ -1341,12 +1549,24 @@ class GeometryEditorApp:
             if math.hypot(row - last[0], col - last[1]) >= max(1.0, 3.0 / self.zoom):
                 self.lasso.append((row, col))
                 self._extend_lasso_canvas(event)
+        elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
+            self.width_drag_current = (row, col)
+            preview, _error = create_normal_width_measurement(
+                self.doc, self.width_drag_start, self.width_drag_current,
+                max_centerline_distance=max(12.0, 24.0 / self.zoom),
+            )
+            if preview is not None:
+                self.context_text.set(f"人工测宽：{float(preview['width_units']):.2f} m")
+            self.refresh()
         elif self.mode.get() in {"surface_add", "surface_remove"} and self.surface_stroke_active:
             self.doc.paint_surface(row, col, self.surface_radius.get(), self.mode.get() == "surface_add")
             self.refresh()
 
-    def mouse_release(self, _event) -> None:
+    def mouse_release(self, event) -> None:
         self.surface_stroke_active = False
+        if self.mode.get() == "measure_width" and self.width_drag_start is not None:
+            self.width_drag_current = self.source_point(event)
+            self.finish_width_measurement()
         if self.drag_node is not None:
             self.doc.snap_moved_node(self.drag_node, max(3.0, 8.0 / self.zoom))
             self.drag_node = None
@@ -1402,6 +1622,10 @@ class GeometryEditorApp:
     def cancel_drawing(self) -> None:
         self.draft = []
         self.width_draft = []
+        self.width_drag_start = None
+        self.width_drag_current = None
+        self.interval_draft = []
+        self.interval_measurement_id = None
         if self.mode.get() == "lasso":
             self.lasso = []
             self.selected_edge_ids.clear()
@@ -1409,49 +1633,67 @@ class GeometryEditorApp:
         self.refresh()
 
     def finish_width_measurement(self) -> None:
-        if len(self.width_draft) != 2:
+        if self.width_drag_start is None or self.width_drag_current is None:
             return
-        start, end = self.width_draft
-        self.width_draft = []
-        width_px = float(math.hypot(end[0] - start[0], end[1] - start[1]))
-        target = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
-        nearest = self.doc.nearest_edge(*target, max(12.0, 24.0 / self.zoom))
-        if nearest is None:
-            messagebox.showwarning("测宽未保存", "测线中点没有落在中心线附近，请跨道路两侧重新绘制。")
-            self.refresh()
-            return
-        if width_px < 1.0:
-            messagebox.showwarning("测宽未保存", "测线过短，请重新点击道路两侧边界。")
-            self.refresh()
-            return
-        _edge_id, projection, distance = nearest
-        self.doc.checkpoint()
-        self.doc.manual_widths.append({
-            "measurement_id": f"MW{len(self.doc.manual_widths) + 1:05d}",
-            "start_row": float(start[0]), "start_col": float(start[1]),
-            "end_row": float(end[0]), "end_col": float(end[1]),
-            "target_row": float(projection[0]), "target_col": float(projection[1]),
-            "width_px": width_px, "target_distance_px": float(distance),
-            "source": "manual_boundary_measurement",
-        })
-        # Show the road-surface result immediately.  The saved measurement is
-        # still applied authoritatively to the full continuous road chain in
-        # finalization; this preview lets the user erase/repair a bad buffer.
-        target_edge = int(nearest[0])
-        chain_edges = next(
-            (chain.edge_ids for chain in build_road_chains(self.doc.nodes, self.doc.edges) if target_edge in chain.edge_ids),
-            [target_edge],
+        start, end = self.width_drag_start, self.width_drag_current
+        self.width_drag_start = None
+        self.width_drag_current = None
+        measurement, error = create_normal_width_measurement(
+            self.doc, start, end,
+            max_centerline_distance=max(12.0, 24.0 / self.zoom),
         )
-        for edge_id in chain_edges:
-            src, dst = self.doc.edges[int(edge_id)]
-            cv2.line(
-                self.doc.surface_additions,
-                (int(round(self.doc.nodes[src, 1])), int(round(self.doc.nodes[src, 0]))),
-                (int(round(self.doc.nodes[dst, 1])), int(round(self.doc.nodes[dst, 0]))),
-                1, max(1, int(round(width_px))), cv2.LINE_AA,
-            )
+        if measurement is None:
+            messagebox.showwarning("测宽未保存", error)
+            self._mode_changed()
+            return
+        self.doc.checkpoint()
+        self.doc.manual_widths.append(measurement)
         self.saved_var.set("尚未保存")
+        self._mode_changed()
+
+    def begin_width_interval(self) -> None:
+        measurement = next((
+            row for row in reversed(self.doc.manual_widths)
+            if str(row.get("source", "")) in {"manual_boundary_measurement", "manual_interval_width"}
+        ), None)
+        if measurement is None:
+            messagebox.showinfo("请先测宽", "请先跨道路拖动一次，得到需要应用的人工宽度。")
+            return
+        self.interval_measurement_id = str(measurement.get("measurement_id", ""))
+        self.interval_draft = []
+        self.width_drag_start = None
+        self.width_drag_current = None
+        self.context_text.set("区间定宽：请在当前道路链中心线上选择区间起点。")
         self.refresh()
+
+    def finish_width_interval(self) -> None:
+        if self.interval_measurement_id is None or len(self.interval_draft) != 2:
+            return
+        index = next((
+            item for item, row in enumerate(self.doc.manual_widths)
+            if str(row.get("measurement_id", "")) == self.interval_measurement_id
+        ), None)
+        if index is None:
+            self.interval_draft = []
+            self.interval_measurement_id = None
+            return
+        interval, error = create_interval_width_measurement(
+            self.doc, self.doc.manual_widths[index],
+            self.interval_draft[0], self.interval_draft[1],
+            max_centerline_distance=max(12.0, 24.0 / self.zoom),
+        )
+        if interval is None:
+            messagebox.showwarning("区间未保存", error)
+            self.interval_draft = []
+            self.context_text.set("区间定宽：请重新选择同一连续道路链上的起点和终点。")
+            self.refresh()
+            return
+        self.doc.checkpoint()
+        self.doc.manual_widths[index] = interval
+        self.interval_draft = []
+        self.interval_measurement_id = None
+        self.saved_var.set("尚未保存")
+        self._mode_changed()
 
     def add_candidate(self) -> None:
         candidate_id = self.candidate_var.get()
@@ -1467,6 +1709,10 @@ class GeometryEditorApp:
             self.draft = []
             self.lasso = []
             self.selected_edge_ids.clear()
+            self.width_drag_start = None
+            self.width_drag_current = None
+            self.interval_draft = []
+            self.interval_measurement_id = None
             self.refresh()
 
     def redo(self) -> None:
@@ -1474,6 +1720,10 @@ class GeometryEditorApp:
             self.draft = []
             self.lasso = []
             self.selected_edge_ids.clear()
+            self.width_drag_start = None
+            self.width_drag_current = None
+            self.interval_draft = []
+            self.interval_measurement_id = None
             self.refresh()
 
     def change_tile(self, _event=None) -> None:
@@ -1483,6 +1733,10 @@ class GeometryEditorApp:
         self.lasso = []
         self.selected_edge_ids.clear()
         self.width_draft = []
+        self.width_drag_start = None
+        self.width_drag_current = None
+        self.interval_draft = []
+        self.interval_measurement_id = None
         self.fit_image()
 
     def show_topology(self) -> None:

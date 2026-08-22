@@ -991,6 +991,11 @@ def _regular_corridor_widths(
     from joining the same corridor.
     """
     result = np.asarray(widths, dtype=np.float32).copy()
+    protected = np.zeros(len(edges), dtype=bool)
+    if edge_metadata is not None:
+        for edge_id, row in enumerate(edge_metadata[:len(edges)]):
+            source = str(row.get("optimized_width_source", row.get("source", "")) or "")
+            protected[edge_id] = source.startswith("manual_")
     directions = _edge_directions(nodes, edges)
     adjacency = _edge_adjacency(edges, len(nodes))
     parent = list(range(len(edges)))
@@ -1012,11 +1017,14 @@ def _regular_corridor_widths(
     for edge_ids in _supplemental_path_groups(edge_metadata).values():
         valid_ids = [edge_id for edge_id in edge_ids if 0 <= edge_id < len(edges)]
         for first, second in zip(valid_ids, valid_ids[1:]):
-            union(first, second)
+            if not protected[first] and not protected[second]:
+                union(first, second)
 
     for node_edges in adjacency:
         for index, first in enumerate(node_edges):
             for second in node_edges[index + 1:]:
+                if protected[first] or protected[second]:
+                    continue
                 if result[first] <= 0 or result[second] <= 0:
                     continue
                 cosine = abs(float(np.dot(directions[first], directions[second])))
@@ -1235,6 +1243,7 @@ def reconstruct_surface_from_widths(
     widths_by_edge: dict[int, float] = {}
     grades_by_edge: dict[int, str] = {}
     reliable_widths = np.zeros(len(graph_edges), dtype=bool)
+    protected_widths = np.zeros(len(graph_edges), dtype=bool)
     for index, row in enumerate(edge_widths):
         try:
             edge_id = int(float(row.get("edge_id", index)))
@@ -1247,6 +1256,7 @@ def reconstruct_surface_from_widths(
         source = str(row.get("source", row.get("optimized_width_source", "")) or "")
         quality = str(row.get("quality_grade", row.get("optimized_quality_grade", "")) or "")
         grades_by_edge[edge_id] = quality.upper()
+        protected_widths[edge_id] = source.startswith("manual_")
         reliable_widths[edge_id] = bool(
             width_px >= config.min_width_px
             and "tile_fallback" not in source
@@ -1264,6 +1274,8 @@ def reconstruct_surface_from_widths(
         dtype=np.float32,
     )
     for edge_id, rows in samples_by_edge.items():
+        if protected_widths[edge_id]:
+            continue
         reliable_rows = [
             width for (_, width), row in zip(rows, sample_rows_by_edge.get(edge_id, []))
             if str(row.get("quality_grade", "A") or "A").upper() != "C"
@@ -1297,6 +1309,7 @@ def reconstruct_surface_from_widths(
     resolved_widths, junction_width_spike_count = _cap_junction_nearby_width_spikes(
         nodes, graph_edges, resolved_widths, config
     )
+    resolved_widths[protected_widths] = initial_widths[protected_widths]
     if config.regular_surface:
         support_widths = resolved_widths.copy()
     edge_corridors: list[np.ndarray | None] = [None] * len(graph_edges)
