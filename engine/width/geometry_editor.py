@@ -7,6 +7,7 @@ import ctypes
 import json
 import math
 import sys
+from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,9 @@ if str(TOOL_DIR) not in sys.path:
 
 from finalize_review_results import load_graph, save_graph  # noqa: E402
 from chain_width_calculator import (  # noqa: E402
+    ChainProjection,
+    _chain_geometry,
+    _tangent_at,
     build_road_chains,
     normalize_manual_width_measurements,
     project_point_to_road_chain,
@@ -188,7 +192,12 @@ def create_normal_width_measurement(
     if drag_length < 1.0:
         return None, "测宽线过短，请跨道路两侧拖动。"
     midpoint = 0.5 * (start + end)
-    projection = project_point_to_road_chain(document.nodes, document.edges, midpoint)
+    if hasattr(document, "project_to_road_chain"):
+        projection = document.project_to_road_chain(
+            midpoint, max_distance=max_centerline_distance,
+        )
+    else:
+        projection = project_point_to_road_chain(document.nodes, document.edges, midpoint)
     if projection is None or projection.distance > max_centerline_distance:
         return None, "测宽线中点没有落在中心线附近，请跨道路两侧拖动。"
     tangent = projection.tangent / max(float(np.linalg.norm(projection.tangent)), 1e-6)
@@ -243,10 +252,24 @@ def create_interval_width_measurement(
         chain_id = int(measurement["target_chain_id"])
     except (KeyError, TypeError, ValueError):
         return None, "请先完成一次人工测宽。"
-    nearest_start = project_point_to_road_chain(document.nodes, document.edges, start_rc)
-    nearest_end = project_point_to_road_chain(document.nodes, document.edges, end_rc)
-    start = project_point_to_road_chain(document.nodes, document.edges, start_rc, chain_id=chain_id)
-    end = project_point_to_road_chain(document.nodes, document.edges, end_rc, chain_id=chain_id)
+    if hasattr(document, "project_to_road_chain"):
+        nearest_start = document.project_to_road_chain(
+            start_rc, max_distance=max_centerline_distance,
+        )
+        nearest_end = document.project_to_road_chain(
+            end_rc, max_distance=max_centerline_distance,
+        )
+        start = document.project_to_road_chain(
+            start_rc, chain_id=chain_id, max_distance=max_centerline_distance,
+        )
+        end = document.project_to_road_chain(
+            end_rc, chain_id=chain_id, max_distance=max_centerline_distance,
+        )
+    else:
+        nearest_start = project_point_to_road_chain(document.nodes, document.edges, start_rc)
+        nearest_end = project_point_to_road_chain(document.nodes, document.edges, end_rc)
+        start = project_point_to_road_chain(document.nodes, document.edges, start_rc, chain_id=chain_id)
+        end = project_point_to_road_chain(document.nodes, document.edges, end_rc, chain_id=chain_id)
     if (
         start is None or end is None or nearest_start is None or nearest_end is None
         or start.distance > max_centerline_distance or end.distance > max_centerline_distance
@@ -314,6 +337,115 @@ class GeometryDocument:
         )
         self.undo_stack: list[EditorSnapshot] = []
         self.redo_stack: list[EditorSnapshot] = []
+        self._cache_revision = 0
+        self._chain_cache = None
+        self._edge_to_chain: dict[int, int] = {}
+        self._chain_geometry_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._edge_grid: dict[tuple[int, int], list[int]] | None = None
+        self._incident_edges: list[list[int]] | None = None
+        self._topology_metrics_cache: dict | None = None
+        self._grid_size = 128.0
+        self.cache_build_counts = {"chains": 0, "spatial": 0}
+
+    def invalidate_geometry_cache(self) -> None:
+        self._cache_revision += 1
+        self._chain_cache = None
+        self._edge_to_chain = {}
+        self._chain_geometry_cache = {}
+        self._edge_grid = None
+        self._incident_edges = None
+        self._topology_metrics_cache = None
+
+    def road_chains(self):
+        if self._chain_cache is None:
+            self._chain_cache = build_road_chains(self.nodes, self.edges)
+            self._edge_to_chain = {}
+            self._chain_geometry_cache = {}
+            for chain in self._chain_cache:
+                self._chain_geometry_cache[int(chain.chain_id)] = _chain_geometry(chain, self.nodes)
+                for edge_id in chain.edge_ids:
+                    self._edge_to_chain[int(edge_id)] = int(chain.chain_id)
+            self.cache_build_counts["chains"] += 1
+        return self._chain_cache
+
+    def incident_edges(self, node_id: int) -> list[int]:
+        if self._incident_edges is None:
+            self._incident_edges = [[] for _ in range(len(self.nodes))]
+            for edge_id, (src, dst) in enumerate(self.edges.tolist()):
+                self._incident_edges[int(src)].append(edge_id)
+                self._incident_edges[int(dst)].append(edge_id)
+        return self._incident_edges[node_id] if 0 <= node_id < len(self._incident_edges) else []
+
+    def _ensure_edge_grid(self) -> None:
+        if self._edge_grid is not None:
+            return
+        grid: dict[tuple[int, int], list[int]] = {}
+        size = self._grid_size
+        for edge_id, (src, dst) in enumerate(self.edges.tolist()):
+            points = self.nodes[[int(src), int(dst)]]
+            row_min, col_min = np.min(points, axis=0)
+            row_max, col_max = np.max(points, axis=0)
+            for grid_row in range(int(math.floor(row_min / size)), int(math.floor(row_max / size)) + 1):
+                for grid_col in range(int(math.floor(col_min / size)), int(math.floor(col_max / size)) + 1):
+                    grid.setdefault((grid_row, grid_col), []).append(edge_id)
+        self._edge_grid = grid
+        self.cache_build_counts["spatial"] += 1
+
+    def spatial_edge_candidates(self, row: float, col: float, tolerance: float) -> list[int]:
+        self._ensure_edge_grid()
+        size = self._grid_size
+        row_min, row_max = row - tolerance, row + tolerance
+        col_min, col_max = col - tolerance, col + tolerance
+        candidates: set[int] = set()
+        for grid_row in range(int(math.floor(row_min / size)), int(math.floor(row_max / size)) + 1):
+            for grid_col in range(int(math.floor(col_min / size)), int(math.floor(col_max / size)) + 1):
+                candidates.update(self._edge_grid.get((grid_row, grid_col), ()))
+        return sorted(candidates)
+
+    def project_to_road_chain(
+        self,
+        point_rc: tuple[float, float] | np.ndarray,
+        *,
+        chain_id: int | None = None,
+        max_distance: float = 24.0,
+        tangent_radius: float = 12.0,
+    ) -> ChainProjection | None:
+        point = np.asarray(point_rc, dtype=np.float32).reshape(2)
+        chains = self.road_chains()
+        if chain_id is None:
+            candidate_ids = self.spatial_edge_candidates(
+                float(point[0]), float(point[1]), max(1.0, max_distance),
+            )
+        else:
+            chain = next((item for item in chains if int(item.chain_id) == int(chain_id)), None)
+            candidate_ids = [] if chain is None else [int(value) for value in chain.edge_ids]
+        best = None
+        for edge_id in candidate_ids:
+            src, dst = (int(value) for value in self.edges[edge_id])
+            projection, distance = point_segment_projection(point, self.nodes[src], self.nodes[dst])
+            if best is None or distance < best[2]:
+                best = (edge_id, projection, distance)
+        if best is None or best[2] > max_distance:
+            return None
+        edge_id, projection, distance = best
+        resolved_chain_id = self._edge_to_chain.get(int(edge_id))
+        if resolved_chain_id is None:
+            return None
+        chain = next(item for item in chains if int(item.chain_id) == resolved_chain_id)
+        points, cumulative = self._chain_geometry_cache[resolved_chain_id]
+        offset = chain.edge_ids.index(int(edge_id))
+        start, end = points[offset], points[offset + 1]
+        vector = end - start
+        denominator = float(np.dot(vector, vector))
+        ratio = 0.0 if denominator <= 1e-9 else float(
+            np.clip(np.dot(projection - start, vector) / denominator, 0.0, 1.0)
+        )
+        position = float(cumulative[offset] + ratio * (cumulative[offset + 1] - cumulative[offset]))
+        return ChainProjection(
+            chain_id=resolved_chain_id, edge_id=int(edge_id), chain_position=position,
+            point=np.asarray(projection, dtype=np.float32), distance=float(distance),
+            tangent=_tangent_at(points, cumulative, position, max(1.0, tangent_radius)),
+        )
 
     def snapshot(self) -> EditorSnapshot:
         return EditorSnapshot(
@@ -332,6 +464,7 @@ class GeometryDocument:
         self.manual_widths = copy.deepcopy(state.manual_widths)
         self.surface_additions = state.surface_additions.copy()
         self.surface_removals = state.surface_removals.copy()
+        self.invalidate_geometry_cache()
 
     def editable_surface(self) -> np.ndarray:
         return (((self.mask > 0) | (self.surface_additions > 0)) & (self.surface_removals == 0)).astype(np.uint8)
@@ -376,7 +509,8 @@ class GeometryDocument:
     def nearest_edge(self, row: float, col: float, tolerance: float) -> tuple[int, np.ndarray, float] | None:
         point = np.asarray([row, col], dtype=np.float32)
         best = None
-        for edge_id, (src, dst) in enumerate(self.edges.tolist()):
+        for edge_id in self.spatial_edge_candidates(row, col, tolerance):
+            src, dst = (int(value) for value in self.edges[edge_id])
             projection, distance = point_segment_projection(point, self.nodes[src], self.nodes[dst])
             if distance <= tolerance and (best is None or distance < best[2]):
                 best = (edge_id, projection, distance)
@@ -384,6 +518,7 @@ class GeometryDocument:
 
     def add_node(self, point: tuple[float, float]) -> int:
         self.nodes = np.vstack([self.nodes, np.asarray(point, dtype=np.float32)]) if len(self.nodes) else np.asarray([point], dtype=np.float32)
+        self.invalidate_geometry_cache()
         return len(self.nodes) - 1
 
     def split_edge(self, edge_id: int, point: tuple[float, float]) -> int:
@@ -391,6 +526,7 @@ class GeometryDocument:
         node_id = self.add_node(point)
         kept = np.delete(self.edges, edge_id, axis=0)
         self.edges = np.vstack([kept, np.asarray([[src, node_id], [node_id, dst]], dtype=np.int32)])
+        self.invalidate_geometry_cache()
         return node_id
 
     def merge_nodes(self, source: int, target: int) -> None:
@@ -413,11 +549,12 @@ class GeometryDocument:
             if float(distances[target]) <= tolerance:
                 self.merge_nodes(node_id, target)
                 return "node"
-        incident = {edge_id for edge_id, edge in enumerate(self.edges.tolist()) if node_id in edge}
+        incident = set(self.incident_edges(node_id))
         best = None
-        for edge_id, (src, dst) in enumerate(self.edges.tolist()):
+        for edge_id in self.spatial_edge_candidates(float(point[0]), float(point[1]), tolerance):
             if edge_id in incident:
                 continue
+            src, dst = (int(value) for value in self.edges[edge_id])
             projection, distance = point_segment_projection(point, self.nodes[src], self.nodes[dst])
             if distance <= tolerance and (best is None or distance < best[2]):
                 best = (edge_id, projection, distance)
@@ -454,6 +591,7 @@ class GeometryDocument:
         if additions:
             array = np.asarray(additions, dtype=np.int32)
             self.edges = np.vstack([self.edges, array]) if len(self.edges) else array
+            self.invalidate_geometry_cache()
         return bool(additions)
 
     def add_candidate(self, candidate_id: str, snap_tolerance: float = 8.0) -> bool:
@@ -514,6 +652,7 @@ class GeometryDocument:
     def compact(self) -> None:
         if not len(self.edges):
             self.nodes = np.empty((0, 2), dtype=np.float32)
+            self.invalidate_geometry_cache()
             return
         unique_edges = []
         seen = set()
@@ -529,6 +668,7 @@ class GeometryDocument:
         self.manual_widths = normalize_manual_width_measurements(
             self.nodes, self.edges, self.manual_widths,
         )
+        self.invalidate_geometry_cache()
 
     def node_intersections(self) -> None:
         """Split exact line crossings into shared graph nodes before saving."""
@@ -571,11 +711,13 @@ class GeometryDocument:
         cv2.circle(self.mask, (int(round(col)), int(round(row))), max(1, int(radius)), int(bool(value)), -1)
 
     def topology_metrics(self, short_edge_px: float = 2.0) -> dict:
+        if self._topology_metrics_cache is not None:
+            return dict(self._topology_metrics_cache)
         graph = nx.Graph()
         graph.add_nodes_from(range(len(self.nodes)))
         graph.add_edges_from((int(src), int(dst)) for src, dst in self.edges.tolist())
         lengths = [float(np.linalg.norm(self.nodes[dst] - self.nodes[src])) for src, dst in self.edges.tolist()]
-        return {
+        self._topology_metrics_cache = {
             "node_count": len(self.nodes), "edge_count": len(self.edges),
             "component_count": nx.number_connected_components(graph) if graph.number_of_nodes() else 0,
             "dangling_endpoint_count": sum(degree == 1 for _, degree in graph.degree()),
@@ -584,6 +726,7 @@ class GeometryDocument:
             "short_edge_count": sum(length < short_edge_px for length in lengths),
             "pending_candidate_count": len(self.candidates),
         }
+        return dict(self._topology_metrics_cache)
 
 
 def load_decisions(review_dir: Path) -> dict[tuple[str, str, str], str]:
@@ -1113,13 +1256,10 @@ def save_global_document(
 
 class GeometryEditorApp:
     MODES = {
-        "select": "选择/拖动节点",
-        "lasso": "自由圈选",
-        "draw": "绘制中心线",
-        "delete": "删除中心线",
-        "measure_width": "手动测宽",
-        "surface_add": "补画道路面",
-        "surface_remove": "擦除道路面",
+        "select": "V 选择/编辑",
+        "draw": "L 绘制中心线",
+        "measure_width": "W 人工测宽",
+        "surface_add": "B 道路面",
     }
 
     def __init__(
@@ -1139,10 +1279,27 @@ class GeometryEditorApp:
         self.status_var = tk.StringVar()
         self.zoom = 0.5
         self.photo = None
+        self.background_item = None
+        self.photo_cache: OrderedDict[tuple, ImageTk.PhotoImage] = OrderedDict()
+        self.background_source_cache: dict[int, tuple[int, np.ndarray]] = {}
+        self.surface_versions = [0 for _ in self.documents]
+        self.min_zoom = 0.02
+        self.max_zoom = 64.0
+        self._background_refresh_pending = False
+        self._refreshing_background = False
+        self.edge_items: dict[int, int] = {}
+        self.node_items: dict[int, int] = {}
+        self.width_preview: dict | None = None
+        self.last_metrics: dict = {}
+        self.mouse_status = (0.0, 0.0)
+        self.geometry_dirty = True
+        self.surface_dirty = True
+        self.topology_dirty = True
         self.drag_node: int | None = None
         self.drag_checkpoint = False
         self.draft: list[tuple[float, float]] = []
         self.lasso: list[tuple[float, float]] = []
+        self.lasso_active = False
         self.selected_edge_ids: set[int] = set()
         self.width_draft: list[tuple[float, float]] = []
         self.width_drag_start: tuple[float, float] | None = None
@@ -1150,7 +1307,13 @@ class GeometryEditorApp:
         self.interval_draft: list[tuple[float, float]] = []
         self.interval_measurement_id: str | None = None
         self.surface_radius = tk.IntVar(value=12)
+        self.surface_action = tk.StringVar(value="add")
         self.surface_stroke_active = False
+        self.surface_right_active = False
+        self.surface_stroke_points: list[tuple[float, float]] = []
+        self.surface_preview_item = None
+        self.space_pressed = False
+        self.space_panning = False
         self.lasso_canvas_item = None
 
         root.title("道路实体变化智能检测与人工核验 · 中心线编辑")
@@ -1164,7 +1327,7 @@ class GeometryEditorApp:
         root.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+{max(0, (screen_h - height) // 2)}")
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.build_ui()
-        self.refresh()
+        self.full_refresh()
         # Wait until the three-column workspace has its final size. Calling
         # fit_image before Tk finishes layout makes the image open as a small
         # thumbnail in the upper-left corner on high-DPI displays.
@@ -1226,6 +1389,12 @@ class GeometryEditorApp:
         toolbar = ttk.Frame(self.root, padding=(14, 8), style="Toolbar.TFrame")
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="← 返回复核", style="Tool.TButton", command=self.close).pack(side="left", padx=(0, 10))
+        for value, label in self.MODES.items():
+            ttk.Radiobutton(
+                toolbar, text=label, variable=self.mode, value=value,
+                style="Tool.TRadiobutton", command=self._mode_changed,
+            ).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar, text="↶  撤销", style="Tool.TButton", command=self.undo).pack(side="left")
         ttk.Button(toolbar, text="↷  重做", style="Tool.TButton", command=self.redo).pack(side="left", padx=(4, 10))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
@@ -1237,9 +1406,7 @@ class GeometryEditorApp:
         ttk.Button(toolbar, text="交叉线建路口", style="Tool.TButton", command=self.node_all_crossings).pack(side="left", padx=4)
 
         self.context_frame = ttk.Frame(self.root, padding=(18, 6), style="Toolbar.TFrame")
-        self.context_frame.pack(fill="x")
         self.context_text = tk.StringVar()
-        ttk.Label(self.context_frame, textvariable=self.context_text, style="ToolbarHint.TLabel").pack(side="left")
         self.context_finish = ttk.Button(self.context_frame, text="完成  Enter", style="Primary.TButton", command=self.finish_drawing)
         self.context_cancel = ttk.Button(self.context_frame, text="取消  Esc", style="Tool.TButton", command=self.cancel_drawing)
         self.context_delete = ttk.Button(self.context_frame, text="删除所选中心线", style="Primary.TButton", command=self.delete_selected_edges)
@@ -1251,26 +1418,15 @@ class GeometryEditorApp:
 
         workspace = ttk.Frame(self.root, padding=(12, 0, 12, 0), style="Editor.TFrame")
         workspace.pack(fill="both", expand=True)
-        left_tools = ttk.Frame(
-            workspace, padding=(7, 9), style="Panel.TFrame",
-            width=round(150 * self.display_scale),
-        )
-        left_tools.pack(side="left", fill="y", padx=(0, 8))
-        left_tools.pack_propagate(False)
-        for value, label in self.MODES.items():
-            ttk.Radiobutton(
-                left_tools, text=label.replace("/拖动节点", "/移动"), variable=self.mode,
-                value=value, style="Tool.TRadiobutton", command=self._mode_changed,
-            ).pack(fill="x", pady=3)
-        ttk.Label(left_tools, text="路面画笔半径(px)", style="Panel.TLabel").pack(fill="x", pady=(14, 3))
-        ttk.Spinbox(left_tools, from_=2, to=100, textvariable=self.surface_radius, width=8).pack(fill="x")
-
         canvas_frame = ttk.Frame(workspace, style="Editor.TFrame")
         canvas_frame.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(canvas_frame, background=palette["viewer"], highlightthickness=1, highlightbackground=palette["line_strong"])
-        xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
-        yscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self._canvas_xview)
+        yscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas_yview)
+        self.canvas.configure(
+            xscrollcommand=lambda first, last: self._scrollbar_changed(xscroll, first, last),
+            yscrollcommand=lambda first, last: self._scrollbar_changed(yscroll, first, last),
+        )
         self.canvas.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
@@ -1283,21 +1439,45 @@ class GeometryEditorApp:
         )
         right_panel.pack(side="left", fill="y")
         right_panel.pack_propagate(False)
-        topology_panel = ttk.LabelFrame(right_panel, text="拓扑概况", style="Panel.TLabelframe")
-        topology_panel.pack(fill="x")
+        tool_panel = ttk.LabelFrame(right_panel, text="当前工具", style="Panel.TLabelframe")
+        tool_panel.pack(fill="x")
+        self.tool_title_var = tk.StringVar()
+        self.tool_hint_var = tk.StringVar()
+        self.tool_value_var = tk.StringVar()
+        ttk.Label(tool_panel, textvariable=self.tool_title_var, style="PanelTitle.TLabel").pack(anchor="w")
+        ttk.Label(tool_panel, textvariable=self.tool_hint_var, style="Panel.TLabel", wraplength=220).pack(anchor="w", pady=(6, 8))
+        ttk.Label(tool_panel, textvariable=self.tool_value_var, style="PanelTitle.TLabel", wraplength=220).pack(anchor="w", pady=(0, 8))
+        self.tool_select_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
+        ttk.Button(self.tool_select_frame, text="自由圈选", command=self.begin_lasso).pack(fill="x", pady=2)
+        ttk.Button(self.tool_select_frame, text="删除所选  Delete", command=self.delete_selected_edges).pack(fill="x", pady=2)
+        ttk.Button(self.tool_select_frame, text="取消选择", command=self.clear_selection).pack(fill="x", pady=2)
+        self.tool_draw_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
+        ttk.Button(self.tool_draw_frame, text="完成绘线  Enter", command=self.finish_drawing).pack(fill="x", pady=2)
+        ttk.Button(self.tool_draw_frame, text="取消  Esc", command=self.cancel_drawing).pack(fill="x", pady=2)
+        self.tool_width_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
+        ttk.Button(self.tool_width_frame, text="保留单点锚点", command=self.keep_width_anchor).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="应用到道路区间", command=self.begin_width_interval).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="删除最近测量", command=self.delete_latest_width).pack(fill="x", pady=2)
+        self.tool_surface_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
+        ttk.Radiobutton(
+            self.tool_surface_frame, text="补画", variable=self.surface_action, value="add",
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            self.tool_surface_frame, text="擦除", variable=self.surface_action, value="remove",
+        ).pack(anchor="w")
+        ttk.Label(self.tool_surface_frame, text="笔刷大小 (px)", style="Panel.TLabel").pack(anchor="w", pady=(8, 2))
+        ttk.Scale(
+            self.tool_surface_frame, from_=2, to=100, variable=self.surface_radius,
+            orient="horizontal",
+        ).pack(fill="x")
         self.metric_vars = {
             key: tk.StringVar(value="--")
             for key in ("node_count", "edge_count", "component_count", "dangling_endpoint_count")
         }
-        for label, key in (
-            ("节点", "node_count"), ("边", "edge_count"),
-            ("连通分量", "component_count"), ("悬挂端点", "dangling_endpoint_count"),
-        ):
-            row = ttk.Frame(topology_panel, style="Panel.TFrame")
-            row.pack(fill="x", pady=3)
-            ttk.Label(row, text=label, style="Panel.TLabel").pack(side="left")
-            ttk.Label(row, textvariable=self.metric_vars[key], style="PanelTitle.TLabel").pack(side="right")
-        ttk.Button(topology_panel, text="查看拓扑问题", command=self.show_topology).pack(fill="x", pady=(8, 0))
+        more_panel = ttk.LabelFrame(right_panel, text="更多", style="Panel.TLabelframe")
+        more_panel.pack(fill="x", pady=(10, 0))
+        ttk.Button(more_panel, text="拓扑检查", command=self.show_topology).pack(fill="x")
+        ttk.Button(more_panel, text="交叉线建路口", command=self.node_all_crossings).pack(fill="x", pady=(4, 0))
 
         legend_panel = ttk.LabelFrame(right_panel, text="图层与图例", style="Panel.TLabelframe")
         legend_panel.pack(fill="x", pady=(10, 0))
@@ -1313,57 +1493,83 @@ class GeometryEditorApp:
         self.canvas.bind("<B1-Motion>", self.mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.mouse_release)
         self.canvas.bind("<ButtonPress-2>", lambda event: self.canvas.scan_mark(event.x, event.y))
-        self.canvas.bind("<B2-Motion>", lambda event: self.canvas.scan_dragto(event.x, event.y, gain=1))
-        self.canvas.bind("<Button-3>", lambda _event: self.finish_drawing())
+        self.canvas.bind("<B2-Motion>", self.middle_mouse_pan)
+        self.canvas.bind("<Double-Button-1>", lambda _event: self.finish_drawing() if self.mode.get() == "draw" else None)
+        self.canvas.bind("<ButtonPress-3>", self.mouse_right_press)
+        self.canvas.bind("<B3-Motion>", self.mouse_right_drag)
+        self.canvas.bind("<ButtonRelease-3>", self.mouse_right_release)
+        self.canvas.bind("<Motion>", self.mouse_motion)
         self.canvas.bind("<MouseWheel>", self.mouse_wheel)
         self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-y>", lambda _event: self.redo())
         self.root.bind("<Control-s>", lambda _event: self.save_all())
         self.root.bind("<Return>", lambda _event: self.finish_drawing())
         self.root.bind("<Escape>", lambda _event: self.cancel_drawing())
+        self.root.bind("<Delete>", lambda event: self.delete_selected_edges() if not self._text_input_focused(event) else None)
+        for key, mode in (("v", "select"), ("l", "draw"), ("w", "measure_width"), ("b", "surface_add")):
+            self.root.bind(key, lambda event, value=mode: self.set_mode_shortcut(event, value))
+            self.root.bind(key.upper(), lambda event, value=mode: self.set_mode_shortcut(event, value))
+        self.root.bind("f", lambda event: self.fit_image() if not self._text_input_focused(event) else None)
+        self.root.bind("F", lambda event: self.fit_image() if not self._text_input_focused(event) else None)
+        self.root.bind("1", lambda event: self.one_to_one() if not self._text_input_focused(event) else None)
+        self.root.bind("<KeyPress-space>", self.space_press)
+        self.root.bind("<KeyRelease-space>", self.space_release)
         self._mode_changed()
 
     def _mode_changed(self) -> None:
-        for widget in (
-            self.context_finish, self.context_cancel, self.context_delete,
-            self.context_clear, self.context_interval,
-        ):
-            widget.pack_forget()
         mode = self.mode.get()
         if mode != "measure_width":
             self.width_drag_start = None
             self.width_drag_current = None
+            self.width_preview = None
             self.interval_draft = []
             self.interval_measurement_id = None
+        self.update_context_panel()
+        self.refresh_dynamic_overlay()
+
+    def update_context_panel(self) -> None:
+        for frame in (
+            self.tool_select_frame, self.tool_draw_frame,
+            self.tool_width_frame, self.tool_surface_frame,
+        ):
+            frame.pack_forget()
+        mode = self.mode.get()
         if mode == "draw":
-            self.context_text.set("绘制中心线：在影像上依次单击添加节点。")
-            self.context_cancel.pack(side="right", padx=4)
-            self.context_finish.pack(side="right")
-        elif mode == "lasso":
-            self.context_text.set("自由圈选：按住鼠标左键绘制选区，松开后完成选择。")
-            self.context_clear.pack(side="right", padx=4)
-            self.context_delete.pack(side="right")
-        elif mode == "delete":
-            self.context_text.set("删除中心线：单击需要删除的线段。")
+            self.tool_title_var.set("绘制中心线  L")
+            self.tool_hint_var.set("左键添加节点；双击或 Enter 完成；Esc 取消。")
+            self.tool_value_var.set(f"当前节点：{len(self.draft)}")
+            self.tool_draw_frame.pack(fill="x")
         elif mode == "measure_width":
-            self.context_text.set("手动测宽：按住左键从道路一侧拖到另一侧；松开后自动校正为道路法线。")
-            self.context_cancel.pack(side="right", padx=4)
-            self.context_interval.pack(side="right")
+            self.tool_title_var.set("人工测宽  W")
+            self.tool_hint_var.set("按住左键跨道路拖动，松开后自动校正到道路法线。")
+            latest = self.doc.manual_widths[-1] if self.doc.manual_widths else None
+            if self.width_preview is not None:
+                value = float(self.width_preview.get("width_units", 0.0))
+                self.tool_value_var.set(f"人工宽度：{value:.2f} m")
+            elif latest is not None:
+                value = float(latest.get("width_units", latest.get("width_px", 0.0)))
+                source = "区间定宽" if latest.get("source") == "manual_interval_width" else "单点锚点"
+                self.tool_value_var.set(f"最近测量：{value:.2f} m\n类型：{source}\n记录：{len(self.doc.manual_widths)}")
+            else:
+                self.tool_value_var.set("尚无人工测宽记录")
+            self.tool_width_frame.pack(fill="x")
         elif mode == "surface_add":
-            self.context_text.set("补画道路面：按住左键涂画遗漏路面；绿色为最终面，蓝色为本次补画。")
-        elif mode == "surface_remove":
-            self.context_text.set("擦除道路面：按住左键擦除错误路面；红色为本次删除范围。")
+            self.tool_title_var.set("道路面编辑  B")
+            self.tool_hint_var.set("左键按当前模式涂画；右键可临时擦除。")
+            action = "补画" if self.surface_action.get() == "add" else "擦除"
+            self.tool_value_var.set(f"模式：{action}\n笔刷：{self.surface_radius.get()} px")
+            self.tool_surface_frame.pack(fill="x")
         else:
-            self.context_text.set("选择/移动：单击节点并拖动；滚轮缩放，中键平移。")
-        self.refresh()
+            self.tool_title_var.set("选择/编辑  V")
+            self.tool_hint_var.set("拖动节点；单击中心线选择；Shift 多选；Delete 删除。")
+            self.tool_value_var.set(f"已选择：{len(self.selected_edge_ids)} 条中心线")
+            self.tool_select_frame.pack(fill="x")
 
     def zoom_by(self, factor: float) -> None:
-        self.zoom = max(0.1, min(3.0, self.zoom * factor))
-        self.refresh()
+        self.apply_zoom(self.zoom * factor)
 
     def one_to_one(self) -> None:
-        self.zoom = 1.0
-        self.refresh()
+        self.apply_zoom(1.0)
 
     def source_point(self, event) -> tuple[float, float]:
         col = self.canvas.canvasx(event.x) / self.zoom
@@ -1374,15 +1580,46 @@ class GeometryEditorApp:
         self.root.update_idletasks()
         width = max(300, self.canvas.winfo_width())
         height = max(300, self.canvas.winfo_height())
-        self.zoom = max(0.1, min(3.0, min((width - 4) / self.doc.image.shape[1], (height - 4) / self.doc.image.shape[0])))
-        self.refresh()
+        self.apply_zoom(min((width - 4) / self.doc.image.shape[1], (height - 4) / self.doc.image.shape[0]))
 
     def mouse_wheel(self, event) -> None:
-        old = self.zoom
-        factor = 1.2 if event.delta > 0 else 1 / 1.2
-        self.zoom = max(0.1, min(3.0, self.zoom * factor))
-        if abs(self.zoom - old) > 1e-6:
-            self.refresh()
+        if event.delta == 0:
+            return
+        steps = event.delta / 120.0 if abs(event.delta) >= 120 else math.copysign(1.0, event.delta)
+        base = 1.08 if event.state & 0x0004 else 1.25
+        factor = base ** steps
+        self.apply_zoom(self.zoom * factor, event)
+
+    def _continuous_zoom(self, requested: float) -> float:
+        return max(self.min_zoom, min(self.max_zoom, float(requested)))
+
+    def apply_zoom(self, requested: float, event=None) -> None:
+        new_zoom = self._continuous_zoom(requested)
+        old_zoom = float(self.zoom)
+        if abs(new_zoom - old_zoom) <= 1e-9:
+            return
+        if event is not None:
+            source_col = self.canvas.canvasx(event.x) / old_zoom
+            source_row = self.canvas.canvasy(event.y) / old_zoom
+            anchor_x, anchor_y = float(event.x), float(event.y)
+        else:
+            anchor_x = max(0.0, self.canvas.winfo_width() * 0.5)
+            anchor_y = max(0.0, self.canvas.winfo_height() * 0.5)
+            source_col = self.canvas.canvasx(anchor_x) / old_zoom
+            source_row = self.canvas.canvasy(anchor_y) / old_zoom
+        self.zoom = new_zoom
+        ratio = new_zoom / old_zoom
+        for tag in ("edge", "node", "manual_width", "dynamic"):
+            self.canvas.scale(tag, 0, 0, ratio, ratio)
+        if (old_zoom < 0.8) != (new_zoom < 0.8):
+            self.refresh_static_geometry()
+        width = max(1.0, self.doc.image.shape[1] * new_zoom)
+        height = max(1.0, self.doc.image.shape[0] * new_zoom)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+        self.canvas.xview_moveto(max(0.0, min(1.0, (source_col * new_zoom - anchor_x) / width)))
+        self.canvas.yview_moveto(max(0.0, min(1.0, (source_row * new_zoom - anchor_y) / height)))
+        self.refresh_background()
+        self.update_status()
 
     def render_source(self) -> np.ndarray:
         canvas = self.doc.image.copy()
@@ -1423,7 +1660,7 @@ class GeometryEditorApp:
                 except (KeyError, TypeError, ValueError):
                     chain_id = -1
                     lo = hi = -1.0
-                for chain in build_road_chains(self.doc.nodes, self.doc.edges):
+                for chain in self.doc.road_chains():
                     if chain.chain_id != chain_id:
                         continue
                     points = self.doc.nodes[np.asarray(chain.node_ids, dtype=np.int32)]
@@ -1462,10 +1699,7 @@ class GeometryEditorApp:
             raw0 = (int(round(self.width_drag_start[1])), int(round(self.width_drag_start[0])))
             raw1 = (int(round(self.width_drag_current[1])), int(round(self.width_drag_current[0])))
             cv2.line(canvas, raw0, raw1, (255, 0, 255), 1, cv2.LINE_AA)
-            preview, _error = create_normal_width_measurement(
-                self.doc, self.width_drag_start, self.width_drag_current,
-                max_centerline_distance=max(12.0, 24.0 / self.zoom),
-            )
+            preview = self.width_preview
             if preview is not None:
                 p0 = (int(round(preview["start_col"])), int(round(preview["start_row"])))
                 p1 = (int(round(preview["end_col"])), int(round(preview["end_row"])))
@@ -1478,49 +1712,282 @@ class GeometryEditorApp:
             cv2.circle(canvas, (int(round(col)), int(round(row))), 5, (0, 210, 255), -1)
         return canvas
 
-    def refresh(self) -> None:
-        source = self.render_source()
-        width = max(1, int(round(source.shape[1] * self.zoom)))
-        height = max(1, int(round(source.shape[0] * self.zoom)))
-        interpolation = cv2.INTER_AREA if self.zoom < 1 else cv2.INTER_LINEAR
-        resized = cv2.resize(source, (width, height), interpolation=interpolation)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
-        self.canvas.configure(scrollregion=(0, 0, width, height))
-        metrics = self.doc.topology_metrics()
+    def _background_source(self) -> np.ndarray:
+        version = self.surface_versions[self.document_index]
+        cached = self.background_source_cache.get(self.document_index)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        source = self.doc.image.copy()
+        overlay = source.copy()
+        editable_surface = self.doc.editable_surface()
+        overlay[editable_surface > 0] = (40, 180, 40)
+        overlay[self.doc.surface_additions > 0] = (255, 120, 0)
+        overlay[self.doc.surface_removals > 0] = (0, 0, 255)
+        source = cv2.addWeighted(overlay, 0.20, source, 0.80, 0)
+        rgb = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
+        self.background_source_cache[self.document_index] = (version, rgb)
+        return rgb
+
+    def _background_photo(self) -> tuple[ImageTk.PhotoImage, float, float]:
+        source = self._background_source()
+        canvas_left = max(0.0, self.canvas.canvasx(0))
+        canvas_top = max(0.0, self.canvas.canvasy(0))
+        canvas_right = canvas_left + max(1, self.canvas.winfo_width())
+        canvas_bottom = canvas_top + max(1, self.canvas.winfo_height())
+        # Keep a small screen-space margin so rapid panning does not expose the
+        # viewer background before the next idle redraw.
+        margin = 96.0
+        left = max(0, int(math.floor((canvas_left - margin) / self.zoom)))
+        top = max(0, int(math.floor((canvas_top - margin) / self.zoom)))
+        right = min(source.shape[1], int(math.ceil((canvas_right + margin) / self.zoom)))
+        bottom = min(source.shape[0], int(math.ceil((canvas_bottom + margin) / self.zoom)))
+        right = max(left + 1, right)
+        bottom = max(top + 1, bottom)
+        key = (
+            self.document_index, self.surface_versions[self.document_index],
+            round(float(self.zoom), 5), left, top, right, bottom,
+        )
+        if key in self.photo_cache:
+            photo = self.photo_cache.pop(key)
+            self.photo_cache[key] = photo
+            return photo, left * self.zoom, top * self.zoom
+        crop = source[top:bottom, left:right]
+        width = max(1, int(round((right - left) * self.zoom)))
+        height = max(1, int(round((bottom - top) * self.zoom)))
+        if self.zoom < 1:
+            interpolation = cv2.INTER_AREA
+        elif self.zoom <= 8:
+            interpolation = cv2.INTER_LINEAR
+        else:
+            interpolation = cv2.INTER_NEAREST
+        resized = cv2.resize(crop, (width, height), interpolation=interpolation)
+        photo = ImageTk.PhotoImage(Image.fromarray(resized))
+        self.photo_cache[key] = photo
+        def cached_pixels() -> int:
+            return sum(item.width() * item.height() for item in self.photo_cache.values())
+        while len(self.photo_cache) > 5 or (len(self.photo_cache) > 1 and cached_pixels() > 32_000_000):
+            self.photo_cache.popitem(last=False)
+        return photo, left * self.zoom, top * self.zoom
+
+    def refresh_background(self) -> None:
+        self._background_refresh_pending = False
+        self._refreshing_background = True
+        try:
+            self.photo, image_x, image_y = self._background_photo()
+            if self.background_item is None or not self.canvas.find_withtag("background"):
+                self.background_item = self.canvas.create_image(
+                    image_x, image_y, image=self.photo, anchor="nw", tags=("background",),
+                )
+                self.canvas.tag_lower(self.background_item)
+            else:
+                self.canvas.itemconfigure(self.background_item, image=self.photo)
+            self.canvas.coords(self.background_item, image_x, image_y)
+            self.canvas.configure(scrollregion=(
+                0, 0, self.doc.image.shape[1] * self.zoom, self.doc.image.shape[0] * self.zoom,
+            ))
+            self.surface_dirty = False
+        finally:
+            self._refreshing_background = False
+
+    def schedule_background_refresh(self) -> None:
+        if self._background_refresh_pending or self._refreshing_background:
+            return
+        self._background_refresh_pending = True
+        self.root.after_idle(self.refresh_background)
+
+    def _scrollbar_changed(self, scrollbar, first: str, last: str) -> None:
+        scrollbar.set(first, last)
+        self.schedule_background_refresh()
+
+    def _canvas_xview(self, *args) -> None:
+        self.canvas.xview(*args)
+        self.schedule_background_refresh()
+
+    def _canvas_yview(self, *args) -> None:
+        self.canvas.yview(*args)
+        self.schedule_background_refresh()
+
+    def middle_mouse_pan(self, event) -> None:
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self.schedule_background_refresh()
+
+    def refresh_static_geometry(self) -> None:
+        self.canvas.delete("edge")
+        self.canvas.delete("node")
+        self.edge_items = {}
+        self.node_items = {}
+        z = self.zoom
+        for edge_id, (src, dst) in enumerate(self.doc.edges.tolist()):
+            r0, c0 = self.doc.nodes[int(src)]
+            r1, c1 = self.doc.nodes[int(dst)]
+            selected = edge_id in self.selected_edge_ids
+            self.edge_items[edge_id] = self.canvas.create_line(
+                c0 * z, r0 * z, c1 * z, r1 * z,
+                fill="#F97316" if selected else "#22C55E",
+                width=4 if selected else 2, tags=("edge", f"edge_{edge_id}"),
+            )
+        if z >= 0.8:
+            for node_id, (row, col) in enumerate(self.doc.nodes.tolist()):
+                radius = 3
+                self.node_items[node_id] = self.canvas.create_oval(
+                    col * z - radius, row * z - radius, col * z + radius, row * z + radius,
+                    fill="#F97316", outline="", tags=("node", f"node_{node_id}"),
+                )
+        self.geometry_dirty = False
+
+    def refresh_manual_widths(self) -> None:
+        self.canvas.delete("manual_width")
+        z = self.zoom
+        chains = {int(chain.chain_id): chain for chain in self.doc.road_chains()}
+        for measurement in self.doc.manual_widths:
+            if str(measurement.get("source", "")) == "manual_interval_width":
+                try:
+                    chain = chains[int(measurement["target_chain_id"])]
+                    lo = float(measurement["range_start_position"])
+                    hi = float(measurement["range_end_position"])
+                    points, cumulative = self.doc._chain_geometry_cache[int(chain.chain_id)]
+                except (KeyError, TypeError, ValueError):
+                    chain = None
+                if chain is not None:
+                    for offset, edge_id in enumerate(chain.edge_ids):
+                        midpoint = 0.5 * float(cumulative[offset] + cumulative[offset + 1])
+                        if lo - 1e-6 <= midpoint <= hi + 1e-6:
+                            src, dst = self.doc.edges[int(edge_id)]
+                            start, end = self.doc.nodes[int(src)], self.doc.nodes[int(dst)]
+                            self.canvas.create_line(
+                                start[1] * z, start[0] * z, end[1] * z, end[0] * z,
+                                fill="#FACC15", width=4, tags=("manual_width",),
+                            )
+            try:
+                p0 = (float(measurement["start_col"]) * z, float(measurement["start_row"]) * z)
+                p1 = (float(measurement["end_col"]) * z, float(measurement["end_row"]) * z)
+                target = (float(measurement["target_col"]) * z, float(measurement["target_row"]) * z)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.canvas.create_line(*p0, *p1, fill="#38BDF8", width=2, tags=("manual_width",))
+            for x, y in (p0, p1):
+                self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#7DD3FC", outline="", tags=("manual_width",))
+            self.canvas.create_oval(
+                target[0] - 3, target[1] - 3, target[0] + 3, target[1] + 3,
+                fill="#FACC15", outline="", tags=("manual_width",),
+            )
+            width_units = float(measurement.get("width_units", measurement.get("width_px", 0.0)))
+            self.canvas.create_text(
+                target[0] + 7, target[1] - 7, text=f"{width_units:.2f} m",
+                fill="#E0F2FE", anchor="sw", tags=("manual_width",),
+            )
+
+    def refresh_dynamic_overlay(self) -> None:
+        self.canvas.delete("dynamic")
+        z = self.zoom
+        if self.draft:
+            coords = [value for row, col in self.draft for value in (col * z, row * z)]
+            if len(coords) >= 4:
+                self.canvas.create_line(*coords, fill="#D946EF", width=2, tags=("dynamic",))
+            for row, col in self.draft:
+                self.canvas.create_oval(
+                    col * z - 4, row * z - 4, col * z + 4, row * z + 4,
+                    fill="#D946EF", outline="", tags=("dynamic",),
+                )
+        for row, col in self.interval_draft:
+            self.canvas.create_oval(
+                col * z - 5, row * z - 5, col * z + 5, row * z + 5,
+                fill="#FACC15", outline="", tags=("dynamic",),
+            )
+        if self.width_drag_start is not None and self.width_drag_current is not None:
+            self.canvas.create_line(
+                self.width_drag_start[1] * z, self.width_drag_start[0] * z,
+                self.width_drag_current[1] * z, self.width_drag_current[0] * z,
+                fill="#D946EF", width=1, tags=("dynamic",),
+            )
+        if self.width_preview is not None:
+            preview = self.width_preview
+            p0 = (float(preview["start_col"]) * z, float(preview["start_row"]) * z)
+            p1 = (float(preview["end_col"]) * z, float(preview["end_row"]) * z)
+            target = (float(preview["target_col"]) * z, float(preview["target_row"]) * z)
+            self.canvas.create_line(*p0, *p1, fill="#22D3EE", width=2, tags=("dynamic",))
+            for x, y in (p0, p1, target):
+                self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#22D3EE", outline="", tags=("dynamic",))
+            self.canvas.create_text(
+                p1[0] + 6, p1[1] - 6,
+                text=f"人工测宽：{float(preview['width_units']):.2f} m",
+                fill="#A5F3FC", anchor="sw", tags=("dynamic",),
+            )
+        if self.surface_stroke_points:
+            coords = [value for row, col in self.surface_stroke_points for value in (col * z, row * z)]
+            if len(coords) >= 4:
+                self.canvas.create_line(
+                    *coords, fill="#38BDF8" if self.surface_action.get() == "add" else "#FB7185",
+                    width=max(2, self.surface_radius.get() * 2 * z), smooth=True,
+                    capstyle="round", tags=("dynamic",),
+                )
+        self.update_status()
+
+    def refresh_metrics(self) -> None:
+        self.last_metrics = self.doc.topology_metrics()
         if hasattr(self, "metric_vars"):
             for key, variable in self.metric_vars.items():
-                variable.set(str(metrics.get(key, "--")))
+                variable.set(str(self.last_metrics.get(key, "--")))
+        self.topology_dirty = False
+        self.update_status()
+
+    def update_status(self) -> None:
+        metrics = self.last_metrics
         self.status_var.set(
-            f"{self.doc.stem}   │   节点 {metrics['node_count']}   │   边 {metrics['edge_count']}   │   "
-            f"连通分量 {metrics['component_count']}   │   ⚠ 悬挂端点 {metrics['dangling_endpoint_count']}"
-            f"                                      当前工具：{self.MODES[self.mode.get()]}   │   {int(round(self.zoom * 100))}%"
+            f"{self.doc.stem}  │  {self.MODES.get(self.mode.get(), self.mode.get())}  │  "
+            f"Zoom {int(round(self.zoom * 100))}%  │  "
+            f"鼠标 {self.mouse_status[1]:.1f}, {self.mouse_status[0]:.1f}  │  "
+            f"节点 {metrics.get('node_count', len(self.doc.nodes))}  │  边 {metrics.get('edge_count', len(self.doc.edges))}"
         )
 
+    def full_refresh(self) -> None:
+        self.refresh_background()
+        self.refresh_static_geometry()
+        self.refresh_manual_widths()
+        self.refresh_dynamic_overlay()
+        self.refresh_metrics()
+        self.update_context_panel()
+
+    def refresh(self) -> None:
+        """Compatibility alias for infrequent document-level rebuilds."""
+        self.full_refresh()
+
     def mouse_press(self, event) -> None:
+        if self.space_pressed:
+            self.space_panning = True
+            self.canvas.scan_mark(event.x, event.y)
+            return
         row, col = self.source_point(event)
         mode = self.mode.get()
         tolerance = max(3.0, 8.0 / self.zoom)
         if mode == "select":
+            if self.lasso_active:
+                self.lasso = [(row, col)]
+                self.selected_edge_ids.clear()
+                self._start_lasso_canvas(event)
+                return
             node_id = self.doc.nearest_node(row, col, tolerance)
             if node_id is not None:
                 self.doc.checkpoint()
                 self.drag_checkpoint = True
                 self.drag_node = node_id
-        elif mode == "lasso":
-            self.lasso = [(row, col)]
-            self.selected_edge_ids.clear()
-            self._start_lasso_canvas(event)
+            else:
+                nearest = self.doc.nearest_edge(row, col, tolerance)
+                if nearest is not None:
+                    edge_id = int(nearest[0])
+                    if event.state & 0x0001:
+                        if edge_id in self.selected_edge_ids:
+                            self.selected_edge_ids.remove(edge_id)
+                        else:
+                            self.selected_edge_ids.add(edge_id)
+                    else:
+                        self.selected_edge_ids = {edge_id}
+                    self.refresh_edge_selection()
+                    self.update_context_panel()
         elif mode == "draw":
             self.draft.append((row, col))
-            self.refresh()
-        elif mode == "delete":
-            nearest = self.doc.nearest_edge(row, col, tolerance)
-            if nearest is not None:
-                self.doc.checkpoint()
-                self.doc.delete_edge_at(row, col, tolerance)
-                self.refresh()
+            self.update_context_panel()
+            self.refresh_dynamic_overlay()
         elif mode == "measure_width":
             if self.interval_measurement_id is not None:
                 self.interval_draft.append((row, col))
@@ -1528,23 +1995,29 @@ class GeometryEditorApp:
                     self.finish_width_interval()
                 else:
                     self.context_text.set("区间定宽：已选择起点，请在同一连续道路链上选择终点。")
-                    self.refresh()
+                    self.refresh_dynamic_overlay()
             else:
                 self.width_drag_start = (row, col)
                 self.width_drag_current = (row, col)
-                self.refresh()
-        elif mode in {"surface_add", "surface_remove"}:
+                self.width_preview = None
+                self.refresh_dynamic_overlay()
+        elif mode == "surface_add":
             self.doc.checkpoint()
             self.surface_stroke_active = True
-            self.doc.paint_surface(row, col, self.surface_radius.get(), mode == "surface_add")
-            self.refresh()
+            self.surface_stroke_points = [(row, col)]
+            self.doc.paint_surface(row, col, self.surface_radius.get(), self.surface_action.get() == "add")
+            self.start_surface_preview(row, col, self.surface_action.get() == "add")
 
     def mouse_drag(self, event) -> None:
+        if self.space_panning:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+            self.schedule_background_refresh()
+            return
         row, col = self.source_point(event)
         if self.mode.get() == "select" and self.drag_node is not None:
             self.doc.nodes[self.drag_node] = (row, col)
-            self.refresh()
-        elif self.mode.get() == "lasso" and self.lasso:
+            self.update_dragged_node_items(self.drag_node)
+        elif self.mode.get() == "select" and self.lasso_active and self.lasso:
             last = self.lasso[-1]
             if math.hypot(row - last[0], col - last[1]) >= max(1.0, 3.0 / self.zoom):
                 self.lasso.append((row, col))
@@ -1557,38 +2030,176 @@ class GeometryEditorApp:
             )
             if preview is not None:
                 self.context_text.set(f"人工测宽：{float(preview['width_units']):.2f} m")
-            self.refresh()
-        elif self.mode.get() in {"surface_add", "surface_remove"} and self.surface_stroke_active:
-            self.doc.paint_surface(row, col, self.surface_radius.get(), self.mode.get() == "surface_add")
-            self.refresh()
+            self.width_preview = preview
+            self.update_context_panel()
+            self.refresh_dynamic_overlay()
+        elif self.mode.get() == "surface_add" and self.surface_stroke_active:
+            self.doc.paint_surface(row, col, self.surface_radius.get(), self.surface_action.get() == "add")
+            if not self.surface_stroke_points or math.hypot(
+                row - self.surface_stroke_points[-1][0], col - self.surface_stroke_points[-1][1]
+            ) >= 1.0:
+                self.surface_stroke_points.append((row, col))
+                self.extend_surface_preview(row, col)
 
     def mouse_release(self, event) -> None:
+        if self.space_panning:
+            self.space_panning = False
+            return
+        surface_was_active = self.surface_stroke_active
         self.surface_stroke_active = False
         if self.mode.get() == "measure_width" and self.width_drag_start is not None:
             self.width_drag_current = self.source_point(event)
             self.finish_width_measurement()
         if self.drag_node is not None:
+            self.doc.invalidate_geometry_cache()
             self.doc.snap_moved_node(self.drag_node, max(3.0, 8.0 / self.zoom))
             self.drag_node = None
             self.drag_checkpoint = False
-            self.refresh()
-        if self.mode.get() == "lasso" and self.lasso:
+            self.geometry_dirty = self.topology_dirty = True
+            self.refresh_static_geometry()
+            self.refresh_manual_widths()
+            self.refresh_metrics()
+        if self.mode.get() == "select" and self.lasso_active and self.lasso:
             if len(self.lasso) >= 3:
                 self.selected_edge_ids = self.doc.edges_in_polygon(self.lasso)
             self._remove_lasso_canvas()
-            self.refresh()
+            self.lasso_active = False
+            self.refresh_edge_selection()
+            self.update_context_panel()
+        if surface_was_active:
+            self.surface_versions[self.document_index] += 1
+            self.surface_stroke_points = []
+            self.surface_preview_item = None
+            self.surface_dirty = True
+            self.refresh_background()
+            self.refresh_dynamic_overlay()
 
     def finish_drawing(self) -> None:
         if len(self.draft) >= 2:
             self.doc.checkpoint()
             self.doc.add_polyline(self.draft, max(4.0, 10.0 / self.zoom))
         self.draft = []
-        self.refresh()
+        self.refresh_static_geometry()
+        self.refresh_manual_widths()
+        self.refresh_dynamic_overlay()
+        self.refresh_metrics()
 
     def _start_lasso_canvas(self, event) -> None:
         self._remove_lasso_canvas()
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         self.lasso_canvas_item = self.canvas.create_line(x, y, x, y, fill="#facc15", width=2, tags="lasso_live")
+
+    def begin_lasso(self) -> None:
+        self.mode.set("select")
+        self.lasso_active = True
+        self.lasso = []
+        self.tool_hint_var.set("按住左键圈住需要选择的中心线。")
+
+    def refresh_edge_selection(self) -> None:
+        for edge_id, item in self.edge_items.items():
+            selected = edge_id in self.selected_edge_ids
+            self.canvas.itemconfigure(
+                item, fill="#F97316" if selected else "#22C55E",
+                width=4 if selected else 2,
+            )
+
+    def update_dragged_node_items(self, node_id: int) -> None:
+        z = self.zoom
+        row, col = self.doc.nodes[node_id]
+        item = self.node_items.get(node_id)
+        if item is not None:
+            self.canvas.coords(item, col * z - 3, row * z - 3, col * z + 3, row * z + 3)
+        for edge_id in self.doc.incident_edges(node_id):
+            edge_item = self.edge_items.get(edge_id)
+            if edge_item is None:
+                continue
+            src, dst = (int(value) for value in self.doc.edges[edge_id])
+            start, end = self.doc.nodes[src], self.doc.nodes[dst]
+            self.canvas.coords(
+                edge_item, start[1] * z, start[0] * z, end[1] * z, end[0] * z,
+            )
+
+    def keep_width_anchor(self) -> None:
+        self.interval_measurement_id = None
+        self.interval_draft = []
+        self.tool_hint_var.set("最近一次测量保留为单点宽度锚点。")
+        self.refresh_dynamic_overlay()
+
+    def delete_latest_width(self) -> None:
+        if not self.doc.manual_widths:
+            return
+        self.doc.checkpoint()
+        self.doc.manual_widths.pop()
+        self.saved_var.set("尚未保存")
+        self.refresh_manual_widths()
+        self.update_context_panel()
+
+    def _text_input_focused(self, event=None) -> bool:
+        widget = getattr(event, "widget", None) or self.root.focus_get()
+        return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Spinbox))
+
+    def set_mode_shortcut(self, event, mode: str) -> None:
+        if self._text_input_focused(event):
+            return
+        self.mode.set(mode)
+        self._mode_changed()
+
+    def space_press(self, event) -> None:
+        if not self._text_input_focused(event):
+            self.space_pressed = True
+
+    def space_release(self, _event) -> None:
+        self.space_pressed = False
+        self.space_panning = False
+
+    def mouse_motion(self, event) -> None:
+        self.mouse_status = self.source_point(event)
+        self.update_status()
+
+    def start_surface_preview(self, row: float, col: float, add: bool) -> None:
+        z = self.zoom
+        self.surface_preview_item = self.canvas.create_line(
+            col * z, row * z, col * z, row * z,
+            fill="#38BDF8" if add else "#FB7185",
+            width=max(2, self.surface_radius.get() * 2 * z), smooth=True,
+            capstyle="round", tags=("dynamic",),
+        )
+
+    def extend_surface_preview(self, row: float, col: float) -> None:
+        if self.surface_preview_item is None:
+            return
+        coords = list(self.canvas.coords(self.surface_preview_item))
+        coords.extend((col * self.zoom, row * self.zoom))
+        self.canvas.coords(self.surface_preview_item, *coords)
+
+    def mouse_right_press(self, event) -> None:
+        if self.mode.get() == "surface_add":
+            row, col = self.source_point(event)
+            self.doc.checkpoint()
+            self.surface_right_active = True
+            self.surface_stroke_points = [(row, col)]
+            self.doc.paint_surface(row, col, self.surface_radius.get(), False)
+            self.start_surface_preview(row, col, False)
+        elif self.mode.get() == "draw":
+            self.finish_drawing()
+
+    def mouse_right_drag(self, event) -> None:
+        if not self.surface_right_active:
+            return
+        row, col = self.source_point(event)
+        self.doc.paint_surface(row, col, self.surface_radius.get(), False)
+        self.surface_stroke_points.append((row, col))
+        self.extend_surface_preview(row, col)
+
+    def mouse_right_release(self, _event) -> None:
+        if not self.surface_right_active:
+            return
+        self.surface_right_active = False
+        self.surface_versions[self.document_index] += 1
+        self.surface_stroke_points = []
+        self.surface_preview_item = None
+        self.refresh_background()
+        self.refresh_dynamic_overlay()
 
     def _extend_lasso_canvas(self, event) -> None:
         if self.lasso_canvas_item is None:
@@ -1606,7 +2217,9 @@ class GeometryEditorApp:
         self.lasso = []
         self.selected_edge_ids.clear()
         self._remove_lasso_canvas()
-        self.refresh()
+        self.lasso_active = False
+        self.refresh_edge_selection()
+        self.update_context_panel()
 
     def delete_selected_edges(self) -> None:
         if not self.selected_edge_ids:
@@ -1617,7 +2230,11 @@ class GeometryEditorApp:
             return
         self.doc.checkpoint()
         self.doc.delete_edges(self.selected_edge_ids)
-        self.clear_selection()
+        self.selected_edge_ids.clear()
+        self.refresh_static_geometry()
+        self.refresh_manual_widths()
+        self.refresh_metrics()
+        self.update_context_panel()
 
     def cancel_drawing(self) -> None:
         self.draft = []
@@ -1626,11 +2243,12 @@ class GeometryEditorApp:
         self.width_drag_current = None
         self.interval_draft = []
         self.interval_measurement_id = None
-        if self.mode.get() == "lasso":
-            self.lasso = []
-            self.selected_edge_ids.clear()
-            self._remove_lasso_canvas()
-        self.refresh()
+        self.lasso = []
+        self.lasso_active = False
+        self._remove_lasso_canvas()
+        self.width_preview = None
+        self.refresh_dynamic_overlay()
+        self.update_context_panel()
 
     def finish_width_measurement(self) -> None:
         if self.width_drag_start is None or self.width_drag_current is None:
@@ -1638,10 +2256,14 @@ class GeometryEditorApp:
         start, end = self.width_drag_start, self.width_drag_current
         self.width_drag_start = None
         self.width_drag_current = None
-        measurement, error = create_normal_width_measurement(
-            self.doc, start, end,
-            max_centerline_distance=max(12.0, 24.0 / self.zoom),
-        )
+        measurement = self.width_preview
+        error = ""
+        if measurement is None:
+            measurement, error = create_normal_width_measurement(
+                self.doc, start, end,
+                max_centerline_distance=max(12.0, 24.0 / self.zoom),
+            )
+        self.width_preview = None
         if measurement is None:
             messagebox.showwarning("测宽未保存", error)
             self._mode_changed()
@@ -1649,7 +2271,9 @@ class GeometryEditorApp:
         self.doc.checkpoint()
         self.doc.manual_widths.append(measurement)
         self.saved_var.set("尚未保存")
-        self._mode_changed()
+        self.refresh_manual_widths()
+        self.refresh_dynamic_overlay()
+        self.update_context_panel()
 
     def begin_width_interval(self) -> None:
         measurement = next((
@@ -1664,7 +2288,8 @@ class GeometryEditorApp:
         self.width_drag_start = None
         self.width_drag_current = None
         self.context_text.set("区间定宽：请在当前道路链中心线上选择区间起点。")
-        self.refresh()
+        self.refresh_dynamic_overlay()
+        self.update_context_panel()
 
     def finish_width_interval(self) -> None:
         if self.interval_measurement_id is None or len(self.interval_draft) != 2:
@@ -1686,14 +2311,16 @@ class GeometryEditorApp:
             messagebox.showwarning("区间未保存", error)
             self.interval_draft = []
             self.context_text.set("区间定宽：请重新选择同一连续道路链上的起点和终点。")
-            self.refresh()
+            self.refresh_dynamic_overlay()
             return
         self.doc.checkpoint()
         self.doc.manual_widths[index] = interval
         self.interval_draft = []
         self.interval_measurement_id = None
         self.saved_var.set("尚未保存")
-        self._mode_changed()
+        self.refresh_manual_widths()
+        self.refresh_dynamic_overlay()
+        self.update_context_panel()
 
     def add_candidate(self) -> None:
         candidate_id = self.candidate_var.get()
@@ -1702,10 +2329,13 @@ class GeometryEditorApp:
         self.doc.checkpoint()
         if not self.doc.add_candidate(candidate_id, max(4.0, 10.0 / self.zoom)):
             self.doc.undo()
-        self.refresh()
+        self.refresh_static_geometry()
+        self.refresh_manual_widths()
+        self.refresh_metrics()
 
     def undo(self) -> None:
         if self.doc.undo():
+            self.surface_versions[self.document_index] += 1
             self.draft = []
             self.lasso = []
             self.selected_edge_ids.clear()
@@ -1713,10 +2343,11 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
-            self.refresh()
+            self.full_refresh()
 
     def redo(self) -> None:
         if self.doc.redo():
+            self.surface_versions[self.document_index] += 1
             self.draft = []
             self.lasso = []
             self.selected_edge_ids.clear()
@@ -1724,7 +2355,7 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
-            self.refresh()
+            self.full_refresh()
 
     def change_tile(self, _event=None) -> None:
         target = self.tile_var.get()
@@ -1737,6 +2368,7 @@ class GeometryEditorApp:
         self.width_drag_current = None
         self.interval_draft = []
         self.interval_measurement_id = None
+        self.full_refresh()
         self.fit_image()
 
     def show_topology(self) -> None:
@@ -1757,7 +2389,9 @@ class GeometryEditorApp:
             return
         self.doc.checkpoint()
         self.doc.node_intersections()
-        self.refresh()
+        self.refresh_static_geometry()
+        self.refresh_manual_widths()
+        self.refresh_metrics()
 
     def save_all(self, show_message: bool = True) -> None:
         self.edited_dir.mkdir(parents=True, exist_ok=True)

@@ -72,10 +72,15 @@ class ManualWidthOverrideTests(unittest.TestCase):
         app.mode, app.zoom = _Variable("measure_width"), 1.0
         app.interval_measurement_id, app.interval_draft = None, []
         app.width_draft, app.width_drag_start, app.width_drag_current = [], None, None
+        app.width_preview = None
         app.surface_stroke_active, app.drag_node, app.lasso = False, None, []
+        app.space_pressed, app.space_panning, app.lasso_active = False, False, False
         app.saved_var, app.context_text = _Variable(), _Variable()
         app.source_point = lambda event: event.rc
         app.refresh = lambda: None
+        app.refresh_dynamic_overlay = lambda: None
+        app.refresh_manual_widths = lambda: None
+        app.update_context_panel = lambda: None
         app._mode_changed = lambda: None
         with mock.patch("geometry_editor.messagebox.showwarning"):
             app.mouse_press(_Event((44.0, 48.0)))
