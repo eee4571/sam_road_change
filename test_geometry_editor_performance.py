@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import queue
 import sys
 import unittest
 from pathlib import Path
@@ -15,6 +17,8 @@ from geometry_editor import (  # noqa: E402
     GeometryDocument,
     GeometryEditorApp,
     create_normal_width_measurement,
+    load_documents_worker,
+    main,
     point_segment_projection,
 )
 
@@ -89,6 +93,78 @@ class GeometryEditorPerformanceTests(unittest.TestCase):
         self.doc.add_polyline([(50, 100), (70, 110)], snap_tolerance=1.0)
         self.doc.road_chains()
         self.assertEqual(self.doc.cache_build_counts["chains"], 2)
+
+    def test_loading_shell_is_built_before_worker_thread_starts(self) -> None:
+        source = inspect.getsource(main)
+        self.assertLess(source.index("build_loading_shell(root)"), source.index("threading.Thread("))
+        self.assertLess(source.index("root.update()"), source.index("threading.Thread("))
+
+    def test_loading_worker_has_no_tk_widget_access_and_completes(self) -> None:
+        source = inspect.getsource(load_documents_worker)
+        self.assertNotIn("tk.", source)
+        self.assertNotIn("ttk.", source)
+        messages = queue.Queue()
+
+        def fake_load(*_args, progress=None, timings=None, **_kwargs):
+            progress("正在准备遥感影像…")
+            timings["fake"] = 1.0
+            return [self.doc]
+
+        timings = {}
+        with mock.patch("geometry_editor.load_documents", side_effect=fake_load):
+            load_documents_worker(
+                messages, Path("review"), Path("edited"), None, None, timings,
+            )
+        self.assertEqual(messages.get_nowait(), ("status", "正在准备遥感影像…"))
+        kind, documents = messages.get_nowait()
+        self.assertEqual(kind, "loaded")
+        self.assertIs(documents[0], self.doc)
+        self.assertEqual(timings["fake"], 1.0)
+
+    def test_startup_metrics_are_lazy(self) -> None:
+        app = GeometryEditorApp.__new__(GeometryEditorApp)
+        app.documents, app.document_index = [self.doc], 0
+        app.last_metrics = {}
+        app.topology_dirty = True
+        app.update_status = lambda: None
+        with mock.patch.object(self.doc, "topology_metrics", wraps=self.doc.topology_metrics) as metrics:
+            app.refresh_metrics()
+        self.assertEqual(metrics.call_count, 0)
+        self.assertEqual(app.last_metrics["node_count"], len(self.doc.nodes))
+        self.assertEqual(app.last_metrics["edge_count"], len(self.doc.edges))
+
+    def test_global_loader_can_defer_legacy_width_normalization_until_save(self) -> None:
+        legacy = [{
+            "measurement_id": "MW00001", "target_row": 50, "target_col": 50,
+            "start_row": 44, "start_col": 50, "end_row": 56, "end_col": 50,
+            "width_px": 12, "source": "manual_boundary_measurement",
+        }]
+        with mock.patch(
+            "geometry_editor.normalize_manual_width_measurements",
+            wraps=__import__("geometry_editor").normalize_manual_width_measurements,
+        ) as normalize:
+            document = GeometryDocument(
+                "lazy", self.doc.image, self.nodes, self.edges, self.doc.mask,
+                manual_widths=legacy, defer_manual_width_normalization=True,
+            )
+            self.assertEqual(normalize.call_count, 0)
+            self.assertNotIn("target_chain_id", document.manual_widths[0])
+            document.compact()
+            self.assertEqual(normalize.call_count, 1)
+            self.assertIn("target_chain_id", document.manual_widths[0])
+
+    def test_worker_owned_binary_arrays_are_adopted_without_copy(self) -> None:
+        mask = np.zeros((120, 120), dtype=np.uint8)
+        additions = np.zeros_like(mask)
+        removals = np.zeros_like(mask)
+        document = GeometryDocument(
+            "adopt", self.doc.image, self.nodes, self.edges, mask,
+            surface_additions=additions, surface_removals=removals,
+            adopt_large_arrays=True,
+        )
+        self.assertIs(document.mask, mask)
+        self.assertIs(document.surface_additions, additions)
+        self.assertIs(document.surface_removals, removals)
 
     def test_spatial_index_nearest_edge_matches_full_scan(self) -> None:
         queries = [(50, 5), (47, 23), (54, 88), (80, 50)]

@@ -22,9 +22,13 @@ from finalize_review_results import apply_manual_width_overrides  # noqa: E402
 from geometry_editor import (  # noqa: E402
     GeometryDocument,
     GeometryEditorApp,
+    create_default_interval_width_measurement,
     create_interval_width_measurement,
     create_normal_width_measurement,
     load_manual_widths,
+    manual_width_interval_overlaps,
+    manual_width_preview_geometry,
+    update_manual_width_interval_endpoint,
 )
 from width_surface_reconstruction import WidthSurfaceConfig, reconstruct_surface_from_widths  # noqa: E402
 
@@ -65,6 +69,15 @@ class ManualWidthOverrideTests(unittest.TestCase):
             for edge_id in range(len(self.edges))
         ]
         return records, widths
+
+    def _default_interval(self, width=12.0, max_length=30.0) -> dict:
+        interval, error = create_default_interval_width_measurement(
+            self.document, self._measurement(width=width),
+            max_default_length_units=max_length,
+        )
+        self.assertEqual(error, "")
+        self.assertIsNotNone(interval)
+        return interval
 
     def test_drag_events_create_one_measurement(self) -> None:
         app = GeometryEditorApp.__new__(GeometryEditorApp)
@@ -156,6 +169,92 @@ class ManualWidthOverrideTests(unittest.TestCase):
         self.assertIsNone(interval)
         self.assertIn("同一连续道路链", error)
 
+    def test_measurement_is_promoted_to_bounded_interval_on_target_chain(self) -> None:
+        interval = self._default_interval(max_length=30.0)
+        self.assertEqual(interval["source"], "manual_interval_width")
+        self.assertEqual(interval["target_chain_id"], 0)
+        self.assertLess(interval["range_start_position"], interval["chain_position"])
+        self.assertGreater(interval["range_end_position"], interval["chain_position"])
+        self.assertAlmostEqual(
+            (interval["range_end_position"] - interval["range_start_position"])
+            * self.document.pixel_size,
+            30.0,
+        )
+
+    def test_dragging_start_and_end_updates_ordered_interval(self) -> None:
+        interval = self._default_interval(max_length=40.0)
+        moved_start, error = update_manual_width_interval_endpoint(
+            self.document, interval, "start", (50.0, 25.0),
+        )
+        self.assertEqual(error, "")
+        self.assertAlmostEqual(moved_start["range_start_position"], 25.0)
+        moved_end, error = update_manual_width_interval_endpoint(
+            self.document, moved_start, "end", (50.0, 85.0),
+        )
+        self.assertEqual(error, "")
+        self.assertAlmostEqual(moved_end["range_end_position"], 85.0)
+        self.assertLess(moved_end["range_start_position"], moved_end["range_end_position"])
+
+    def test_dragged_handle_is_projected_to_original_chain(self) -> None:
+        interval = self._default_interval(max_length=30.0)
+        moved, error = update_manual_width_interval_endpoint(
+            self.document, interval, "start", (65.0, 20.0),
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(moved["target_chain_id"], interval["target_chain_id"])
+        self.assertAlmostEqual(moved["range_start_row"], 50.0)
+
+    def test_endpoint_drag_is_one_undo_redo_step(self) -> None:
+        interval = self._default_interval(max_length=30.0)
+        self.document.manual_widths = [interval]
+        original_start = interval["range_start_position"]
+        self.document.checkpoint()
+        moved, error = update_manual_width_interval_endpoint(
+            self.document, interval, "start", (50.0, 15.0),
+        )
+        self.assertEqual(error, "")
+        self.document.manual_widths[0] = moved
+        moved_start = moved["range_start_position"]
+        self.assertNotEqual(moved_start, original_start)
+        self.assertTrue(self.document.undo())
+        self.assertAlmostEqual(self.document.manual_widths[0]["range_start_position"], original_start)
+        self.assertTrue(self.document.redo())
+        self.assertAlmostEqual(self.document.manual_widths[0]["range_start_position"], moved_start)
+
+    def test_overlapping_intervals_are_detected_but_touching_is_allowed(self) -> None:
+        first = self._default_interval(max_length=30.0)
+        overlapping = dict(
+            first, measurement_id="MW99998",
+            range_start_position=first["range_end_position"] - 5.0,
+            range_end_position=first["range_end_position"] + 5.0,
+        )
+        touching = dict(
+            first, measurement_id="MW99999",
+            range_start_position=first["range_end_position"],
+            range_end_position=first["range_end_position"] + 5.0,
+        )
+        self.assertTrue(manual_width_interval_overlaps([first], overlapping))
+        self.assertFalse(manual_width_interval_overlaps([first], touching))
+
+    def test_preview_area_increases_with_width_and_range(self) -> None:
+        narrow = self._default_interval(width=8.0, max_length=20.0)
+        wide = dict(narrow, width_px=16.0, width_units=8.0)
+        long = self._default_interval(width=8.0, max_length=40.0)
+        narrow_preview = manual_width_preview_geometry(self.document, narrow)
+        wide_preview = manual_width_preview_geometry(self.document, wide)
+        long_preview = manual_width_preview_geometry(self.document, long)
+        self.assertGreater(wide_preview.area, narrow_preview.area)
+        self.assertGreater(long_preview.area, narrow_preview.area)
+
+    def test_preview_does_not_write_formal_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            surface = Path(raw) / "road_surfaces.shp"
+            surface.write_bytes(b"formal-surface-sentinel")
+            before = surface.read_bytes()
+            preview = manual_width_preview_geometry(self.document, self._default_interval())
+            self.assertFalse(preview.is_empty)
+            self.assertEqual(surface.read_bytes(), before)
+
     def test_later_edit_has_predictable_precedence(self) -> None:
         anchor = self._measurement(width=8.0)
         interval, _ = create_interval_width_measurement(self.document, anchor, (50, 20), (50, 80))
@@ -195,6 +294,23 @@ class ManualWidthOverrideTests(unittest.TestCase):
         self.assertEqual(len(reopened.manual_widths), 1)
         self.assertIn("target_chain_id", reopened.manual_widths[0])
         self.assertIn("chain_position", reopened.manual_widths[0])
+
+    def test_interval_json_round_trip_preserves_range(self) -> None:
+        interval = self._default_interval(max_length=30.0)
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            (directory / "tile_manual_widths.json").write_text(
+                json.dumps([interval], ensure_ascii=False), encoding="utf-8",
+            )
+            reopened = GeometryDocument(
+                "tile", self.document.image, self.nodes, self.edges, self.document.mask,
+                manual_widths=load_manual_widths(directory, "tile"),
+            )
+        saved = reopened.manual_widths[0]
+        self.assertEqual(saved["source"], "manual_interval_width")
+        self.assertEqual(saved["target_chain_id"], interval["target_chain_id"])
+        self.assertAlmostEqual(saved["range_start_position"], interval["range_start_position"])
+        self.assertAlmostEqual(saved["range_end_position"], interval["range_end_position"])
 
     def test_file_wrapper_preserves_automatic_edges_outside_anchor(self) -> None:
         records, widths = self._rows()

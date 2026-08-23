@@ -434,6 +434,8 @@ def geometry_editor_process_state(
             payload = {}
         if isinstance(payload, dict) and payload.get("status") == "ready":
             return "ready", payload
+        if isinstance(payload, dict) and payload.get("status") == "failed":
+            return "failed", payload
     returncode = process.poll()
     if returncode is not None:
         return "failed", {"returncode": int(returncode)}
@@ -4274,11 +4276,16 @@ class UserApp:
                     pass
                 self.editor_ready_file = None
             return
-        returncode = int(detail.get("returncode", process.poll() or 0))
+        raw_returncode = detail.get("returncode")
+        returncode = int(raw_returncode) if raw_returncode is not None else None
         error_lines = self.editor_stderr_lines[-20:] or self.editor_stdout_lines[-20:]
-        error_text = "\n".join(error_lines).strip() or "编辑器未输出错误详情。"
-        message = f"人工编辑器在窗口就绪前退出。退出码：{returncode}\n\n{error_text}"
-        self.status.set(f"人工编辑器启动失败（退出码 {returncode}）。")
+        error_text = str(detail.get("error") or "\n".join(error_lines)).strip() or "编辑器未输出错误详情。"
+        exit_text = f"退出码：{returncode}" if returncode is not None else "编辑器窗口报告加载失败"
+        message = f"人工编辑器未能进入可编辑状态。{exit_text}\n\n{error_text}"
+        self.status.set(
+            f"人工编辑器启动失败（退出码 {returncode}）。"
+            if returncode is not None else "人工编辑器数据加载失败。"
+        )
         if hasattr(self, "review_status"):
             self.review_status.set("人工编辑器启动失败；请查看全流程日志。")
         self._append_log("人工编辑", message.replace("\n", " | "))

@@ -7,8 +7,11 @@ import ctypes
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
+import traceback
 from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -37,6 +40,7 @@ from finalize_review_results import load_graph, save_graph  # noqa: E402
 from chain_width_calculator import (  # noqa: E402
     ChainProjection,
     _chain_geometry,
+    _point_at,
     _tangent_at,
     build_road_chains,
     normalize_manual_width_measurements,
@@ -293,6 +297,165 @@ def create_interval_width_measurement(
     return result, ""
 
 
+def chain_interval_points(
+    document: "GeometryDocument", chain_id: int, start_position: float, end_position: float,
+) -> np.ndarray:
+    """Return a clipped chain polyline for one finite chain-position interval."""
+    chains = {int(chain.chain_id): chain for chain in document.road_chains()}
+    chain = chains.get(int(chain_id))
+    if chain is None:
+        return np.empty((0, 2), dtype=np.float32)
+    points, cumulative = document._chain_geometry_cache[int(chain_id)]
+    total = float(cumulative[-1])
+    lo = float(np.clip(min(start_position, end_position), 0.0, total))
+    hi = float(np.clip(max(start_position, end_position), 0.0, total))
+    if hi - lo <= 1e-6:
+        return np.empty((0, 2), dtype=np.float32)
+    start, _ = _point_at(points, cumulative, lo)
+    end, _ = _point_at(points, cumulative, hi)
+    interior = points[(cumulative > lo + 1e-6) & (cumulative < hi - 1e-6)]
+    return np.vstack((start, interior, end)).astype(np.float32)
+
+
+def create_default_interval_width_measurement(
+    document: "GeometryDocument", measurement: dict,
+    *, max_default_length_units: float = 100.0,
+) -> tuple[dict | None, str]:
+    """Promote one boundary measurement to a bounded natural-chain interval."""
+    try:
+        chain_id = int(measurement["target_chain_id"])
+        center = float(measurement["chain_position"])
+    except (KeyError, TypeError, ValueError):
+        return None, "测宽结果没有匹配到道路链，请重新测量。"
+    chains = {int(chain.chain_id): chain for chain in document.road_chains()}
+    chain = chains.get(chain_id)
+    if chain is None:
+        return None, "测宽结果对应的道路链不存在，请重新测量。"
+    points, cumulative = document._chain_geometry_cache[chain_id]
+    total = float(cumulative[-1])
+    scale = max(float(getattr(document, "pixel_size", 1.0) or 1.0), 1e-6)
+    maximum_pixels = max(2.0, float(max_default_length_units) / scale)
+    if total <= maximum_pixels:
+        lo, hi = 0.0, total
+    else:
+        half = maximum_pixels * 0.5
+        lo, hi = max(0.0, center - half), min(total, center + half)
+        if hi - lo < maximum_pixels:
+            if lo <= 0.0:
+                hi = min(total, maximum_pixels)
+            else:
+                lo = max(0.0, total - maximum_pixels)
+    start, _ = _point_at(points, cumulative, lo)
+    end, _ = _point_at(points, cumulative, hi)
+    result = dict(measurement)
+    result.update({
+        "source": "manual_interval_width",
+        "range_start_position": float(lo),
+        "range_end_position": float(hi),
+        "range_start_row": float(start[0]),
+        "range_start_col": float(start[1]),
+        "range_end_row": float(end[0]),
+        "range_end_col": float(end[1]),
+    })
+    return result, ""
+
+
+def manual_width_interval_overlaps(
+    measurements: list[dict], candidate: dict, *, exclude_measurement_id: str = "",
+) -> bool:
+    try:
+        chain_id = int(candidate["target_chain_id"])
+        lo = float(candidate["range_start_position"])
+        hi = float(candidate["range_end_position"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    for row in measurements:
+        if str(row.get("source", "")) != "manual_interval_width":
+            continue
+        if str(row.get("measurement_id", "")) == exclude_measurement_id:
+            continue
+        try:
+            if int(row["target_chain_id"]) != chain_id:
+                continue
+            other_lo = float(row["range_start_position"])
+            other_hi = float(row["range_end_position"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if max(lo, other_lo) < min(hi, other_hi) - 1e-6:
+            return True
+    return False
+
+
+def update_manual_width_interval_endpoint(
+    document: "GeometryDocument", measurement: dict, handle: str,
+    point_rc: tuple[float, float], *, max_centerline_distance: float = 48.0,
+    minimum_range_units: float = 5.0,
+) -> tuple[dict | None, str]:
+    """Project a dragged range handle onto its existing chain and clamp its order."""
+    if handle not in {"start", "end"}:
+        return None, "未知的宽度区间控制点。"
+    try:
+        chain_id = int(measurement["target_chain_id"])
+        lo = float(measurement["range_start_position"])
+        hi = float(measurement["range_end_position"])
+    except (KeyError, TypeError, ValueError):
+        return None, "人工宽度记录缺少有效区间。"
+    projection = document.project_to_road_chain(
+        point_rc, chain_id=chain_id, max_distance=max_centerline_distance,
+    )
+    if projection is None:
+        return None, "控制点只能沿当前道路链移动。"
+    scale = max(float(getattr(document, "pixel_size", 1.0) or 1.0), 1e-6)
+    minimum_pixels = max(1.0, float(minimum_range_units) / scale)
+    position = float(projection.chain_position)
+    if handle == "start":
+        position = min(position, hi - minimum_pixels)
+        if position < 0.0 or hi - position < minimum_pixels - 1e-6:
+            return None, "宽度作用区间不能短于最小范围。"
+        lo = position
+    else:
+        position = max(position, lo + minimum_pixels)
+        chains = {int(chain.chain_id): chain for chain in document.road_chains()}
+        chain = chains.get(chain_id)
+        total = float(document._chain_geometry_cache[chain_id][1][-1]) if chain is not None else hi
+        if position > total or position - lo < minimum_pixels - 1e-6:
+            return None, "宽度作用区间不能短于最小范围。"
+        hi = position
+    points = chain_interval_points(document, chain_id, lo, hi)
+    if len(points) < 2:
+        return None, "无法生成有效的宽度作用区间。"
+    result = dict(measurement)
+    result.update({
+        "range_start_position": lo,
+        "range_end_position": hi,
+        "range_start_row": float(points[0, 0]),
+        "range_start_col": float(points[0, 1]),
+        "range_end_row": float(points[-1, 0]),
+        "range_end_col": float(points[-1, 1]),
+    })
+    return result, ""
+
+
+def manual_width_preview_geometry(document: "GeometryDocument", measurement: dict):
+    """Build a local pixel-space corridor preview without touching formal surfaces."""
+    try:
+        points = chain_interval_points(
+            document, int(measurement["target_chain_id"]),
+            float(measurement["range_start_position"]),
+            float(measurement["range_end_position"]),
+        )
+        scale = max(float(getattr(document, "pixel_size", 1.0) or 1.0), 1e-6)
+        width_px = float(measurement.get("width_units", 0.0)) / scale
+        if width_px <= 0:
+            width_px = float(measurement["width_px"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(points) < 2 or width_px <= 0:
+        return None
+    line = LineString([(float(col), float(row)) for row, col in points])
+    return line.buffer(0.5 * width_px, cap_style=2, join_style=2)
+
+
 @dataclass
 class EditorSnapshot:
     nodes: np.ndarray
@@ -318,23 +481,34 @@ class GeometryDocument:
         manual_widths: list[dict] | None = None,
         surface_additions: np.ndarray | None = None,
         surface_removals: np.ndarray | None = None,
+        defer_manual_width_normalization: bool = False,
+        adopt_large_arrays: bool = False,
     ) -> None:
         self.stem = stem
         self.image = image
         self.nodes = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
         self.edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
-        self.mask = (np.asarray(mask) > 0).astype(np.uint8)
+        self.mask = (
+            np.asarray(mask, dtype=np.uint8)
+            if adopt_large_arrays else (np.asarray(mask) > 0).astype(np.uint8)
+        )
         self.candidates = copy.deepcopy(candidates or {})
         self.applied_surface_region_ids = set(applied_surface_region_ids or set())
-        self.manual_widths = normalize_manual_width_measurements(
-            self.nodes, self.edges, copy.deepcopy(manual_widths or []),
+        raw_manual_widths = copy.deepcopy(manual_widths or [])
+        self.manual_widths = (
+            raw_manual_widths if defer_manual_width_normalization
+            else normalize_manual_width_measurements(self.nodes, self.edges, raw_manual_widths)
         )
         self.surface_additions = (
-            (np.asarray(surface_additions) > 0).astype(np.uint8)
+            np.asarray(surface_additions, dtype=np.uint8)
+            if adopt_large_arrays and surface_additions is not None
+            else (np.asarray(surface_additions) > 0).astype(np.uint8)
             if surface_additions is not None else np.zeros_like(self.mask)
         )
         self.surface_removals = (
-            (np.asarray(surface_removals) > 0).astype(np.uint8)
+            np.asarray(surface_removals, dtype=np.uint8)
+            if adopt_large_arrays and surface_removals is not None
+            else (np.asarray(surface_removals) > 0).astype(np.uint8)
             if surface_removals is not None else np.zeros_like(self.mask)
         )
         self.undo_stack: list[EditorSnapshot] = []
@@ -960,10 +1134,20 @@ def _world_lines_from_document(document: GeometryDocument) -> list[LineString]:
 
 def _final_centerline_documents(
     review_dir: Path, edited_dir: Path, final_centerlines: Path, final_surfaces: Path,
+    progress=None, timings: dict[str, float] | None = None,
 ) -> list[GeometryDocument]:
     """Create one global editor document from the authoritative period product."""
+    timings = timings if timings is not None else {}
+    stage_started = time.perf_counter()
+    if progress:
+        progress("正在加载道路中心线…")
     lines = gpd.read_file(final_centerlines)
+    timings["centerline_shp_read"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
+    if progress:
+        progress("正在加载最终道路面…")
     surfaces = gpd.read_file(final_surfaces)
+    timings["surface_shp_read"] = time.perf_counter() - stage_started
     if lines.crs is None:
         raise ValueError(f"最终中心线缺少 CRS：{final_centerlines}")
     if surfaces.crs is None:
@@ -980,7 +1164,9 @@ def _final_centerline_documents(
         and str(saved_manifest.get("base_final_surfaces", "")) == str(final_surfaces.resolve())
         and int(saved_manifest.get("base_final_surfaces_mtime_ns", -1)) == final_surfaces.stat().st_mtime_ns
     )
+    stage_started = time.perf_counter()
     summary_rows = _review_summary_rows(review_dir)
+    timings["summary_json_read"] = time.perf_counter() - stage_started
     if not summary_rows:
         raise FileNotFoundError(f"No review summaries under {review_dir}")
     edited_global_path = edited_dir / "global_edited_centerlines.gpkg"
@@ -991,22 +1177,36 @@ def _final_centerline_documents(
             raise ValueError(f"已保存的全局中心线缺少 CRS：{edited_global_path}")
         active_lines = active_lines if active_lines.crs == lines.crs else active_lines.to_crs(lines.crs)
     image_paths = [Path(summary["image"]).expanduser().resolve() for _, summary in summary_rows]
+    if progress:
+        progress("正在准备遥感影像…")
+    stage_started = time.perf_counter()
     bounds = _image_union_bounds(image_paths, lines.crs)
+    timings["raster_metadata_read"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     image, transform = _build_global_overview(image_paths, lines.crs, bounds)
+    timings["global_image_mosaic"] = time.perf_counter() - stage_started
+    if progress:
+        progress("正在生成地图显示…")
     surface_shapes = [
         (geometry, 1) for geometry in surfaces.geometry
         if geometry is not None and not geometry.is_empty
     ]
+    stage_started = time.perf_counter()
     mask = rasterize(
         surface_shapes, out_shape=image.shape[:2], transform=transform,
         fill=0, all_touched=True, dtype="uint8",
     ) if surface_shapes else np.zeros(image.shape[:2], dtype=np.uint8)
+    timings["surface_rasterize"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     nodes, edges = _graph_from_world_lines(active_lines, transform, box(*bounds))
+    timings["centerline_graph_build"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     surface_additions, surface_removals = load_surface_edits(edited_dir, "global", image.shape[:2])
     document = GeometryDocument(
         "全局最终中心线", image, nodes, edges, mask, candidates={},
         manual_widths=load_manual_widths(edited_dir, "global"),
         surface_additions=surface_additions, surface_removals=surface_removals,
+        defer_manual_width_normalization=True, adopt_large_arrays=True,
     )
     document.global_mode = True
     document.global_transform = transform
@@ -1016,20 +1216,32 @@ def _final_centerline_documents(
     document.global_base_lines = lines.copy()
     document.global_base_surfaces = surfaces.copy()
     document.global_overview_scale = max(abs(float(transform.a)), abs(float(transform.e)))
+    document.pixel_size = document.global_overview_scale
+    timings["document_construct"] = time.perf_counter() - stage_started
     return [document]
 
 
 def load_documents(
     review_dir: Path, edited_dir: Path, final_centerlines: Path | None = None,
-    final_surfaces: Path | None = None,
+    final_surfaces: Path | None = None, progress=None,
+    timings: dict[str, float] | None = None,
 ) -> list[GeometryDocument]:
+    load_started = time.perf_counter()
+    if progress:
+        progress("正在读取人工编辑资料…")
     if final_centerlines is not None:
         final_centerlines = final_centerlines.expanduser().resolve()
         if not final_centerlines.is_file():
             raise FileNotFoundError(f"找不到每期最终融合中心线：{final_centerlines}")
         if final_surfaces is None or not final_surfaces.is_file():
             raise FileNotFoundError(f"找不到每期最终道路面：{final_surfaces}")
-        return _final_centerline_documents(review_dir, edited_dir, final_centerlines, final_surfaces)
+        documents = _final_centerline_documents(
+            review_dir, edited_dir, final_centerlines, final_surfaces,
+            progress=progress, timings=timings,
+        )
+        if timings is not None:
+            timings["load_documents_total"] = time.perf_counter() - load_started
+        return documents
     decisions = load_decisions(review_dir)
     manifest_path = edited_dir / "edited_manifest.json"
     try:
@@ -1041,6 +1253,8 @@ def load_documents(
         if summary_path.name.startswith("batch_") or summary_path.name.endswith("_optimized_summary.json"):
             continue
         stem = summary_path.name.removesuffix("_summary.json")
+        if progress:
+            progress(f"正在读取切片 {stem}…")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         image = imread_unicode(Path(summary["image"]), cv2.IMREAD_COLOR)
         if image is None:
@@ -1112,6 +1326,8 @@ def load_documents(
         documents.append(document)
     if not documents:
         raise FileNotFoundError(f"No review summaries under {review_dir}")
+    if timings is not None:
+        timings["load_documents_total"] = time.perf_counter() - load_started
     return documents
 
 
@@ -1261,20 +1477,27 @@ class GeometryEditorApp:
         "select": "V 选择/编辑",
         "draw": "L 绘制中心线",
         "measure_width": "W 人工测宽",
-        "surface_add": "B 道路面",
+        "surface_add": "B 路面高级编辑",
     }
+    PRIMARY_MODES = ("select", "draw", "measure_width")
 
     def __init__(
         self, root: tk.Tk, review_dir: Path, edited_dir: Path,
         final_centerlines: Path | None = None,
         final_surfaces: Path | None = None,
+        documents: list[GeometryDocument] | None = None,
+        startup_timings: dict[str, float] | None = None,
     ) -> None:
         self.root = root
         self.review_dir = review_dir
         self.edited_dir = edited_dir
         self.final_centerlines = final_centerlines.expanduser().resolve() if final_centerlines is not None else None
         self.final_surfaces = final_surfaces.expanduser().resolve() if final_surfaces is not None else None
-        self.documents = load_documents(review_dir, edited_dir, self.final_centerlines, self.final_surfaces)
+        self.documents = documents if documents is not None else load_documents(
+            review_dir, edited_dir, self.final_centerlines, self.final_surfaces,
+        )
+        if not self.documents:
+            raise ValueError("人工编辑资料中没有可加载的道路文档。")
         self.document_index = 0
         self.mode = tk.StringVar(value="select")
         self.tile_var = tk.StringVar(value=self.documents[0].stem)
@@ -1313,6 +1536,9 @@ class GeometryEditorApp:
         self.width_drag_current: tuple[float, float] | None = None
         self.interval_draft: list[tuple[float, float]] = []
         self.interval_measurement_id: str | None = None
+        self.active_width_measurement_id: str | None = None
+        self.width_range_drag_handle: str | None = None
+        self.width_range_drag_checkpoint = False
         self.surface_radius = tk.IntVar(value=12)
         self.surface_action = tk.StringVar(value="add")
         self.surface_stroke_active = False
@@ -1333,8 +1559,11 @@ class GeometryEditorApp:
         root.minsize(max(900, min_width), max(580, min_height))
         root.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+{max(0, (screen_h - height) // 2)}")
         root.protocol("WM_DELETE_WINDOW", self.close)
+        stage_started = time.perf_counter()
         self.build_ui()
-        self.full_refresh()
+        if startup_timings is not None:
+            startup_timings["editor_ui_build"] = time.perf_counter() - stage_started
+        self.full_refresh(startup_timings=startup_timings)
         # Wait until the three-column workspace has its final size. Calling
         # fit_image before Tk finishes layout makes the image open as a small
         # thumbnail in the upper-left corner on high-DPI displays.
@@ -1396,7 +1625,8 @@ class GeometryEditorApp:
         toolbar = ttk.Frame(self.root, padding=(14, 8), style="Toolbar.TFrame")
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="← 返回复核", style="Tool.TButton", command=self.close).pack(side="left", padx=(0, 10))
-        for value, label in self.MODES.items():
+        for value in self.PRIMARY_MODES:
+            label = self.MODES[value]
             ttk.Radiobutton(
                 toolbar, text=label, variable=self.mode, value=value,
                 style="Tool.TRadiobutton", command=self._mode_changed,
@@ -1462,8 +1692,8 @@ class GeometryEditorApp:
         ttk.Button(self.tool_draw_frame, text="完成绘线  Enter", command=self.finish_drawing).pack(fill="x", pady=2)
         ttk.Button(self.tool_draw_frame, text="取消  Esc", command=self.cancel_drawing).pack(fill="x", pady=2)
         self.tool_width_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
-        ttk.Button(self.tool_width_frame, text="保留单点锚点", command=self.keep_width_anchor).pack(fill="x", pady=2)
-        ttk.Button(self.tool_width_frame, text="应用到道路区间", command=self.begin_width_interval).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="确认当前区间", command=self.confirm_active_width).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="取消当前区间", command=self.cancel_active_width).pack(fill="x", pady=2)
         ttk.Button(self.tool_width_frame, text="删除最近测量", command=self.delete_latest_width).pack(fill="x", pady=2)
         self.tool_surface_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
         ttk.Radiobutton(
@@ -1485,6 +1715,18 @@ class GeometryEditorApp:
         more_panel.pack(fill="x", pady=(10, 0))
         ttk.Button(more_panel, text="拓扑检查", command=self.show_topology).pack(fill="x")
         ttk.Button(more_panel, text="交叉线建路口", command=self.node_all_crossings).pack(fill="x", pady=(4, 0))
+        advanced = ttk.Menubutton(more_panel, text="高级工具  ▸")
+        advanced_menu = tk.Menu(advanced, tearoff=False)
+        advanced_menu.add_command(label="路面局部修补", command=lambda: self.activate_surface_tool("add"))
+        advanced_menu.add_command(label="路面局部擦除", command=lambda: self.activate_surface_tool("remove"))
+        advanced.configure(menu=advanced_menu)
+        advanced.pack(fill="x", pady=(4, 0))
+        ttk.Label(
+            more_panel,
+            text=("仅用于路口、匝道、广场式道路等特殊区域的局部修补。"
+                  "通常修改中心线或人工宽度即可自动重建道路面。"),
+            style="Panel.TLabel", wraplength=220,
+        ).pack(anchor="w", pady=(6, 0))
 
         legend_panel = ttk.LabelFrame(right_panel, text="图层与图例", style="Panel.TLabelframe")
         legend_panel.pack(fill="x", pady=(10, 0))
@@ -1532,8 +1774,24 @@ class GeometryEditorApp:
             self.width_preview = None
             self.interval_draft = []
             self.interval_measurement_id = None
+            self.width_range_drag_handle = None
+            self.width_range_drag_checkpoint = False
         self.update_context_panel()
         self.refresh_dynamic_overlay()
+
+    def activate_surface_tool(self, action: str) -> None:
+        self.surface_action.set("remove" if action == "remove" else "add")
+        self.mode.set("surface_add")
+        self._mode_changed()
+
+    def active_width_measurement(self) -> dict | None:
+        measurement_id = getattr(self, "active_width_measurement_id", None)
+        if not measurement_id:
+            return None
+        return next((
+            row for row in self.doc.manual_widths
+            if str(row.get("measurement_id", "")) == measurement_id
+        ), None)
 
     def update_context_panel(self) -> None:
         for frame in (
@@ -1544,32 +1802,41 @@ class GeometryEditorApp:
         mode = self.mode.get()
         if mode == "draw":
             self.tool_title_var.set("绘制中心线  L")
-            self.tool_hint_var.set("左键添加节点；双击或 Enter 完成；Esc 取消。")
+            self.tool_hint_var.set("沿道路依次点击添加节点，双击或 Enter 完成；Esc 取消。")
             self.tool_value_var.set(f"当前节点：{len(self.draft)}")
             self.tool_draw_frame.pack(fill="x")
         elif mode == "measure_width":
             self.tool_title_var.set("人工测宽  W")
-            self.tool_hint_var.set("按住左键跨道路拖动，松开后自动校正到道路法线。")
-            latest = self.doc.manual_widths[-1] if self.doc.manual_widths else None
+            active = self.active_width_measurement()
             if self.width_preview is not None:
                 value = float(self.width_preview.get("width_units", 0.0))
                 self.tool_value_var.set(f"人工宽度：{value:.2f} m")
-            elif latest is not None:
-                value = float(latest.get("width_units", latest.get("width_px", 0.0)))
-                source = "区间定宽" if latest.get("source") == "manual_interval_width" else "单点锚点"
-                self.tool_value_var.set(f"最近测量：{value:.2f} m\n类型：{source}\n记录：{len(self.doc.manual_widths)}")
+                self.tool_hint_var.set("跨道路两侧拖动鼠标测量宽度。")
+            elif active is not None:
+                value = float(active.get("width_units", active.get("width_px", 0.0)))
+                lo = float(active.get("range_start_position", 0.0)) * float(getattr(self.doc, "pixel_size", 1.0))
+                hi = float(active.get("range_end_position", lo)) * float(getattr(self.doc, "pixel_size", 1.0))
+                self.tool_hint_var.set("拖动地图中的两个端点，可调整该宽度的作用范围。")
+                self.tool_value_var.set(
+                    f"宽度\n{value:.2f} m\n\n应用范围\n当前道路链\n\n"
+                    f"区间长度\n{max(0.0, hi - lo):.1f} m\n\n起点 {lo:.1f} m\n终点 {hi:.1f} m"
+                )
             else:
+                self.tool_hint_var.set(
+                    "跨道路两侧拖动鼠标测量宽度。"
+                    "系统会自动吸附到最近道路中心线，并将宽度应用到该道路的一段范围。"
+                )
                 self.tool_value_var.set("尚无人工测宽记录")
             self.tool_width_frame.pack(fill="x")
         elif mode == "surface_add":
-            self.tool_title_var.set("道路面编辑  B")
-            self.tool_hint_var.set("左键按当前模式涂画；右键可临时擦除。")
+            self.tool_title_var.set("路面高级编辑  B")
+            self.tool_hint_var.set("仅用于特殊道路区域的局部修补。左键涂画，右键可临时擦除。")
             action = "补画" if self.surface_action.get() == "add" else "擦除"
             self.tool_value_var.set(f"模式：{action}\n笔刷：{self.surface_radius.get()} px")
             self.tool_surface_frame.pack(fill="x")
         else:
             self.tool_title_var.set("选择/编辑  V")
-            self.tool_hint_var.set("拖动节点；单击中心线选择；Shift 多选；Delete 删除。")
+            self.tool_hint_var.set("拖动节点调整中心线；单击道路选择；Shift 可多选；Delete 删除。")
             self.tool_value_var.set(f"已选择：{len(self.selected_edge_ids)} 条中心线")
             self.tool_select_frame.pack(fill="x")
 
@@ -1905,7 +2172,15 @@ class GeometryEditorApp:
     def refresh_manual_widths(self) -> None:
         self.canvas.delete("manual_width")
         z = self.zoom
-        chains = {int(chain.chain_id): chain for chain in self.doc.road_chains()}
+        interval_rows = [
+            row for row in self.doc.manual_widths
+            if str(row.get("source", "")) == "manual_interval_width"
+        ]
+        # Keep chain construction lazy: an untouched document needs no chain
+        # cache merely to paint its first frame.
+        chains = {
+            int(chain.chain_id): chain for chain in self.doc.road_chains()
+        } if interval_rows else {}
         for measurement in self.doc.manual_widths:
             if str(measurement.get("source", "")) == "manual_interval_width":
                 try:
@@ -1916,14 +2191,47 @@ class GeometryEditorApp:
                 except (KeyError, TypeError, ValueError):
                     chain = None
                 if chain is not None:
-                    for offset, edge_id in enumerate(chain.edge_ids):
-                        midpoint = 0.5 * float(cumulative[offset] + cumulative[offset + 1])
-                        if lo - 1e-6 <= midpoint <= hi + 1e-6:
-                            src, dst = self.doc.edges[int(edge_id)]
-                            start, end = self.doc.nodes[int(src)], self.doc.nodes[int(dst)]
-                            self.canvas.create_line(
-                                start[1] * z, start[0] * z, end[1] * z, end[0] * z,
-                                fill="#FACC15", width=4, tags=("manual_width",),
+                    preview = manual_width_preview_geometry(self.doc, measurement)
+                    if preview is not None and not preview.is_empty:
+                        polygon_coords = [
+                            value
+                            for col, row in preview.exterior.coords
+                            for value in (float(col) * z, float(row) * z)
+                        ]
+                        if len(polygon_coords) >= 6:
+                            self.canvas.create_polygon(
+                                *polygon_coords, fill="#0EA5E9", outline="#38BDF8",
+                                stipple="gray50", width=1, tags=("manual_width", "width_preview"),
+                            )
+                    interval_points = chain_interval_points(self.doc, int(chain.chain_id), lo, hi)
+                    if len(interval_points) >= 2:
+                        interval_coords = [
+                            value for row, col in interval_points
+                            for value in (float(col) * z, float(row) * z)
+                        ]
+                        self.canvas.create_line(
+                            *interval_coords, fill="#FACC15", width=5,
+                            capstyle="round", joinstyle="round",
+                            tags=("manual_width", "width_interval"),
+                        )
+                    if str(measurement.get("measurement_id", "")) == getattr(self, "active_width_measurement_id", None):
+                        chain_coords = [
+                            value for row, col in points
+                            for value in (float(col) * z, float(row) * z)
+                        ]
+                        self.canvas.create_line(
+                            *chain_coords, fill="#FDE68A", width=2, dash=(6, 4),
+                            tags=("manual_width", "active_width_chain"),
+                        )
+                        for handle, fill in (("start", "#F97316"), ("end", "#EF4444")):
+                            row = float(measurement[f"range_{handle}_row"])
+                            col = float(measurement[f"range_{handle}_col"])
+                            radius = max(6.0, 7.0 * float(getattr(self, "display_scale", 1.0)))
+                            self.canvas.create_oval(
+                                col * z - radius, row * z - radius,
+                                col * z + radius, row * z + radius,
+                                fill=fill, outline="#FFFFFF", width=2,
+                                tags=("manual_width", f"width_range_{handle}_handle"),
                             )
             try:
                 p0 = (float(measurement["start_col"]) * z, float(measurement["start_row"]) * z)
@@ -1943,6 +2251,25 @@ class GeometryEditorApp:
                 target[0] + 7, target[1] - 7, text=f"{width_units:.2f} m",
                 fill="#E0F2FE", anchor="sw", tags=("manual_width",),
             )
+
+    def width_range_handle_at(self, row: float, col: float) -> tuple[str, str] | None:
+        """Return the nearest visible interval handle in source-pixel space."""
+        tolerance = max(5.0, 10.0 / max(self.zoom, 1e-6))
+        best: tuple[float, str, str] | None = None
+        for measurement in self.doc.manual_widths:
+            if str(measurement.get("source", "")) != "manual_interval_width":
+                continue
+            measurement_id = str(measurement.get("measurement_id", ""))
+            for handle in ("start", "end"):
+                try:
+                    handle_row = float(measurement[f"range_{handle}_row"])
+                    handle_col = float(measurement[f"range_{handle}_col"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                distance = math.hypot(row - handle_row, col - handle_col)
+                if distance <= tolerance and (best is None or distance < best[0]):
+                    best = (distance, measurement_id, handle)
+        return None if best is None else (best[1], best[2])
 
     def refresh_dynamic_overlay(self) -> None:
         self.canvas.delete("dynamic")
@@ -1991,7 +2318,16 @@ class GeometryEditorApp:
         self.update_status()
 
     def refresh_metrics(self) -> None:
-        self.last_metrics = self.doc.topology_metrics()
+        # Full connected-component/topology analysis is intentionally lazy.
+        # It is computed by show_topology(), not while the first frame loads.
+        self.last_metrics = {
+            "node_count": int(len(self.doc.nodes)),
+            "edge_count": int(len(self.doc.edges)),
+            **{
+                key: value for key, value in self.last_metrics.items()
+                if key not in {"node_count", "edge_count"}
+            },
+        }
         if hasattr(self, "metric_vars"):
             for key, variable in self.metric_vars.items():
                 variable.set(str(self.last_metrics.get(key, "--")))
@@ -2007,10 +2343,19 @@ class GeometryEditorApp:
             f"节点 {metrics.get('node_count', len(self.doc.nodes))}  │  边 {metrics.get('edge_count', len(self.doc.edges))}"
         )
 
-    def full_refresh(self) -> None:
+    def full_refresh(self, startup_timings: dict[str, float] | None = None) -> None:
+        stage_started = time.perf_counter()
         self.refresh_background()
+        if startup_timings is not None:
+            startup_timings["first_background_render"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         self.refresh_static_geometry()
+        if startup_timings is not None:
+            startup_timings["first_vector_overlay"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         self.refresh_manual_widths()
+        if startup_timings is not None:
+            startup_timings["manual_width_overlay_and_lazy_chains"] = time.perf_counter() - stage_started
         self.refresh_dynamic_overlay()
         self.refresh_metrics()
         self.update_context_panel()
@@ -2056,7 +2401,15 @@ class GeometryEditorApp:
             self.update_context_panel()
             self.refresh_dynamic_overlay()
         elif mode == "measure_width":
-            if self.interval_measurement_id is not None:
+            handle_hit = self.width_range_handle_at(row, col)
+            if handle_hit is not None:
+                self.active_width_measurement_id, self.width_range_drag_handle = handle_hit
+                self.width_range_drag_checkpoint = False
+                self.width_drag_start = None
+                self.width_drag_current = None
+                self.refresh_manual_widths()
+                self.update_context_panel()
+            elif self.interval_measurement_id is not None:
                 self.interval_draft.append((row, col))
                 if len(self.interval_draft) == 2:
                     self.finish_width_interval()
@@ -2089,6 +2442,33 @@ class GeometryEditorApp:
             if math.hypot(row - last[0], col - last[1]) >= max(1.0, 3.0 / self.zoom):
                 self.lasso.append((row, col))
                 self._extend_lasso_canvas(event)
+        elif self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
+            active = self.active_width_measurement()
+            if active is None:
+                self.width_range_drag_handle = None
+                return
+            updated, error = update_manual_width_interval_endpoint(
+                self.doc, active, self.width_range_drag_handle, (row, col),
+                max_centerline_distance=max(12.0, 24.0 / self.zoom),
+            )
+            if updated is None:
+                self.context_text.set(error)
+                return
+            if manual_width_interval_overlaps(
+                self.doc.manual_widths, updated,
+                exclude_measurement_id=str(updated.get("measurement_id", "")),
+            ):
+                self.context_text.set("该范围与已有人工宽度区间重叠，已保持原范围。")
+                return
+            if not getattr(self, "width_range_drag_checkpoint", False):
+                self.doc.checkpoint()
+                self.width_range_drag_checkpoint = True
+            index = self.doc.manual_widths.index(active)
+            self.doc.manual_widths[index] = updated
+            self.saved_var.set("尚未保存")
+            self.context_text.set("拖动端点调整人工宽度作用范围。")
+            self.refresh_manual_widths()
+            self.update_context_panel()
         elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
             self.width_drag_current = (row, col)
             preview, _error = create_normal_width_measurement(
@@ -2114,7 +2494,12 @@ class GeometryEditorApp:
             return
         surface_was_active = self.surface_stroke_active
         self.surface_stroke_active = False
-        if self.mode.get() == "measure_width" and self.width_drag_start is not None:
+        if self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
+            self.width_range_drag_handle = None
+            self.width_range_drag_checkpoint = False
+            self.refresh_manual_widths()
+            self.update_context_panel()
+        elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
             self.width_drag_current = self.source_point(event)
             self.finish_width_measurement()
         if self.drag_node is not None:
@@ -2196,7 +2581,9 @@ class GeometryEditorApp:
         if not self.doc.manual_widths:
             return
         self.doc.checkpoint()
-        self.doc.manual_widths.pop()
+        deleted = self.doc.manual_widths.pop()
+        if str(deleted.get("measurement_id", "")) == self.active_width_measurement_id:
+            self.active_width_measurement_id = None
         self.saved_var.set("尚未保存")
         self.refresh_manual_widths()
         self.update_context_panel()
@@ -2221,6 +2608,13 @@ class GeometryEditorApp:
 
     def mouse_motion(self, event) -> None:
         self.mouse_status = self.source_point(event)
+        if self.mode.get() == "measure_width":
+            cursor = "hand2" if self.width_range_handle_at(*self.mouse_status) is not None else "crosshair"
+            self.canvas.configure(cursor=cursor)
+        elif self.mode.get() == "surface_add":
+            self.canvas.configure(cursor="pencil")
+        else:
+            self.canvas.configure(cursor="")
         self.update_status()
 
     def start_surface_preview(self, row: float, col: float, add: bool) -> None:
@@ -2335,11 +2729,54 @@ class GeometryEditorApp:
             messagebox.showwarning("测宽未保存", error)
             self._mode_changed()
             return
+        measurement, error = create_default_interval_width_measurement(self.doc, measurement)
+        if measurement is None:
+            messagebox.showwarning("测宽未保存", error)
+            self._mode_changed()
+            return
+        if manual_width_interval_overlaps(self.doc.manual_widths, measurement):
+            messagebox.showwarning(
+                "人工宽度区间重叠",
+                "新建范围与当前道路链上已有的人工宽度区间重叠。\n\n"
+                "本次测宽已取消，请先调整已有区间的两端控制点。",
+            )
+            self.refresh_manual_widths()
+            self.update_context_panel()
+            return
         self.doc.checkpoint()
         self.doc.manual_widths.append(measurement)
+        self.active_width_measurement_id = str(measurement.get("measurement_id", ""))
         self.saved_var.set("尚未保存")
+        self.context_text.set(
+            f"已测得 {float(measurement['width_units']):.2f} m。"
+            "宽度已应用到当前道路段，拖动两端控制点可调整作用范围。"
+        )
         self.refresh_manual_widths()
         self.refresh_dynamic_overlay()
+        self.update_context_panel()
+
+    def confirm_active_width(self) -> None:
+        if self.active_width_measurement() is None:
+            return
+        self.active_width_measurement_id = None
+        self.width_range_drag_handle = None
+        self.width_range_drag_checkpoint = False
+        self.context_text.set("人工宽度区间已保留在当前编辑状态。")
+        self.refresh_manual_widths()
+        self.update_context_panel()
+
+    def cancel_active_width(self) -> None:
+        active = self.active_width_measurement()
+        if active is None:
+            return
+        self.doc.checkpoint()
+        self.doc.manual_widths.remove(active)
+        self.active_width_measurement_id = None
+        self.width_range_drag_handle = None
+        self.width_range_drag_checkpoint = False
+        self.saved_var.set("尚未保存")
+        self.context_text.set("已取消当前人工宽度区间。")
+        self.refresh_manual_widths()
         self.update_context_panel()
 
     def begin_width_interval(self) -> None:
@@ -2410,6 +2847,8 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
+            self.width_range_drag_handle = None
+            self.width_range_drag_checkpoint = False
             self.full_refresh()
 
     def redo(self) -> None:
@@ -2422,6 +2861,8 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
+            self.width_range_drag_handle = None
+            self.width_range_drag_checkpoint = False
             self.full_refresh()
 
     def change_tile(self, _event=None) -> None:
@@ -2435,6 +2876,9 @@ class GeometryEditorApp:
         self.width_drag_current = None
         self.interval_draft = []
         self.interval_measurement_id = None
+        self.active_width_measurement_id = None
+        self.width_range_drag_handle = None
+        self.width_range_drag_checkpoint = False
         self._last_background_view = None
         self._background_scrollregion = None
         self.full_refresh()
@@ -2442,6 +2886,12 @@ class GeometryEditorApp:
 
     def show_topology(self) -> None:
         metrics = self.doc.topology_metrics()
+        self.last_metrics = metrics
+        if hasattr(self, "metric_vars"):
+            for key, variable in self.metric_vars.items():
+                variable.set(str(metrics.get(key, "--")))
+        self.topology_dirty = False
+        self.update_status()
         text = "\n".join(f"{key}: {value}" for key, value in metrics.items())
         warnings = []
         if metrics["isolated_node_count"]: warnings.append("存在孤立节点")
@@ -2562,11 +3012,32 @@ def configure_ui_fonts(root: tk.Tk) -> None:
             continue
 
 
+def write_editor_signal(
+    ready_file: Path | None, status: str, review_dir: Path, error: str = "",
+) -> None:
+    if ready_file is None:
+        return
+    ready_path = ready_file.expanduser().resolve()
+    payload = {
+        "status": status,
+        "pid": os.getpid(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "review_dir": str(review_dir.expanduser().resolve()),
+    }
+    if error:
+        payload["error"] = error
+    ready_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ready_path.with_name(f".{ready_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    temporary.replace(ready_path)
+
+
 def schedule_ready_signal(root: tk.Tk, ready_file: Path | None, review_dir: Path) -> None:
     """Write the launcher handshake only after Tk has mapped the editor window."""
     if ready_file is None:
         return
-    ready_path = ready_file.expanduser().resolve()
 
     def signal_when_viewable() -> None:
         try:
@@ -2575,22 +3046,67 @@ def schedule_ready_signal(root: tk.Tk, ready_file: Path | None, review_dir: Path
             if not root.winfo_viewable():
                 root.after(50, signal_when_viewable)
                 return
-            payload = {
-                "status": "ready",
-                "pid": os.getpid(),
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "review_dir": str(review_dir.expanduser().resolve()),
-            }
-            ready_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = ready_path.with_name(f".{ready_path.name}.{os.getpid()}.tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
-            )
-            temporary.replace(ready_path)
+            write_editor_signal(ready_file, "ready", review_dir)
         except (OSError, tk.TclError) as exc:
             print(f"Unable to write geometry editor ready signal: {exc}", file=sys.stderr, flush=True)
 
     root.after(50, signal_when_viewable)
+
+
+def build_loading_shell(root: tk.Tk) -> tuple[ttk.Frame, tk.StringVar]:
+    """Build a lightweight editor-shaped shell before any GIS data is loaded."""
+    root.title("道路实体变化智能检测与人工核验 · 中心线编辑")
+    root.geometry("1100x720+80+60")
+    root.minsize(900, 580)
+    root.configure(background="#F3F0E8")
+    shell = ttk.Frame(root, padding=0)
+    shell.pack(fill="both", expand=True)
+    header = tk.Frame(shell, background="#1D4034", height=72)
+    header.pack(fill="x")
+    header.pack_propagate(False)
+    tk.Label(
+        header, text="最终成果中心线编辑", background="#1D4034", foreground="#F8F5EC",
+        font=("Microsoft YaHei UI", 15, "bold"),
+    ).pack(side="left", padx=22, pady=18)
+    body = ttk.Frame(shell, padding=24)
+    body.pack(fill="both", expand=True)
+    map_shell = tk.Frame(body, background="#162A23")
+    map_shell.pack(side="left", fill="both", expand=True)
+    status = tk.StringVar(value="正在读取人工编辑资料…")
+    loading = tk.Frame(map_shell, background="#162A23")
+    loading.place(relx=0.5, rely=0.5, anchor="center")
+    tk.Label(
+        loading, text="正在加载当前期次影像与道路数据…", background="#162A23",
+        foreground="#F8F5EC", font=("Microsoft YaHei UI", 14, "bold"),
+    ).pack(pady=(0, 10))
+    tk.Label(
+        loading, textvariable=status, background="#162A23", foreground="#AFC3B9",
+        font=("Microsoft YaHei UI", 10),
+    ).pack()
+    side = ttk.Frame(body, width=250, padding=(18, 8))
+    side.pack(side="left", fill="y")
+    side.pack_propagate(False)
+    ttk.Label(side, text="当前状态", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+    ttk.Label(
+        side, text="数据加载完成后将自动解锁编辑工具。", wraplength=210,
+    ).pack(anchor="w", pady=(10, 0))
+    return shell, status
+
+
+def load_documents_worker(
+    messages: queue.Queue[tuple[str, object]], review_dir: Path, edited_dir: Path,
+    final_centerlines: Path | None, final_surfaces: Path | None,
+    timings: dict[str, float] | None = None,
+) -> None:
+    """Read/compute editor data in a worker without touching any Tk object."""
+    try:
+        documents = load_documents(
+            review_dir, edited_dir, final_centerlines, final_surfaces,
+            progress=lambda value: messages.put(("status", value)), timings=timings,
+        )
+        messages.put(("loaded", documents))
+    except Exception:
+        messages.put(("error", traceback.format_exc()))
 
 
 def main() -> int:
@@ -2601,23 +3117,89 @@ def main() -> int:
     parser.add_argument("--final-surfaces", default="", help="Authoritative per-period road-surface SHP.")
     parser.add_argument("--ready-file", default="", help="Launcher handshake written after the Tk window is viewable.")
     args = parser.parse_args()
+    startup_started = time.perf_counter()
+    startup_timings: dict[str, float] = {}
     enable_windows_high_dpi()
+    stage_started = time.perf_counter()
     root = tk.Tk()
+    startup_timings["tk_root_create"] = time.perf_counter() - stage_started
     configure_tk_scaling(root)
     configure_ui_fonts(root)
-    try:
-        GeometryEditorApp(
-            root, Path(args.review_dir), Path(args.edited_dir),
-            Path(args.final_centerlines) if args.final_centerlines else None,
-            Path(args.final_surfaces) if args.final_surfaces else None,
-        )
-    except Exception as exc:
-        messagebox.showerror("几何编辑器启动失败", str(exc))
-        raise
-    root.update_idletasks()
-    schedule_ready_signal(
-        root, Path(args.ready_file) if args.ready_file else None, Path(args.review_dir),
-    )
+    review_dir = Path(args.review_dir)
+    edited_dir = Path(args.edited_dir)
+    final_centerlines = Path(args.final_centerlines) if args.final_centerlines else None
+    final_surfaces = Path(args.final_surfaces) if args.final_surfaces else None
+    ready_file = Path(args.ready_file) if args.ready_file else None
+    stage_started = time.perf_counter()
+    shell, loading_status = build_loading_shell(root)
+    root.update()
+    startup_timings["loading_shell_build_and_map"] = time.perf_counter() - stage_started
+    startup_timings["window_first_visible"] = time.perf_counter() - startup_started
+    messages: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def show_loading_error(error: str) -> None:
+        print(error, file=sys.stderr, flush=True)
+        for child in root.winfo_children():
+            child.destroy()
+        panel = ttk.Frame(root, padding=30)
+        panel.pack(fill="both", expand=True)
+        ttk.Label(panel, text="人工编辑资料加载失败", font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(panel, text=error[-3000:], wraplength=900, justify="left").pack(anchor="w", pady=16)
+        ttk.Button(panel, text="关闭编辑器", command=root.destroy).pack(anchor="w")
+        try:
+            write_editor_signal(ready_file, "failed", review_dir, error=error[-3000:])
+        except OSError:
+            pass
+
+    def poll_loading() -> None:
+        try:
+            while True:
+                kind, value = messages.get_nowait()
+                if kind == "status":
+                    loading_status.set(str(value))
+                elif kind == "loaded":
+                    try:
+                        shell.destroy()
+                        app = GeometryEditorApp(
+                            root, review_dir, edited_dir, final_centerlines, final_surfaces,
+                            documents=value, startup_timings=startup_timings,
+                        )
+                        root.update_idletasks()
+                        stage_started = time.perf_counter()
+                        app.fit_image()
+                        root.update_idletasks()
+                        startup_timings["initial_fit_and_render"] = time.perf_counter() - stage_started
+                        period = review_dir.name
+                        parts = list(review_dir.parts)
+                        if "periods" in parts and parts.index("periods") + 1 < len(parts):
+                            period = parts[parts.index("periods") + 1]
+                        app.status_var.set(
+                            f"数据已加载 · 中心线 {len(app.doc.edges)} 条 · 当前期次 {period}"
+                        )
+                        startup_timings["editor_usable"] = time.perf_counter() - startup_started
+                        print(
+                            "GEOMETRY_EDITOR_STARTUP_TIMINGS="
+                            + json.dumps(startup_timings, ensure_ascii=False, sort_keys=True),
+                            flush=True,
+                        )
+                        schedule_ready_signal(root, ready_file, review_dir)
+                    except Exception:
+                        show_loading_error(traceback.format_exc())
+                    return
+                elif kind == "error":
+                    error = str(value)
+                    show_loading_error(error)
+                    return
+        except queue.Empty:
+            pass
+        root.after(50, poll_loading)
+
+    threading.Thread(
+        target=load_documents_worker,
+        args=(messages, review_dir, edited_dir, final_centerlines, final_surfaces, startup_timings),
+        daemon=True,
+    ).start()
+    root.after(50, poll_loading)
     root.mainloop()
     return 0
 
