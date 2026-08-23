@@ -2,6 +2,18 @@
 
 本目录可单独运行和迁移。运行时只使用本目录内部的代码、模型、配置、环境和输出，不访问父目录，也不包含模型训练功能。
 
+顶层目录按职责分开：
+
+```text
+sam_road_change/
+├─ code/       应用、GUI、算法引擎、开发工具和测试
+├─ project/    当前项目配置、输入数据、日志和运行成果
+├─ runtime/    Python 环境、模型和运行配置
+├─ docs/       使用说明、计划和诊断记录
+├─ launcher.ps1
+└─ 启动用户界面.bat
+```
+
 面向地信生产的默认流程是：**新建或打开项目，连接一个或多个外部原始数据目录，扫描并确认映射，然后点击“运行完整流程”**。项目目录只保存 `project_config.json`、任务状态、日志和成果；外部 SHP、TXT 与影像不会被移动、复制或重命名。变化真值不再作为运行前的任务模式；道路和变化成果生成后，在“成果与评价”页自动匹配项目真值并运行精度评价。程序会自动完成：
 
 1. 在模型启动前解析全部期次 TXT，并检查每张影像能否打开、CRS、波段和数据类型；
@@ -25,7 +37,7 @@
 
 ## 默认输入：验证区项目
 
-面向业务人员的数据摆放模板、TXT 清单写法、影像/真值约束和大影像注意事项，见 [`数据输入组织说明.md`](数据输入组织说明.md)。正式批量运行前建议先按其中的“提交前检查表”核对一次。
+面向业务人员的数据摆放模板、TXT 清单写法、影像/真值约束和大影像注意事项，见 [`数据输入组织说明.md`](docs/guides/数据输入组织说明.md)。正式批量运行前建议先按其中的“提交前检查表”核对一次。
 
 默认模式以多个验证区文件夹为任务单元。每个验证区文件夹需要两类必填数据，另有一类可选评价数据：
 
@@ -40,7 +52,7 @@ GUI 中先填写期次名称并完成生产检测；结果页会按自然顺序�
 两个验证区的命令行等价示例（各区可以使用不同年份）：
 
 ```powershell
-env\samroad_env\python.exe 面向用户\user_pipeline.py all `
+runtime\env\samroad_env\python.exe code\user_pipeline.py all `
   --validation-area north D:\project\north\01_验证区\boundary.shp `
   --period north 2021 D:\project\north\02_影像\2021.txt `
   --period north 2022 D:\project\north\02_影像\2022.txt `
@@ -49,9 +61,9 @@ env\samroad_env\python.exe 面向用户\user_pipeline.py all `
   --period south 2020 D:\project\south\02_影像\2020.txt `
   --period south 2023 D:\project\south\02_影像\2023.txt `
   --truth south 2020 2023 D:\project\south\03_变化真值\2020_to_2023.shp `
-  --output-root 面向用户\outputs `
-  --checkpoint 面向用户\models\samroad\samroad.ckpt `
-  --config 面向用户\config\samroad_inference.yaml
+  --output-root project\04_成果输出 `
+  --checkpoint runtime\models\samroad\samroad.ckpt `
+  --config runtime\config\samroad_inference.yaml
 ```
 
 无真值生产模式在同一命令中增加 `--no-evaluation`，并省略全部 `--truth` 参数。
@@ -120,7 +132,7 @@ area_01/2022/*.tif
 每次点击会创建独立任务目录，避免覆盖历史成果：
 
 ```text
-outputs/
+project/04_成果输出/
 ├─ latest_pipeline.json
 ├─ _logs/<任务名称>.log
 └─ run_YYYYMMDD_HHMMSS/
@@ -191,7 +203,7 @@ outputs/
 
 ## 启动
 
-双击 `启动用户界面.bat`。启动器优先使用本项目内的 `env/samroad_env/python.exe`。
+双击 `启动用户界面.bat`。启动器使用本项目内的 `runtime/env/samroad_env/python.exe`，并启动 `code/user_workflow_gui.py`。
 
 用户界面和人工编辑工作台会在创建窗口前启用 Windows 原生高 DPI 渲染，并按当前显示器的 100%/125%/150% 等缩放比例同步调整字体、窗口和侧栏尺寸，避免系统位图拉伸导致文字模糊。默认页面按 1280×820 的内容比例布局；屏幕空间不足时会自动限制到可用屏幕范围，高级参数拆分为多行以避免控件挤压重叠。
 
@@ -221,7 +233,7 @@ outputs/
 
 ## 道路面模型
 
-道路面提取固定读取 `models/sam_molra/adapter.th`。该文件是
+道路面提取固定读取 `runtime/models/sam_molra/adapter.th`。该文件是
 `sam_molra/weight/b_adapter_sam_multi_lora/b_adapter_sam_multi_lora_120.th`
 的完整副本，为适配程序参数而重命名。两者大小均为 `416883396` 字节，SHA-256 均为：
 

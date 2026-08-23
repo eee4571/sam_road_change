@@ -1,5 +1,6 @@
 # Local Python/Conda environments
 env/
+/runtime/env/
 .venv/
 venv/
 ENV/
@@ -7,6 +8,7 @@ conda-env/
 
 # Large model weights are kept locally and distributed separately
 models/
+/runtime/models/
 
 # Python caches, test output, and coverage
 __pycache__/

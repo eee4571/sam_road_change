@@ -25,19 +25,19 @@ try {
     }
 
     $appRoot = "${appDrive}\"
-    $python = Join-Path $appRoot "env\samroad_env\python.exe"
+    $python = Join-Path $appRoot "runtime\env\samroad_env\python.exe"
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
         throw "The bundled Python runtime was not found: $python"
     }
 
-    $env:PATH = "${appRoot}env\samroad_env;${appRoot}env\samroad_env\Library\bin;${appRoot}env\samroad_env\Scripts;$env:PATH"
-    $env:TCL_LIBRARY = "${appRoot}env\samroad_env\Library\lib\tcl8.6"
-    $env:TK_LIBRARY = "${appRoot}env\samroad_env\Library\lib\tk8.6"
+    $env:PATH = "${appRoot}runtime\env\samroad_env;${appRoot}runtime\env\samroad_env\Library\bin;${appRoot}runtime\env\samroad_env\Scripts;$env:PATH"
+    $env:TCL_LIBRARY = "${appRoot}runtime\env\samroad_env\Library\lib\tcl8.6"
+    $env:TK_LIBRARY = "${appRoot}runtime\env\samroad_env\Library\lib\tk8.6"
     # The portable environment stores GIS databases inside the wheels rather
     # than Conda's Library\share directories.  Pointing PROJ at a missing
     # directory makes valid EPSG rasters appear as LOCAL_CS.
-    $env:GDAL_DATA = "${appRoot}env\samroad_env\Lib\site-packages\rasterio\gdal_data"
-    $env:PROJ_DATA = "${appRoot}env\samroad_env\Lib\site-packages\rasterio\proj_data"
+    $env:GDAL_DATA = "${appRoot}runtime\env\samroad_env\Lib\site-packages\rasterio\gdal_data"
+    $env:PROJ_DATA = "${appRoot}runtime\env\samroad_env\Lib\site-packages\rasterio\proj_data"
     $env:PROJ_LIB = $env:PROJ_DATA
     $env:PYTHONNOUSERSITE = "1"
     $env:PYTHONUTF8 = "1"
@@ -45,7 +45,7 @@ try {
 
     Push-Location $appRoot
     try {
-        & $python (Join-Path $appRoot "user_workflow_gui.py")
+        & $python (Join-Path $appRoot "code\user_workflow_gui.py")
         $exitCode = $LASTEXITCODE
     }
     finally {

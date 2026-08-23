@@ -1,13 +1,13 @@
 # Production Regularized Skeleton audit
 
-This lightweight synthetic audit loads `config/samroad_inference.yaml`, resolves
+This lightweight synthetic audit loads `runtime/config/samroad_inference.yaml`, resolves
 the production `auto` threshold profile, and runs `compute_relative_roadness()`.
 It does not load a model, use a GPU, or run a 4096 image.
 
 Regenerate from the repository root:
 
 ```powershell
-env\samroad_env\python.exe dev_tools\production_relative_path_audit.py
+runtime\env\samroad_env\python.exe code\dev_tools\production_relative_path_audit.py
 ```
 
 Expected route: Relative Roadness → Regularized Skeleton, with Continuous Trace,
