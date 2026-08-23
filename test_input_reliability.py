@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from input_catalog import period_order_manifest, read_path_list
 import user_pipeline
@@ -27,6 +28,67 @@ class PathListEncodingTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "第 2 行") as caught:
                 read_path_list(listing)
             self.assertIn("检测编码", str(caught.exception))
+            self.assertIn("已尝试编码", str(caught.exception))
+            self.assertIn(str(listing.resolve()), str(caught.exception))
+
+    def test_common_unicode_and_windows_encodings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cases = (
+                ("utf8.txt", "utf-8", "中文 UTF8.tif"),
+                ("utf8_bom.txt", "utf-8-sig", "中文 BOM.tif"),
+                ("gbk.txt", "gbk", "中文 GBK.tif"),
+                ("gb18030.txt", "gb18030", "扩展字符𠀀.tif"),
+                ("utf16.txt", "utf-16", "中文 UTF16.tif"),
+                ("utf16le.txt", "utf-16-le", "中文 LE.tif"),
+                ("utf16be.txt", "utf-16-be", "中文 BE.tif"),
+            )
+            for listing_name, encoding, image_name in cases:
+                image = root / image_name
+                image.touch()
+                listing = root / listing_name
+                listing.write_bytes((image.name + "\n").encode(encoding))
+                self.assertEqual(read_path_list(listing).entries[0].path, image.resolve())
+
+    def test_path_existence_disambiguates_single_byte_decoders(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            image = root / "道路影像.tif"
+            image.touch()
+            listing = root / "ambiguous.txt"
+            listing.write_bytes((image.name + "\n").encode("gbk"))
+            parsed = read_path_list(listing)
+            self.assertEqual(parsed.entries[0].path, image.resolve())
+            self.assertIn(parsed.encoding.casefold(), {"gbk", "gb18030"})
+            self.assertNotEqual(parsed.encoding.casefold(), "cp1252")
+
+    def test_system_preferred_encoding_candidate_can_win_by_path_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            image = root / "表画像.tif"
+            image.touch()
+            listing = root / "system.txt"
+            listing.write_bytes((image.name + "\n").encode("cp932"))
+            with mock.patch("input_catalog.locale.getpreferredencoding", return_value="cp932"):
+                parsed = read_path_list(listing)
+            self.assertEqual(parsed.entries[0].path, image.resolve())
+            self.assertEqual(parsed.encoding.casefold(), "cp932")
+
+    def test_relative_paths_prefer_txt_directory_then_search_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            second = root / "subdir"
+            second.mkdir()
+            first_image = root / "image1.tif"
+            second_image = second / "image2.tif"
+            first_image.touch(); second_image.touch()
+            listing = root / "relative.txt"
+            listing.write_text('"image1.tif"\nsubdir\\image2.tif\n', encoding="utf-8")
+            parsed = read_path_list(listing)
+            self.assertEqual(
+                [entry.path for entry in parsed.entries],
+                [first_image.resolve(), second_image.resolve()],
+            )
 
 
 class PeriodOrderingTests(unittest.TestCase):

@@ -38,6 +38,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".img", ".jp2", ".vrt", ".png", ".jpg", ".jpeg", ".bmp"}
 DIRECT_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+_REPORTED_PATH_LISTS: set[Path] = set()
 PIPELINE_VERSION = "2026.08-user-batch-6-cross-period-existence-evidence"
 
 PERIOD_STAGE_DEFINITIONS = (
@@ -331,7 +332,15 @@ def read_text_auto(path: Path) -> str:
 
 def listed_rasters(path: Path) -> list[Path]:
     if path.is_file() and path.suffix.lower() == ".txt":
-        return [entry.path for entry in read_path_list(path).entries]
+        parsed = read_path_list(path)
+        if parsed.source not in _REPORTED_PATH_LISTS:
+            _REPORTED_PATH_LISTS.add(parsed.source)
+            print("__SAMROAD_USER__" + json.dumps({
+                "kind": "input-list", "stage": "数据检查", "status": "complete",
+                "path": str(parsed.source), "encoding": parsed.encoding,
+                "image_count": len(parsed.entries),
+            }, ensure_ascii=False), flush=True)
+        return [entry.path for entry in parsed.entries]
     if path.is_file():
         return [path.resolve()]
     if path.is_dir():

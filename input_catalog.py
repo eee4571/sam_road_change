@@ -2,8 +2,11 @@ from __future__ import annotations
 
 """Shared offline input-list decoding and period ordering utilities."""
 
+import json
 import locale
+import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -22,6 +25,7 @@ class PathList:
     source: Path
     encoding: str
     entries: tuple[ListedPath, ...]
+    attempted_encodings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,7 +49,7 @@ def _candidate_encodings(data: bytes) -> list[str]:
     preferred = locale.getpreferredencoding(False)
     if preferred:
         encodings.append(preferred)
-    encodings.extend(("mbcs", "cp1252"))
+    encodings.extend(("mbcs", "cp932", "cp950", "big5", "cp1252"))
     unique: list[str] = []
     for encoding in encodings:
         if encoding and encoding.casefold() not in {item.casefold() for item in unique}:
@@ -53,12 +57,49 @@ def _candidate_encodings(data: bytes) -> list[str]:
     return unique
 
 
-def decode_text_auto(path: Path | str) -> tuple[str, str]:
-    """Decode common GIS path-list encodings without replacement characters."""
+def _candidate_path_lines(text: str, limit: int = 50) -> list[tuple[int, str]]:
+    rows: list[tuple[int, str]] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        value = _clean_list_line(raw_line)
+        if value:
+            rows.append((line_number, value))
+            if len(rows) >= limit:
+                break
+    return rows
+
+
+def _path_hit_count(lines: list[tuple[int, str]], roots: list[Path]) -> int:
+    hits = 0
+    for _line_number, value in lines:
+        candidate = Path(value).expanduser()
+        choices = [candidate] if candidate.is_absolute() else [root / candidate for root in roots]
+        if any(choice.is_file() for choice in choices):
+            hits += 1
+    return hits
+
+
+def decode_text_auto(
+    path: Path | str, *, search_roots: Iterable[Path | str] = (),
+    encoding_override: str | None = None,
+) -> tuple[str, str]:
+    """Score every strict decode using real path hits and text quality."""
     source = Path(path).expanduser().resolve()
     data = source.read_bytes()
+    roots = [source.parent, *(Path(root).expanduser().resolve() for root in search_roots)]
+    if encoding_override:
+        try:
+            text = data.decode(encoding_override, errors="strict")
+        except (LookupError, UnicodeError) as exc:
+            raise UnicodeError(
+                f"指定的 TXT 编码无法读取文件：{source}；编码：{encoding_override}；错误：{exc}"
+            ) from exc
+        if "\x00" in text:
+            raise UnicodeError(f"指定编码解码后包含 NUL：{source}；编码：{encoding_override}")
+        return text, encoding_override
     failures: list[str] = []
-    for encoding in _candidate_encodings(data):
+    successes: list[tuple[tuple[int, int, int, int, int], str, str]] = []
+    encodings = _candidate_encodings(data)
+    for priority, encoding in enumerate(encodings):
         try:
             text = data.decode(encoding, errors="strict")
         except (LookupError, UnicodeError) as exc:
@@ -67,9 +108,24 @@ def decode_text_auto(path: Path | str) -> tuple[str, str]:
         if "\x00" in text:
             failures.append(f"{encoding}: decoded text contains NUL characters")
             continue
+        lines = _candidate_path_lines(text)
+        hits = _path_hit_count(lines, roots)
+        bad_controls = sum(
+            1 for character in text
+            if unicodedata.category(character).startswith("C") and character not in "\r\n\t"
+        )
+        western_fallback_penalty = 1 if encoding.casefold() in {"cp1252", "latin-1"} else 0
+        score = (hits, int(bool(lines)), len(lines), -bad_controls - western_fallback_penalty, -priority)
+        successes.append((score, text, encoding))
+    if successes:
+        _score, text, encoding = max(successes, key=lambda item: item[0])
         return text, encoding
-    detail = "; ".join(failures[:5])
-    raise UnicodeError(f"无法识别 TXT 编码：{source}。尝试结果：{detail}")
+    detail = "; ".join(failures[:8])
+    attempted = "、".join(encodings)
+    raise UnicodeError(
+        f"无法可靠识别影像路径 TXT 的编码。文件：{source}。"
+        f"已尝试：{attempted}。解码结果：{detail}"
+    )
 
 
 def _clean_list_line(value: str) -> str:
@@ -86,14 +142,25 @@ def read_path_list(
     *,
     search_roots: Iterable[Path | str] = (),
     require_files: bool = True,
+    encoding_override: str | None = None,
 ) -> PathList:
     """Read a TXT path list and retain actionable line-level diagnostics."""
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"影像路径 TXT 不存在：{source}")
-    text, encoding = decode_text_auto(source)
     roots = [source.parent]
     roots.extend(Path(root).expanduser().resolve() for root in search_roots)
+    if encoding_override is None:
+        try:
+            overrides = json.loads(os.environ.get("SAMROAD_TXT_ENCODINGS", "{}"))
+        except json.JSONDecodeError:
+            overrides = {}
+        if isinstance(overrides, dict):
+            encoding_override = overrides.get(str(source)) or overrides.get(str(path))
+    attempted_encodings = tuple(_candidate_encodings(source.read_bytes()))
+    text, encoding = decode_text_auto(
+        source, search_roots=roots[1:], encoding_override=encoding_override,
+    )
     entries: list[ListedPath] = []
     missing: list[str] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
@@ -112,11 +179,14 @@ def read_path_list(
         suffix = "" if len(missing) <= 20 else f"\n……另有 {len(missing) - 20} 条"
         raise FileNotFoundError(
             f"影像路径 TXT 中有 {len(missing)} 条路径不存在（检测编码：{encoding}）：\n"
-            f"TXT：{source}\n{preview}{suffix}"
+            f"TXT：{source}\n已尝试编码：{'、'.join(attempted_encodings)}\n{preview}{suffix}"
         )
     if not entries:
         raise ValueError(f"影像路径 TXT 没有有效路径（检测编码：{encoding}）：{source}")
-    return PathList(source=source, encoding=encoding, entries=tuple(entries))
+    return PathList(
+        source=source, encoding=encoding, entries=tuple(entries),
+        attempted_encodings=attempted_encodings,
+    )
 
 
 def natural_key(value: str) -> tuple:

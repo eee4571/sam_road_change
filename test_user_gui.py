@@ -127,7 +127,7 @@ class UserGuiInputCommandTests(unittest.TestCase):
         self.assertIn("quick_actions.grid_columnconfigure(1, weight=1)", source)
         self.assertIn('textvariable=self.project_path_display, style="PathText.TLabel", width=1', source)
         self.assertIn('text="连接数据源"', source)
-        self.assertEqual(source.count('text="扫描数据"'), 1)
+        self.assertEqual(source.count('text="重新扫描"'), 1)
 
     def test_result_metrics_keep_four_equal_columns(self) -> None:
         source = inspect.getsource(gui.UserApp._build_result_page)

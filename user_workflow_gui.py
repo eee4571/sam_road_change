@@ -28,6 +28,21 @@ DEFAULT_TEST_DATA = ROOT / "功能测试数据"
 USER_VECTOR_SUFFIX = ".shp"
 USER_IMAGE_LIST_SUFFIX = ".txt"
 PROJECT_CONFIG_NAME = "project_config.json"
+MAX_QUEUE_EVENTS_PER_POLL = 200
+MAX_PRIORITY_EVENTS_PER_POLL = 50
+QUEUE_POLL_TIME_BUDGET_SECONDS = 0.012
+TEMPORAL_ATTRIBUTE_PAGE_SIZE = 500
+SCAN_PROGRESS_FILE_INTERVAL = 250
+SCAN_PROGRESS_TIME_INTERVAL = 0.3
+SCAN_EXCLUDED_DIRECTORY_NAMES = frozenset({
+    ".git", ".github", "env", ".venv", "venv", "__pycache__",
+    "04_成果输出", "_logs", ".editor_cache", "models", ".runtime",
+    "runtime", "node_modules", "tmp", "temp", ".cache",
+    "cache", "caches", "_cache", "_tmp", "temporary",
+})
+_SCAN_EXCLUDED_DIRECTORY_NAMES_CASEFOLD = frozenset(
+    value.casefold() for value in SCAN_EXCLUDED_DIRECTORY_NAMES
+)
 
 _HARMLESS_TIFF_WARNING = re.compile(
     r"TIFFReadDirectory:\s*Unknown field with tag\s+(?:33550|33922|34735|34737)\b"
@@ -631,8 +646,28 @@ def affected_change_pairs(periods: list[str] | tuple[str, ...], selected: str) -
     ]
 
 
-def scan_external_data_source(source_dir: Path | str) -> dict:
-    """Scan an external source without moving or rewriting any source file."""
+def external_source_signature(source_dir: Path | str) -> dict[str, int]:
+    """Return a cheap source fingerprint; explicit rescans remain authoritative."""
+    root = Path(source_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"外部数据源不存在：{root}")
+    stat = root.stat()
+    return {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+
+
+def _scan_directory_is_excluded(name: str) -> bool:
+    folded = name.casefold()
+    return (
+        name.startswith(".")
+        or folded in _SCAN_EXCLUDED_DIRECTORY_NAMES_CASEFOLD
+    )
+
+
+def scan_external_data_source(
+    source_dir: Path | str, *, cancel_event: threading.Event | None = None,
+    progress=None,
+) -> dict:
+    """Discover only SHP/TXT candidates, pruning irrelevant trees during traversal."""
     root = Path(source_dir).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"外部数据源不存在：{root}")
@@ -640,11 +675,130 @@ def scan_external_data_source(source_dir: Path | str) -> dict:
         discovered = discover_validation_project(root)
     except ValueError:
         discovered = None
-    candidates = {
-        "shp": [str(path.resolve()) for path in sorted(root.rglob("*.shp"), key=lambda item: natural_key(str(item)))],
-        "txt": [str(path.resolve()) for path in sorted(root.rglob("*.txt"), key=lambda item: natural_key(str(item)))],
+    candidates: dict[str, list[str]] = {"shp": [], "txt": []}
+    visited_files = 0
+    visited_directories = 0
+    last_progress = time.monotonic()
+    last_progress_files = 0
+    for current, directories, filenames in os.walk(root, topdown=True):
+        if cancel_event is not None and cancel_event.is_set():
+            return {"root": str(root), "cancelled": True}
+        directories[:] = [name for name in directories if not _scan_directory_is_excluded(name)]
+        visited_directories += 1
+        current_path = Path(current)
+        for filename in filenames:
+            visited_files += 1
+            suffix = Path(filename).suffix.casefold()
+            if suffix == ".shp":
+                candidates["shp"].append(str((current_path / filename).resolve()))
+            elif suffix == ".txt":
+                candidates["txt"].append(str((current_path / filename).resolve()))
+            if cancel_event is not None and cancel_event.is_set():
+                return {"root": str(root), "cancelled": True}
+        now = time.monotonic()
+        if progress is not None and (
+            visited_files - last_progress_files >= SCAN_PROGRESS_FILE_INTERVAL
+            or now - last_progress >= SCAN_PROGRESS_TIME_INTERVAL
+        ):
+            progress({
+                "root": str(root), "directory": str(current_path),
+                "visited_files": visited_files,
+                "visited_directories": visited_directories,
+                "shp_count": len(candidates["shp"]), "txt_count": len(candidates["txt"]),
+            })
+            last_progress = now
+            last_progress_files = visited_files
+    return {
+        "root": str(root), "discovered": discovered, "candidates": candidates,
+        "signature": external_source_signature(root),
+        "visited_files": visited_files, "visited_directories": visited_directories,
+        "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"), "cancelled": False,
     }
-    return {"root": str(root), "discovered": discovered, "candidates": candidates}
+
+
+def scan_result_for_cache(scan: dict) -> dict:
+    """Convert a completed scan to a project-config-compatible lightweight record."""
+    discovered = scan.get("discovered")
+    cached_discovered = None
+    if isinstance(discovered, dict):
+        area_truths = discovered.get("area_truths") or {}
+        if isinstance(area_truths, dict):
+            truth_rows = [[*key, value] for key, value in area_truths.items()]
+        else:
+            truth_rows = [list(row) for row in area_truths]
+        cached_discovered = {
+            "validation_areas": [list(row) for row in discovered.get("validation_areas", [])],
+            "area_periods": {
+                str(area): [list(row) for row in rows]
+                for area, rows in (discovered.get("area_periods") or {}).items()
+            },
+            "area_truths": truth_rows,
+        }
+    return {
+        "root": str(scan.get("root") or ""),
+        "signature": dict(scan.get("signature") or {}),
+        "scanned_at": str(scan.get("scanned_at") or ""),
+        "visited_files": int(scan.get("visited_files", 0) or 0),
+        "visited_directories": int(scan.get("visited_directories", 0) or 0),
+        "candidates": {
+            kind: [str(value) for value in (scan.get("candidates") or {}).get(kind, [])]
+            for kind in ("shp", "txt")
+        },
+        "discovered": cached_discovered,
+    }
+
+
+def read_temporal_attributes(path: Path | str):
+    """Read only DBF attributes; road geometry is intentionally excluded."""
+    source = Path(path).expanduser().resolve()
+    try:
+        import pyogrio
+        return pyogrio.read_dataframe(source, read_geometry=False)
+    except (ImportError, TypeError):
+        import geopandas as gpd
+        return gpd.read_file(source, ignore_geometry=True)
+
+
+class TemporalAttributePager:
+    """In-memory attribute-only filtering and fixed-size Treeview pages."""
+    def __init__(self, frame, page_size: int = TEMPORAL_ATTRIBUTE_PAGE_SIZE) -> None:
+        self.frame = frame
+        self.columns = [str(name) for name in frame.columns]
+        self.page_size = max(1, int(page_size))
+        self.page_index = 0
+        self._filtered_positions: list[int] | None = None
+        self._search_cache = None
+
+    @property
+    def match_count(self) -> int:
+        return len(self.frame) if self._filtered_positions is None else len(self._filtered_positions)
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (self.match_count + self.page_size - 1) // self.page_size)
+
+    def set_query(self, query: str) -> None:
+        needle = str(query).strip().casefold()
+        if not needle:
+            self._filtered_positions = None
+            self.page_index = 0
+            return
+        if self._search_cache is None:
+            values = self.frame.fillna("").astype(str)
+            self._search_cache = values.agg(" ".join, axis=1).str.casefold()
+        mask = self._search_cache.str.contains(needle, regex=False, na=False)
+        self._filtered_positions = [index for index, matched in enumerate(mask.tolist()) if matched]
+        self.page_index = 0
+
+    def set_page(self, page_index: int) -> None:
+        self.page_index = max(0, min(int(page_index), self.page_count - 1))
+
+    def page_frame(self):
+        start = self.page_index * self.page_size
+        stop = min(self.match_count, start + self.page_size)
+        if self._filtered_positions is None:
+            return self.frame.iloc[start:stop]
+        return self.frame.iloc[self._filtered_positions[start:stop]]
 
 
 def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
@@ -1117,7 +1271,8 @@ class UserApp:
         self.display_scale = configure_window_geometry(
             self.root, base_width=1280, base_height=820, min_width=1000, min_height=680,
         )
-        self.queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.priority_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
         self.editor_process: subprocess.Popen[str] | None = None
         self.editor_ready_file: Path | None = None
@@ -1137,10 +1292,13 @@ class UserApp:
         self.project_area_truths: list[tuple[str, str, str, str]] = []
         self.project_area_periods: dict[str, list[tuple[str, str]]] = {}
         self.project_data_sources: list[str] = []
+        self.project_scan_cache: dict[str, dict] = {}
+        self.project_txt_encodings: dict[str, str] = {}
         self.project_candidates: dict[str, list[str]] = {"shp": [], "txt": []}
         self.project_config: dict = {}
         self.project_root_path = ""
-        self.project_region = StringVar(value="")
+        self.data_region = StringVar(value="")
+        self.stage_region = StringVar(value="")
         self.project_period = StringVar(value="")
         self.project_change_pair = StringVar(value="")
         self.project_scan_summary = StringVar(value="尚未扫描数据源。")
@@ -1170,6 +1328,11 @@ class UserApp:
         self.current_stage_payload: dict | None = None
         self.active_log_path: Path | None = None
         self.recent_log_lines: list[str] = []
+        self._pending_log_insert_lines: list[str] = []
+        self._pending_log_delete_lines = 0
+        self.scan_thread: threading.Thread | None = None
+        self.scan_cancel_event: threading.Event | None = None
+        self._result_tree_fingerprint: tuple | None = None
         self.result_tree_paths: dict[str, Path] = {}
         self.vars = {
             key: StringVar(value=value)
@@ -1564,10 +1727,17 @@ class UserApp:
             quick_actions, text="连接数据源", style="Primary.TButton",
             command=self.connect_data_source,
         ).grid(row=0, column=3, rowspan=2, sticky="e")
-        ttk.Button(
-            quick_actions, text="扫描数据", style="Secondary.TButton",
+        self.scan_data_button = ttk.Button(
+            quick_actions, text="重新扫描", style="Secondary.TButton",
             command=self.scan_data_sources,
-        ).grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 8))
+        )
+        self.scan_data_button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 8))
+        self.cancel_scan_button = ttk.Button(
+            quick_actions, text="取消扫描", style="Compact.TButton",
+            command=self.cancel_data_source_scan,
+        )
+        self.cancel_scan_button.grid(row=0, column=4, rowspan=2, sticky="e", padx=(0, 8))
+        self.cancel_scan_button.state(["disabled"])
         self.input_summary = StringVar(value="请选择项目目录；如需手工指定数据，可展开高级设置。")
         summary_row = ttk.Frame(quick)
         summary_row.pack(fill=X, pady=(13, 0))
@@ -1585,7 +1755,7 @@ class UserApp:
         region_row = ttk.Frame(config_card)
         region_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(region_row, text="区域", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
-        self.project_region_combo = ttk.Combobox(region_row, textvariable=self.project_region, state="readonly", width=35)
+        self.project_region_combo = ttk.Combobox(region_row, textvariable=self.data_region, state="readonly", width=35)
         self.project_region_combo.pack(side=LEFT, fill=X, expand=True)
         self.project_region_combo.bind("<<ComboboxSelected>>", self._project_region_changed)
         ttk.Button(region_row, text="＋ 添加区域", style="Compact.TButton", command=self.add_project_region).pack(side=LEFT, padx=(8, 0))
@@ -1752,9 +1922,9 @@ class UserApp:
         selectors = ttk.Frame(stage_card, style="Soft.TFrame", padding=(14, 10))
         selectors.pack(fill=X, pady=(0, 10))
         ttk.Label(selectors, text="区域", style="PathTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.project_region, state="readonly", width=24)
+        self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.stage_region, state="readonly", width=24)
         self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(8, 18))
-        self.stage_region_combo.bind("<<ComboboxSelected>>", self._project_region_changed)
+        self.stage_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
         ttk.Label(selectors, text="期次", style="PathTitle.TLabel").grid(row=0, column=2, sticky="w")
         self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=22)
         self.stage_period_combo.grid(row=0, column=3, sticky="ew", padx=(8, 18))
@@ -1768,14 +1938,18 @@ class UserApp:
         ttk.Label(stage_card, textvariable=self.affected_pairs_summary, style="WarningNote.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(0, 10))
         stage_actions = ttk.Frame(stage_card)
         stage_actions.pack(fill=X)
+        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=(10, 8))
+        road_actions.pack(side=LEFT, fill=X, expand=True, padx=(0, 6))
+        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=(10, 8))
+        change_actions.pack(side=LEFT, fill=X, expand=True, padx=(6, 0))
         self.stage_buttons = []
-        for text, command, style in (
-            ("重跑所选期次", lambda: self.rerun_selected_period(False), "Secondary.TButton"),
-            ("重跑并更新相关结果", lambda: self.rerun_selected_period(True), "Primary.TButton"),
-            ("重跑所选变化对", lambda: self.rerun_selected_change(False), "Secondary.TButton"),
-            ("重跑并更新长时序成果", lambda: self.rerun_selected_change(True), "Secondary.TButton"),
+        for parent, text, command, style in (
+            (road_actions, "重跑该期", lambda: self.rerun_selected_period(False), "Secondary.TButton"),
+            (road_actions, "重跑并更新相关结果", lambda: self.rerun_selected_period(True), "Primary.TButton"),
+            (change_actions, "重跑该变化对", lambda: self.rerun_selected_change(False), "Secondary.TButton"),
+            (change_actions, "重跑并更新长时序成果", lambda: self.rerun_selected_change(True), "Secondary.TButton"),
         ):
-            button = ttk.Button(stage_actions, text=text, style=style, command=command)
+            button = ttk.Button(parent, text=text, style=style, command=command)
             button.pack(side=LEFT, padx=(0, 8))
             self.stage_buttons.append(button)
         advanced_stage = ttk.Frame(stage_card)
@@ -2174,79 +2348,177 @@ class UserApp:
             )
         return filedialog.askopenfilename(parent=self.root)
 
-    def _selected_project_region(self) -> str:
-        selected = self.project_region.get().strip()
+    def _selected_project_region(self, scope: str = "data") -> str:
+        variable = self.stage_region if scope == "stage" else self.data_region
+        selected = variable.get().strip()
         names = [name for name, _path in self.project_validation_areas]
         if selected in names:
             return selected
         return names[0] if names else ""
 
+    def _ensure_project_config_tables(self) -> None:
+        if hasattr(self, "project_period_tree"):
+            return
+        ttk.Label(self.project_config_container, text="多时间影像", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 5))
+        period_frame = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        period_frame.pack(fill=X)
+        self.project_period_tree = ttk.Treeview(
+            period_frame, columns=("period", "path", "encoding", "status"),
+            show="headings", height=6, style="Data.Treeview",
+        )
+        for column, title, width, stretch in (
+            ("period", "期次", 110, False), ("path", "影像路径 TXT", 560, True),
+            ("encoding", "编码", 90, False), ("status", "状态", 90, False),
+        ):
+            self.project_period_tree.heading(column, text=title, anchor="w")
+            self.project_period_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")
+        period_scroll = ttk.Scrollbar(period_frame, orient="vertical", command=self.project_period_tree.yview)
+        self.project_period_tree.configure(yscrollcommand=period_scroll.set)
+        self.project_period_tree.pack(side=LEFT, fill=X, expand=True)
+        period_scroll.pack(side=RIGHT, fill="y")
+        self.project_period_tree.bind("<Double-1>", lambda _event: self.replace_selected_project_period())
+        period_actions = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        period_actions.pack(fill=X, pady=(4, 8))
+        ttk.Button(period_actions, text="更换路径", style="Compact.TButton", command=self.replace_selected_project_period).pack(side=LEFT)
+        ttk.Button(period_actions, text="移除期次", style="Compact.TButton", command=self.remove_selected_project_period).pack(side=LEFT, padx=(4, 0))
+        ttk.Button(period_actions, text="指定 TXT 编码", style="Compact.TButton", command=self.set_selected_txt_encoding).pack(side=LEFT, padx=(4, 0))
+
+        ttk.Label(self.project_config_container, text="变化真值（可选）", style="PathTitle.TLabel").pack(anchor="w", pady=(2, 5))
+        truth_frame = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        truth_frame.pack(fill=X)
+        self.project_truth_tree = ttk.Treeview(
+            truth_frame, columns=("pair", "path", "status"), show="headings",
+            height=5, style="Data.Treeview",
+        )
+        for column, title, width, stretch in (
+            ("pair", "变化对", 150, False), ("path", "真值 SHP", 650, True),
+            ("status", "状态", 90, False),
+        ):
+            self.project_truth_tree.heading(column, text=title, anchor="w")
+            self.project_truth_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")
+        truth_scroll = ttk.Scrollbar(truth_frame, orient="vertical", command=self.project_truth_tree.yview)
+        self.project_truth_tree.configure(yscrollcommand=truth_scroll.set)
+        self.project_truth_tree.pack(side=LEFT, fill=X, expand=True)
+        truth_scroll.pack(side=RIGHT, fill="y")
+        self.project_truth_tree.bind("<Double-1>", lambda _event: self.set_selected_project_truth())
+        truth_actions = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        truth_actions.pack(fill=X, pady=(4, 8))
+        ttk.Button(truth_actions, text="选择真值", style="Compact.TButton", command=self.set_selected_project_truth).pack(side=LEFT)
+        ttk.Button(truth_actions, text="移除真值", style="Compact.TButton", command=self.remove_selected_project_truth).pack(side=LEFT, padx=(4, 0))
+
+        ttk.Label(self.project_config_container, text="待确认候选（最多显示 10 项）", style="PathTitle.TLabel").pack(anchor="w", pady=(2, 5))
+        self.project_candidate_tree = ttk.Treeview(
+            self.project_config_container, columns=("kind", "path"), show="headings",
+            height=3, style="Data.Treeview",
+        )
+        self.project_candidate_tree.heading("kind", text="类型", anchor="w")
+        self.project_candidate_tree.heading("path", text="路径", anchor="w")
+        self.project_candidate_tree.column("kind", width=70, stretch=False, anchor="w")
+        self.project_candidate_tree.column("path", width=760, stretch=True, anchor="w")
+        self.project_candidate_tree.pack(fill=X)
+
+    @staticmethod
+    def _selected_tree_iid(tree) -> str:
+        selected = tree.selection()
+        return str(selected[0]) if selected else ""
+
+    def replace_selected_project_period(self) -> None:
+        period = self._selected_tree_iid(self.project_period_tree)
+        if period:
+            self.replace_project_period_source(period)
+
+    def remove_selected_project_period(self) -> None:
+        period = self._selected_tree_iid(self.project_period_tree)
+        if period:
+            self.remove_project_period(period)
+
+    def _selected_truth_pair(self) -> tuple[str, str] | None:
+        iid = self._selected_tree_iid(self.project_truth_tree)
+        values = self.project_truth_tree.item(iid, "values") if iid else ()
+        if not values or "→" not in str(values[0]):
+            return None
+        before, after = (part.strip() for part in str(values[0]).split("→", 1))
+        return before, after
+
+    def set_selected_project_truth(self) -> None:
+        pair = self._selected_truth_pair()
+        if pair:
+            self.set_project_truth(*pair)
+
+    def remove_selected_project_truth(self) -> None:
+        pair = self._selected_truth_pair()
+        if pair:
+            self.remove_project_truth(*pair)
+
+    def set_selected_txt_encoding(self) -> None:
+        period = self._selected_tree_iid(self.project_period_tree)
+        region = self._selected_project_region()
+        source = next((path for name, path in self.project_area_periods.get(region, []) if name == period), "")
+        if not source:
+            return
+        current = self.project_txt_encodings.get(str(Path(source).resolve()), "auto")
+        value = simpledialog.askstring(
+            "指定 TXT 编码", "输入编码名称（auto、utf-8、gbk、gb18030、utf-16、cp932、cp950）：",
+            initialvalue=current, parent=self.root,
+        )
+        if value is None:
+            return
+        normalized = value.strip().casefold()
+        key = str(Path(source).resolve())
+        if normalized in {"", "auto"}:
+            self.project_txt_encodings.pop(key, None)
+        else:
+            try:
+                "".encode(normalized)
+            except LookupError:
+                messagebox.showerror("编码不可用", f"Python 不支持编码：{normalized}", parent=self.root)
+                return
+            self.project_txt_encodings[key] = normalized
+        self._save_project_config()
+        self._refresh_project_config_panel()
+
     def _refresh_project_config_panel(self) -> None:
         if not hasattr(self, "project_config_container"):
             return
-        def render_candidates() -> None:
-            pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
-            if not pending:
-                return
-            ttk.Label(self.project_config_container, text="待确认候选", style="PathTitle.TLabel").pack(anchor="w", pady=(10, 5))
-            for kind, path in pending[:10]:
-                row = ttk.Frame(self.project_config_container, style="Soft.TFrame")
-                row.pack(fill=X, pady=1)
-                ttk.Label(row, text=kind, width=6, style="PathText.TLabel").pack(side=LEFT)
-                ttk.Label(row, text=path, style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
-            if len(pending) > 10:
-                ttk.Label(self.project_config_container, text=f"另有 {len(pending) - 10} 项候选保存在项目配置中。", style="PathText.TLabel").pack(anchor="w")
+        self._ensure_project_config_tables()
         names = [name for name, _path in self.project_validation_areas]
         self.project_region_combo.configure(values=names)
-        if self.project_region.get() not in names:
-            self.project_region.set(names[0] if names else "")
+        if self.data_region.get() not in names:
+            self.data_region.set(names[0] if names else "")
         region = self._selected_project_region()
         area_path = next((path for name, path in self.project_validation_areas if name == region), "")
         self.project_validation_path.set(area_path or "尚未选择验证区。")
-        for child in self.project_config_container.winfo_children():
-            child.destroy()
+        for tree in (self.project_period_tree, self.project_truth_tree, self.project_candidate_tree):
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
         if not region:
-            ttk.Label(
-                self.project_config_container,
-                text="连接项目文件夹后，这里会按区域列出多期影像和变化真值；也可先添加区域。",
-                style="PathText.TLabel",
-            ).pack(anchor="w")
             if hasattr(self, "add_project_period_button"):
                 self.add_project_period_button.state(["disabled"])
-            render_candidates()
             self._refresh_stage_selectors()
             return
         if hasattr(self, "add_project_period_button"):
             self.add_project_period_button.state(["!disabled"])
         rows = sorted(self.project_area_periods.get(region, []), key=lambda row: period_sort_key(row[0]))
-        ttk.Label(self.project_config_container, text="多时间影像", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 5))
-        if not rows:
-            ttk.Label(self.project_config_container, text="尚未添加影像期次。", style="PathText.TLabel").pack(anchor="w")
         for period, source in rows:
-            row = ttk.Frame(self.project_config_container, style="Soft.TFrame")
-            row.pack(fill=X, pady=2)
-            ttk.Label(row, text=period, width=18, style="PathText.TLabel").pack(side=LEFT)
-            ttk.Label(row, text=source, style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
-            ttk.Button(row, text="选择", style="Compact.TButton", command=lambda p=period: self.replace_project_period_source(p)).pack(side=LEFT, padx=(6, 0))
-            ttk.Button(row, text="移除", style="Compact.TButton", command=lambda p=period: self.remove_project_period(p)).pack(side=LEFT, padx=(4, 0))
-        ttk.Label(self.project_config_container, text="变化真值（可选）", style="PathTitle.TLabel").pack(anchor="w", pady=(10, 5))
+            resolved = str(Path(source).expanduser().resolve())
+            encoding = self.project_txt_encodings.get(resolved, "自动")
+            status = "已配置" if Path(source).is_file() else "文件缺失"
+            self.project_period_tree.insert("", END, iid=period, values=(period, source, encoding, status))
         truth_map = {
             (area, before, after): path
             for area, before, after, path in self.project_area_truths
         }
         pairs = [(before[0], after[0]) for before, after in zip(rows, rows[1:])]
-        if not pairs:
-            ttk.Label(self.project_config_container, text="至少添加两个期次后才会生成相邻变化对。", style="PathText.TLabel").pack(anchor="w")
         for before, after in pairs:
-            row = ttk.Frame(self.project_config_container, style="Soft.TFrame")
-            row.pack(fill=X, pady=2)
-            ttk.Label(row, text=f"{before} → {after}", width=18, style="PathText.TLabel").pack(side=LEFT)
             truth = truth_map.get((region, before, after), "")
-            ttk.Label(row, text=truth or "未设置", style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
-            ttk.Button(row, text="选择", style="Compact.TButton", command=lambda b=before, a=after: self.set_project_truth(b, a)).pack(side=LEFT, padx=(6, 0))
-            if truth:
-                ttk.Button(row, text="移除", style="Compact.TButton", command=lambda b=before, a=after: self.remove_project_truth(b, a)).pack(side=LEFT, padx=(4, 0))
-        render_candidates()
+            iid = f"truth:{before}:{after}"
+            self.project_truth_tree.insert(
+                "", END, iid=iid, values=(f"{before} → {after}", truth or "", "已配置" if truth else "未配置"),
+            )
+        pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
+        for index, (kind, path) in enumerate(pending[:10]):
+            self.project_candidate_tree.insert("", END, iid=f"candidate:{index}", values=(kind, path))
         self._refresh_stage_selectors()
         self._schedule_content_layout()
 
@@ -2255,9 +2527,9 @@ class UserApp:
             return
         names = [name for name, _path in self.project_validation_areas]
         self.stage_region_combo.configure(values=names)
-        if self.project_region.get() not in names:
-            self.project_region.set(names[0] if names else "")
-        region = self._selected_project_region()
+        if self.stage_region.get() not in names:
+            self.stage_region.set(names[0] if names else "")
+        region = self._selected_project_region("stage")
         rows = sorted(self.project_area_periods.get(region, []), key=lambda row: period_sort_key(row[0]))
         periods = [period for period, _source in rows]
         pairs = [f"{before} → {after}" for before, after in zip(periods, periods[1:])]
@@ -2272,12 +2544,17 @@ class UserApp:
     def _project_region_changed(self, _event=None) -> None:
         self._refresh_project_config_panel()
 
+    def _stage_region_changed(self, _event=None) -> None:
+        self._refresh_stage_selectors()
+
     def _project_payload(self) -> dict:
         payload = dict(self.project_config)
         payload.update({
             "version": 3,
             "project_root": self.project_root_path,
             "external_data_sources": list(dict.fromkeys(self.project_data_sources)),
+            "external_scan_cache": self.project_scan_cache,
+            "txt_encodings": self.project_txt_encodings,
             "validation_areas": [list(row) for row in self.project_validation_areas],
             "area_periods": {
                 area: [list(row) for row in rows]
@@ -2310,10 +2587,14 @@ class UserApp:
 
     def _apply_discovered_project(self, project: dict, *, merge: bool = False) -> None:
         discovered_areas = list(project.get("validation_areas") or [])
-        discovered_truths = [
-            (area, before, after, path)
-            for (area, before, after), path in (project.get("area_truths") or {}).items()
-        ]
+        raw_truths = project.get("area_truths") or {}
+        if isinstance(raw_truths, dict):
+            discovered_truths = [
+                (area, before, after, path)
+                for (area, before, after), path in raw_truths.items()
+            ]
+        else:
+            discovered_truths = [tuple(row) for row in raw_truths if len(row) == 4]
         discovered_periods = {
             str(area): [(str(period), str(source)) for period, source in rows]
             for area, rows in (project.get("area_periods") or {}).items()
@@ -2334,6 +2615,16 @@ class UserApp:
     def _apply_project_config(self, payload: dict) -> None:
         self.project_config = dict(payload)
         self.project_data_sources = [str(Path(value).expanduser().resolve()) for value in payload.get("external_data_sources", []) if str(value).strip()]
+        self.project_scan_cache = {
+            str(Path(source).expanduser().resolve()): dict(record)
+            for source, record in (payload.get("external_scan_cache") or {}).items()
+            if isinstance(record, dict)
+        }
+        self.project_txt_encodings = {
+            str(Path(source).expanduser().resolve()): str(encoding)
+            for source, encoding in (payload.get("txt_encodings") or {}).items()
+            if str(source).strip() and str(encoding).strip()
+        }
         self.project_validation_areas = [
             (str(name), str(path)) for name, path in payload.get("validation_areas", [])
         ]
@@ -2357,6 +2648,12 @@ class UserApp:
         if isinstance(active, dict) and str(active.get("run_id") or "").strip():
             self.vars["run_id"].set(str(active["run_id"]))
         self.data_source_display.set("；".join(self.project_data_sources) if self.project_data_sources else "尚未连接外部数据源")
+        if self.project_scan_cache:
+            cached_files = sum(int(record.get("visited_files", 0) or 0) for record in self.project_scan_cache.values())
+            self.project_scan_summary.set(
+                f"已恢复 {len(self.project_scan_cache)} 个数据源的扫描索引（上次遍历 {cached_files} 个文件），未重新递归扫描。"
+            )
+            self.data_status.set("已恢复扫描缓存")
 
     def connect_data_source(self) -> None:
         if not self.project_root_path:
@@ -2366,32 +2663,96 @@ class UserApp:
         if not directory:
             return
         resolved = str(Path(directory).resolve())
-        if resolved not in self.project_data_sources:
+        is_new = resolved not in self.project_data_sources
+        if is_new:
             self.project_data_sources.append(resolved)
         self.data_source_display.set("；".join(self.project_data_sources))
-        self.data_status.set("已连接，尚未扫描")
+        self.data_status.set("已连接，正在扫描新增数据源" if is_new else "数据源已连接")
         self._save_project_config()
-        self.scan_data_sources()
+        if is_new or resolved not in self.project_scan_cache:
+            self.scan_data_sources(sources=[resolved], force=True)
+        else:
+            self.status.set("该数据源已有完整扫描缓存；点击“重新扫描”可显式刷新。")
 
-    def scan_data_sources(self) -> None:
+    def scan_data_sources(self, *, sources: list[str] | None = None, force: bool = True) -> None:
         if not self.project_data_sources:
             self.data_status.set("未连接数据源")
             messagebox.showinfo("未连接数据源", "请先连接一个或多个外部原始数据目录。", parent=self.root)
             return
-        discovered_count = 0
+        if self.scan_thread is not None and self.scan_thread.is_alive():
+            self.status.set("数据源扫描正在进行；如需重启，请先取消当前扫描。")
+            return
+        requested = list(dict.fromkeys(sources or self.project_data_sources))
+        event_queue = self.priority_queue
+        cancel_event = threading.Event()
+        cache_snapshot = dict(self.project_scan_cache)
+        self.scan_cancel_event = cancel_event
+        self.data_status.set("正在后台扫描")
+        self.project_scan_summary.set(f"准备扫描 {len(requested)} 个数据源；窗口可继续操作。")
+        if hasattr(self, "scan_data_button"):
+            self.scan_data_button.state(["disabled"])
+            self.cancel_scan_button.state(["!disabled"])
+
+        def worker() -> None:
+            started = time.perf_counter()
+            completed: list[dict] = []
+            try:
+                for index, source in enumerate(requested, start=1):
+                    if cancel_event.is_set():
+                        event_queue.put(("scan_cancelled", {"elapsed_seconds": time.perf_counter() - started}))
+                        return
+                    if not force:
+                        cached = cache_snapshot.get(str(Path(source).expanduser().resolve()))
+                        try:
+                            unchanged = cached and cached.get("signature") == external_source_signature(source)
+                        except (OSError, ValueError):
+                            unchanged = False
+                        if unchanged:
+                            completed.append(dict(cached))
+                            continue
+                    def report(payload: dict, source_index=index) -> None:
+                        event_queue.put(("scan_progress", {**payload, "source_index": source_index, "source_total": len(requested)}))
+                    scan = scan_external_data_source(source, cancel_event=cancel_event, progress=report)
+                    if scan.get("cancelled") or cancel_event.is_set():
+                        event_queue.put(("scan_cancelled", {"elapsed_seconds": time.perf_counter() - started}))
+                        return
+                    completed.append(scan_result_for_cache(scan))
+                event_queue.put(("scan_done", {
+                    "results": completed, "requested": requested,
+                    "elapsed_seconds": time.perf_counter() - started,
+                }))
+            except Exception as exc:
+                event_queue.put(("scan_error", str(exc)))
+
+        self.scan_thread = threading.Thread(target=worker, name="samroad-data-source-scan", daemon=True)
+        self.scan_thread.start()
+
+    def cancel_data_source_scan(self) -> None:
+        event = self.scan_cancel_event
+        if event is not None:
+            event.set()
+            self.data_status.set("正在取消扫描")
+            self.project_scan_summary.set("正在安全停止目录遍历；上一次完整扫描结果将保留。")
+
+    def _finish_scan_ui(self) -> None:
+        self.scan_thread = None
+        self.scan_cancel_event = None
+        if hasattr(self, "scan_data_button"):
+            self.scan_data_button.state(["!disabled"])
+            self.cancel_scan_button.state(["disabled"])
+
+    def _apply_scan_results(self, payload: dict) -> None:
+        results = payload.get("results") or []
+        for record in results:
+            source = str(Path(record.get("root", "")).expanduser().resolve())
+            self.project_scan_cache[source] = dict(record)
+            if record.get("discovered"):
+                self._apply_discovered_project(record["discovered"], merge=True)
         candidates = {"shp": [], "txt": []}
         for source in self.project_data_sources:
-            try:
-                scan = scan_external_data_source(source)
-            except ValueError as exc:
-                messagebox.showerror("数据源不可用", str(exc), parent=self.root)
-                self.data_status.set("数据检查失败")
-                return
+            record = self.project_scan_cache.get(str(Path(source).expanduser().resolve()), {})
             for kind in candidates:
-                candidates[kind].extend(scan["candidates"][kind])
-            if scan["discovered"]:
-                self._apply_discovered_project(scan["discovered"], merge=True)
-                discovered_count += 1
+                candidates[kind].extend((record.get("candidates") or {}).get(kind, []))
         mapped = {
             path for _area, path in self.project_validation_areas
         } | {
@@ -2399,20 +2760,25 @@ class UserApp:
         } | {
             path for _area, _before, _after, path in self.project_area_truths
         }
-        self.project_candidates = {
-            kind: sorted({path for path in paths if path not in mapped}, key=natural_key)
-            for kind, paths in candidates.items()
-        }
+        self.project_candidates = {}
+        for kind, paths in candidates.items():
+            seen = set()
+            self.project_candidates[kind] = [
+                path for path in paths
+                if path not in mapped and not (path in seen or seen.add(path))
+            ]
         pending = sum(len(values) for values in self.project_candidates.values())
         self.data_status.set("已扫描，存在待确认项" if pending else "已扫描，等待数据检查")
         self.project_scan_summary.set(
-            f"已扫描 {len(self.project_data_sources)} 个外部目录；自动识别 {len(self.project_validation_areas)} 个区域、"
-            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个期次；待确认候选 {pending} 项。"
+            f"已索引 {len(self.project_scan_cache)} 个外部目录；自动识别 {len(self.project_validation_areas)} 个区域、"
+            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个期次；待确认候选 {pending} 项；"
+            f"本轮用时 {float(payload.get('elapsed_seconds', 0.0)):.2f} 秒。"
         )
         self._refresh_project_config_panel()
         self._refresh_input_summary()
         self._save_project_config()
         self.status.set(self.project_scan_summary.get())
+        self._finish_scan_ui()
 
     def add_project_region(self) -> None:
         path = self._select_path("shp")
@@ -2432,7 +2798,9 @@ class UserApp:
         self.project_validation_areas.append((name, str(Path(path).resolve())))
         self._consume_candidate(path)
         self.project_area_periods[name] = []
-        self.project_region.set(name)
+        self.data_region.set(name)
+        if not self.stage_region.get():
+            self.stage_region.set(name)
         self.vars["mode"].set("validation")
         self._refresh_project_config_panel()
         self._refresh_input_summary()
@@ -2464,7 +2832,7 @@ class UserApp:
         self.project_validation_areas = [row for row in self.project_validation_areas if row[0] != region]
         self.project_area_periods.pop(region, None)
         self.project_area_truths = [row for row in self.project_area_truths if row[0] != region]
-        self.project_region.set("")
+        self.data_region.set("")
         self._refresh_project_config_panel()
         self._refresh_input_summary()
         self._save_project_config()
@@ -2573,6 +2941,8 @@ class UserApp:
         self.project_area_periods = {}
         self.project_area_truths = []
         self.project_data_sources = []
+        self.project_scan_cache = {}
+        self.project_txt_encodings = {}
         self.project_candidates = {"shp": [], "txt": []}
         self.vars["output_root"].set(str((root / "04_成果输出").resolve()))
         self.data_source_display.set("尚未连接外部数据源")
@@ -2628,6 +2998,8 @@ class UserApp:
         else:
             self.project_config = {}
             self.project_data_sources = []
+            self.project_scan_cache = {}
+            self.project_txt_encodings = {}
             self.project_validation_areas = []
             self.project_area_truths = []
             self.project_area_periods = {}
@@ -2657,7 +3029,8 @@ class UserApp:
         self.project_scan_summary.set(
             f"项目已打开：{len(self.project_validation_areas)} 个验证区、"
             f"{sum(len(rows) for rows in self.project_area_periods.values())} 个影像期次、"
-            f"{len(self.project_area_truths)} 个变化真值、{pending} 个待确认候选。"
+            f"{len(self.project_area_truths)} 个变化真值、{pending} 个待确认候选；"
+            f"已恢复 {len(self.project_scan_cache)} 个数据源扫描索引，未递归重扫。"
         )
         unfinished = unfinished_task_state(
             self.vars["output_root"].get(), self.project_config.get("active_task"),
@@ -2942,7 +3315,7 @@ class UserApp:
         root = Path(self.project_root_path).expanduser() if self.project_root_path else None
         if root is None or not root.is_dir():
             raise ValueError("分步执行需要先在首页打开规范项目文件夹。")
-        region = self._selected_project_region()
+        region = self._selected_project_region("stage")
         if not region:
             raise ValueError("请选择需要处理的区域。")
         run_id = self.vars["run_id"].get().strip()
@@ -2962,7 +3335,7 @@ class UserApp:
         ]
 
     def _stage_period_changed(self, _event=None) -> None:
-        region = self._selected_project_region()
+        region = self._selected_project_region("stage")
         periods = [period for period, _source in self.project_area_periods.get(region, [])]
         pairs = affected_change_pairs(periods, self.project_period.get().strip())
         if pairs:
@@ -2981,7 +3354,7 @@ class UserApp:
     def rerun_selected_period(self, update_related: bool) -> None:
         try:
             manifest = self._current_pipeline_manifest_path()
-            region = self._selected_project_region()
+            region = self._selected_project_region("stage")
             period = self.project_period.get().strip()
             if not region or not period:
                 raise ValueError("请选择需要重跑的区域和影像期次。")
@@ -2997,7 +3370,7 @@ class UserApp:
     def rerun_selected_change(self, update_temporal: bool) -> None:
         try:
             manifest = self._current_pipeline_manifest_path()
-            region = self._selected_project_region()
+            region = self._selected_project_region("stage")
             pair = self.project_change_pair.get().strip()
             if not region or "→" not in pair:
                 raise ValueError("请选择需要重跑的区域和相邻变化对。")
@@ -3204,6 +3577,10 @@ class UserApp:
                 env = os.environ.copy()
                 env["PYTHONUTF8"] = "1"
                 env["PYTHONIOENCODING"] = "utf-8"
+                if self.project_txt_encodings:
+                    env["SAMROAD_TXT_ENCODINGS"] = json.dumps(
+                        self.project_txt_encodings, ensure_ascii=False,
+                    )
                 site_packages = ROOT / "env" / "samroad_env" / "Lib" / "site-packages"
                 proj_data = site_packages / "rasterio" / "proj_data"
                 gdal_data = site_packages / "rasterio" / "gdal_data"
@@ -3232,13 +3609,14 @@ class UserApp:
                     for line in self.process.stdout:
                         visible_line = write_and_filter_gui_log(line, log_file)
                         if visible_line is not None:
-                            self.queue.put(("log", visible_line))
+                            target = self.priority_queue if visible_line.startswith("__SAMROAD_USER__") else self.queue
+                            target.put(("log", visible_line))
                 finally:
                     if log_file is not None:
                         log_file.close()
-                self.queue.put(("done", str(self.process.wait())))
+                self.priority_queue.put(("done", str(self.process.wait())))
             except Exception as exc:
-                self.queue.put(("error", str(exc)))
+                self.priority_queue.put(("error", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3278,14 +3656,27 @@ class UserApp:
         line = f"[{stage}] {message}" if stage else message
         self.recent_log_lines.append(line)
         if len(self.recent_log_lines) > 2000:
-            del self.recent_log_lines[:200]
-            self.log.delete("1.0", "201.0")
-        self.log.insert(END, line + "\n")
-        self.log.see(END)
+            remove_count = max(200, len(self.recent_log_lines) - 2000)
+            del self.recent_log_lines[:remove_count]
+            self._pending_log_delete_lines += remove_count
+        self._pending_log_insert_lines.append(line + "\n")
         summary = " ".join(line.split())
         if len(summary) > 110:
             summary = summary[:107] + "…"
         self.shared_log_status.set(summary or "日志已更新")
+
+    def _flush_log_batch(self) -> None:
+        if not hasattr(self, "log"):
+            self._pending_log_insert_lines.clear()
+            self._pending_log_delete_lines = 0
+            return
+        if self._pending_log_delete_lines:
+            self.log.delete("1.0", f"{self._pending_log_delete_lines + 1}.0")
+            self._pending_log_delete_lines = 0
+        if self._pending_log_insert_lines:
+            self.log.insert(END, "".join(self._pending_log_insert_lines))
+            self._pending_log_insert_lines.clear()
+            self.log.see(END)
 
     def _set_cancel_enabled(self, enabled: bool) -> None:
         state = ["!disabled"] if enabled else ["disabled"]
@@ -3370,10 +3761,56 @@ class UserApp:
         mark_task_cancelled(output, run_id)
 
     def _poll(self) -> None:
+        poll_started = time.perf_counter()
+        handled = 0
+        priority_handled = 0
         try:
             while True:
-                kind, value = self.queue.get_nowait()
+                if priority_handled < MAX_PRIORITY_EVENTS_PER_POLL:
+                    try:
+                        kind, value = self.priority_queue.get_nowait()
+                        priority_handled += 1
+                    except queue.Empty:
+                        if handled >= MAX_QUEUE_EVENTS_PER_POLL or (
+                            handled and time.perf_counter() - poll_started >= QUEUE_POLL_TIME_BUDGET_SECONDS
+                        ):
+                            break
+                        kind, value = self.queue.get_nowait()
+                        handled += 1
+                else:
+                    if handled >= MAX_QUEUE_EVENTS_PER_POLL or (
+                        handled and time.perf_counter() - poll_started >= QUEUE_POLL_TIME_BUDGET_SECONDS
+                    ):
+                        break
+                    kind, value = self.queue.get_nowait()
+                    handled += 1
+                if kind == "scan_progress":
+                    progress = dict(value)
+                    self.data_status.set("正在后台扫描")
+                    self.project_scan_summary.set(
+                        f"数据源 {progress.get('source_index', 1)}/{progress.get('source_total', 1)}；"
+                        f"正在扫描：{progress.get('directory', progress.get('root', ''))}；"
+                        f"已遍历 {progress.get('visited_files', 0)} 个文件，发现 "
+                        f"SHP {progress.get('shp_count', 0)}、TXT {progress.get('txt_count', 0)}。"
+                    )
+                    continue
+                if kind == "scan_done":
+                    self._apply_scan_results(dict(value))
+                    continue
+                if kind == "scan_cancelled":
+                    self.data_status.set("扫描已取消")
+                    self.project_scan_summary.set("扫描已取消；上一次完整扫描索引保持不变。")
+                    self.status.set(self.project_scan_summary.get())
+                    self._finish_scan_ui()
+                    continue
+                if kind == "scan_error":
+                    self.data_status.set("扫描失败")
+                    self.project_scan_summary.set(f"数据源扫描失败：{value}")
+                    self._finish_scan_ui()
+                    messagebox.showerror("数据源不可用", str(value), parent=self.root)
+                    continue
                 if kind == "log":
+                    value = str(value)
                     if value.startswith("__SAMROAD_USER__"):
                         try:
                             payload = json.loads(value[len("__SAMROAD_USER__"):])
@@ -3399,18 +3836,21 @@ class UserApp:
                     else:
                         self._append_log("日志", value)
                 elif kind == "editor_stdout":
+                    value = str(value)
                     self.editor_stdout_lines.append(value)
                     if len(self.editor_stdout_lines) > 200:
                         del self.editor_stdout_lines[:-200]
                     if value:
                         self._append_log("人工编辑", value)
                 elif kind == "editor_stderr":
+                    value = str(value)
                     self.editor_stderr_lines.append(value)
                     if len(self.editor_stderr_lines) > 200:
                         del self.editor_stderr_lines[:-200]
                     if value:
                         self._append_log("人工编辑错误", value)
                 elif kind == "done":
+                    value = str(value)
                     if self.cancel_requested:
                         if self.active_command == "all":
                             self._mark_cancelled_state()
@@ -3507,8 +3947,10 @@ class UserApp:
         except queue.Empty:
             pass
         self._poll_geometry_editor()
+        self._flush_log_batch()
         self._refresh_progress_text()
-        self.root.after(100, self._poll)
+        delay = 1 if (not self.priority_queue.empty() or not self.queue.empty()) else 100
+        self.root.after(delay, self._poll)
 
     @staticmethod
     def _friendly(payload: dict) -> str:
@@ -3525,6 +3967,11 @@ class UserApp:
             return (
                 f"检查有效像元覆盖：{Path(str(payload.get('path', '影像'))).name}，"
                 f"数据块 {payload.get('index')}/{payload.get('total')}。"
+            )
+        if kind == "input-list":
+            return (
+                f"影像路径清单 {Path(str(payload.get('path', ''))).name}："
+                f"TXT 编码 {payload.get('encoding', '未知')}，影像 {payload.get('image_count', 0)} 景。"
             )
         if kind == "pipeline" and payload.get("stage") == "数据扫描":
             return f"已识别 {payload.get('grid_count')} 个项目/格网、{payload.get('period_count')} 个影像期次。"
@@ -3669,6 +4116,13 @@ class UserApp:
     def _populate_result_tree(self, items: list[dict[str, str]], _base_dir: Path | None) -> None:
         if not hasattr(self, "result_tree"):
             return
+        fingerprint = tuple(
+            (item.get("id", ""), item.get("parent", ""), item.get("label", ""), item.get("path", ""), item.get("status", ""))
+            for item in items
+        )
+        if fingerprint == self._result_tree_fingerprint:
+            return
+        self._result_tree_fingerprint = fingerprint
         self.result_tree.delete(*self.result_tree.get_children())
         self.result_tree_paths = {}
         pending = list(items)
@@ -3959,14 +4413,70 @@ class UserApp:
         target = life_paths[0] if len(life_paths) == 1 else Path(str(manifest.get("job_root") or latest.parent)) / "grids"
         self._open(target)
 
+    def _choose_temporal_item(self) -> dict[str, str] | None:
+        if not self.temporal_items:
+            return None
+        selected_path = None
+        selected_area = ""
+        if hasattr(self, "result_tree"):
+            selected = self.result_tree.selection()
+            if selected:
+                node = selected[0]
+                selected_path = self.result_tree_paths.get(node)
+                while node:
+                    if str(node).startswith("area:"):
+                        selected_area = str(node).removeprefix("area:")
+                        break
+                    node = self.result_tree.parent(node)
+        if selected_path is not None:
+            matched = next((
+                item for item in self.temporal_items
+                if Path(item["path"]).resolve() == selected_path.resolve()
+            ), None)
+            if matched is not None:
+                return matched
+        region_candidates = [
+            selected_area, self.data_region.get().strip(), self.stage_region.get().strip(),
+        ]
+        for region in region_candidates:
+            matches = [item for item in self.temporal_items if item.get("grid") == region]
+            if len(matches) == 1:
+                return matches[0]
+        if len(self.temporal_items) == 1:
+            return self.temporal_items[0]
+
+        chooser = Toplevel(self.root)
+        chooser.title("选择长时序成果区域")
+        configure_window_geometry(chooser, base_width=560, base_height=190, min_width=480, min_height=160)
+        chooser.transient(self.root)
+        chooser.grab_set()
+        ttk.Label(chooser, text="存在多个区域，请选择要浏览的 road_life：", padding=(18, 18, 18, 8)).pack(anchor="w")
+        labels = [item["label"] for item in self.temporal_items]
+        choice = StringVar(value=labels[0])
+        combo = ttk.Combobox(chooser, textvariable=choice, values=labels, state="readonly")
+        combo.pack(fill=X, padx=18)
+        result: list[dict[str, str]] = []
+        actions = ttk.Frame(chooser, padding=(18, 14))
+        actions.pack(fill=X)
+        def accept() -> None:
+            result.append(self.temporal_items[labels.index(choice.get())])
+            chooser.destroy()
+        ttk.Button(actions, text="打开", style="Primary.TButton", command=accept).pack(side=RIGHT)
+        ttk.Button(actions, text="取消", command=chooser.destroy).pack(side=RIGHT, padx=(0, 8))
+        chooser.protocol("WM_DELETE_WINDOW", chooser.destroy)
+        self.root.wait_window(chooser)
+        return result[0] if result else None
+
     def open_temporal_attribute_table(self) -> None:
         self._refresh_result_availability()
         if not self.temporal_items:
             messagebox.showinfo("暂无长时序属性表", "已有任务中没有可读取的 road_life.shp。", parent=self.root)
             return
+        item = self._choose_temporal_item()
+        if item is None:
+            return
         try:
-            import geopandas as gpd
-            frame = gpd.read_file(self.temporal_items[0]["path"])
+            frame = read_temporal_attributes(item["path"])
         except Exception as exc:
             messagebox.showerror("属性表读取失败", str(exc), parent=self.root)
             return
@@ -3981,7 +4491,7 @@ class UserApp:
         title_area.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(title_area, text="长时序道路属性表", style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(
-            title_area, text=f"{self.temporal_items[0]['label']}  ·  road_life.shp",
+            title_area, text=f"{item['label']}  ·  road_life.shp",
             style="HeaderMeta.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         ttk.Label(header, text=f"共 {len(frame)} 条道路", style="HeaderProject.TLabel").pack(side=RIGHT)
@@ -3998,7 +4508,8 @@ class UserApp:
         match_var = StringVar(value=f"显示 {len(frame)} 条")
         ttk.Label(filters, textvariable=match_var, style="CardMuted.TLabel").pack(side=RIGHT, padx=(12, 0))
         ttk.Button(filters, text="清除筛选", style="Secondary.TButton", command=lambda: search_var.set("")).pack(side=RIGHT)
-        columns = [name for name in frame.columns if name != frame.geometry.name]
+        pager = TemporalAttributePager(frame)
+        columns = pager.columns
         table_frame = ttk.Frame(window, padding=(14, 0, 14, 0), style="Page.TFrame")
         table_frame.pack(fill=BOTH, expand=True)
         table = ttk.Treeview(table_frame, columns=columns, show="headings", style="Data.Treeview")
@@ -4024,28 +4535,55 @@ class UserApp:
         table.tag_configure("odd", background="#F7F4ED")
         table.tag_configure("review", foreground=UI["amber"])
 
-        def fill(*_args) -> None:
+        page_var = StringVar()
+        debounce_after_id = None
+
+        def fill() -> None:
             table.delete(*table.get_children())
-            needle = search_var.get().strip().casefold()
             shown = 0
-            for _, row in frame.iterrows():
-                values = ["" if row[name] is None else str(row[name]) for name in columns]
-                if needle and needle not in " ".join(values).casefold():
-                    continue
-                state = str(row.get("review_state", row.get("life_state", ""))).casefold()
+            for row in pager.page_frame().itertuples(index=False, name=None):
+                values = ["" if value is None else str(value) for value in row]
+                state_column = "review_state" if "review_state" in columns else "life_state"
+                state = values[columns.index(state_column)].casefold() if state_column in columns else ""
                 tags = ("review",) if "review" in state or "uncertain" in state else (("odd",) if shown % 2 else ())
                 table.insert("", END, values=values, tags=tags)
                 shown += 1
-            match_var.set(f"显示 {shown} / {len(frame)} 条")
+            start = pager.page_index * pager.page_size + (1 if pager.match_count else 0)
+            stop = pager.page_index * pager.page_size + shown
+            match_var.set(f"显示 {start}–{stop} / {pager.match_count} 条")
+            page_var.set(f"第 {pager.page_index + 1} / {pager.page_count} 页")
+            previous_button.state(["!disabled"] if pager.page_index > 0 else ["disabled"])
+            next_button.state(["!disabled"] if pager.page_index + 1 < pager.page_count else ["disabled"])
 
-        search_var.trace_add("write", fill)
-        fill()
+        def apply_search() -> None:
+            nonlocal debounce_after_id
+            debounce_after_id = None
+            pager.set_query(search_var.get())
+            fill()
+
+        def schedule_search(*_args) -> None:
+            nonlocal debounce_after_id
+            if debounce_after_id is not None:
+                window.after_cancel(debounce_after_id)
+            debounce_after_id = window.after(300, apply_search)
+
+        def change_page(delta: int) -> None:
+            pager.set_page(pager.page_index + delta)
+            fill()
+
+        search_var.trace_add("write", schedule_search)
         footer = ttk.Frame(window, padding=(16, 8), style="Footer.TFrame")
         footer.pack(fill=X)
         ttk.Label(
-            footer, text="横向滚动查看全部时序字段  ·  单击表头可清晰对应各列",
+            footer, text="横向滚动查看全部时序字段  ·  搜索停止输入 300 ms 后执行",
             style="FooterStatus.TLabel",
         ).pack(side=LEFT)
+        next_button = ttk.Button(footer, text="下一页", command=lambda: change_page(1))
+        next_button.pack(side=RIGHT)
+        ttk.Label(footer, textvariable=page_var, style="FooterStatus.TLabel").pack(side=RIGHT, padx=12)
+        previous_button = ttk.Button(footer, text="上一页", command=lambda: change_page(-1))
+        previous_button.pack(side=RIGHT)
+        fill()
         search_entry.focus_set()
 
     def export_diagnostics(self) -> None:
