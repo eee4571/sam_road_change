@@ -8,12 +8,13 @@ import json
 import math
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -27,6 +28,7 @@ from PIL import Image, ImageTk
 import rasterio
 from rasterio.features import rasterize
 from rasterio.merge import merge
+from rasterio.transform import array_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 from shapely.geometry import LineString, Point, Polygon, box
@@ -48,6 +50,15 @@ from chain_width_calculator import (  # noqa: E402
 )
 from global_edit_utils import _graph_from_world_lines, _project_manual_widths  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
+
+
+EDITOR_CACHE_VERSION = 1
+EDITOR_CACHE_DIRECTORY_NAME = ".editor_cache"
+BACKGROUND_CACHE_NAME = "background_mosaic.tif"
+SURFACE_CACHE_NAME = "surface_mask.tif"
+CACHE_METADATA_NAME = "cache_meta.json"
+CACHE_LOCK_NAME = "cache.lock"
+SHAPEFILE_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
 
 
 def imread_unicode(path: str | Path, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray | None:
@@ -989,6 +1000,305 @@ def load_surface_edits(edited_dir: Path, stem: str, shape: tuple[int, int]) -> t
     )
 
 
+def editor_cache_directory(review_dir: Path) -> Path:
+    """Return the disposable period-level editor cache beside road outputs."""
+    return review_dir.expanduser().resolve().parent / EDITOR_CACHE_DIRECTORY_NAME
+
+
+def editor_cache_identity(review_dir: Path) -> dict[str, str]:
+    resolved = review_dir.expanduser().resolve()
+    parts = list(resolved.parts)
+    grid = ""
+    period = ""
+    if "grids" in parts and parts.index("grids") + 1 < len(parts):
+        grid = parts[parts.index("grids") + 1]
+    if "periods" in parts and parts.index("periods") + 1 < len(parts):
+        period = parts[parts.index("periods") + 1]
+    return {"grid": grid, "period": period, "review_dir": str(resolved)}
+
+
+def build_file_fingerprint(path: Path) -> dict:
+    resolved = path.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {"path": str(resolved), "exists": False}
+    return {
+        "path": str(resolved), "exists": True,
+        "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def build_background_fingerprint(image_paths: list[Path], target_crs) -> dict:
+    return {
+        "target_crs": _canonical_crs(target_crs),
+        "max_dimension": 8192,
+        "sources": [build_file_fingerprint(path) for path in image_paths],
+    }
+
+
+def build_surface_fingerprint(path: Path) -> dict:
+    resolved = path.expanduser().resolve()
+    if resolved.suffix.lower() == ".shp":
+        components = [
+            build_file_fingerprint(resolved.with_suffix(suffix))
+            for suffix in SHAPEFILE_SIDECARS
+        ]
+    else:
+        components = [build_file_fingerprint(resolved)]
+    return {"source": str(resolved), "components": components}
+
+
+def load_cache_metadata(cache_dir: Path) -> dict:
+    path = cache_dir / CACHE_METADATA_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("cache_version") != EDITOR_CACHE_VERSION:
+        return {}
+    return payload
+
+
+def _canonical_crs(value) -> str:
+    return rasterio.crs.CRS.from_user_input(value).to_wkt()
+
+
+def _grid_metadata(
+    width: int, height: int, crs, transform: rasterio.Affine,
+    *, count: int, dtype: str,
+) -> dict:
+    return {
+        "width": int(width), "height": int(height),
+        "crs": _canonical_crs(crs),
+        "transform": [float(value) for value in list(transform)[:6]],
+        "count": int(count), "dtype": str(dtype),
+    }
+
+
+def _same_grid(left: dict | None, right: dict | None) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if (
+        int(left.get("width", -1)) != int(right.get("width", -2))
+        or int(left.get("height", -1)) != int(right.get("height", -2))
+    ):
+        return False
+    try:
+        same_crs = (
+            rasterio.crs.CRS.from_user_input(left["crs"])
+            == rasterio.crs.CRS.from_user_input(right["crs"])
+        )
+        return same_crs and bool(np.allclose(
+            np.asarray(left["transform"], dtype=float),
+            np.asarray(right["transform"], dtype=float),
+            rtol=0.0, atol=1e-9,
+        ))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _cached_raster_matches(path: Path, grid: dict, *, count: int, dtype: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with rasterio.open(path) as dataset:
+            actual = _grid_metadata(
+                dataset.width, dataset.height, dataset.crs, dataset.transform,
+                count=dataset.count, dtype=dataset.dtypes[0],
+            )
+            if dataset.driver != "GTiff" or dataset.count != count:
+                return False
+            if any(str(value) != dtype for value in dataset.dtypes):
+                return False
+    except (OSError, ValueError, rasterio.errors.RasterioError):
+        return False
+    return _same_grid(actual, grid) and actual["count"] == count and actual["dtype"] == dtype
+
+
+def background_cache_is_valid(cache_dir: Path, metadata: dict, fingerprint: dict) -> bool:
+    entry = metadata.get("background") if isinstance(metadata, dict) else None
+    return bool(
+        isinstance(entry, dict)
+        and entry.get("fingerprint") == fingerprint
+        and _cached_raster_matches(
+            cache_dir / BACKGROUND_CACHE_NAME, entry.get("grid", {}),
+            count=3, dtype="uint8",
+        )
+    )
+
+
+def surface_cache_is_valid(
+    cache_dir: Path, metadata: dict, fingerprint: dict, background_grid: dict,
+) -> bool:
+    entry = metadata.get("surface") if isinstance(metadata, dict) else None
+    return bool(
+        isinstance(entry, dict)
+        and entry.get("fingerprint") == fingerprint
+        and _same_grid(entry.get("grid"), background_grid)
+        and _cached_raster_matches(
+            cache_dir / SURFACE_CACHE_NAME, entry.get("grid", {}),
+            count=1, dtype="uint8",
+        )
+    )
+
+
+def read_background_cache(cache_dir: Path) -> tuple[np.ndarray, rasterio.Affine, object]:
+    with rasterio.open(cache_dir / BACKGROUND_CACHE_NAME) as dataset:
+        values = dataset.read()
+        if values.shape[0] != 3:
+            raise ValueError("影像编辑缓存必须包含三个波段")
+        return np.moveaxis(values, 0, 2), dataset.transform, dataset.crs
+
+
+def read_surface_cache(cache_dir: Path) -> np.ndarray:
+    with rasterio.open(cache_dir / SURFACE_CACHE_NAME) as dataset:
+        return (dataset.read(1) > 0).astype(np.uint8)
+
+
+def _tiff_block_options(width: int, height: int) -> dict:
+    if width < 16 or height < 16:
+        return {"tiled": False}
+    block_width = min(512, max(16, (int(width) // 16) * 16))
+    block_height = min(512, max(16, (int(height) // 16) * 16))
+    return {"tiled": True, "blockxsize": block_width, "blockysize": block_height}
+
+
+def _atomic_raster_write(
+    path: Path, values: np.ndarray, crs, transform: rasterio.Affine,
+    *, nodata: int = 0, predictor: int = 1,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.stem}.{os.getpid()}.{time.time_ns()}.tmp.tif"
+    bands = values[np.newaxis, ...] if values.ndim == 2 else np.moveaxis(values, 2, 0)
+    profile = {
+        "driver": "GTiff", "width": int(bands.shape[2]), "height": int(bands.shape[1]),
+        "count": int(bands.shape[0]), "dtype": str(bands.dtype),
+        "crs": crs, "transform": transform, "nodata": nodata,
+        "compress": "DEFLATE", "predictor": predictor, "zlevel": 1,
+        "BIGTIFF": "IF_SAFER", **_tiff_block_options(bands.shape[2], bands.shape[1]),
+    }
+    try:
+        with rasterio.open(temporary, "w", **profile) as dataset:
+            dataset.write(bands)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def write_background_cache(
+    cache_dir: Path, image: np.ndarray, crs, transform: rasterio.Affine,
+) -> None:
+    _atomic_raster_write(
+        cache_dir / BACKGROUND_CACHE_NAME, image.astype(np.uint8, copy=False),
+        crs, transform, predictor=2,
+    )
+
+
+def write_surface_cache(
+    cache_dir: Path, mask: np.ndarray, crs, transform: rasterio.Affine,
+) -> None:
+    _atomic_raster_write(
+        cache_dir / SURFACE_CACHE_NAME, (mask > 0).astype(np.uint8, copy=False),
+        crs, transform,
+    )
+
+
+def _atomic_json_write(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _update_cache_metadata(
+    cache_dir: Path, section: str, entry: dict, *, background_grid: dict | None = None,
+    identity: dict[str, str] | None = None,
+) -> None:
+    metadata = load_cache_metadata(cache_dir)
+    if not metadata:
+        metadata = {"cache_version": EDITOR_CACHE_VERSION}
+    metadata["cache_version"] = EDITOR_CACHE_VERSION
+    if identity:
+        metadata.update(identity)
+    metadata[section] = entry
+    if section == "background" and not _same_grid(
+        (metadata.get("surface") or {}).get("grid"), background_grid,
+    ):
+        metadata.pop("surface", None)
+    _atomic_json_write(cache_dir / CACHE_METADATA_NAME, metadata)
+
+
+@contextmanager
+def editor_cache_write_lock(cache_dir: Path, timeout_seconds: float = 5.0):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / CACHE_LOCK_NAME
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    acquired = False
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(descriptor, f"{os.getpid()} {time.time_ns()}".encode("ascii"))
+            finally:
+                os.close(descriptor)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > 300.0
+                if stale:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        except OSError:
+            break
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def clear_editor_cache(review_dir: Path) -> bool:
+    cache_dir = editor_cache_directory(review_dir)
+    if cache_dir.name != EDITOR_CACHE_DIRECTORY_NAME:
+        raise ValueError("编辑缓存目录不安全")
+    if not cache_dir.exists():
+        return False
+    shutil.rmtree(cache_dir)
+    return True
+
+
+def editor_cache_sizes(cache_dir: Path) -> dict[str, int]:
+    sizes = {}
+    for name in (BACKGROUND_CACHE_NAME, SURFACE_CACHE_NAME, CACHE_METADATA_NAME):
+        try:
+            sizes[name] = int((cache_dir / name).stat().st_size)
+        except OSError:
+            sizes[name] = 0
+    sizes["total"] = sum(sizes.values())
+    return sizes
+
+
 def rasterize_final_surface(final_surfaces: gpd.GeoDataFrame, image_path: Path) -> np.ndarray:
     with rasterio.open(image_path) as dataset:
         if dataset.crs is None:
@@ -1132,6 +1442,178 @@ def _world_lines_from_document(document: GeometryDocument) -> list[LineString]:
     return lines
 
 
+def _load_valid_background_cache(
+    cache_dir: Path, metadata: dict, fingerprint: dict, progress=None,
+) -> tuple[np.ndarray, rasterio.Affine, object] | None:
+    if not background_cache_is_valid(cache_dir, metadata, fingerprint):
+        return None
+    if progress:
+        progress("正在读取影像缓存…")
+    try:
+        return read_background_cache(cache_dir)
+    except (OSError, ValueError, rasterio.errors.RasterioError):
+        return None
+
+
+def _load_or_build_background_cache(
+    review_dir: Path, image_paths: list[Path], target_crs,
+    progress=None, timings: dict[str, float] | None = None,
+) -> tuple[np.ndarray, rasterio.Affine, object, tuple[float, float, float, float], dict, bool]:
+    timings = timings if timings is not None else {}
+    cache_dir = editor_cache_directory(review_dir)
+    fingerprint = build_background_fingerprint(image_paths, target_crs)
+    metadata = load_cache_metadata(cache_dir)
+    cache_read_started = time.perf_counter()
+    cached = _load_valid_background_cache(cache_dir, metadata, fingerprint, progress)
+    if cached is not None:
+        image, transform, crs = cached
+        timings["background_cache_load"] = time.perf_counter() - cache_read_started
+        timings["background_cache_used"] = 1.0
+        bounds = tuple(float(value) for value in array_bounds(image.shape[0], image.shape[1], transform))
+        grid = _grid_metadata(image.shape[1], image.shape[0], crs, transform, count=3, dtype="uint8")
+        return image, transform, crs, bounds, grid, True
+
+    if progress:
+        period = editor_cache_identity(review_dir).get("period", "")
+        period_label = f"{period} 期" if period else "当前期"
+        progress(f"未找到可用缓存，正在准备 {period_label}编辑数据…")
+    with editor_cache_write_lock(cache_dir) as may_write:
+        # Another instance may have completed while this worker waited.
+        metadata = load_cache_metadata(cache_dir)
+        cache_read_started = time.perf_counter()
+        cached = _load_valid_background_cache(cache_dir, metadata, fingerprint, progress)
+        if cached is not None:
+            image, transform, crs = cached
+            timings["background_cache_load"] = time.perf_counter() - cache_read_started
+            timings["background_cache_used"] = 1.0
+            bounds = tuple(float(value) for value in array_bounds(image.shape[0], image.shape[1], transform))
+            grid = _grid_metadata(image.shape[1], image.shape[0], crs, transform, count=3, dtype="uint8")
+            return image, transform, crs, bounds, grid, True
+        if progress:
+            progress("正在拼接遥感影像…")
+        stage_started = time.perf_counter()
+        bounds = _image_union_bounds(image_paths, target_crs)
+        timings["raster_metadata_read"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        image, transform = _build_global_overview(image_paths, target_crs, bounds)
+        timings["global_image_mosaic"] = time.perf_counter() - stage_started
+        bounds = tuple(float(value) for value in array_bounds(
+            image.shape[0], image.shape[1], transform,
+        ))
+        crs = rasterio.crs.CRS.from_user_input(target_crs)
+        grid = _grid_metadata(image.shape[1], image.shape[0], crs, transform, count=3, dtype="uint8")
+        if may_write:
+            if progress:
+                progress("正在保存影像编辑缓存…")
+            stage_started = time.perf_counter()
+            try:
+                write_background_cache(cache_dir, image, crs, transform)
+                _update_cache_metadata(
+                    cache_dir, "background", {
+                        "fingerprint": fingerprint, "grid": grid,
+                        "file": BACKGROUND_CACHE_NAME,
+                        "file_size": int((cache_dir / BACKGROUND_CACHE_NAME).stat().st_size),
+                    },
+                    background_grid=grid, identity=editor_cache_identity(review_dir),
+                )
+                timings["background_cache_write"] = time.perf_counter() - stage_started
+            except (OSError, ValueError, rasterio.errors.RasterioError) as exc:
+                timings["background_cache_write_failed"] = 1.0
+                print(f"Unable to persist background editor cache: {exc}", file=sys.stderr, flush=True)
+        else:
+            timings["background_cache_write_skipped_locked"] = 1.0
+    timings["background_cache_used"] = 0.0
+    return image, transform, crs, bounds, grid, False
+
+
+def _load_valid_surface_cache(
+    cache_dir: Path, metadata: dict, fingerprint: dict, background_grid: dict,
+    progress=None,
+) -> np.ndarray | None:
+    if not surface_cache_is_valid(cache_dir, metadata, fingerprint, background_grid):
+        return None
+    if progress:
+        progress("正在读取道路面缓存…")
+    try:
+        return read_surface_cache(cache_dir)
+    except (OSError, ValueError, rasterio.errors.RasterioError):
+        return None
+
+
+def _load_or_build_surface_cache(
+    review_dir: Path, final_surfaces: Path, image_shape: tuple[int, int],
+    crs, transform: rasterio.Affine, background_grid: dict,
+    *, background_was_cached: bool, progress=None,
+    timings: dict[str, float] | None = None,
+) -> tuple[np.ndarray, gpd.GeoDataFrame | None, bool]:
+    timings = timings if timings is not None else {}
+    cache_dir = editor_cache_directory(review_dir)
+    fingerprint = build_surface_fingerprint(final_surfaces)
+    metadata = load_cache_metadata(cache_dir)
+    cache_read_started = time.perf_counter()
+    cached = _load_valid_surface_cache(
+        cache_dir, metadata, fingerprint, background_grid, progress,
+    )
+    if cached is not None:
+        mask = cached
+        timings["surface_cache_load"] = time.perf_counter() - cache_read_started
+        timings["surface_cache_used"] = 1.0
+        return mask, None, True
+
+    if progress:
+        progress(
+            "影像缓存有效。检测到道路面成果已更新，正在重新生成道路面缓存…"
+            if background_was_cached else "正在生成道路面缓存…"
+        )
+    with editor_cache_write_lock(cache_dir) as may_write:
+        metadata = load_cache_metadata(cache_dir)
+        cache_read_started = time.perf_counter()
+        cached = _load_valid_surface_cache(
+            cache_dir, metadata, fingerprint, background_grid, progress,
+        )
+        if cached is not None:
+            mask = cached
+            timings["surface_cache_load"] = time.perf_counter() - cache_read_started
+            timings["surface_cache_used"] = 1.0
+            return mask, None, True
+        stage_started = time.perf_counter()
+        surfaces = gpd.read_file(final_surfaces)
+        timings["surface_shp_read"] = time.perf_counter() - stage_started
+        if surfaces.crs is None:
+            raise ValueError(f"最终道路面缺少 CRS：{final_surfaces}")
+        surfaces = surfaces if _canonical_crs(surfaces.crs) == _canonical_crs(crs) else surfaces.to_crs(crs)
+        surface_shapes = [
+            (geometry, 1) for geometry in surfaces.geometry
+            if geometry is not None and not geometry.is_empty
+        ]
+        stage_started = time.perf_counter()
+        mask = rasterize(
+            surface_shapes, out_shape=image_shape, transform=transform,
+            fill=0, all_touched=True, dtype="uint8",
+        ) if surface_shapes else np.zeros(image_shape, dtype=np.uint8)
+        timings["surface_rasterize"] = time.perf_counter() - stage_started
+        if may_write:
+            stage_started = time.perf_counter()
+            try:
+                write_surface_cache(cache_dir, mask, crs, transform)
+                surface_grid = dict(background_grid, count=1, dtype="uint8")
+                _update_cache_metadata(
+                    cache_dir, "surface", {
+                        "fingerprint": fingerprint, "grid": surface_grid,
+                        "file": SURFACE_CACHE_NAME,
+                        "file_size": int((cache_dir / SURFACE_CACHE_NAME).stat().st_size),
+                    }, identity=editor_cache_identity(review_dir),
+                )
+                timings["surface_cache_write"] = time.perf_counter() - stage_started
+            except (OSError, ValueError, rasterio.errors.RasterioError) as exc:
+                timings["surface_cache_write_failed"] = 1.0
+                print(f"Unable to persist surface editor cache: {exc}", file=sys.stderr, flush=True)
+        else:
+            timings["surface_cache_write_skipped_locked"] = 1.0
+    timings["surface_cache_used"] = 0.0
+    return mask, surfaces, False
+
+
 def _final_centerline_documents(
     review_dir: Path, edited_dir: Path, final_centerlines: Path, final_surfaces: Path,
     progress=None, timings: dict[str, float] | None = None,
@@ -1143,16 +1625,8 @@ def _final_centerline_documents(
         progress("正在加载道路中心线…")
     lines = gpd.read_file(final_centerlines)
     timings["centerline_shp_read"] = time.perf_counter() - stage_started
-    stage_started = time.perf_counter()
-    if progress:
-        progress("正在加载最终道路面…")
-    surfaces = gpd.read_file(final_surfaces)
-    timings["surface_shp_read"] = time.perf_counter() - stage_started
     if lines.crs is None:
         raise ValueError(f"最终中心线缺少 CRS：{final_centerlines}")
-    if surfaces.crs is None:
-        raise ValueError(f"最终道路面缺少 CRS：{final_surfaces}")
-    surfaces = surfaces if surfaces.crs == lines.crs else surfaces.to_crs(lines.crs)
     manifest_path = edited_dir / "edited_manifest.json"
     try:
         saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
@@ -1178,25 +1652,33 @@ def _final_centerline_documents(
         active_lines = active_lines if active_lines.crs == lines.crs else active_lines.to_crs(lines.crs)
     image_paths = [Path(summary["image"]).expanduser().resolve() for _, summary in summary_rows]
     if progress:
-        progress("正在准备遥感影像…")
-    stage_started = time.perf_counter()
-    bounds = _image_union_bounds(image_paths, lines.crs)
-    timings["raster_metadata_read"] = time.perf_counter() - stage_started
-    stage_started = time.perf_counter()
-    image, transform = _build_global_overview(image_paths, lines.crs, bounds)
-    timings["global_image_mosaic"] = time.perf_counter() - stage_started
+        progress("正在检查本地编辑缓存…")
+    image, transform, cache_crs, bounds, background_grid, background_cached = (
+        _load_or_build_background_cache(
+            review_dir, image_paths, lines.crs, progress=progress, timings=timings,
+        )
+    )
+    mask, surfaces, surface_cached = _load_or_build_surface_cache(
+        review_dir, final_surfaces, image.shape[:2], cache_crs, transform,
+        background_grid, background_was_cached=background_cached,
+        progress=progress, timings=timings,
+    )
     if progress:
-        progress("正在生成地图显示…")
-    surface_shapes = [
-        (geometry, 1) for geometry in surfaces.geometry
-        if geometry is not None and not geometry.is_empty
-    ]
-    stage_started = time.perf_counter()
-    mask = rasterize(
-        surface_shapes, out_shape=image.shape[:2], transform=transform,
-        fill=0, all_touched=True, dtype="uint8",
-    ) if surface_shapes else np.zeros(image.shape[:2], dtype=np.uint8)
-    timings["surface_rasterize"] = time.perf_counter() - stage_started
+        if background_cached and surface_cached:
+            progress("已使用本地编辑缓存。")
+        else:
+            progress("编辑缓存已建立，之后再次打开该期次将直接读取缓存。")
+    cache_sizes = editor_cache_sizes(editor_cache_directory(review_dir))
+    print(
+        "GEOMETRY_EDITOR_CACHE=" + json.dumps({
+            "directory": str(editor_cache_directory(review_dir)),
+            "background_used": background_cached, "surface_used": surface_cached,
+            "background_bytes": cache_sizes[BACKGROUND_CACHE_NAME],
+            "surface_bytes": cache_sizes[SURFACE_CACHE_NAME],
+            "total_bytes": cache_sizes["total"],
+        }, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
     stage_started = time.perf_counter()
     nodes, edges = _graph_from_world_lines(active_lines, transform, box(*bounds))
     timings["centerline_graph_build"] = time.perf_counter() - stage_started
@@ -1210,11 +1692,11 @@ def _final_centerline_documents(
     )
     document.global_mode = True
     document.global_transform = transform
-    document.global_crs = lines.crs
+    document.global_crs = cache_crs
     document.global_bounds = bounds
     document.global_summary_rows = summary_rows
     document.global_base_lines = lines.copy()
-    document.global_base_surfaces = surfaces.copy()
+    document.global_base_surfaces = surfaces.copy() if surfaces is not None else None
     document.global_overview_scale = max(abs(float(transform.a)), abs(float(transform.e)))
     document.pixel_size = document.global_overview_scale
     timings["document_construct"] = time.perf_counter() - stage_started
@@ -1719,6 +2201,8 @@ class GeometryEditorApp:
         advanced_menu = tk.Menu(advanced, tearoff=False)
         advanced_menu.add_command(label="路面局部修补", command=lambda: self.activate_surface_tool("add"))
         advanced_menu.add_command(label="路面局部擦除", command=lambda: self.activate_surface_tool("remove"))
+        advanced_menu.add_separator()
+        advanced_menu.add_command(label="清除本期编辑缓存", command=self.clear_current_editor_cache)
         advanced.configure(menu=advanced_menu)
         advanced.pack(fill="x", pady=(4, 0))
         ttk.Label(
@@ -1783,6 +2267,22 @@ class GeometryEditorApp:
         self.surface_action.set("remove" if action == "remove" else "add")
         self.mode.set("surface_add")
         self._mode_changed()
+
+    def clear_current_editor_cache(self) -> None:
+        if not messagebox.askyesno(
+            "清除本期编辑缓存",
+            "确定清除当前期次的本地编辑缓存吗？\n\n"
+            "这不会删除道路成果或人工编辑成果，下次打开时会自动重新生成。",
+            parent=self.root,
+        ):
+            return
+        try:
+            removed = clear_editor_cache(self.review_dir)
+        except OSError as exc:
+            messagebox.showerror("无法清除缓存", str(exc), parent=self.root)
+            return
+        message = "本期编辑缓存已清除。" if removed else "当前期次尚无本地编辑缓存。"
+        self.status_var.set(message)
 
     def active_width_measurement(self) -> dict | None:
         measurement_id = getattr(self, "active_width_measurement_id", None)
