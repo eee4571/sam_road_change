@@ -397,6 +397,190 @@ def manual_width_interval_overlaps(
     return False
 
 
+def _manual_interval_bounds(measurement: dict) -> tuple[int, float, float] | None:
+    """Return one valid manual interval as ``(chain_id, lo, hi)``."""
+    if str(measurement.get("source", "")) != "manual_interval_width":
+        return None
+    try:
+        chain_id = int(measurement["target_chain_id"])
+        lo = float(measurement["range_start_position"])
+        hi = float(measurement["range_end_position"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not np.isfinite(lo) or not np.isfinite(hi) or abs(hi - lo) <= 1e-6:
+        return None
+    return chain_id, min(lo, hi), max(lo, hi)
+
+
+def _set_manual_interval_range(
+    measurement: dict, lo: float, hi: float,
+    document: "GeometryDocument" | None = None,
+) -> dict:
+    """Clone an interval fragment and, when possible, refresh its map anchors."""
+    result = copy.deepcopy(measurement)
+    lo, hi = float(min(lo, hi)), float(max(lo, hi))
+    result["source"] = "manual_interval_width"
+    result["range_start_position"] = lo
+    result["range_end_position"] = hi
+    if document is None:
+        return result
+    try:
+        chain_id = int(result["target_chain_id"])
+        points, cumulative = document._chain_geometry_cache.get(chain_id, (None, None))
+        if points is None:
+            document.road_chains()
+            points, cumulative = document._chain_geometry_cache[chain_id]
+        start, _ = _point_at(points, cumulative, lo)
+        end, _ = _point_at(points, cumulative, hi)
+        midpoint, edge_offset = _point_at(points, cumulative, 0.5 * (lo + hi))
+    except (KeyError, TypeError, ValueError):
+        return result
+    old_target = np.asarray([
+        float(result.get("target_row", midpoint[0])),
+        float(result.get("target_col", midpoint[1])),
+    ], dtype=np.float32)
+    delta = midpoint - old_target
+    result.update({
+        "range_start_row": float(start[0]),
+        "range_start_col": float(start[1]),
+        "range_end_row": float(end[0]),
+        "range_end_col": float(end[1]),
+        "chain_position": float(0.5 * (lo + hi)),
+        "target_row": float(midpoint[0]),
+        "target_col": float(midpoint[1]),
+    })
+    chains = {int(chain.chain_id): chain for chain in document.road_chains()}
+    chain = chains.get(chain_id)
+    if chain is not None and chain.edge_ids:
+        result["target_edge_id"] = int(chain.edge_ids[min(edge_offset, len(chain.edge_ids) - 1)])
+    for prefix in ("start", "end"):
+        try:
+            result[f"{prefix}_row"] = float(result[f"{prefix}_row"]) + float(delta[0])
+            result[f"{prefix}_col"] = float(result[f"{prefix}_col"]) + float(delta[1])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return result
+
+
+def replace_manual_width_interval(
+    measurements: list[dict], new_interval: dict,
+    document: "GeometryDocument" | None = None,
+    *, minimum_length: float = 1e-6,
+) -> list[dict]:
+    """Replace overlaps on one chain, splitting older manual intervals as needed.
+
+    A row with the same measurement id is the interval being edited.  It is
+    replaced outright (rather than split), so shortening an interval restores
+    automatic width outside its new range.
+    """
+    bounds = _manual_interval_bounds(new_interval)
+    if bounds is None:
+        raise ValueError("new_interval must be a valid manual_interval_width row")
+    chain_id, new_lo, new_hi = bounds
+    candidate = _set_manual_interval_range(new_interval, new_lo, new_hi, document)
+    candidate_id = str(candidate.get("measurement_id", ""))
+    used_ids = {
+        str(row.get("measurement_id", "")) for row in measurements
+        if str(row.get("measurement_id", ""))
+    }
+    if not candidate_id:
+        candidate_id = _next_measurement_id(measurements)
+        candidate["measurement_id"] = candidate_id
+        used_ids.add(candidate_id)
+
+    result: list[dict] = []
+    for original in measurements:
+        row = copy.deepcopy(original)
+        row_id = str(row.get("measurement_id", ""))
+        if candidate_id and row_id == candidate_id:
+            continue
+        old_bounds = _manual_interval_bounds(row)
+        if old_bounds is None or old_bounds[0] != chain_id:
+            result.append(row)
+            continue
+        _, old_lo, old_hi = old_bounds
+        if new_hi <= old_lo + minimum_length or new_lo >= old_hi - minimum_length:
+            result.append(row)
+            continue
+        fragments: list[tuple[float, float]] = []
+        if old_lo < new_lo - minimum_length:
+            fragments.append((old_lo, new_lo))
+        if new_hi < old_hi - minimum_length:
+            fragments.append((new_hi, old_hi))
+        for fragment_index, (fragment_lo, fragment_hi) in enumerate(fragments):
+            fragment = _set_manual_interval_range(row, fragment_lo, fragment_hi, document)
+            if fragment_index > 0 or not row_id:
+                fragment_id = _next_measurement_id([
+                    *measurements, *result,
+                    *({"measurement_id": value} for value in used_ids),
+                ])
+                fragment["measurement_id"] = fragment_id
+                used_ids.add(fragment_id)
+            result.append(fragment)
+
+    result.append(candidate)
+    for order, row in enumerate(result):
+        row["edit_order"] = order
+    return result
+
+
+def delete_manual_width_interval(measurements: list[dict], measurement_id: str) -> list[dict]:
+    """Delete one manual override; automatic width data is intentionally untouched."""
+    result = [
+        copy.deepcopy(row) for row in measurements
+        if str(row.get("measurement_id", "")) != str(measurement_id)
+    ]
+    for order, row in enumerate(result):
+        row["edit_order"] = order
+    return result
+
+
+def normalize_manual_width_intervals(
+    measurements: list[dict], document: "GeometryDocument" | None = None,
+) -> list[dict]:
+    """Resolve legacy overlaps in edit order while retaining non-interval anchors."""
+    normalized: list[dict] = []
+    ordered = sorted(
+        (copy.deepcopy(row) for row in measurements if isinstance(row, dict)),
+        key=lambda row: int(row.get("edit_order", 0)),
+    )
+    for row in ordered:
+        if _manual_interval_bounds(row) is None:
+            normalized.append(row)
+        else:
+            normalized = replace_manual_width_interval(normalized, row, document)
+    for order, row in enumerate(normalized):
+        row["edit_order"] = order
+    return normalized
+
+
+def query_effective_width(
+    automatic_width, measurements: list[dict], chain_id: int, chain_position: float,
+):
+    """Return manual width at a chain position, otherwise the untouched auto value."""
+    value = automatic_width(chain_position) if callable(automatic_width) else automatic_width
+    winner: tuple[int, int, dict] | None = None
+    for index, row in enumerate(measurements):
+        bounds = _manual_interval_bounds(row)
+        if bounds is None or bounds[0] != int(chain_id):
+            continue
+        _row_chain, lo, hi = bounds
+        if lo - 1e-6 <= float(chain_position) <= hi + 1e-6:
+            candidate = (int(row.get("edit_order", index)), index, row)
+            if winner is None or candidate[:2] >= winner[:2]:
+                winner = candidate
+    if winner is None:
+        return value
+    row = winner[2]
+    try:
+        width_units = float(row.get("width_units", 0.0))
+        if np.isfinite(width_units) and width_units > 0:
+            return width_units
+        return float(row["width_px"])
+    except (KeyError, TypeError, ValueError):
+        return value
+
+
 def update_manual_width_interval_endpoint(
     document: "GeometryDocument", measurement: dict, handle: str,
     point_rc: tuple[float, float], *, max_centerline_distance: float = 48.0,
@@ -465,6 +649,65 @@ def manual_width_preview_geometry(document: "GeometryDocument", measurement: dic
         return None
     line = LineString([(float(col), float(row)) for row, col in points])
     return line.buffer(0.5 * width_px, cap_style=2, join_style=2)
+
+
+def effective_width_surface_preview(
+    document: "GeometryDocument", automatic_surface: np.ndarray | None = None,
+    measurements: list[dict] | None = None,
+) -> np.ndarray:
+    """Compose automatic surface and manual override corridors for editor preview.
+
+    Each manual interval first clears the local automatic corridor around its
+    centerline and then writes the new corridor.  This makes a 12 m -> 6 m edit
+    visibly shrink instead of unioning the narrow corridor with the old surface.
+    """
+    automatic = (
+        document.editable_surface() if automatic_surface is None
+        else (np.asarray(automatic_surface) > 0).astype(np.uint8)
+    )
+    result = automatic.copy()
+    intervals = [
+        row for row in (document.manual_widths if measurements is None else measurements)
+        if _manual_interval_bounds(row) is not None
+    ]
+    if not intervals:
+        return result
+    distance = cv2.distanceTransform(automatic.astype(np.uint8), cv2.DIST_L2, 5)
+    out_shape = result.shape
+    for measurement in intervals:
+        bounds = _manual_interval_bounds(measurement)
+        if bounds is None:
+            continue
+        chain_id, lo, hi = bounds
+        points = chain_interval_points(document, chain_id, lo, hi)
+        corridor = manual_width_preview_geometry(document, measurement)
+        if len(points) < 2 or corridor is None or corridor.is_empty:
+            continue
+        indices = np.rint(points).astype(np.int32)
+        indices[:, 0] = np.clip(indices[:, 0], 0, out_shape[0] - 1)
+        indices[:, 1] = np.clip(indices[:, 1], 0, out_shape[1] - 1)
+        automatic_half_width = float(np.max(distance[indices[:, 0], indices[:, 1]]))
+        try:
+            scale = max(float(getattr(document, "pixel_size", 1.0) or 1.0), 1e-6)
+            manual_half_width = 0.5 * float(measurement.get("width_units", 0.0)) / scale
+            if manual_half_width <= 0:
+                manual_half_width = 0.5 * float(measurement["width_px"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        line = LineString([(float(col), float(row)) for row, col in points])
+        clear_geometry = line.buffer(
+            max(automatic_half_width, manual_half_width) + 2.0,
+            cap_style=2, join_style=2,
+        )
+        clear_mask = rasterize(
+            [(clear_geometry, 1)], out_shape=out_shape, fill=0, dtype="uint8",
+        )
+        corridor_mask = rasterize(
+            [(corridor, 1)], out_shape=out_shape, fill=0, dtype="uint8",
+        )
+        result[clear_mask > 0] = 0
+        result[corridor_mask > 0] = 1
+    return result
 
 
 @dataclass
@@ -577,6 +820,8 @@ class GeometryDocument:
         self._topology_metrics_cache: dict | None = None
         self._grid_size = 128.0
         self.cache_build_counts = {"chains": 0, "spatial": 0}
+        if self.manual_widths:
+            self.manual_widths = normalize_manual_width_intervals(self.manual_widths, self)
         self.edit_revision = 0
         self.dirty_geometry = False
         self.dirty_widths = False
@@ -2556,7 +2801,10 @@ class GeometryEditorApp:
         self.interval_measurement_id: str | None = None
         self.active_width_measurement_id: str | None = None
         self.width_range_drag_handle: str | None = None
-        self.width_range_drag_checkpoint = False
+        self.width_range_drag_original: dict | None = None
+        self.width_range_drag_preview: dict | None = None
+        self.remeasure_interval_id: str | None = None
+        self.pending_width_interval_id: str | None = None
         self.surface_radius = tk.IntVar(value=12)
         self.surface_action = tk.StringVar(value="add")
         self.surface_stroke_active = False
@@ -2722,9 +2970,9 @@ class GeometryEditorApp:
         ttk.Button(self.tool_draw_frame, text="完成绘线  Enter", command=self.finish_drawing).pack(fill="x", pady=2)
         ttk.Button(self.tool_draw_frame, text="取消  Esc", command=self.cancel_drawing).pack(fill="x", pady=2)
         self.tool_width_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
-        ttk.Button(self.tool_width_frame, text="确认当前区间", command=self.confirm_active_width).pack(fill="x", pady=2)
-        ttk.Button(self.tool_width_frame, text="取消当前区间", command=self.cancel_active_width).pack(fill="x", pady=2)
-        ttk.Button(self.tool_width_frame, text="删除最近测量", command=self.delete_latest_width).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="调整范围", command=self.begin_adjust_width_range).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="重新测宽", command=self.begin_remeasure_width).pack(fill="x", pady=2)
+        ttk.Button(self.tool_width_frame, text="删除人工宽度  Delete", command=self.delete_active_width).pack(fill="x", pady=2)
         self.tool_surface_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
         ttk.Radiobutton(
             self.tool_surface_frame, text="补画", variable=self.surface_action, value="add",
@@ -2787,7 +3035,7 @@ class GeometryEditorApp:
         self.root.bind("<Control-s>", lambda _event: self.save_all())
         self.root.bind("<Return>", lambda _event: self.finish_drawing())
         self.root.bind("<Escape>", lambda _event: self.cancel_drawing())
-        self.root.bind("<Delete>", lambda event: self.delete_selected_edges() if not self._text_input_focused(event) else None)
+        self.root.bind("<Delete>", self.delete_key)
         for key, mode in (("v", "select"), ("l", "draw"), ("w", "measure_width"), ("b", "surface_add")):
             self.root.bind(key, lambda event, value=mode: self.set_mode_shortcut(event, value))
             self.root.bind(key.upper(), lambda event, value=mode: self.set_mode_shortcut(event, value))
@@ -2807,7 +3055,10 @@ class GeometryEditorApp:
             self.interval_draft = []
             self.interval_measurement_id = None
             self.width_range_drag_handle = None
-            self.width_range_drag_checkpoint = False
+            self.width_range_drag_original = None
+            self.width_range_drag_preview = None
+            self.remeasure_interval_id = None
+            self.pending_width_interval_id = None
         self.update_context_panel()
         self.refresh_dynamic_overlay()
 
@@ -2864,10 +3115,12 @@ class GeometryEditorApp:
                 value = float(active.get("width_units", active.get("width_px", 0.0)))
                 lo = float(active.get("range_start_position", 0.0)) * float(getattr(self.doc, "pixel_size", 1.0))
                 hi = float(active.get("range_end_position", lo)) * float(getattr(self.doc, "pixel_size", 1.0))
-                self.tool_hint_var.set("拖动地图中的两个端点，可调整该宽度的作用范围。")
+                if self.remeasure_interval_id:
+                    self.tool_hint_var.set("请再次跨道路拖动；新宽度将沿用当前区间范围。")
+                else:
+                    self.tool_hint_var.set("已选中人工宽度。拖动两端控制点可调整范围。")
                 self.tool_value_var.set(
-                    f"宽度\n{value:.2f} m\n\n应用范围\n当前道路链\n\n"
-                    f"区间长度\n{max(0.0, hi - lo):.1f} m\n\n起点 {lo:.1f} m\n终点 {hi:.1f} m"
+                    f"人工宽度\n{value:.2f} m\n\n范围\n{lo:.1f}–{hi:.1f} m\n\n来源\n人工测宽"
                 )
             else:
                 self.tool_hint_var.set(
@@ -3045,7 +3298,7 @@ class GeometryEditorApp:
             return cached[1]
         source = self.doc.image.copy()
         overlay = source.copy()
-        editable_surface = self.doc.editable_surface()
+        editable_surface = effective_width_surface_preview(self.doc)
         overlay[editable_surface > 0] = (40, 180, 40)
         overlay[self.doc.surface_additions > 0] = (255, 120, 0)
         overlay[self.doc.surface_removals > 0] = (0, 0, 255)
@@ -3220,8 +3473,14 @@ class GeometryEditorApp:
     def refresh_manual_widths(self) -> None:
         self.canvas.delete("manual_width")
         z = self.zoom
+        measurements = self.doc.manual_widths
+        range_preview = getattr(self, "width_range_drag_preview", None)
+        if range_preview is not None:
+            measurements = replace_manual_width_interval(
+                measurements, range_preview, self.doc,
+            )
         interval_rows = [
-            row for row in self.doc.manual_widths
+            row for row in measurements
             if str(row.get("source", "")) == "manual_interval_width"
         ]
         # Keep chain construction lazy: an untouched document needs no chain
@@ -3229,7 +3488,7 @@ class GeometryEditorApp:
         chains = {
             int(chain.chain_id): chain for chain in self.doc.road_chains()
         } if interval_rows else {}
-        for measurement in self.doc.manual_widths:
+        for measurement in measurements:
             if str(measurement.get("source", "")) == "manual_interval_width":
                 try:
                     chain = chains[int(measurement["target_chain_id"])]
@@ -3247,9 +3506,15 @@ class GeometryEditorApp:
                             for value in (float(col) * z, float(row) * z)
                         ]
                         if len(polygon_coords) >= 6:
+                            active = str(measurement.get("measurement_id", "")) == getattr(
+                                self, "active_width_measurement_id", None,
+                            )
                             self.canvas.create_polygon(
-                                *polygon_coords, fill="#0EA5E9", outline="#38BDF8",
-                                stipple="gray50", width=1, tags=("manual_width", "width_preview"),
+                                *polygon_coords,
+                                fill="#0EA5E9" if active else "#5B8C85",
+                                outline="#7DD3FC" if active else "#8CB3AC",
+                                stipple="gray50" if active else "gray75", width=1,
+                                tags=("manual_width", "width_preview"),
                             )
                     interval_points = chain_interval_points(self.doc, int(chain.chain_id), lo, hi)
                     if len(interval_points) >= 2:
@@ -3257,10 +3522,17 @@ class GeometryEditorApp:
                             value for row, col in interval_points
                             for value in (float(col) * z, float(row) * z)
                         ]
+                        active = str(measurement.get("measurement_id", "")) == getattr(
+                            self, "active_width_measurement_id", None,
+                        )
                         self.canvas.create_line(
-                            *interval_coords, fill="#FACC15", width=5,
+                            *interval_coords, fill="#FACC15" if active else "#B7C8A6",
+                            width=5 if active else 3,
                             capstyle="round", joinstyle="round",
-                            tags=("manual_width", "width_interval"),
+                            tags=(
+                                "manual_width", "width_interval",
+                                f"manual_width_{measurement.get('measurement_id', '')}",
+                            ),
                         )
                     if str(measurement.get("measurement_id", "")) == getattr(self, "active_width_measurement_id", None):
                         chain_coords = [
@@ -3318,6 +3590,41 @@ class GeometryEditorApp:
                 if distance <= tolerance and (best is None or distance < best[0]):
                     best = (distance, measurement_id, handle)
         return None if best is None else (best[1], best[2])
+
+    def manual_width_interval_at(self, row: float, col: float) -> str | None:
+        """Hit-test visible manual corridors without exposing internal chain ids."""
+        tolerance = max(4.0, 8.0 / max(self.zoom, 1e-6))
+        point = Point(float(col), float(row))
+        best: tuple[float, str] | None = None
+        for measurement in self.doc.manual_widths:
+            if _manual_interval_bounds(measurement) is None:
+                continue
+            geometry = manual_width_preview_geometry(self.doc, measurement)
+            try:
+                points = chain_interval_points(
+                    self.doc, int(measurement["target_chain_id"]),
+                    float(measurement["range_start_position"]),
+                    float(measurement["range_end_position"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(points) < 2:
+                continue
+            centerline = LineString([(float(c), float(r)) for r, c in points])
+            distance = float(centerline.distance(point))
+            if (geometry is not None and geometry.buffer(tolerance).contains(point)) or distance <= tolerance:
+                measurement_id = str(measurement.get("measurement_id", ""))
+                if measurement_id and (best is None or distance < best[0]):
+                    best = (distance, measurement_id)
+        return None if best is None else best[1]
+
+    def _manual_widths_changed(self) -> None:
+        if not hasattr(self, "surface_versions"):
+            return
+        self.surface_versions[self.document_index] += 1
+        self.background_source_cache.pop(self.document_index, None)
+        self._last_background_view = None
+        self.refresh_background()
 
     def refresh_dynamic_overlay(self) -> None:
         self.canvas.delete("dynamic")
@@ -3451,9 +3758,10 @@ class GeometryEditorApp:
             self.refresh_dynamic_overlay()
         elif mode == "measure_width":
             handle_hit = self.width_range_handle_at(row, col)
-            if handle_hit is not None:
+            if handle_hit is not None and handle_hit[0] == self.active_width_measurement_id:
                 self.active_width_measurement_id, self.width_range_drag_handle = handle_hit
-                self.width_range_drag_checkpoint = False
+                self.width_range_drag_original = copy.deepcopy(self.active_width_measurement())
+                self.width_range_drag_preview = None
                 self.width_drag_start = None
                 self.width_drag_current = None
                 self.refresh_manual_widths()
@@ -3465,6 +3773,14 @@ class GeometryEditorApp:
                 else:
                     self.context_text.set("区间定宽：已选择起点，请在同一连续道路链上选择终点。")
                     self.refresh_dynamic_overlay()
+            elif getattr(self, "remeasure_interval_id", None) is None:
+                interval_hit = self.manual_width_interval_at(row, col)
+                if interval_hit is not None:
+                    self.pending_width_interval_id = interval_hit
+                self.width_drag_start = (row, col)
+                self.width_drag_current = (row, col)
+                self.width_preview = None
+                self.refresh_dynamic_overlay()
             else:
                 self.width_drag_start = (row, col)
                 self.width_drag_current = (row, col)
@@ -3497,7 +3813,7 @@ class GeometryEditorApp:
                 self.lasso.append((row, col))
                 self._extend_lasso_canvas(event)
         elif self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
-            active = self.active_width_measurement()
+            active = self.width_range_drag_original or self.active_width_measurement()
             if active is None:
                 self.width_range_drag_handle = None
                 return
@@ -3508,24 +3824,16 @@ class GeometryEditorApp:
             if updated is None:
                 self.context_text.set(error)
                 return
-            if manual_width_interval_overlaps(
-                self.doc.manual_widths, updated,
-                exclude_measurement_id=str(updated.get("measurement_id", "")),
-            ):
-                self.context_text.set("该范围与已有人工宽度区间重叠，已保持原范围。")
-                return
-            if not getattr(self, "width_range_drag_checkpoint", False):
-                self.doc.checkpoint("widths")
-                self._show_unsaved()
-                self.width_range_drag_checkpoint = True
-            index = self.doc.manual_widths.index(active)
-            self.doc.manual_widths[index] = updated
-            self.saved_var.set("尚未保存")
-            self.context_text.set("拖动端点调整人工宽度作用范围。")
+            self.width_range_drag_preview = updated
+            self.context_text.set("正在预览人工宽度作用范围；松开鼠标后应用。")
             self.refresh_manual_widths()
             self.update_context_panel()
         elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
             self.width_drag_current = (row, col)
+            if math.hypot(
+                row - self.width_drag_start[0], col - self.width_drag_start[1],
+            ) >= max(2.0, 4.0 / max(self.zoom, 1e-6)):
+                self.pending_width_interval_id = None
             preview, _error = create_normal_width_measurement(
                 self.doc, self.width_drag_start, self.width_drag_current,
                 max_centerline_distance=max(12.0, 24.0 / self.zoom),
@@ -3550,13 +3858,41 @@ class GeometryEditorApp:
         surface_was_active = self.surface_stroke_active
         self.surface_stroke_active = False
         if self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
+            preview = self.width_range_drag_preview
+            if preview is not None:
+                self.doc.checkpoint("widths")
+                self._show_unsaved()
+                self.doc.manual_widths = replace_manual_width_interval(
+                    self.doc.manual_widths, preview, self.doc,
+                )
+                self.saved_var.set("尚未保存")
+                self.context_text.set("已更新当前道路段的人工宽度。")
+                self._manual_widths_changed()
             self.width_range_drag_handle = None
-            self.width_range_drag_checkpoint = False
+            self.width_range_drag_original = None
+            self.width_range_drag_preview = None
             self.refresh_manual_widths()
             self.update_context_panel()
         elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
             self.width_drag_current = self.source_point(event)
-            self.finish_width_measurement()
+            pending = getattr(self, "pending_width_interval_id", None)
+            distance = math.hypot(
+                self.width_drag_current[0] - self.width_drag_start[0],
+                self.width_drag_current[1] - self.width_drag_start[1],
+            )
+            if pending is not None and distance < max(2.0, 4.0 / max(self.zoom, 1e-6)):
+                self.active_width_measurement_id = pending
+                self.pending_width_interval_id = None
+                self.width_drag_start = None
+                self.width_drag_current = None
+                self.width_preview = None
+                self.context_text.set("已选中人工宽度区间。")
+                self.refresh_manual_widths()
+                self.refresh_dynamic_overlay()
+                self.update_context_panel()
+            else:
+                self.pending_width_interval_id = None
+                self.finish_width_measurement()
         if self.drag_node is not None:
             if self.drag_changed:
                 self.doc.invalidate_geometry_cache()
@@ -3646,6 +3982,58 @@ class GeometryEditorApp:
         if str(deleted.get("measurement_id", "")) == self.active_width_measurement_id:
             self.active_width_measurement_id = None
         self.saved_var.set("尚未保存")
+        self._manual_widths_changed()
+        self.refresh_manual_widths()
+        self.update_context_panel()
+
+    def delete_key(self, event=None) -> None:
+        if self._text_input_focused(event):
+            return
+        if self.mode.get() == "measure_width" and self.active_width_measurement() is not None:
+            self.delete_active_width()
+        else:
+            self.delete_selected_edges()
+
+    def begin_adjust_width_range(self) -> None:
+        if self.active_width_measurement() is None:
+            self.context_text.set("请先在地图上单击一个人工宽度区间。")
+            return
+        self.remeasure_interval_id = None
+        self.context_text.set("拖动选中区间的橙色或红色端点，松开后应用新范围。")
+        self.refresh_manual_widths()
+        self.update_context_panel()
+
+    def begin_remeasure_width(self) -> None:
+        active = self.active_width_measurement()
+        if active is None:
+            self.context_text.set("请先在地图上单击一个人工宽度区间。")
+            return
+        self.remeasure_interval_id = str(active.get("measurement_id", ""))
+        self.width_drag_start = None
+        self.width_drag_current = None
+        self.width_preview = None
+        self.context_text.set("请再次跨道路拖动；只更新宽度，保留当前作用范围。")
+        self.update_context_panel()
+
+    def delete_active_width(self) -> None:
+        active = self.active_width_measurement()
+        if active is None:
+            self.context_text.set("请先在地图上单击一个人工宽度区间。")
+            return
+        measurement_id = str(active.get("measurement_id", ""))
+        self.doc.checkpoint("widths")
+        self._show_unsaved()
+        self.doc.manual_widths = delete_manual_width_interval(
+            self.doc.manual_widths, measurement_id,
+        )
+        self.active_width_measurement_id = None
+        self.remeasure_interval_id = None
+        self.width_range_drag_handle = None
+        self.width_range_drag_original = None
+        self.width_range_drag_preview = None
+        self.saved_var.set("尚未保存")
+        self.context_text.set("已删除该段人工宽度，当前范围恢复使用自动测宽结果。")
+        self._manual_widths_changed()
         self.refresh_manual_widths()
         self.update_context_panel()
 
@@ -3771,6 +4159,7 @@ class GeometryEditorApp:
         self.lasso_active = False
         self._remove_lasso_canvas()
         self.width_preview = None
+        self.pending_width_interval_id = None
         self.refresh_dynamic_overlay()
         self.update_context_panel()
 
@@ -3797,24 +4186,36 @@ class GeometryEditorApp:
             messagebox.showwarning("测宽未保存", error)
             self._mode_changed()
             return
-        if manual_width_interval_overlaps(self.doc.manual_widths, measurement):
-            messagebox.showwarning(
-                "人工宽度区间重叠",
-                "新建范围与当前道路链上已有的人工宽度区间重叠。\n\n"
-                "本次测宽已取消，请先调整已有区间的两端控制点。",
-            )
-            self.refresh_manual_widths()
-            self.update_context_panel()
-            return
+        remeasure_id = getattr(self, "remeasure_interval_id", None)
+        if remeasure_id:
+            selected = next((
+                row for row in self.doc.manual_widths
+                if str(row.get("measurement_id", "")) == remeasure_id
+            ), None)
+            if selected is None:
+                self.remeasure_interval_id = None
+            elif int(selected.get("target_chain_id", -1)) != int(measurement.get("target_chain_id", -2)):
+                messagebox.showwarning("测宽未保存", "重新测宽必须落在当前人工区间所在的道路链上。")
+                self.update_context_panel()
+                return
+            else:
+                for key in (
+                    "measurement_id", "target_chain_id", "range_start_position",
+                    "range_end_position", "range_start_row", "range_start_col",
+                    "range_end_row", "range_end_col",
+                ):
+                    measurement[key] = copy.deepcopy(selected[key])
+                measurement["source"] = "manual_interval_width"
         self.doc.checkpoint("widths")
         self._show_unsaved()
-        self.doc.manual_widths.append(measurement)
-        self.active_width_measurement_id = str(measurement.get("measurement_id", ""))
-        self.saved_var.set("尚未保存")
-        self.context_text.set(
-            f"已测得 {float(measurement['width_units']):.2f} m。"
-            "宽度已应用到当前道路段，拖动两端控制点可调整作用范围。"
+        self.doc.manual_widths = replace_manual_width_interval(
+            self.doc.manual_widths, measurement, self.doc,
         )
+        self.active_width_measurement_id = str(measurement.get("measurement_id", ""))
+        self.remeasure_interval_id = None
+        self.saved_var.set("尚未保存")
+        self.context_text.set("已更新当前道路段的人工宽度。")
+        self._manual_widths_changed()
         self.refresh_manual_widths()
         self.refresh_dynamic_overlay()
         self.update_context_panel()
@@ -3824,25 +4225,14 @@ class GeometryEditorApp:
             return
         self.active_width_measurement_id = None
         self.width_range_drag_handle = None
-        self.width_range_drag_checkpoint = False
+        self.width_range_drag_original = None
+        self.width_range_drag_preview = None
         self.context_text.set("人工宽度区间已保留在当前编辑状态。")
         self.refresh_manual_widths()
         self.update_context_panel()
 
     def cancel_active_width(self) -> None:
-        active = self.active_width_measurement()
-        if active is None:
-            return
-        self.doc.checkpoint("widths")
-        self._show_unsaved()
-        self.doc.manual_widths.remove(active)
-        self.active_width_measurement_id = None
-        self.width_range_drag_handle = None
-        self.width_range_drag_checkpoint = False
-        self.saved_var.set("尚未保存")
-        self.context_text.set("已取消当前人工宽度区间。")
-        self.refresh_manual_widths()
-        self.update_context_panel()
+        self.delete_active_width()
 
     def begin_width_interval(self) -> None:
         measurement = next((
@@ -3884,10 +4274,15 @@ class GeometryEditorApp:
             return
         self.doc.checkpoint("widths")
         self._show_unsaved()
-        self.doc.manual_widths[index] = interval
+        self.doc.manual_widths = replace_manual_width_interval(
+            self.doc.manual_widths, interval, self.doc,
+        )
+        self.active_width_measurement_id = str(interval.get("measurement_id", ""))
         self.interval_draft = []
         self.interval_measurement_id = None
         self.saved_var.set("尚未保存")
+        self.context_text.set("已更新当前道路段的人工宽度。")
+        self._manual_widths_changed()
         self.refresh_manual_widths()
         self.refresh_dynamic_overlay()
         self.update_context_panel()
@@ -3915,8 +4310,12 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
+            self.active_width_measurement_id = None
             self.width_range_drag_handle = None
-            self.width_range_drag_checkpoint = False
+            self.width_range_drag_original = None
+            self.width_range_drag_preview = None
+            self.remeasure_interval_id = None
+            self.pending_width_interval_id = None
             self.full_refresh()
 
     def redo(self) -> None:
@@ -3930,8 +4329,12 @@ class GeometryEditorApp:
             self.width_drag_current = None
             self.interval_draft = []
             self.interval_measurement_id = None
+            self.active_width_measurement_id = None
             self.width_range_drag_handle = None
-            self.width_range_drag_checkpoint = False
+            self.width_range_drag_original = None
+            self.width_range_drag_preview = None
+            self.remeasure_interval_id = None
+            self.pending_width_interval_id = None
             self.full_refresh()
 
     def change_tile(self, _event=None) -> None:
@@ -3947,7 +4350,10 @@ class GeometryEditorApp:
         self.interval_measurement_id = None
         self.active_width_measurement_id = None
         self.width_range_drag_handle = None
-        self.width_range_drag_checkpoint = False
+        self.width_range_drag_original = None
+        self.width_range_drag_preview = None
+        self.remeasure_interval_id = None
+        self.pending_width_interval_id = None
         self._last_background_view = None
         self._background_scrollregion = None
         self.full_refresh()

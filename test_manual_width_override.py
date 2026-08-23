@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import cv2
 import numpy as np
+import rasterio
 
 ENGINE = Path(__file__).resolve().parent / "engine" / "width"
 if str(ENGINE) not in sys.path:
@@ -19,18 +25,25 @@ from chain_width_calculator import (  # noqa: E402
     normalize_manual_width_measurements,
 )
 from finalize_review_results import apply_manual_width_overrides  # noqa: E402
+from global_edit_utils import _project_manual_widths  # noqa: E402
 from geometry_editor import (  # noqa: E402
     GeometryDocument,
     GeometryEditorApp,
     create_default_interval_width_measurement,
     create_interval_width_measurement,
     create_normal_width_measurement,
+    delete_manual_width_interval,
+    effective_width_surface_preview,
     load_manual_widths,
     manual_width_interval_overlaps,
     manual_width_preview_geometry,
+    normalize_manual_width_intervals,
+    query_effective_width,
+    replace_manual_width_interval,
     update_manual_width_interval_endpoint,
 )
 from width_surface_reconstruction import WidthSurfaceConfig, reconstruct_surface_from_widths  # noqa: E402
+from production_workflow import apply_global_edit_directory  # noqa: E402
 
 
 class _Variable:
@@ -78,6 +91,28 @@ class ManualWidthOverrideTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertIsNotNone(interval)
         return interval
+
+    def _interval(self, lo: float, hi: float, width: float, measurement_id: str) -> dict:
+        anchor = self._measurement(width=width, start=(45.0, 0.5 * (lo + hi)), end=(55.0, 0.5 * (lo + hi)))
+        interval, error = create_interval_width_measurement(
+            self.document, anchor, (50.0, lo), (50.0, hi),
+        )
+        self.assertEqual(error, "")
+        interval["measurement_id"] = measurement_id
+        interval["width_px"] = width
+        interval["width_units"] = width * self.document.pixel_size
+        return interval
+
+    @staticmethod
+    def _profile(rows: list[dict]) -> list[tuple[float, float, float]]:
+        return sorted(
+            (
+                round(float(row["range_start_position"]), 5),
+                round(float(row["range_end_position"]), 5),
+                round(float(row["width_px"]), 5),
+            )
+            for row in rows if row.get("source") == "manual_interval_width"
+        )
 
     def test_drag_events_create_one_measurement(self) -> None:
         app = GeometryEditorApp.__new__(GeometryEditorApp)
@@ -339,6 +374,298 @@ class ManualWidthOverrideTests(unittest.TestCase):
         resolved = result.metadata["resolved_widths_px"]
         self.assertEqual(resolved[2:8], [12.0] * 6)
         self.assertTrue(np.any(result.surface))
+
+    def test_automatic_profile_is_base_and_manual_interval_wins(self) -> None:
+        interval = self._interval(30, 70, 18, "MW00001")
+        self.assertEqual(query_effective_width(7.6, [interval], 0, 10), 7.6)
+        self.assertEqual(query_effective_width(7.6, [interval], 0, 50), 9.0)
+        self.assertEqual(query_effective_width(7.6, [interval], 0, 90), 7.6)
+
+    def test_replacement_splits_old_interval_on_both_sides(self) -> None:
+        old = self._interval(0, 100, 16, "MW00001")
+        new = self._interval(40, 70, 20, "MW00002")
+        result = replace_manual_width_interval([old], new, self.document)
+        self.assertEqual(self._profile(result), [(0, 40, 16), (40, 70, 20), (70, 100, 16)])
+        self.assertEqual(len({row["measurement_id"] for row in result}), 3)
+
+    def test_replacement_fully_removes_covered_old_interval(self) -> None:
+        old = self._interval(20, 60, 16, "MW00001")
+        new = self._interval(0, 100, 20, "MW00002")
+        self.assertEqual(self._profile(replace_manual_width_interval([old], new, self.document)), [(0, 100, 20)])
+
+    def test_replacement_trims_old_interval_right_side(self) -> None:
+        old = self._interval(20, 80, 16, "MW00001")
+        new = self._interval(50, 100, 20, "MW00002")
+        result = replace_manual_width_interval([old], new, self.document)
+        self.assertEqual(self._profile(result), [(20, 50, 16), (50, 100, 20)])
+
+    def test_replacement_covers_multiple_old_intervals(self) -> None:
+        rows = [
+            self._interval(0, 20, 12, "MW00001"),
+            self._interval(25, 45, 14, "MW00002"),
+            self._interval(50, 100, 16, "MW00003"),
+        ]
+        new = self._interval(10, 80, 22, "MW00004")
+        self.assertEqual(
+            self._profile(replace_manual_width_interval(rows, new, self.document)),
+            [(0, 10, 12), (10, 80, 22), (80, 100, 16)],
+        )
+
+    def test_delete_interval_restores_automatic_query(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.assertEqual(query_effective_width(7.5, [interval], 0, 50), 8.0)
+        deleted = delete_manual_width_interval([interval], "MW00001")
+        self.assertEqual(query_effective_width(7.5, deleted, 0, 50), 7.5)
+
+    def test_delete_interval_undo_restores_manual_override(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        self.document.checkpoint("widths")
+        self.document.manual_widths = delete_manual_width_interval(self.document.manual_widths, "MW00001")
+        self.assertTrue(self.document.undo())
+        self.assertEqual(self._profile(self.document.manual_widths), [(20, 80, 16)])
+
+    def test_replacement_undo_restores_unsplit_interval(self) -> None:
+        old = self._interval(0, 100, 16, "MW00001")
+        new = self._interval(40, 70, 20, "MW00002")
+        self.document.manual_widths = [old]
+        self.document.checkpoint("widths")
+        self.document.manual_widths = replace_manual_width_interval(self.document.manual_widths, new, self.document)
+        self.assertTrue(self.document.undo())
+        self.assertEqual(self._profile(self.document.manual_widths), [(0, 100, 16)])
+
+    def test_replacement_redo_restores_complete_split_structure(self) -> None:
+        old = self._interval(0, 100, 16, "MW00001")
+        new = self._interval(40, 70, 20, "MW00002")
+        self.document.manual_widths = [old]
+        self.document.checkpoint("widths")
+        self.document.manual_widths = replace_manual_width_interval(self.document.manual_widths, new, self.document)
+        split = self._profile(self.document.manual_widths)
+        self.assertTrue(self.document.undo())
+        self.assertTrue(self.document.redo())
+        self.assertEqual(self._profile(self.document.manual_widths), split)
+
+    def test_dragged_interval_overwrites_and_splits_neighbor(self) -> None:
+        current = self._interval(20, 40, 16, "MW00001")
+        neighbor = self._interval(50, 100, 12, "MW00002")
+        moved, error = update_manual_width_interval_endpoint(
+            self.document, current, "end", (50, 80), minimum_range_units=1,
+        )
+        self.assertEqual(error, "")
+        result = replace_manual_width_interval([current, neighbor], moved, self.document)
+        self.assertEqual(self._profile(result), [(20, 80, 16), (80, 100, 12)])
+
+    def test_ui_handle_drag_is_preview_until_release_and_one_transaction(self) -> None:
+        current = self._interval(20, 40, 16, "MW00001")
+        neighbor = self._interval(50, 100, 12, "MW00002")
+        self.document.manual_widths = [current, neighbor]
+        app = GeometryEditorApp.__new__(GeometryEditorApp)
+        app.documents, app.document_index = [self.document], 0
+        app.mode, app.zoom = _Variable("measure_width"), 1.0
+        app.active_width_measurement_id = "MW00001"
+        app.width_range_drag_handle = None
+        app.width_range_drag_original = None
+        app.width_range_drag_preview = None
+        app.width_drag_start = app.width_drag_current = app.width_preview = None
+        app.interval_measurement_id, app.interval_draft = None, []
+        app.remeasure_interval_id = app.pending_width_interval_id = None
+        app.space_pressed = app.space_panning = False
+        app.surface_stroke_active, app.drag_node = False, None
+        app.lasso_active, app.lasso = False, []
+        app.context_text, app.saved_var = _Variable(), _Variable()
+        app.source_point = lambda event: event.rc
+        app.refresh_manual_widths = lambda: None
+        app.refresh_dynamic_overlay = lambda: None
+        app.update_context_panel = lambda: None
+        app._show_unsaved = lambda: None
+        app.mouse_press(_Event((50, 40)))
+        app.mouse_drag(_Event((50, 80)))
+        self.assertEqual(self._profile(self.document.manual_widths), [(20, 40, 16), (50, 100, 12)])
+        self.assertEqual(len(self.document.undo_stack), 0)
+        self.assertIsNotNone(app.width_range_drag_preview)
+        app.mouse_release(_Event((50, 80)))
+        self.assertEqual(self._profile(self.document.manual_widths), [(20, 80, 16), (80, 100, 12)])
+        self.assertEqual(len(self.document.undo_stack), 1)
+
+    def test_preview_shrinks_when_manual_width_changes_12_to_6(self) -> None:
+        auto = np.zeros((120, 120), dtype=np.uint8)
+        cv2.rectangle(auto, (0, 44), (110, 56), 1, -1)
+        wide = self._interval(20, 80, 24, "MW00001")
+        narrow = dict(wide, width_px=12, width_units=6)
+        wide_area = int(effective_width_surface_preview(self.document, auto, [wide]).sum())
+        narrow_area = int(effective_width_surface_preview(self.document, auto, [narrow]).sum())
+        self.assertLess(narrow_area, wide_area)
+
+    def test_preview_grows_when_manual_width_changes_6_to_12(self) -> None:
+        auto = np.zeros((120, 120), dtype=np.uint8)
+        cv2.rectangle(auto, (0, 47), (110, 53), 1, -1)
+        narrow = self._interval(20, 80, 12, "MW00001")
+        wide = dict(narrow, width_px=24, width_units=12)
+        self.assertGreater(
+            int(effective_width_surface_preview(self.document, auto, [wide]).sum()),
+            int(effective_width_surface_preview(self.document, auto, [narrow]).sum()),
+        )
+
+    def test_preview_after_delete_matches_automatic_surface(self) -> None:
+        auto = np.zeros((120, 120), dtype=np.uint8)
+        cv2.rectangle(auto, (0, 44), (110, 56), 1, -1)
+        interval = self._interval(20, 80, 8, "MW00001")
+        changed = effective_width_surface_preview(self.document, auto, [interval])
+        restored = effective_width_surface_preview(
+            self.document, auto, delete_manual_width_interval([interval], "MW00001"),
+        )
+        self.assertFalse(np.array_equal(changed, auto))
+        self.assertTrue(np.array_equal(restored, auto))
+
+    def test_split_result_round_trips_through_manual_width_json(self) -> None:
+        rows = replace_manual_width_interval(
+            [self._interval(0, 100, 16, "MW00001")],
+            self._interval(40, 70, 20, "MW00002"), self.document,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            (directory / "tile_manual_widths.json").write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8",
+            )
+            reopened = GeometryDocument(
+                "tile", self.document.image, self.nodes, self.edges, self.document.mask,
+                manual_widths=load_manual_widths(directory, "tile"),
+            )
+        self.assertEqual(self._profile(reopened.manual_widths), self._profile(rows))
+
+    def test_apply_pipeline_rebuilds_narrower_and_wider_surfaces(self) -> None:
+        def rebuilt_area(width_px: float | None) -> int:
+            records, widths = self._rows(width=24)
+            manual = [] if width_px is None else [self._interval(0, 100, width_px, "MW00001")]
+            apply_manual_width_constraints(
+                self.nodes, self.edges, records, widths, manual, 0.5,
+            )
+            result = reconstruct_surface_from_widths(
+                (120, 120), self.nodes, self.edges, widths, [],
+                edge_metadata=records,
+                config=WidthSurfaceConfig(regular_surface=True, preserve_reference_surface=False),
+            )
+            return int(result.surface.sum())
+
+        automatic_area = rebuilt_area(None)
+        narrow_area = rebuilt_area(12)
+        wide_area = rebuilt_area(30)
+        self.assertLess(narrow_area, automatic_area)
+        self.assertGreater(wide_area, automatic_area)
+
+    def test_normalize_legacy_overlaps_uses_later_edit_precedence(self) -> None:
+        old = self._interval(0, 100, 16, "MW00001")
+        new = self._interval(40, 70, 20, "MW00002")
+        old["edit_order"], new["edit_order"] = 0, 1
+        self.assertEqual(
+            self._profile(normalize_manual_width_intervals([old, new], self.document)),
+            [(0, 40, 16), (40, 70, 20), (70, 100, 16)],
+        )
+
+    def test_real_area1_2021_apply_edits_rebuilds_manual_width(self) -> None:
+        if os.environ.get("SAMROAD_REAL_WIDTH_VERIFY") != "1":
+            self.skipTest("set SAMROAD_REAL_WIDTH_VERIFY=1 for the isolated real-result verification")
+        period = Path(
+            "project/04_成果输出/run_20260818_231625/grids/area1/periods/2021"
+        ).resolve()
+        review = period / "runs/roads/width_review"
+        source_edit = period / "runs/roads/centerline_edit"
+        if not (review.is_dir() and source_edit.is_dir()):
+            self.skipTest("run_20260818_231625 area1/2021 is not available")
+        manifest = json.loads((source_edit / "edited_manifest.json").read_text(encoding="utf-8"))
+        widths = json.loads((source_edit / "global_manual_widths.json").read_text(encoding="utf-8"))
+        intervals = [row for row in widths if row.get("source") == "manual_interval_width"]
+        self.assertTrue(intervals)
+        global_transform = rasterio.Affine(*manifest["global_transform"][:6])
+        selected_stem = None
+        selected_interval = None
+        for stem in manifest.get("affected_tiles", []):
+            summary = json.loads((review / f"{stem}_summary.json").read_text(encoding="utf-8"))
+            with rasterio.open(Path(summary["image"])) as dataset:
+                for interval in intervals:
+                    projected = _project_manual_widths(
+                        [interval], global_transform, manifest["global_crs"],
+                        dataset.transform, dataset.crs, dataset.bounds,
+                    )
+                    if any(row.get("source") == "manual_interval_width" for row in projected):
+                        selected_stem, selected_interval = str(stem), interval
+                        break
+            if selected_interval is not None:
+                break
+        self.assertIsNotNone(selected_interval)
+
+        def resize_interval(width_units: float) -> dict:
+            row = dict(selected_interval)
+            target = np.asarray([row["target_row"], row["target_col"]], dtype=np.float64)
+            vector = np.asarray([
+                row["end_row"] - row["start_row"],
+                row["end_col"] - row["start_col"],
+            ], dtype=np.float64)
+            vector /= max(float(np.linalg.norm(vector)), 1e-9)
+            half_pixels = 0.5 * width_units / max(
+                abs(float(global_transform.a)), abs(float(global_transform.e)), 1e-9,
+            )
+            start, end = target - vector * half_pixels, target + vector * half_pixels
+            row.update({
+                "start_row": float(start[0]), "start_col": float(start[1]),
+                "end_row": float(end[0]), "end_col": float(end[1]),
+                "width_px": float(2.0 * half_pixels), "width_units": float(width_units),
+            })
+            return row
+
+        def rebuilt_area(root: Path, variant: str, replacement: dict | None) -> int:
+            edited = root / variant / "edited"
+            final = root / variant / "final"
+            edited.mkdir(parents=True)
+            local_manifest = copy.deepcopy(manifest)
+            for key in ("global_centerlines", "global_manual_surface_add", "global_manual_surface_remove"):
+                source = Path(manifest[key])
+                destination = edited / source.name
+                shutil.copy2(source, destination)
+                local_manifest[key] = str(destination)
+            local_widths = [
+                row for row in widths
+                if row.get("measurement_id") != selected_interval.get("measurement_id")
+            ]
+            if replacement is not None:
+                local_widths.append(replacement)
+            width_path = edited / "global_manual_widths.json"
+            width_path.write_text(json.dumps(local_widths, ensure_ascii=False), encoding="utf-8")
+            local_manifest["global_manual_widths"] = str(width_path)
+            local_manifest["affected_tiles"] = [selected_stem]
+            (edited / "edited_manifest.json").write_text(
+                json.dumps(local_manifest, ensure_ascii=False), encoding="utf-8",
+            )
+            apply_global_edit_directory(review, edited, {selected_stem})
+            completed = subprocess.run(
+                [
+                    sys.executable, str(ENGINE / "finalize_review_results.py"),
+                    "--output-dir", str(review), "--edited-dir", str(edited),
+                    "--final-dir", str(final), "--only-stem", selected_stem,
+                ],
+                cwd=Path(__file__).resolve().parent,
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            surface = cv2.imread(str(final / f"{selected_stem}_optimized_road_surface.png"), cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(surface)
+            return int(np.count_nonzero(surface))
+
+        with tempfile.TemporaryDirectory(prefix="samroad-real-width-") as raw:
+            root = Path(raw)
+            narrow_area = rebuilt_area(root, "manual_6m", resize_interval(6.0))
+            wide_area = rebuilt_area(root, "manual_12m", resize_interval(12.0))
+            automatic_area = rebuilt_area(root, "automatic", None)
+        self.assertLess(narrow_area, wide_area)
+        self.assertNotEqual(automatic_area, narrow_area)
+        self.assertNotEqual(automatic_area, wide_area)
+        print(json.dumps({
+            "real_period": str(period), "stem": selected_stem,
+            "manual_6m_surface_px": narrow_area,
+            "manual_12m_surface_px": wide_area,
+            "deleted_override_surface_px": automatic_area,
+            "real_outputs_modified": False,
+        }, ensure_ascii=False))
 
 
 if __name__ == "__main__":
