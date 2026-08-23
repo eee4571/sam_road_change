@@ -477,6 +477,50 @@ class EditorSnapshot:
     manual_widths: list[dict]
     surface_additions: np.ndarray
     surface_removals: np.ndarray
+    change_kinds: tuple[str, ...] = ()
+
+
+SAVE_KINDS = ("geometry", "widths", "surface")
+
+
+@dataclass(frozen=True)
+class DocumentSaveSnapshot:
+    document_index: int
+    stem: str
+    snapshot_revision: int
+    requested_dirty_kinds: tuple[str, ...]
+    write_kinds: tuple[str, ...]
+    dirty_revisions: dict[str, int]
+    nodes: np.ndarray | None = None
+    edges: np.ndarray | None = None
+    manual_widths: list[dict] | None = None
+    surface_additions: np.ndarray | None = None
+    surface_removals: np.ndarray | None = None
+    candidates: dict[str, list[tuple[float, float]]] | None = None
+    applied_surface_region_ids: set[str] | None = None
+    saved_geometry_nodes: np.ndarray | None = None
+    saved_geometry_edges: np.ndarray | None = None
+    global_transform: rasterio.Affine | None = None
+    global_crs_wkt: str = ""
+    global_overview_scale: float = 1.0
+    global_raster_shape: tuple[int, int] | None = None
+    global_summary_rows: tuple[tuple[str, dict], ...] = ()
+
+
+@dataclass(frozen=True)
+class SaveSnapshot:
+    edited_dir: Path
+    documents: tuple[DocumentSaveSnapshot, ...]
+    global_mode: bool
+    final_centerlines: Path | None
+    final_surfaces: Path | None
+
+
+@dataclass
+class SaveResult:
+    manifest: dict
+    saved_documents: list[dict]
+    timings: dict[str, float]
 
 
 class GeometryDocument:
@@ -533,6 +577,40 @@ class GeometryDocument:
         self._topology_metrics_cache: dict | None = None
         self._grid_size = 128.0
         self.cache_build_counts = {"chains": 0, "spatial": 0}
+        self.edit_revision = 0
+        self.dirty_geometry = False
+        self.dirty_widths = False
+        self.dirty_surface = False
+        self._dirty_revisions = {kind: 0 for kind in SAVE_KINDS}
+        self._saved_geometry_nodes = self.nodes.copy()
+        self._saved_geometry_edges = self.edges.copy()
+
+    def mark_dirty(self, *kinds: str) -> int:
+        kinds = tuple(dict.fromkeys(kind for kind in kinds if kind in SAVE_KINDS))
+        if not kinds:
+            return self.edit_revision
+        self.edit_revision += 1
+        for kind in kinds:
+            setattr(self, f"dirty_{kind}", True)
+            self._dirty_revisions[kind] = self.edit_revision
+        return self.edit_revision
+
+    def dirty_kinds(self) -> tuple[str, ...]:
+        return tuple(kind for kind in SAVE_KINDS if getattr(self, f"dirty_{kind}"))
+
+    def has_unsaved_changes(self) -> bool:
+        return bool(self.dirty_kinds())
+
+    def accept_saved_snapshot(
+        self, dirty_revisions: dict[str, int],
+        saved_nodes: np.ndarray | None = None, saved_edges: np.ndarray | None = None,
+    ) -> None:
+        for kind, revision in dirty_revisions.items():
+            if kind in SAVE_KINDS and self._dirty_revisions[kind] == revision:
+                setattr(self, f"dirty_{kind}", False)
+        if saved_nodes is not None and saved_edges is not None:
+            self._saved_geometry_nodes = saved_nodes.copy()
+            self._saved_geometry_edges = saved_edges.copy()
 
     def invalidate_geometry_cache(self) -> None:
         self._cache_revision += 1
@@ -634,12 +712,13 @@ class GeometryDocument:
             tangent=_tangent_at(points, cumulative, position, max(1.0, tangent_radius)),
         )
 
-    def snapshot(self) -> EditorSnapshot:
+    def snapshot(self, change_kinds: tuple[str, ...] = ()) -> EditorSnapshot:
         return EditorSnapshot(
             self.nodes.copy(), self.edges.copy(), self.mask.copy(),
             copy.deepcopy(self.candidates), set(self.applied_surface_region_ids),
             copy.deepcopy(self.manual_widths),
             self.surface_additions.copy(), self.surface_removals.copy(),
+            change_kinds,
         )
 
     def restore(self, state: EditorSnapshot) -> None:
@@ -666,24 +745,31 @@ class GeometryDocument:
             cv2.circle(self.surface_removals, point, radius, 1, -1)
             cv2.circle(self.surface_additions, point, radius, 0, -1)
 
-    def checkpoint(self) -> None:
-        self.undo_stack.append(self.snapshot())
+    def checkpoint(self, *change_kinds: str, mark_dirty: bool = True) -> None:
+        kinds = tuple(dict.fromkeys(change_kinds or SAVE_KINDS))
+        self.undo_stack.append(self.snapshot(kinds))
         if len(self.undo_stack) > 30:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
+        if mark_dirty:
+            self.mark_dirty(*kinds)
 
     def undo(self) -> bool:
         if not self.undo_stack:
             return False
-        self.redo_stack.append(self.snapshot())
-        self.restore(self.undo_stack.pop())
+        state = self.undo_stack.pop()
+        self.redo_stack.append(self.snapshot(state.change_kinds))
+        self.restore(state)
+        self.mark_dirty(*state.change_kinds)
         return True
 
     def redo(self) -> bool:
         if not self.redo_stack:
             return False
-        self.undo_stack.append(self.snapshot())
-        self.restore(self.redo_stack.pop())
+        state = self.redo_stack.pop()
+        self.undo_stack.append(self.snapshot(state.change_kinds))
+        self.restore(state)
+        self.mark_dirty(*state.change_kinds)
         return True
 
     def nearest_node(self, row: float, col: float, tolerance: float) -> int | None:
@@ -1207,7 +1293,7 @@ def write_surface_cache(
     )
 
 
-def _atomic_json_write(path: Path, payload: dict) -> None:
+def _atomic_json_write(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     try:
@@ -1954,6 +2040,455 @@ def save_global_document(
     }
 
 
+def _atomic_bytes_write(path: Path, data: bytes | bytearray | memoryview) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        temporary.write_bytes(data)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _atomic_graph_write(path: Path, nodes: np.ndarray, edges: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        save_graph(
+            temporary,
+            [tuple(float(value) for value in point) for point in nodes.tolist()],
+            edges.tolist(),
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _atomic_global_centerline_write(
+    path: Path, lines: list[LineString], crs_wkt: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.stem}.{os.getpid()}.{time.time_ns()}.tmp.gpkg"
+    try:
+        frame = gpd.GeoDataFrame(
+            {"edge_id": list(range(len(lines))), "geometry": lines},
+            geometry="geometry", crs=crs_wkt,
+        )
+        frame.to_file(temporary, layer="edited_centerlines", driver="GPKG")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _atomic_surface_png_write(path: Path, mask: np.ndarray) -> None:
+    encoded_ok, encoded = cv2.imencode(
+        ".png", (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255,
+    )
+    if not encoded_ok:
+        raise OSError(f"无法编码道路面局部编辑：{path}")
+    _atomic_bytes_write(path, encoded.tobytes())
+
+
+def _compact_graph_arrays(
+    nodes: np.ndarray, edges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    nodes = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
+    edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    if len(edges) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.int32)
+    valid = edges[:, 0] != edges[:, 1]
+    edges = edges[valid]
+    if len(edges) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.int32)
+    canonical = np.sort(edges, axis=1)
+    _, first = np.unique(canonical, axis=0, return_index=True)
+    edges = edges[np.sort(first)]
+    used = np.unique(edges.reshape(-1))
+    if len(used) == 0 or int(used[0]) < 0 or int(used[-1]) >= len(nodes):
+        raise ValueError("中心线图包含无效节点索引")
+    compact_nodes = nodes[used].copy()
+    compact_edges = np.searchsorted(used, edges).astype(np.int32, copy=False)
+    return compact_nodes, compact_edges
+
+
+def _world_lines_from_arrays(
+    nodes: np.ndarray, edges: np.ndarray, transform: rasterio.Affine,
+) -> list[LineString]:
+    lines = []
+    for src, dst in edges.tolist():
+        start_row, start_col = nodes[int(src)]
+        end_row, end_col = nodes[int(dst)]
+        start = transform * (float(start_col), float(start_row))
+        end = transform * (float(end_col), float(end_row))
+        if start != end:
+            lines.append(LineString((start, end)))
+    return lines
+
+
+def _segment_lookup(nodes: np.ndarray, edges: np.ndarray) -> dict[tuple, tuple]:
+    lookup = {}
+    for src, dst in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist():
+        if not (0 <= int(src) < len(nodes) and 0 <= int(dst) < len(nodes)):
+            continue
+        start = tuple(round(float(value), 4) for value in nodes[int(src)])
+        end = tuple(round(float(value), 4) for value in nodes[int(dst)])
+        if start == end:
+            continue
+        key = tuple(sorted((start, end)))
+        lookup[key] = (start, end)
+    return lookup
+
+
+def _geometry_delta_bounds(
+    saved_nodes: np.ndarray, saved_edges: np.ndarray,
+    nodes: np.ndarray, edges: np.ndarray,
+    transform: rasterio.Affine, buffer_distance: float,
+):
+    before = _segment_lookup(saved_nodes, saved_edges)
+    after = _segment_lookup(nodes, edges)
+    changed = (before.keys() - after.keys()) | (after.keys() - before.keys())
+    if not changed:
+        return None
+    points = []
+    for key in changed:
+        for row, col in before.get(key, after.get(key, ())):
+            points.append(transform * (float(col), float(row)))
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return box(min(xs), min(ys), max(xs), max(ys)).buffer(buffer_distance)
+
+
+def _manual_width_change_bounds(
+    measurements: list[dict], transform: rasterio.Affine, buffer_distance: float,
+):
+    parts = []
+    for measurement in measurements:
+        try:
+            target = transform * (
+                float(measurement["target_col"]), float(measurement["target_row"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        parts.append(Point(*target).buffer(buffer_distance))
+        if str(measurement.get("source", "")) == "manual_interval_width":
+            try:
+                interval = LineString([
+                    transform * (
+                        float(measurement["range_start_col"]),
+                        float(measurement["range_start_row"]),
+                    ),
+                    transform * (
+                        float(measurement["range_end_col"]),
+                        float(measurement["range_end_row"]),
+                    ),
+                ])
+            except (KeyError, TypeError, ValueError):
+                continue
+            parts.append(interval.buffer(buffer_distance))
+    return unary_union(parts) if parts else None
+
+
+def _affected_tile_manifest(
+    rows: tuple[tuple[str, dict], ...], global_crs_wkt: str,
+    changed_geometry, previous_manifest: dict,
+) -> tuple[list[str], dict]:
+    affected = {
+        str(value) for value in previous_manifest.get("affected_tiles", [])
+        if str(value).strip()
+    }
+    tile_manifest = {}
+    previous_tiles = previous_manifest.get("tiles", {})
+    for stem, summary in rows:
+        image_path = Path(summary["image"]).expanduser().resolve()
+        with rasterio.open(image_path) as dataset:
+            if dataset.crs is None:
+                raise ValueError(f"影像缺少 CRS：{image_path}")
+            raster_crs, raster_bounds = dataset.crs, dataset.bounds
+        if changed_geometry is not None and not changed_geometry.is_empty:
+            left, bottom, right, top = transform_bounds(
+                raster_crs, global_crs_wkt,
+                raster_bounds.left, raster_bounds.bottom,
+                raster_bounds.right, raster_bounds.top, densify_pts=21,
+            )
+            if changed_geometry.intersects(box(left, bottom, right, top)):
+                affected.add(stem)
+        old = previous_tiles.get(stem, {}) if isinstance(previous_tiles, dict) else {}
+        tile_manifest[stem] = {
+            "image": str(image_path),
+            "affected": stem in affected,
+            "tile_inputs_materialized": bool(old.get("tile_inputs_materialized", False)),
+        }
+    return sorted(affected), tile_manifest
+
+
+def _topology_metrics_from_arrays(
+    nodes: np.ndarray, edges: np.ndarray, pending_candidate_count: int,
+    short_edge_px: float = 2.0,
+) -> dict:
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(nodes)))
+    graph.add_edges_from((int(src), int(dst)) for src, dst in edges.tolist())
+    lengths = [float(np.linalg.norm(nodes[dst] - nodes[src])) for src, dst in edges.tolist()]
+    return {
+        "node_count": len(nodes), "edge_count": len(edges),
+        "component_count": nx.number_connected_components(graph) if graph.number_of_nodes() else 0,
+        "dangling_endpoint_count": sum(degree == 1 for _, degree in graph.degree()),
+        "junction_count": sum(degree >= 3 for _, degree in graph.degree()),
+        "isolated_node_count": sum(degree == 0 for _, degree in graph.degree()),
+        "short_edge_count": sum(length < short_edge_px for length in lengths),
+        "pending_candidate_count": int(pending_candidate_count),
+    }
+
+
+def _load_previous_manifest(edited_dir: Path) -> dict:
+    try:
+        payload = json.loads((edited_dir / "edited_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _persist_global_snapshot(
+    snapshot: SaveSnapshot, progress, timings: dict[str, float],
+) -> SaveResult:
+    document = snapshot.documents[0]
+    write_kinds = set(document.write_kinds)
+    edited_dir = snapshot.edited_dir
+    previous = _load_previous_manifest(edited_dir)
+    global_path = (edited_dir / "global_edited_centerlines.gpkg").resolve()
+    width_path = (edited_dir / "global_manual_widths.json").resolve()
+    add_path = (edited_dir / "global_manual_surface_add.png").resolve()
+    remove_path = (edited_dir / "global_manual_surface_remove.png").resolve()
+    report_path = edited_dir / "global_edit_report.json"
+    manifest_path = edited_dir / "edited_manifest.json"
+    saved_nodes = saved_edges = None
+    nodes, edges = document.nodes, document.edges
+    edited_lines = None
+
+    if "geometry" in write_kinds:
+        progress("正在保存中心线…")
+        started = time.perf_counter()
+        nodes, edges = _compact_graph_arrays(nodes, edges)
+        timings["document_compact"] = time.perf_counter() - started
+        if document.global_transform is None:
+            raise ValueError("全局编辑保存快照缺少地图变换参数")
+        started = time.perf_counter()
+        edited_lines = _world_lines_from_arrays(nodes, edges, document.global_transform)
+        timings["global_centerline_build"] = time.perf_counter() - started
+        if not edited_lines:
+            raise ValueError("全局最终中心线已为空；请至少保留一条道路后再保存")
+        started = time.perf_counter()
+        _atomic_global_centerline_write(global_path, edited_lines, document.global_crs_wkt)
+        timings["global_centerline_export"] = time.perf_counter() - started
+        saved_nodes, saved_edges = nodes, edges
+
+    normalized_widths = document.manual_widths
+    if "widths" in write_kinds:
+        progress("正在保存人工宽度…")
+        started = time.perf_counter()
+        normalized_widths = normalize_manual_width_measurements(
+            nodes, edges, document.manual_widths or [],
+        )
+        timings["manual_width_normalize"] = time.perf_counter() - started
+        started = time.perf_counter()
+        _atomic_json_write(width_path, normalized_widths)
+        timings["manual_widths_json"] = time.perf_counter() - started
+
+    if "surface" in write_kinds:
+        progress("正在保存道路面局部修改…")
+        started = time.perf_counter()
+        _atomic_surface_png_write(add_path, document.surface_additions)
+        timings["surface_additions_write"] = time.perf_counter() - started
+        started = time.perf_counter()
+        _atomic_surface_png_write(remove_path, document.surface_removals)
+        timings["surface_removals_write"] = time.perf_counter() - started
+
+    progress("正在更新编辑索引…")
+    started = time.perf_counter()
+    buffer_distance = max(float(document.global_overview_scale) * 3.0, 0.01)
+    changed_parts = []
+    if "geometry" in write_kinds:
+        geometry_delta = _geometry_delta_bounds(
+            document.saved_geometry_nodes, document.saved_geometry_edges,
+            nodes, edges, document.global_transform, buffer_distance,
+        )
+        if geometry_delta is not None:
+            changed_parts.append(geometry_delta)
+    if "widths" in write_kinds:
+        width_delta = _manual_width_change_bounds(
+            normalized_widths or [], document.global_transform, buffer_distance,
+        )
+        if width_delta is not None:
+            changed_parts.append(width_delta)
+    if "surface" in write_kinds:
+        for mask in (document.surface_additions, document.surface_removals):
+            bounds = _mask_world_bounds(mask, document.global_transform)
+            if bounds is not None:
+                changed_parts.append(bounds.buffer(buffer_distance))
+    changed_geometry = unary_union(changed_parts) if changed_parts else None
+    affected_tiles, tile_manifest = _affected_tile_manifest(
+        document.global_summary_rows, document.global_crs_wkt,
+        changed_geometry, previous,
+    )
+    timings["affected_tiles"] = time.perf_counter() - started
+
+    edge_count = len(edges) if edges is not None else int(previous.get("global_edge_count", 0))
+    report = {
+        "editing_scope": "period_final_fused_centerlines_global_once",
+        "global_centerlines": str(global_path),
+        "global_edge_count": edge_count,
+        "affected_tiles": affected_tiles,
+        "affected_tile_count": len(affected_tiles),
+        "tile_count": len(tile_manifest),
+        "overview_pixel_size": float(document.global_overview_scale),
+        "global_transform": list(document.global_transform)[:6],
+        "global_crs": document.global_crs_wkt,
+        "global_raster_shape": list(document.global_raster_shape),
+    }
+    started = time.perf_counter()
+    _atomic_json_write(report_path, report)
+    timings["global_report_json"] = time.perf_counter() - started
+    manifest = {
+        "editor": "builtin_geometry_editor_v3_global_final",
+        "base_final_centerlines": str(snapshot.final_centerlines),
+        "base_final_centerlines_mtime_ns": snapshot.final_centerlines.stat().st_mtime_ns,
+        "base_final_surfaces": str(snapshot.final_surfaces),
+        "base_final_surfaces_mtime_ns": snapshot.final_surfaces.stat().st_mtime_ns,
+        **report,
+        "tiles": tile_manifest,
+        "global_manual_widths": str(width_path),
+        "global_manual_surface_add": str(add_path),
+        "global_manual_surface_remove": str(remove_path),
+    }
+    started = time.perf_counter()
+    _atomic_json_write(manifest_path, manifest)
+    timings["edited_manifest_json"] = time.perf_counter() - started
+    return SaveResult(manifest, [{
+        "document_index": document.document_index,
+        "dirty_revisions": document.dirty_revisions,
+        "saved_nodes": saved_nodes,
+        "saved_edges": saved_edges,
+    }], timings)
+
+
+def _persist_tiled_snapshot(
+    snapshot: SaveSnapshot, progress, timings: dict[str, float],
+) -> SaveResult:
+    edited_dir = snapshot.edited_dir
+    previous = _load_previous_manifest(edited_dir)
+    manifest = previous if previous.get("editor") == "builtin_geometry_editor_v2_final_fused" else {
+        "editor": "builtin_geometry_editor_v2_final_fused", "tiles": {},
+    }
+    if snapshot.final_centerlines is not None:
+        manifest.update({
+            "base_final_centerlines": str(snapshot.final_centerlines),
+            "base_final_centerlines_mtime_ns": snapshot.final_centerlines.stat().st_mtime_ns,
+            "base_final_surfaces": str(snapshot.final_surfaces) if snapshot.final_surfaces else "",
+            "base_final_surfaces_mtime_ns": snapshot.final_surfaces.stat().st_mtime_ns if snapshot.final_surfaces else -1,
+            "editing_scope": "period_final_fused_centerlines",
+        })
+    saved_documents = []
+    for document in snapshot.documents:
+        kinds = set(document.write_kinds)
+        entry = dict(manifest.get("tiles", {}).get(document.stem, {}))
+        nodes, edges = document.nodes, document.edges
+        saved_nodes = saved_edges = None
+        if "geometry" in kinds:
+            progress(f"正在保存中心线：{document.stem}…")
+            started = time.perf_counter()
+            nodes, edges = _compact_graph_arrays(nodes, edges)
+            timings["document_compact"] = timings.get("document_compact", 0.0) + time.perf_counter() - started
+            graph_path = edited_dir / f"{document.stem}_edited_graph.p"
+            report_path = edited_dir / f"{document.stem}_topology_report.json"
+            started = time.perf_counter()
+            _atomic_graph_write(graph_path, nodes, edges)
+            timings["graph_write"] = timings.get("graph_write", 0.0) + time.perf_counter() - started
+            started = time.perf_counter()
+            metrics = _topology_metrics_from_arrays(nodes, edges, len(document.candidates or {}))
+            timings["topology_metrics"] = timings.get("topology_metrics", 0.0) + time.perf_counter() - started
+            _atomic_json_write(report_path, metrics)
+            entry.update({
+                "graph": str(graph_path), "topology_report": str(report_path), **metrics,
+                "pending_candidate_ids": sorted(document.candidates or {}),
+                "applied_surface_region_ids": sorted(document.applied_surface_region_ids or set()),
+            })
+            saved_nodes, saved_edges = nodes, edges
+        if "widths" in kinds:
+            progress(f"正在保存人工宽度：{document.stem}…")
+            started = time.perf_counter()
+            widths = normalize_manual_width_measurements(nodes, edges, document.manual_widths or [])
+            timings["manual_width_normalize"] = timings.get("manual_width_normalize", 0.0) + time.perf_counter() - started
+            width_path = edited_dir / f"{document.stem}_manual_widths.json"
+            _atomic_json_write(width_path, widths)
+            entry.update({"manual_widths": str(width_path), "manual_width_count": len(widths)})
+        if "surface" in kinds:
+            progress(f"正在保存道路面局部修改：{document.stem}…")
+            add_path = edited_dir / f"{document.stem}_manual_surface_add.png"
+            remove_path = edited_dir / f"{document.stem}_manual_surface_remove.png"
+            started = time.perf_counter()
+            _atomic_surface_png_write(add_path, document.surface_additions)
+            _atomic_surface_png_write(remove_path, document.surface_removals)
+            timings["surface_write"] = timings.get("surface_write", 0.0) + time.perf_counter() - started
+            entry.update({
+                "manual_surface_add": str(add_path),
+                "manual_surface_remove": str(remove_path),
+                "manual_surface_added_px": int(np.count_nonzero(document.surface_additions)),
+                "manual_surface_removed_px": int(np.count_nonzero(document.surface_removals)),
+            })
+        manifest.setdefault("tiles", {})[document.stem] = entry
+        saved_documents.append({
+            "document_index": document.document_index,
+            "dirty_revisions": document.dirty_revisions,
+            "saved_nodes": saved_nodes, "saved_edges": saved_edges,
+        })
+    progress("正在更新编辑索引…")
+    started = time.perf_counter()
+    _atomic_json_write(edited_dir / "edited_manifest.json", manifest)
+    timings["edited_manifest_json"] = time.perf_counter() - started
+    return SaveResult(manifest, saved_documents, timings)
+
+
+def persist_save_snapshot(snapshot: SaveSnapshot, progress=None) -> SaveResult:
+    progress = progress or (lambda _message: None)
+    timings: dict[str, float] = {}
+    started = time.perf_counter()
+    snapshot.edited_dir.mkdir(parents=True, exist_ok=True)
+    result = (
+        _persist_global_snapshot(snapshot, progress, timings)
+        if snapshot.global_mode else _persist_tiled_snapshot(snapshot, progress, timings)
+    )
+    timings["total"] = time.perf_counter() - started
+    print(
+        "GEOMETRY_EDITOR_SAVE=" + json.dumps({
+            "global_mode": snapshot.global_mode,
+            "documents": len(snapshot.documents),
+            "timings": timings,
+        }, ensure_ascii=False, sort_keys=True), flush=True,
+    )
+    return result
+
+
+def save_snapshot_worker(messages: queue.Queue, snapshot: SaveSnapshot) -> None:
+    """Persist an immutable snapshot without touching Tk or live documents."""
+    try:
+        result = persist_save_snapshot(
+            snapshot, progress=lambda message: messages.put(("progress", message)),
+        )
+        messages.put(("saved", result))
+    except Exception as exc:  # pragma: no cover - traceback is asserted via queue tests
+        messages.put(("error", exc, traceback.format_exc()))
+
+
 class GeometryEditorApp:
     MODES = {
         "select": "V 选择/编辑",
@@ -2009,6 +2544,7 @@ class GeometryEditorApp:
         self.topology_dirty = True
         self.drag_node: int | None = None
         self.drag_checkpoint = False
+        self.drag_changed = False
         self.draft: list[tuple[float, float]] = []
         self.lasso: list[tuple[float, float]] = []
         self.lasso_active = False
@@ -2030,6 +2566,15 @@ class GeometryEditorApp:
         self.space_pressed = False
         self.space_panning = False
         self.lasso_canvas_item = None
+        self._save_queue: queue.Queue | None = None
+        self._save_thread: threading.Thread | None = None
+        self._active_save_snapshot: SaveSnapshot | None = None
+        self._save_in_progress = False
+        self._save_requested_again = False
+        self._save_show_message = True
+        self._close_after_save = False
+        self.last_save_result: SaveResult | None = None
+        self.last_save_submit_seconds = 0.0
 
         root.title("道路实体变化智能检测与人工核验 · 中心线编辑")
         self.display_scale = max(1.0, min(float(root.winfo_fpixels("1i")) / 96.0, 2.5))
@@ -2098,7 +2643,10 @@ class GeometryEditorApp:
         ttk.Label(title, text="直接修正正式融合成果；保存后仅重建本期与相关时序成果", style="EditorSub.TLabel").pack(anchor="w", pady=(2, 0))
         self.saved_var = tk.StringVar(value="尚未保存")
         ttk.Label(header, textvariable=self.saved_var, style="EditorSub.TLabel").pack(side="right", padx=(12, 0))
-        ttk.Button(header, text="保存编辑", style="Primary.TButton", command=self.save_all).pack(side="right", padx=(12, 0))
+        self.save_button = ttk.Button(
+            header, text="保存编辑", style="Primary.TButton", command=self.save_all,
+        )
+        self.save_button.pack(side="right", padx=(12, 0))
         ttk.Label(header, text="当前切片", style="EditorSub.TLabel").pack(side="right", padx=(18, 6))
         tile = ttk.Combobox(header, textvariable=self.tile_var, values=[doc.stem for doc in self.documents], state="readonly", width=25)
         tile.pack(side="right")
@@ -2880,8 +3428,9 @@ class GeometryEditorApp:
                 return
             node_id = self.doc.nearest_node(row, col, tolerance)
             if node_id is not None:
-                self.doc.checkpoint()
+                self.doc.checkpoint("geometry", mark_dirty=False)
                 self.drag_checkpoint = True
+                self.drag_changed = False
                 self.drag_node = node_id
             else:
                 nearest = self.doc.nearest_edge(row, col, tolerance)
@@ -2922,7 +3471,8 @@ class GeometryEditorApp:
                 self.width_preview = None
                 self.refresh_dynamic_overlay()
         elif mode == "surface_add":
-            self.doc.checkpoint()
+            self.doc.checkpoint("surface")
+            self._show_unsaved()
             self.surface_stroke_active = True
             self.surface_stroke_points = [(row, col)]
             self.doc.paint_surface(row, col, self.surface_radius.get(), self.surface_action.get() == "add")
@@ -2935,6 +3485,10 @@ class GeometryEditorApp:
             return
         row, col = self.source_point(event)
         if self.mode.get() == "select" and self.drag_node is not None:
+            if not self.drag_changed:
+                self.doc.mark_dirty("geometry")
+                self._show_unsaved()
+                self.drag_changed = True
             self.doc.nodes[self.drag_node] = (row, col)
             self.update_dragged_node_items(self.drag_node)
         elif self.mode.get() == "select" and self.lasso_active and self.lasso:
@@ -2961,7 +3515,8 @@ class GeometryEditorApp:
                 self.context_text.set("该范围与已有人工宽度区间重叠，已保持原范围。")
                 return
             if not getattr(self, "width_range_drag_checkpoint", False):
-                self.doc.checkpoint()
+                self.doc.checkpoint("widths")
+                self._show_unsaved()
                 self.width_range_drag_checkpoint = True
             index = self.doc.manual_widths.index(active)
             self.doc.manual_widths[index] = updated
@@ -3003,10 +3558,14 @@ class GeometryEditorApp:
             self.width_drag_current = self.source_point(event)
             self.finish_width_measurement()
         if self.drag_node is not None:
-            self.doc.invalidate_geometry_cache()
-            self.doc.snap_moved_node(self.drag_node, max(3.0, 8.0 / self.zoom))
+            if self.drag_changed:
+                self.doc.invalidate_geometry_cache()
+                self.doc.snap_moved_node(self.drag_node, max(3.0, 8.0 / self.zoom))
+            elif self.drag_checkpoint and self.doc.undo_stack:
+                self.doc.undo_stack.pop()
             self.drag_node = None
             self.drag_checkpoint = False
+            self.drag_changed = False
             self.geometry_dirty = self.topology_dirty = True
             self.refresh_static_geometry()
             self.refresh_manual_widths()
@@ -3028,7 +3587,8 @@ class GeometryEditorApp:
 
     def finish_drawing(self) -> None:
         if len(self.draft) >= 2:
-            self.doc.checkpoint()
+            self.doc.checkpoint("geometry")
+            self._show_unsaved()
             self.doc.add_polyline(self.draft, max(4.0, 10.0 / self.zoom))
         self.draft = []
         self.refresh_static_geometry()
@@ -3080,7 +3640,8 @@ class GeometryEditorApp:
     def delete_latest_width(self) -> None:
         if not self.doc.manual_widths:
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("widths")
+        self._show_unsaved()
         deleted = self.doc.manual_widths.pop()
         if str(deleted.get("measurement_id", "")) == self.active_width_measurement_id:
             self.active_width_measurement_id = None
@@ -3136,7 +3697,8 @@ class GeometryEditorApp:
     def mouse_right_press(self, event) -> None:
         if self.mode.get() == "surface_add":
             row, col = self.source_point(event)
-            self.doc.checkpoint()
+            self.doc.checkpoint("surface")
+            self._show_unsaved()
             self.surface_right_active = True
             self.surface_stroke_points = [(row, col)]
             self.doc.paint_surface(row, col, self.surface_radius.get(), False)
@@ -3189,7 +3751,8 @@ class GeometryEditorApp:
         count = len(self.selected_edge_ids)
         if not messagebox.askyesno("批量删除中心线", f"确认删除圈选命中的 {count} 条中心线？"):
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("geometry")
+        self._show_unsaved()
         self.doc.delete_edges(self.selected_edge_ids)
         self.selected_edge_ids.clear()
         self.refresh_static_geometry()
@@ -3243,7 +3806,8 @@ class GeometryEditorApp:
             self.refresh_manual_widths()
             self.update_context_panel()
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("widths")
+        self._show_unsaved()
         self.doc.manual_widths.append(measurement)
         self.active_width_measurement_id = str(measurement.get("measurement_id", ""))
         self.saved_var.set("尚未保存")
@@ -3269,7 +3833,8 @@ class GeometryEditorApp:
         active = self.active_width_measurement()
         if active is None:
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("widths")
+        self._show_unsaved()
         self.doc.manual_widths.remove(active)
         self.active_width_measurement_id = None
         self.width_range_drag_handle = None
@@ -3317,7 +3882,8 @@ class GeometryEditorApp:
             self.context_text.set("区间定宽：请重新选择同一连续道路链上的起点和终点。")
             self.refresh_dynamic_overlay()
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("widths")
+        self._show_unsaved()
         self.doc.manual_widths[index] = interval
         self.interval_draft = []
         self.interval_measurement_id = None
@@ -3330,7 +3896,8 @@ class GeometryEditorApp:
         candidate_id = self.candidate_var.get()
         if not candidate_id:
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("geometry")
+        self._show_unsaved()
         if not self.doc.add_candidate(candidate_id, max(4.0, 10.0 / self.zoom)):
             self.doc.undo()
         self.refresh_static_geometry()
@@ -3339,6 +3906,7 @@ class GeometryEditorApp:
 
     def undo(self) -> None:
         if self.doc.undo():
+            self._show_unsaved()
             self.surface_versions[self.document_index] += 1
             self.draft = []
             self.lasso = []
@@ -3353,6 +3921,7 @@ class GeometryEditorApp:
 
     def redo(self) -> None:
         if self.doc.redo():
+            self._show_unsaved()
             self.surface_versions[self.document_index] += 1
             self.draft = []
             self.lasso = []
@@ -3406,82 +3975,240 @@ class GeometryEditorApp:
             "如果影像中存在高架、下穿或不同层道路，请不要执行；应只拖动需要连接的端点到目标线。是否继续？",
         ):
             return
-        self.doc.checkpoint()
+        self.doc.checkpoint("geometry")
+        self._show_unsaved()
         self.doc.node_intersections()
         self.refresh_static_geometry()
         self.refresh_manual_widths()
         self.refresh_metrics()
 
-    def save_all(self, show_message: bool = True) -> None:
-        self.edited_dir.mkdir(parents=True, exist_ok=True)
-        if self.final_centerlines is not None and getattr(self.documents[0], "global_mode", False):
-            manifest = save_global_document(
-                self.documents[0], self.edited_dir,
-                self.final_centerlines, self.final_surfaces,
-            )
-            (self.edited_dir / "edited_manifest.json").write_text(
-                json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8",
-            )
-            if hasattr(self, "saved_var"):
-                self.saved_var.set("✓ 已保存全局最终中心线")
-            if show_message:
-                messagebox.showinfo(
-                    "保存完成",
-                    f"最终中心线已作为一个全局网络保存到：\n{self.edited_dir}\n\n"
-                    f"受影响切片：{manifest['affected_tile_count']} / {manifest['tile_count']}。\n"
-                    "返回主程序点击“应用编辑并重新生成结果”后，只会重新测算受影响窗口，"
-                    "最终中心线直接采用当前全局编辑成果，并更新道路面和相邻期次变化。",
-                )
+    def _has_unsaved_changes(self) -> bool:
+        return any(document.has_unsaved_changes() for document in self.documents)
+
+    def _show_unsaved(self) -> None:
+        if not hasattr(self, "saved_var"):
             return
-        manifest = {"editor": "builtin_geometry_editor_v2_final_fused", "tiles": {}}
-        if self.final_centerlines is not None:
-            manifest.update({
-                "base_final_centerlines": str(self.final_centerlines),
-                "base_final_centerlines_mtime_ns": self.final_centerlines.stat().st_mtime_ns,
-                "base_final_surfaces": str(self.final_surfaces) if self.final_surfaces is not None else "",
-                "base_final_surfaces_mtime_ns": self.final_surfaces.stat().st_mtime_ns if self.final_surfaces is not None else -1,
-                "editing_scope": "period_final_fused_centerlines",
-            })
-        for doc in self.documents:
-            doc.compact()
-            graph_path = self.edited_dir / f"{doc.stem}_edited_graph.p"
-            report_path = self.edited_dir / f"{doc.stem}_topology_report.json"
-            save_graph(graph_path, [tuple(float(value) for value in point) for point in doc.nodes.tolist()], doc.edges.tolist())
-            metrics = doc.topology_metrics()
-            report_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
-            manual_width_path = self.edited_dir / f"{doc.stem}_manual_widths.json"
-            manual_width_path.write_text(json.dumps(doc.manual_widths, indent=2, ensure_ascii=False), encoding="utf-8")
-            manual_surface_add = self.edited_dir / f"{doc.stem}_manual_surface_add.png"
-            manual_surface_remove = self.edited_dir / f"{doc.stem}_manual_surface_remove.png"
-            cv2.imwrite(str(manual_surface_add), doc.surface_additions.astype(np.uint8) * 255)
-            cv2.imwrite(str(manual_surface_remove), doc.surface_removals.astype(np.uint8) * 255)
-            manifest["tiles"][doc.stem] = {
-                "graph": str(graph_path),
-                "topology_report": str(report_path), **metrics,
-                "pending_candidate_ids": sorted(doc.candidates),
-                "applied_surface_region_ids": sorted(doc.applied_surface_region_ids),
-                "manual_widths": str(manual_width_path),
-                "manual_width_count": len(doc.manual_widths),
-                "manual_surface_add": str(manual_surface_add),
-                "manual_surface_remove": str(manual_surface_remove),
-                "manual_surface_added_px": int(np.count_nonzero(doc.surface_additions)),
-                "manual_surface_removed_px": int(np.count_nonzero(doc.surface_removals)),
-            }
-        (self.edited_dir / "edited_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.saved_var.set(
+            "正在保存上一版本 · 当前有未保存修改"
+            if getattr(self, "_save_in_progress", False) else "尚未保存"
+        )
+
+    def _build_save_snapshot(self) -> SaveSnapshot | None:
+        global_mode = bool(
+            self.final_centerlines is not None
+            and getattr(self.documents[0], "global_mode", False)
+        )
+        snapshots = []
+        selected = self.documents[:1] if global_mode else self.documents
+        for document_index, document in enumerate(selected):
+            requested = document.dirty_kinds()
+            if not requested:
+                continue
+            write_kinds = set(requested)
+            if global_mode and not (
+                self.edited_dir / "global_edited_centerlines.gpkg"
+            ).is_file():
+                # A first width/surface-only save still needs the authoritative
+                # centerline artifact required by apply-global-edit.
+                write_kinds.add("geometry")
+            needs_graph = bool(write_kinds & {"geometry", "widths"})
+            snapshots.append(DocumentSaveSnapshot(
+                document_index=document_index,
+                stem=document.stem,
+                snapshot_revision=document.edit_revision,
+                requested_dirty_kinds=requested,
+                write_kinds=tuple(kind for kind in SAVE_KINDS if kind in write_kinds),
+                dirty_revisions={kind: document._dirty_revisions[kind] for kind in requested},
+                nodes=document.nodes.copy() if needs_graph else None,
+                edges=document.edges.copy() if needs_graph else None,
+                manual_widths=copy.deepcopy(document.manual_widths)
+                if "widths" in write_kinds else None,
+                surface_additions=document.surface_additions.copy()
+                if "surface" in write_kinds else None,
+                surface_removals=document.surface_removals.copy()
+                if "surface" in write_kinds else None,
+                candidates=copy.deepcopy(document.candidates)
+                if "geometry" in write_kinds else None,
+                applied_surface_region_ids=set(document.applied_surface_region_ids)
+                if "geometry" in write_kinds else None,
+                saved_geometry_nodes=document._saved_geometry_nodes.copy()
+                if "geometry" in write_kinds else None,
+                saved_geometry_edges=document._saved_geometry_edges.copy()
+                if "geometry" in write_kinds else None,
+                global_transform=getattr(document, "global_transform", None),
+                global_crs_wkt=(document.global_crs.to_wkt()
+                    if getattr(document, "global_mode", False) else ""),
+                global_overview_scale=float(
+                    getattr(document, "global_overview_scale", 1.0)
+                ),
+                global_raster_shape=tuple(document.surface_additions.shape)
+                if getattr(document, "global_mode", False) else None,
+                global_summary_rows=tuple(
+                    (stem, dict(summary))
+                    for stem, summary in getattr(document, "global_summary_rows", [])
+                ),
+            ))
+        if not snapshots:
+            return None
+        return SaveSnapshot(
+            edited_dir=self.edited_dir.expanduser().resolve(),
+            documents=tuple(snapshots), global_mode=global_mode,
+            final_centerlines=self.final_centerlines,
+            final_surfaces=self.final_surfaces,
+        )
+
+    def save_all(
+        self, show_message: bool = True, *, close_after: bool = False,
+    ) -> bool:
+        if self._save_in_progress:
+            self._save_requested_again = True
+            self._close_after_save = self._close_after_save or close_after
+            if hasattr(self, "status_var"):
+                self.status_var.set("正在保存编辑成果；已记录再次保存请求…")
+            return False
+        submit_started = time.perf_counter()
+        snapshot = self._build_save_snapshot()
+        self.last_save_submit_seconds = time.perf_counter() - submit_started
+        if snapshot is None:
+            if hasattr(self, "saved_var"):
+                self.saved_var.set("✓ 已保存")
+            if hasattr(self, "status_var"):
+                self.status_var.set("当前没有需要保存的新修改。")
+            if close_after:
+                self.root.destroy()
+            return False
+        self._save_in_progress = True
+        self._save_requested_again = False
+        self._save_show_message = bool(show_message)
+        self._close_after_save = bool(close_after)
+        self._active_save_snapshot = snapshot
+        self._save_queue = queue.Queue()
+        if hasattr(self, "saved_var"):
+            self.saved_var.set("正在保存…")
+        if hasattr(self, "status_var"):
+            self.status_var.set(
+                "正在保存编辑成果…" if not close_after else "正在保存后关闭…"
+            )
+        if hasattr(self, "save_button"):
+            self.save_button.configure(text="正在保存…", state="disabled")
+        self._save_thread = threading.Thread(
+            target=save_snapshot_worker,
+            args=(self._save_queue, snapshot),
+            name="geometry-editor-save", daemon=True,
+        )
+        self._save_thread.start()
+        self.root.after(25, self._poll_save_queue)
+        return True
+
+    def _finish_save_ui(self) -> None:
+        self._save_in_progress = False
+        self._save_thread = None
+        self._active_save_snapshot = None
+        if hasattr(self, "save_button"):
+            self.save_button.configure(text="保存编辑", state="normal")
+
+    def _poll_save_queue(self) -> None:
+        if self._save_queue is None:
+            return
+        terminal = None
+        while True:
+            try:
+                message = self._save_queue.get_nowait()
+            except queue.Empty:
+                break
+            if message[0] == "progress":
+                if hasattr(self, "status_var"):
+                    self.status_var.set(message[1])
+            else:
+                terminal = message
+        if terminal is None:
+            if self._save_in_progress:
+                self.root.after(50, self._poll_save_queue)
+            return
+        if terminal[0] == "error":
+            _kind, error, detail = terminal
+            print(detail, file=sys.stderr, flush=True)
+            self._finish_save_ui()
+            self._close_after_save = False
+            if hasattr(self, "saved_var"):
+                self.saved_var.set("保存失败 · 仍有未保存修改")
+            if hasattr(self, "status_var"):
+                self.status_var.set("保存失败。")
+            messagebox.showerror(
+                "保存失败",
+                f"无法保存人工编辑成果。\n\n原因：\n{error}",
+                parent=self.root,
+            )
+            return
+
+        result: SaveResult = terminal[1]
+        self.last_save_result = result
+        for saved in result.saved_documents:
+            document = self.documents[int(saved["document_index"])]
+            document.accept_saved_snapshot(
+                saved["dirty_revisions"], saved.get("saved_nodes"), saved.get("saved_edges"),
+            )
+        requested_again = self._save_requested_again
+        close_after = self._close_after_save
+        show_message = self._save_show_message
+        self._finish_save_ui()
+        self._save_requested_again = False
+        self._close_after_save = False
+        if self._has_unsaved_changes():
+            if hasattr(self, "saved_var"):
+                self.saved_var.set("已保存上一版本 · 当前还有未保存修改")
+            if hasattr(self, "status_var"):
+                self.status_var.set("上一版本已保存；当前仍有新的未保存修改。")
+            if requested_again or close_after:
+                self.save_all(show_message=False, close_after=close_after)
+            return
         if hasattr(self, "saved_var"):
             self.saved_var.set("✓ 已保存")
+        if hasattr(self, "status_var"):
+            self.status_var.set("✓ 已保存")
+        if close_after:
+            self.root.destroy()
+            return
         if show_message:
-            messagebox.showinfo(
-                "保存完成",
-                f"已保存 {len(self.documents)} 个切片到：\n{self.edited_dir}\n\n"
-                "请返回 SAMRoad 的“人工复核”步骤，点击“应用编辑并重新生成结果”。\n"
-                "此操作只重建本期道路面、宽度、相邻变化和长时序成果，不会重跑模型推理。",
-            )
+            manifest = result.manifest
+            if manifest.get("editing_scope") == "period_final_fused_centerlines_global_once":
+                messagebox.showinfo(
+                    "保存完成",
+                    f"编辑成果已保存到：\n{self.edited_dir}\n\n"
+                    f"受影响切片：{manifest['affected_tile_count']} / {manifest['tile_count']}。",
+                    parent=self.root,
+                )
+            else:
+                messagebox.showinfo(
+                    "保存完成", f"编辑成果已保存到：\n{self.edited_dir}", parent=self.root,
+                )
 
     def close(self) -> None:
-        if messagebox.askyesno("关闭编辑器", "关闭前是否保存所有修改？"):
-            self.save_all(show_message=False)
-        self.root.destroy()
+        if self._save_in_progress:
+            self._close_after_save = True
+            self._save_requested_again = True
+            if hasattr(self, "status_var"):
+                self.status_var.set("正在保存编辑成果，请稍候…")
+            messagebox.showinfo(
+                "正在保存", "正在保存编辑成果，请稍候。保存成功后编辑器将自动关闭。",
+                parent=self.root,
+            )
+            return
+        if not self._has_unsaved_changes():
+            self.root.destroy()
+            return
+        choice = messagebox.askyesnocancel(
+            "关闭编辑器",
+            "是否保存当前修改后关闭？\n\n选择“是”将保存完成后关闭；"
+            "选择“否”将放弃未保存修改；选择“取消”继续编辑。",
+            parent=self.root,
+        )
+        if choice is None:
+            return
+        if choice:
+            self.save_all(show_message=False, close_after=True)
+        else:
+            self.root.destroy()
 
 
 def enable_windows_high_dpi() -> None:
