@@ -36,16 +36,40 @@ class _Event:
 
 
 class _Canvas:
-    def __init__(self): self.coords_calls = []
+    def __init__(self):
+        self.coords_calls = []
+        self.xview_value = (0.0, 1.0)
+        self.yview_value = (0.0, 1.0)
     def canvasx(self, value): return value
     def canvasy(self, value): return value
     def winfo_width(self): return 400
     def winfo_height(self): return 300
+    def xview(self, *args): return self.xview_value
+    def yview(self, *args): return self.yview_value
     def scale(self, *args): pass
     def configure(self, **kwargs): pass
     def xview_moveto(self, value): pass
     def yview_moveto(self, value): pass
     def coords(self, *args): self.coords_calls.append(args)
+
+
+class _Root:
+    def __init__(self):
+        self.after_calls = []
+        self.cancelled = []
+
+    def after(self, delay, callback):
+        after_id = f"after-{len(self.after_calls) + 1}"
+        self.after_calls.append((after_id, delay, callback))
+        return after_id
+
+    def after_cancel(self, after_id):
+        self.cancelled.append(after_id)
+
+
+class _Scrollbar:
+    def __init__(self): self.values = []
+    def set(self, first, last): self.values.append((first, last))
 
 
 class GeometryEditorPerformanceTests(unittest.TestCase):
@@ -111,7 +135,8 @@ class GeometryEditorPerformanceTests(unittest.TestCase):
         app.canvas = _Canvas()
         app.zoom = 1.0
         app.min_zoom, app.max_zoom = 0.02, 64.0
-        app.refresh_background = lambda: None
+        app._background_scrollregion = None
+        app.schedule_background_refresh = lambda force=False: None
         app.refresh_static_geometry = lambda: None
         app.update_status = lambda: None
         before_nodes, before_edges = self.doc.nodes.copy(), self.doc.edges.copy()
@@ -127,6 +152,37 @@ class GeometryEditorPerformanceTests(unittest.TestCase):
         self.assertAlmostEqual(app._continuous_zoom(3.14159), 3.14159)
         self.assertEqual(app._continuous_zoom(100.0), 64.0)
         self.assertEqual(app._continuous_zoom(0.001), 0.02)
+
+    def test_background_refresh_schedule_is_debounced(self) -> None:
+        app = GeometryEditorApp.__new__(GeometryEditorApp)
+        app.documents, app.document_index = [self.doc], 0
+        app.canvas, app.root, app.zoom = _Canvas(), _Root(), 1.0
+        app.surface_versions = [0]
+        app._background_refresh_after_id = None
+        app._refreshing_background = False
+        app._last_background_view = None
+
+        app.schedule_background_refresh()
+        app.schedule_background_refresh()
+
+        self.assertEqual(len(app.root.after_calls), 1)
+        self.assertEqual(app.root.after_calls[0][1], 20)
+
+    def test_internal_scrollbar_callback_does_not_self_schedule(self) -> None:
+        app = GeometryEditorApp.__new__(GeometryEditorApp)
+        app.documents, app.document_index = [self.doc], 0
+        app.canvas, app.root, app.zoom = _Canvas(), _Root(), 1.0
+        app.surface_versions = [0]
+        app._background_refresh_after_id = None
+        app._refreshing_background = True
+        app._last_background_view = None
+        app._last_scrollbar_views = {"x": None, "y": None}
+        scrollbar = _Scrollbar()
+
+        app._scrollbar_changed("x", scrollbar, "0.0", "1.0")
+
+        self.assertEqual(scrollbar.values, [("0.0", "1.0")])
+        self.assertEqual(app.root.after_calls, [])
 
     def test_node_drag_updates_only_node_and_incident_edge_items(self) -> None:
         app = GeometryEditorApp.__new__(GeometryEditorApp)

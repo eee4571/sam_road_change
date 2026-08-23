@@ -6,7 +6,9 @@ import csv
 import ctypes
 import json
 import math
+import os
 import sys
+import time
 from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -1285,8 +1287,13 @@ class GeometryEditorApp:
         self.surface_versions = [0 for _ in self.documents]
         self.min_zoom = 0.02
         self.max_zoom = 64.0
-        self._background_refresh_pending = False
+        self._background_refresh_after_id: str | None = None
         self._refreshing_background = False
+        self._last_background_view: tuple | None = None
+        self._last_scrollbar_views: dict[str, tuple[float, float] | None] = {
+            "x": None, "y": None,
+        }
+        self._background_scrollregion: tuple[float, float, float, float] | None = None
         self.edge_items: dict[int, int] = {}
         self.node_items: dict[int, int] = {}
         self.width_preview: dict | None = None
@@ -1424,8 +1431,8 @@ class GeometryEditorApp:
         xscroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self._canvas_xview)
         yscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas_yview)
         self.canvas.configure(
-            xscrollcommand=lambda first, last: self._scrollbar_changed(xscroll, first, last),
-            yscrollcommand=lambda first, last: self._scrollbar_changed(yscroll, first, last),
+            xscrollcommand=lambda first, last: self._scrollbar_changed("x", xscroll, first, last),
+            yscrollcommand=lambda first, last: self._scrollbar_changed("y", yscroll, first, last),
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -1500,6 +1507,7 @@ class GeometryEditorApp:
         self.canvas.bind("<ButtonRelease-3>", self.mouse_right_release)
         self.canvas.bind("<Motion>", self.mouse_motion)
         self.canvas.bind("<MouseWheel>", self.mouse_wheel)
+        self.canvas.bind("<Configure>", lambda _event: self.schedule_background_refresh())
         self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-y>", lambda _event: self.redo())
         self.root.bind("<Control-s>", lambda _event: self.save_all())
@@ -1615,10 +1623,13 @@ class GeometryEditorApp:
             self.refresh_static_geometry()
         width = max(1.0, self.doc.image.shape[1] * new_zoom)
         height = max(1.0, self.doc.image.shape[0] * new_zoom)
-        self.canvas.configure(scrollregion=(0, 0, width, height))
+        scrollregion = (0.0, 0.0, float(width), float(height))
+        if self._background_scrollregion != scrollregion:
+            self.canvas.configure(scrollregion=scrollregion)
+            self._background_scrollregion = scrollregion
         self.canvas.xview_moveto(max(0.0, min(1.0, (source_col * new_zoom - anchor_x) / width)))
         self.canvas.yview_moveto(max(0.0, min(1.0, (source_row * new_zoom - anchor_y) / height)))
-        self.refresh_background()
+        self.schedule_background_refresh(force=True)
         self.update_status()
 
     def render_source(self) -> np.ndarray:
@@ -1769,8 +1780,34 @@ class GeometryEditorApp:
             self.photo_cache.popitem(last=False)
         return photo, left * self.zoom, top * self.zoom
 
+    def _background_view_state(self) -> tuple:
+        """Return the viewport inputs that materially affect the cached crop."""
+        xview = tuple(round(float(value), 7) for value in self.canvas.xview())
+        yview = tuple(round(float(value), 7) for value in self.canvas.yview())
+        return (
+            self.document_index,
+            round(float(self.zoom), 7),
+            xview,
+            yview,
+            int(self.canvas.winfo_width()),
+            int(self.canvas.winfo_height()),
+            int(self.surface_versions[self.document_index]),
+        )
+
+    def _cancel_background_refresh(self) -> None:
+        after_id = self._background_refresh_after_id
+        self._background_refresh_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.root.after_cancel(after_id)
+        except tk.TclError:
+            pass
+
     def refresh_background(self) -> None:
-        self._background_refresh_pending = False
+        self._cancel_background_refresh()
+        if self._refreshing_background:
+            return
         self._refreshing_background = True
         try:
             self.photo, image_x, image_y = self._background_photo()
@@ -1782,21 +1819,51 @@ class GeometryEditorApp:
             else:
                 self.canvas.itemconfigure(self.background_item, image=self.photo)
             self.canvas.coords(self.background_item, image_x, image_y)
-            self.canvas.configure(scrollregion=(
-                0, 0, self.doc.image.shape[1] * self.zoom, self.doc.image.shape[0] * self.zoom,
-            ))
+            scrollregion = (
+                0.0, 0.0,
+                float(self.doc.image.shape[1] * self.zoom),
+                float(self.doc.image.shape[0] * self.zoom),
+            )
+            if self._background_scrollregion != scrollregion:
+                self.canvas.configure(scrollregion=scrollregion)
+                self._background_scrollregion = scrollregion
             self.surface_dirty = False
         finally:
             self._refreshing_background = False
+            self._last_background_view = self._background_view_state()
 
-    def schedule_background_refresh(self) -> None:
-        if self._background_refresh_pending or self._refreshing_background:
+    def _run_scheduled_background_refresh(self) -> None:
+        self._background_refresh_after_id = None
+        if self._refreshing_background:
             return
-        self._background_refresh_pending = True
-        self.root.after_idle(self.refresh_background)
+        if self._last_background_view == self._background_view_state():
+            return
+        self.refresh_background()
 
-    def _scrollbar_changed(self, scrollbar, first: str, last: str) -> None:
+    def schedule_background_refresh(self, force: bool = False) -> None:
+        if self._refreshing_background:
+            return
+        if force:
+            self._last_background_view = None
+        elif self._last_background_view == self._background_view_state():
+            return
+        if self._background_refresh_after_id is not None:
+            return
+        self._background_refresh_after_id = self.root.after(
+            20, self._run_scheduled_background_refresh,
+        )
+
+    def _scrollbar_changed(self, axis: str, scrollbar, first: str, last: str) -> None:
         scrollbar.set(first, last)
+        current = (float(first), float(last))
+        previous = self._last_scrollbar_views.get(axis)
+        self._last_scrollbar_views[axis] = current
+        if self._refreshing_background:
+            return
+        if previous is not None and all(
+            abs(before - after) <= 1e-7 for before, after in zip(previous, current)
+        ):
+            return
         self.schedule_background_refresh()
 
     def _canvas_xview(self, *args) -> None:
@@ -2368,6 +2435,8 @@ class GeometryEditorApp:
         self.width_drag_current = None
         self.interval_draft = []
         self.interval_measurement_id = None
+        self._last_background_view = None
+        self._background_scrollregion = None
         self.full_refresh()
         self.fit_image()
 
@@ -2493,12 +2562,44 @@ def configure_ui_fonts(root: tk.Tk) -> None:
             continue
 
 
+def schedule_ready_signal(root: tk.Tk, ready_file: Path | None, review_dir: Path) -> None:
+    """Write the launcher handshake only after Tk has mapped the editor window."""
+    if ready_file is None:
+        return
+    ready_path = ready_file.expanduser().resolve()
+
+    def signal_when_viewable() -> None:
+        try:
+            if not root.winfo_exists():
+                return
+            if not root.winfo_viewable():
+                root.after(50, signal_when_viewable)
+                return
+            payload = {
+                "status": "ready",
+                "pid": os.getpid(),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "review_dir": str(review_dir.expanduser().resolve()),
+            }
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = ready_path.with_name(f".{ready_path.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            temporary.replace(ready_path)
+        except (OSError, tk.TclError) as exc:
+            print(f"Unable to write geometry editor ready signal: {exc}", file=sys.stderr, flush=True)
+
+    root.after(50, signal_when_viewable)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Built-in SAMRoad centerline and road-surface geometry editor.")
     parser.add_argument("--review-dir", required=True)
     parser.add_argument("--edited-dir", required=True)
     parser.add_argument("--final-centerlines", default="", help="Authoritative per-period fused centerline SHP.")
     parser.add_argument("--final-surfaces", default="", help="Authoritative per-period road-surface SHP.")
+    parser.add_argument("--ready-file", default="", help="Launcher handshake written after the Tk window is viewable.")
     args = parser.parse_args()
     enable_windows_high_dpi()
     root = tk.Tk()
@@ -2513,6 +2614,10 @@ def main() -> int:
     except Exception as exc:
         messagebox.showerror("几何编辑器启动失败", str(exc))
         raise
+    root.update_idletasks()
+    schedule_ready_signal(
+        root, Path(args.ready_file) if args.ready_file else None, Path(args.review_dir),
+    )
     root.mainloop()
     return 0
 

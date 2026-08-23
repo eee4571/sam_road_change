@@ -7,6 +7,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -390,7 +391,9 @@ def geometry_editor_diagnostics(review_dir: Path | str) -> list[str]:
     return diagnostics
 
 
-def build_geometry_editor_command(script: Path | str, item: dict[str, str]) -> list[str]:
+def build_geometry_editor_command(
+    script: Path | str, item: dict[str, str], ready_file: Path | str | None = None,
+) -> list[str]:
     """Build the exact optional-editor command from one manifest review item."""
     script_path = Path(script).expanduser().resolve()
     review_path = Path(item["directory"]).expanduser().resolve()
@@ -402,7 +405,7 @@ def build_geometry_editor_command(script: Path | str, item: dict[str, str]) -> l
         raise ValueError("该期次缺少最终融合中心线 SHP，无法按正式成果进行人工编辑。")
     if not final_surfaces:
         final_surfaces = str(Path(final_centerlines).with_name("road_surfaces.shp"))
-    return [
+    command = [
         sys.executable,
         str(script_path),
         "--review-dir",
@@ -414,6 +417,30 @@ def build_geometry_editor_command(script: Path | str, item: dict[str, str]) -> l
         "--final-surfaces",
         str(Path(final_surfaces).expanduser().resolve()),
     ]
+    if ready_file:
+        command.extend(("--ready-file", str(Path(ready_file).expanduser().resolve())))
+    return command
+
+
+def geometry_editor_process_state(
+    process: subprocess.Popen[str], ready_file: Path | None,
+    started_monotonic: float, now: float | None = None, timeout: float = 60.0,
+) -> tuple[str, dict[str, object]]:
+    """Return the non-blocking geometry-editor launcher state."""
+    if ready_file is not None and ready_file.is_file():
+        try:
+            payload = json.loads(ready_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("status") == "ready":
+            return "ready", payload
+    returncode = process.poll()
+    if returncode is not None:
+        return "failed", {"returncode": int(returncode)}
+    elapsed = (time.monotonic() if now is None else now) - started_monotonic
+    if elapsed >= timeout:
+        return "loading", {"elapsed_seconds": max(0.0, elapsed)}
+    return "starting", {"elapsed_seconds": max(0.0, elapsed)}
 
 
 def natural_key(value: str) -> tuple:
@@ -1090,6 +1117,13 @@ class UserApp:
         )
         self.queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
+        self.editor_process: subprocess.Popen[str] | None = None
+        self.editor_ready_file: Path | None = None
+        self.editor_started_monotonic: float | None = None
+        self.editor_launch_state = "idle"
+        self.editor_timeout_reported = False
+        self.editor_stdout_lines: list[str] = []
+        self.editor_stderr_lines: list[str] = []
         self.results_available = False
         self.review_items: list[dict[str, str]] = []
         self.temporal_items: list[dict[str, str]] = []
@@ -1928,8 +1962,8 @@ class UserApp:
             self.status.set("任务运行期间不能修改数据配置或人工编辑；仍可查看日志和已有成果。")
             return
         has_results = self.results_available
-        if index >= 2 and not has_results and not force:
-            self.status.set("请先完成自动处理，再进入人工编辑或成果步骤。")
+        if index == 3 and not has_results and not force:
+            self.status.set("请先完成自动处理或载入已有成果，再进入成果与评价步骤。")
             return
         for page in self.step_pages:
             page.pack_forget()
@@ -1955,7 +1989,7 @@ class UserApp:
         self.footer_next.configure(text=labels[index])
         if index == 3:
             self.footer_next.state(["disabled"])
-        elif index == 1 and not has_results:
+        elif index == 2 and not has_results:
             self.footer_next.state(["disabled"])
         else:
             self.footer_next.state(["!disabled"])
@@ -3362,6 +3396,18 @@ class UserApp:
                             self._append_log("日志", value)
                     else:
                         self._append_log("日志", value)
+                elif kind == "editor_stdout":
+                    self.editor_stdout_lines.append(value)
+                    if len(self.editor_stdout_lines) > 200:
+                        del self.editor_stdout_lines[:-200]
+                    if value:
+                        self._append_log("人工编辑", value)
+                elif kind == "editor_stderr":
+                    self.editor_stderr_lines.append(value)
+                    if len(self.editor_stderr_lines) > 200:
+                        del self.editor_stderr_lines[:-200]
+                    if value:
+                        self._append_log("人工编辑错误", value)
                 elif kind == "done":
                     if self.cancel_requested:
                         if self.active_command == "all":
@@ -3458,6 +3504,7 @@ class UserApp:
                     self._set_cancel_enabled(False)
         except queue.Empty:
             pass
+        self._poll_geometry_editor()
         self._refresh_progress_text()
         self.root.after(100, self._poll)
 
@@ -4092,9 +4139,12 @@ class UserApp:
         if not labels:
             self.review_selection.set("")
             self.review_combo.configure(state="disabled")
-            self.review_detail.set("自动处理结果没有可编辑的中心线复核资料，可直接跳过本步骤。")
+            self.review_detail.set(
+                "当前没有可编辑成果。完成至少一个期次的道路处理或载入已有成果后，"
+                "可在此进行人工编辑。"
+            )
             self.review_edit_directory.set("暂无可用编辑目录")
-            self.review_status.set("人工编辑是可选步骤；当前任务可直接进入成果页。")
+            self.review_status.set("当前没有可编辑成果；人工编辑是可选步骤。")
             self.launch_review_button.state(["disabled"])
             self.apply_review_button.state(["disabled"])
             return
@@ -4156,10 +4206,99 @@ class UserApp:
         if item is not None:
             self._open(Path(item["directory"]))
 
+    def _read_geometry_editor_stream(self, kind: str, stream) -> None:
+        try:
+            for line in stream:
+                self.queue.put((kind, line.rstrip("\r\n")))
+        finally:
+            stream.close()
+
+    def _clear_geometry_editor_state(self) -> None:
+        ready_file = self.editor_ready_file
+        self.editor_process = None
+        self.editor_ready_file = None
+        self.editor_started_monotonic = None
+        self.editor_launch_state = "idle"
+        self.editor_timeout_reported = False
+        if ready_file is not None:
+            try:
+                ready_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if hasattr(self, "launch_review_button") and self.review_items:
+            self.launch_review_button.state(["!disabled"])
+
+    def _poll_geometry_editor(self) -> None:
+        process = self.editor_process
+        if process is None:
+            return
+        if self.editor_launch_state == "ready":
+            returncode = process.poll()
+            if returncode is not None:
+                self._append_log("人工编辑", f"人工编辑器已关闭，退出码 {returncode}。")
+                self.status.set("人工编辑器已关闭；如已保存编辑，可应用并更新相关结果。")
+                self._clear_geometry_editor_state()
+            return
+        started = self.editor_started_monotonic
+        if started is None:
+            started = time.monotonic()
+            self.editor_started_monotonic = started
+        state, detail = geometry_editor_process_state(
+            process, self.editor_ready_file, started,
+        )
+        if state == "starting":
+            return
+        if state == "loading":
+            if not self.editor_timeout_reported:
+                self.editor_timeout_reported = True
+                message = "人工编辑器仍在加载，但尚未完成窗口初始化。"
+                self.status.set(message)
+                if hasattr(self, "review_status"):
+                    self.review_status.set(message)
+                self._append_log("人工编辑", message + "进程仍在运行，将继续等待 ready 信号。")
+            return
+        if state == "ready":
+            self.editor_launch_state = "ready"
+            message = "人工编辑器已打开。完成编辑并保存后，可返回此处更新相关结果。"
+            self.status.set(message)
+            if hasattr(self, "review_status"):
+                self.review_status.set(message)
+            self._append_log(
+                "人工编辑",
+                f"编辑器窗口已就绪（PID {detail.get('pid', process.pid)}）。",
+            )
+            if self.editor_ready_file is not None:
+                try:
+                    self.editor_ready_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.editor_ready_file = None
+            return
+        returncode = int(detail.get("returncode", process.poll() or 0))
+        error_lines = self.editor_stderr_lines[-20:] or self.editor_stdout_lines[-20:]
+        error_text = "\n".join(error_lines).strip() or "编辑器未输出错误详情。"
+        message = f"人工编辑器在窗口就绪前退出。退出码：{returncode}\n\n{error_text}"
+        self.status.set(f"人工编辑器启动失败（退出码 {returncode}）。")
+        if hasattr(self, "review_status"):
+            self.review_status.set("人工编辑器启动失败；请查看全流程日志。")
+        self._append_log("人工编辑", message.replace("\n", " | "))
+        messagebox.showerror("人工编辑器启动失败", message, parent=self.root)
+        self._show_log()
+        self._clear_geometry_editor_state()
+
     def launch_selected_review_editor(self) -> None:
         item = self._selected_review_item()
         if item is None:
             return
+        if self.editor_process is not None:
+            if self.editor_process.poll() is None:
+                messagebox.showinfo(
+                    "人工编辑器正在运行",
+                    "当前人工编辑器仍在启动或运行，请先使用现有窗口。",
+                    parent=self.root,
+                )
+                return
+            self._clear_geometry_editor_state()
         script = self._geometry_editor_script()
         if script is None:
             messagebox.showerror("缺少中心线编辑器", "未找到 geometry_editor.py。", parent=self.root)
@@ -4179,18 +4318,49 @@ class UserApp:
                 parent=self.root,
             )
             return
-        edited_dir = Path(item.get("edited_directory") or review_dir.parent / "centerline_edit").expanduser().resolve()
-        edited_dir.mkdir(parents=True, exist_ok=True)
-        self.review_edit_directory.set(str(edited_dir))
-        env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
+        ready_file = Path(tempfile.gettempdir()) / (
+            f"samroad_geometry_editor_ready_{os.getpid()}_{time.time_ns()}.json"
+        )
         try:
-            subprocess.Popen(build_geometry_editor_command(script, item), cwd=str(script.parent), env=env)
+            edited_dir = Path(
+                item.get("edited_directory") or review_dir.parent / "centerline_edit"
+            ).expanduser().resolve()
+            edited_dir.mkdir(parents=True, exist_ok=True)
+            self.review_edit_directory.set(str(edited_dir))
+            ready_file.unlink(missing_ok=True)
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            process = subprocess.Popen(
+                build_geometry_editor_command(script, item, ready_file),
+                cwd=str(script.parent), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法启动中心线编辑器", str(exc), parent=self.root)
             return
-        self.status.set("每期最终融合中心线编辑器已打开；保存后可增量重建，不会重跑推理。")
+        self.editor_process = process
+        self.editor_ready_file = ready_file
+        self.editor_started_monotonic = time.monotonic()
+        self.editor_launch_state = "starting"
+        self.editor_timeout_reported = False
+        self.editor_stdout_lines = []
+        self.editor_stderr_lines = []
+        self.launch_review_button.state(["disabled"])
+        self.status.set("正在启动人工编辑器，请稍候…")
+        if hasattr(self, "review_status"):
+            self.review_status.set("正在启动人工编辑器，请稍候…")
+        self._append_log("人工编辑", f"正在启动人工编辑器：{review_dir}")
+        assert process.stdout is not None and process.stderr is not None
+        threading.Thread(
+            target=self._read_geometry_editor_stream,
+            args=("editor_stdout", process.stdout), daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._read_geometry_editor_stream,
+            args=("editor_stderr", process.stderr), daemon=True,
+        ).start()
 
     def apply_selected_review(self) -> None:
         item = self._selected_review_item()

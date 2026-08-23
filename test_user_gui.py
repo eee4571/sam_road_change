@@ -4,8 +4,10 @@ import json
 import inspect
 import io
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import user_workflow_gui as gui
 
@@ -236,6 +238,25 @@ class UserGuiInputCommandTests(unittest.TestCase):
     def test_entering_run_step_does_not_auto_start_preflight(self) -> None:
         source = inspect.getsource(gui.UserApp._show_step)
         self.assertNotIn("preflight_inputs", source)
+
+    def test_manual_review_step_is_not_blocked_without_results(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.step_pages = [mock.Mock() for _ in range(4)]
+        app.process = None
+        app.current_step = 0
+        app.results_available = False
+        app.preflight_passed = False
+        app.status = mock.Mock()
+        app.root = mock.Mock()
+        app.footer_back = mock.Mock()
+        app.footer_next = mock.Mock()
+        app._populate_review_step = mock.Mock()
+
+        app._show_step(2)
+
+        self.assertEqual(app.current_step, 2)
+        app.step_pages[2].pack.assert_called_once()
+        app._populate_review_step.assert_called_once()
 
     def test_shared_log_widget_supports_selection_copy_and_file_opening(self) -> None:
         source = inspect.getsource(gui.UserApp._build_shared_log_panel)
@@ -579,7 +600,10 @@ class UserGuiArtifactTests(unittest.TestCase):
             self.assertTrue(inputs[0]["image_exists"])
             self.assertTrue(inputs[0]["prepared_graph_exists"])
             self.assertEqual(gui.geometry_editor_diagnostics(review), [])
-            command = gui.build_geometry_editor_command(root / "geometry_editor.py", item)
+            ready_file = root / "editor_ready.json"
+            command = gui.build_geometry_editor_command(
+                root / "geometry_editor.py", item, ready_file,
+            )
             self.assertEqual(Path(command[command.index("--review-dir") + 1]), review.resolve())
             self.assertEqual(
                 Path(command[command.index("--edited-dir") + 1]),
@@ -589,6 +613,140 @@ class UserGuiArtifactTests(unittest.TestCase):
                 Path(command[command.index("--final-centerlines") + 1]),
                 Path(item["final_centerlines"]).resolve(),
             )
+            self.assertEqual(
+                Path(command[command.index("--ready-file") + 1]), ready_file.resolve(),
+            )
+
+    def test_geometry_editor_process_stays_starting_until_ready_file_exists(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as raw:
+            ready_file = Path(raw) / "ready.json"
+            state, _detail = gui.geometry_editor_process_state(
+                process, ready_file, started_monotonic=10.0, now=20.0,
+            )
+            self.assertEqual(state, "starting")
+
+            ready_file.write_text(
+                json.dumps({"status": "ready", "pid": 123}), encoding="utf-8",
+            )
+            state, detail = gui.geometry_editor_process_state(
+                process, ready_file, started_monotonic=10.0, now=20.0,
+            )
+            self.assertEqual(state, "ready")
+            self.assertEqual(detail["pid"], 123)
+
+    def test_geometry_editor_process_reports_exit_before_ready(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = 7
+        state, detail = gui.geometry_editor_process_state(
+            process, None, started_monotonic=10.0, now=11.0,
+        )
+        self.assertEqual(state, "failed")
+        self.assertEqual(detail["returncode"], 7)
+
+    def test_editor_poll_sets_opened_only_after_ready_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            ready_file = Path(raw) / "ready.json"
+            ready_file.write_text(
+                json.dumps({"status": "ready", "pid": 123}), encoding="utf-8",
+            )
+            app = object.__new__(gui.UserApp)
+            app.editor_process = mock.Mock(pid=123)
+            app.editor_process.poll.return_value = None
+            app.editor_ready_file = ready_file
+            app.editor_started_monotonic = time.monotonic()
+            app.editor_launch_state = "starting"
+            app.editor_timeout_reported = False
+            app.editor_stdout_lines = []
+            app.editor_stderr_lines = []
+            app.status = mock.Mock()
+            app.review_status = mock.Mock()
+            app._append_log = mock.Mock()
+
+            app._poll_geometry_editor()
+
+            self.assertEqual(app.editor_launch_state, "ready")
+            app.status.set.assert_called_with(
+                "人工编辑器已打开。完成编辑并保存后，可返回此处更新相关结果。"
+            )
+            self.assertFalse(ready_file.exists())
+
+    def test_editor_poll_reports_early_exit_and_keeps_stderr(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.editor_process = mock.Mock(pid=999)
+        app.editor_process.poll.return_value = 9
+        app.editor_ready_file = None
+        app.editor_started_monotonic = time.monotonic()
+        app.editor_launch_state = "starting"
+        app.editor_timeout_reported = False
+        app.editor_stdout_lines = []
+        app.editor_stderr_lines = ["Traceback line", "RuntimeError: boom"]
+        app.status = mock.Mock()
+        app.review_status = mock.Mock()
+        app._append_log = mock.Mock()
+        app._show_log = mock.Mock()
+        app.root = mock.Mock()
+        app.review_items = [{}]
+        app.launch_review_button = mock.Mock()
+
+        with mock.patch.object(gui.messagebox, "showerror") as showerror:
+            app._poll_geometry_editor()
+
+        self.assertEqual(app.editor_launch_state, "idle")
+        error_message = showerror.call_args.args[1]
+        self.assertIn("退出码：9", error_message)
+        self.assertIn("RuntimeError: boom", error_message)
+
+    def test_launching_editor_reports_starting_not_opened_after_popen(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            review = root / "review"
+            review.mkdir()
+            image = root / "tile.tif"
+            graph = root / "tile_graph.p"
+            centerlines = root / "road_centerlines.shp"
+            surfaces = root / "road_surfaces.shp"
+            script = root / "geometry_editor.py"
+            for path in (image, graph, centerlines, surfaces, script):
+                path.touch()
+            (review / "tile_summary.json").write_text(
+                json.dumps({"image": str(image), "prepared_graph": str(graph)}),
+                encoding="utf-8",
+            )
+            item = {
+                "directory": str(review),
+                "edited_directory": str(root / "edited"),
+                "final_centerlines": str(centerlines),
+                "final_surfaces": str(surfaces),
+            }
+            app = object.__new__(gui.UserApp)
+            app.root = mock.Mock()
+            app.editor_process = None
+            app.review_items = [item]
+            app.review_edit_directory = mock.Mock()
+            app.launch_review_button = mock.Mock()
+            app.status = mock.Mock()
+            app.review_status = mock.Mock()
+            app._append_log = mock.Mock()
+            app._selected_review_item = lambda: item
+            app._geometry_editor_script = lambda: script
+            fake_process = mock.Mock()
+            fake_process.stdout = io.StringIO("")
+            fake_process.stderr = io.StringIO("")
+            fake_process.pid = 321
+            fake_process.poll.return_value = None
+
+            with mock.patch.object(gui.subprocess, "Popen", return_value=fake_process):
+                app.launch_selected_review_editor()
+
+            self.assertEqual(app.editor_launch_state, "starting")
+            app.status.set.assert_called_with("正在启动人工编辑器，请稍候…")
+            self.assertNotIn(
+                "已打开",
+                " ".join(str(call) for call in app.status.set.call_args_list),
+            )
+            app._clear_geometry_editor_state()
 
     def test_actual_run_2022_geometry_editor_paths_are_resolved(self) -> None:
         manifest_path = Path(__file__).resolve().parent / "outputs" / "latest_pipeline.json"
