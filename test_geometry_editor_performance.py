@@ -194,6 +194,7 @@ class GeometryEditorPerformanceTests(unittest.TestCase):
         app = GeometryEditorApp.__new__(GeometryEditorApp)
         app.documents, app.document_index = [self.doc], 0
         app.mode, app.zoom = _Var("measure_width"), 1.0
+        app.width_interaction_mode, app.active_pointer_action = "measure", "width_measure"
         app.width_drag_start, app.width_drag_current, app.width_preview = (43.0, 50.0), None, None
         app.space_panning = False
         app.source_point = lambda event: event.rc

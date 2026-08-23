@@ -2800,11 +2800,12 @@ class GeometryEditorApp:
         self.interval_draft: list[tuple[float, float]] = []
         self.interval_measurement_id: str | None = None
         self.active_width_measurement_id: str | None = None
+        self.width_interaction_mode = "select"
+        self.active_pointer_action: str | None = None
         self.width_range_drag_handle: str | None = None
         self.width_range_drag_original: dict | None = None
         self.width_range_drag_preview: dict | None = None
         self.remeasure_interval_id: str | None = None
-        self.pending_width_interval_id: str | None = None
         self.surface_radius = tk.IntVar(value=12)
         self.surface_action = tk.StringVar(value="add")
         self.surface_stroke_active = False
@@ -2970,6 +2971,7 @@ class GeometryEditorApp:
         ttk.Button(self.tool_draw_frame, text="完成绘线  Enter", command=self.finish_drawing).pack(fill="x", pady=2)
         ttk.Button(self.tool_draw_frame, text="取消  Esc", command=self.cancel_drawing).pack(fill="x", pady=2)
         self.tool_width_frame = ttk.Frame(tool_panel, style="Panel.TFrame")
+        ttk.Button(self.tool_width_frame, text="新建测宽", command=self.begin_new_width_measurement).pack(fill="x", pady=2)
         ttk.Button(self.tool_width_frame, text="调整范围", command=self.begin_adjust_width_range).pack(fill="x", pady=2)
         ttk.Button(self.tool_width_frame, text="重新测宽", command=self.begin_remeasure_width).pack(fill="x", pady=2)
         ttk.Button(self.tool_width_frame, text="删除人工宽度  Delete", command=self.delete_active_width).pack(fill="x", pady=2)
@@ -3048,6 +3050,7 @@ class GeometryEditorApp:
 
     def _mode_changed(self) -> None:
         mode = self.mode.get()
+        self.active_pointer_action = None
         if mode != "measure_width":
             self.width_drag_start = None
             self.width_drag_current = None
@@ -3058,7 +3061,11 @@ class GeometryEditorApp:
             self.width_range_drag_original = None
             self.width_range_drag_preview = None
             self.remeasure_interval_id = None
-            self.pending_width_interval_id = None
+            self.width_interaction_mode = "select"
+        else:
+            self.width_interaction_mode = (
+                "adjust_range" if self.active_width_measurement() is not None else "select"
+            )
         self.update_context_panel()
         self.refresh_dynamic_overlay()
 
@@ -3107,6 +3114,7 @@ class GeometryEditorApp:
         elif mode == "measure_width":
             self.tool_title_var.set("人工测宽  W")
             active = self.active_width_measurement()
+            interaction = getattr(self, "width_interaction_mode", "select")
             if self.width_preview is not None:
                 value = float(self.width_preview.get("width_units", 0.0))
                 self.tool_value_var.set(f"人工宽度：{value:.2f} m")
@@ -3115,17 +3123,21 @@ class GeometryEditorApp:
                 value = float(active.get("width_units", active.get("width_px", 0.0)))
                 lo = float(active.get("range_start_position", 0.0)) * float(getattr(self.doc, "pixel_size", 1.0))
                 hi = float(active.get("range_end_position", lo)) * float(getattr(self.doc, "pixel_size", 1.0))
-                if self.remeasure_interval_id:
+                if interaction == "remeasure":
                     self.tool_hint_var.set("请再次跨道路拖动；新宽度将沿用当前区间范围。")
+                elif interaction == "measure":
+                    self.tool_hint_var.set("新建测宽：请跨道路两侧拖动。")
+                elif interaction == "adjust_range":
+                    self.tool_hint_var.set("范围调整：只能选择人工区间或拖动两端控制点。")
                 else:
-                    self.tool_hint_var.set("已选中人工宽度。拖动两端控制点可调整范围。")
+                    self.tool_hint_var.set("已选中人工宽度。请选择调整范围、重新测宽或新建测宽。")
                 self.tool_value_var.set(
                     f"人工宽度\n{value:.2f} m\n\n范围\n{lo:.1f}–{hi:.1f} m\n\n来源\n人工测宽"
                 )
             else:
                 self.tool_hint_var.set(
-                    "跨道路两侧拖动鼠标测量宽度。"
-                    "系统会自动吸附到最近道路中心线，并将宽度应用到该道路的一段范围。"
+                    "新建测宽：请跨道路两侧拖动。" if interaction == "measure"
+                    else "单击已有人工宽度进行选择，或点击“新建测宽”。"
                 )
                 self.tool_value_var.set("尚无人工测宽记录")
             self.tool_width_frame.pack(fill="x")
@@ -3534,7 +3546,11 @@ class GeometryEditorApp:
                                 f"manual_width_{measurement.get('measurement_id', '')}",
                             ),
                         )
-                    if str(measurement.get("measurement_id", "")) == getattr(self, "active_width_measurement_id", None):
+                    if (
+                        str(measurement.get("measurement_id", ""))
+                        == getattr(self, "active_width_measurement_id", None)
+                        and getattr(self, "width_interaction_mode", "select") == "adjust_range"
+                    ):
                         chain_coords = [
                             value for row, col in points
                             for value in (float(col) * z, float(row) * z)
@@ -3546,7 +3562,9 @@ class GeometryEditorApp:
                         for handle, fill in (("start", "#F97316"), ("end", "#EF4444")):
                             row = float(measurement[f"range_{handle}_row"])
                             col = float(measurement[f"range_{handle}_col"])
-                            radius = max(6.0, 7.0 * float(getattr(self, "display_scale", 1.0)))
+                            # Canvas coordinates are already screen-space here, so keep
+                            # the visible handle at a stable 16-pixel diameter.
+                            radius = 8.0
                             self.canvas.create_oval(
                                 col * z - radius, row * z - radius,
                                 col * z + radius, row * z + radius,
@@ -3574,12 +3592,15 @@ class GeometryEditorApp:
 
     def width_range_handle_at(self, row: float, col: float) -> tuple[str, str] | None:
         """Return the nearest visible interval handle in source-pixel space."""
-        tolerance = max(5.0, 10.0 / max(self.zoom, 1e-6))
+        tolerance = 14.0 / max(self.zoom, 1e-6)
         best: tuple[float, str, str] | None = None
+        active_id = str(getattr(self, "active_width_measurement_id", "") or "")
         for measurement in self.doc.manual_widths:
             if str(measurement.get("source", "")) != "manual_interval_width":
                 continue
             measurement_id = str(measurement.get("measurement_id", ""))
+            if not active_id or measurement_id != active_id:
+                continue
             for handle in ("start", "end"):
                 try:
                     handle_row = float(measurement[f"range_{handle}_row"])
@@ -3757,31 +3778,42 @@ class GeometryEditorApp:
             self.update_context_panel()
             self.refresh_dynamic_overlay()
         elif mode == "measure_width":
-            handle_hit = self.width_range_handle_at(row, col)
-            if handle_hit is not None and handle_hit[0] == self.active_width_measurement_id:
-                self.active_width_measurement_id, self.width_range_drag_handle = handle_hit
-                self.width_range_drag_original = copy.deepcopy(self.active_width_measurement())
-                self.width_range_drag_preview = None
-                self.width_drag_start = None
-                self.width_drag_current = None
-                self.refresh_manual_widths()
-                self.update_context_panel()
-            elif self.interval_measurement_id is not None:
+            self.active_pointer_action = None
+            interaction = getattr(self, "width_interaction_mode", "select")
+            if self.interval_measurement_id is not None:
                 self.interval_draft.append((row, col))
                 if len(self.interval_draft) == 2:
                     self.finish_width_interval()
                 else:
                     self.context_text.set("区间定宽：已选择起点，请在同一连续道路链上选择终点。")
                     self.refresh_dynamic_overlay()
-            elif getattr(self, "remeasure_interval_id", None) is None:
+            elif interaction == "adjust_range":
+                handle_hit = self.width_range_handle_at(row, col)
+                if handle_hit is not None:
+                    self.active_width_measurement_id, self.width_range_drag_handle = handle_hit
+                    self.active_pointer_action = f"range_{handle_hit[1]}_drag"
+                    self.width_range_drag_original = copy.deepcopy(self.active_width_measurement())
+                    self.width_range_drag_preview = None
+                    self.refresh_manual_widths()
+                    self.update_context_panel()
+                    return
                 interval_hit = self.manual_width_interval_at(row, col)
                 if interval_hit is not None:
-                    self.pending_width_interval_id = interval_hit
-                self.width_drag_start = (row, col)
-                self.width_drag_current = (row, col)
-                self.width_preview = None
-                self.refresh_dynamic_overlay()
-            else:
+                    self.active_width_measurement_id = interval_hit
+                    self.active_pointer_action = "interval_select"
+                    self.context_text.set("已选中人工宽度区间；可直接拖动两端控制点调整范围。")
+                    self.refresh_manual_widths()
+                    self.update_context_panel()
+            elif interaction == "select":
+                interval_hit = self.manual_width_interval_at(row, col)
+                if interval_hit is not None:
+                    self.active_width_measurement_id = interval_hit
+                    self.active_pointer_action = "interval_select"
+                    self.context_text.set("已选中人工宽度区间。")
+                    self.refresh_manual_widths()
+                    self.update_context_panel()
+            elif interaction in {"measure", "remeasure"}:
+                self.active_pointer_action = "width_measure"
                 self.width_drag_start = (row, col)
                 self.width_drag_current = (row, col)
                 self.width_preview = None
@@ -3812,7 +3844,9 @@ class GeometryEditorApp:
             if math.hypot(row - last[0], col - last[1]) >= max(1.0, 3.0 / self.zoom):
                 self.lasso.append((row, col))
                 self._extend_lasso_canvas(event)
-        elif self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
+        elif self.mode.get() == "measure_width" and str(
+            getattr(self, "active_pointer_action", "") or ""
+        ).startswith("range_"):
             active = self.width_range_drag_original or self.active_width_measurement()
             if active is None:
                 self.width_range_drag_handle = None
@@ -3828,12 +3862,12 @@ class GeometryEditorApp:
             self.context_text.set("正在预览人工宽度作用范围；松开鼠标后应用。")
             self.refresh_manual_widths()
             self.update_context_panel()
-        elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
+        elif (
+            self.mode.get() == "measure_width"
+            and getattr(self, "active_pointer_action", None) == "width_measure"
+            and self.width_drag_start is not None
+        ):
             self.width_drag_current = (row, col)
-            if math.hypot(
-                row - self.width_drag_start[0], col - self.width_drag_start[1],
-            ) >= max(2.0, 4.0 / max(self.zoom, 1e-6)):
-                self.pending_width_interval_id = None
             preview, _error = create_normal_width_measurement(
                 self.doc, self.width_drag_start, self.width_drag_current,
                 max_centerline_distance=max(12.0, 24.0 / self.zoom),
@@ -3857,7 +3891,8 @@ class GeometryEditorApp:
             return
         surface_was_active = self.surface_stroke_active
         self.surface_stroke_active = False
-        if self.mode.get() == "measure_width" and getattr(self, "width_range_drag_handle", None) is not None:
+        pointer_action = getattr(self, "active_pointer_action", None)
+        if self.mode.get() == "measure_width" and str(pointer_action or "").startswith("range_"):
             preview = self.width_range_drag_preview
             if preview is not None:
                 self.doc.checkpoint("widths")
@@ -3868,31 +3903,19 @@ class GeometryEditorApp:
                 self.saved_var.set("尚未保存")
                 self.context_text.set("已更新当前道路段的人工宽度。")
                 self._manual_widths_changed()
-            self.width_range_drag_handle = None
-            self.width_range_drag_original = None
-            self.width_range_drag_preview = None
+            self._clear_width_pointer_action()
+            self.width_interaction_mode = "adjust_range"
             self.refresh_manual_widths()
             self.update_context_panel()
-        elif self.mode.get() == "measure_width" and self.width_drag_start is not None:
+        elif (
+            self.mode.get() == "measure_width"
+            and pointer_action == "width_measure"
+            and self.width_drag_start is not None
+        ):
             self.width_drag_current = self.source_point(event)
-            pending = getattr(self, "pending_width_interval_id", None)
-            distance = math.hypot(
-                self.width_drag_current[0] - self.width_drag_start[0],
-                self.width_drag_current[1] - self.width_drag_start[1],
-            )
-            if pending is not None and distance < max(2.0, 4.0 / max(self.zoom, 1e-6)):
-                self.active_width_measurement_id = pending
-                self.pending_width_interval_id = None
-                self.width_drag_start = None
-                self.width_drag_current = None
-                self.width_preview = None
-                self.context_text.set("已选中人工宽度区间。")
-                self.refresh_manual_widths()
-                self.refresh_dynamic_overlay()
-                self.update_context_panel()
-            else:
-                self.pending_width_interval_id = None
-                self.finish_width_measurement()
+            self.finish_width_measurement()
+        elif self.mode.get() == "measure_width" and pointer_action == "interval_select":
+            self.active_pointer_action = None
         if self.drag_node is not None:
             if self.drag_changed:
                 self.doc.invalidate_geometry_cache()
@@ -3994,11 +4017,31 @@ class GeometryEditorApp:
         else:
             self.delete_selected_edges()
 
+    def _clear_width_pointer_action(self) -> None:
+        self.active_pointer_action = None
+        self.width_drag_start = None
+        self.width_drag_current = None
+        self.width_preview = None
+        self.width_range_drag_handle = None
+        self.width_range_drag_original = None
+        self.width_range_drag_preview = None
+
+    def begin_new_width_measurement(self) -> None:
+        self._clear_width_pointer_action()
+        self.remeasure_interval_id = None
+        self.width_interaction_mode = "measure"
+        self.context_text.set("新建测宽：请跨道路两侧拖动。")
+        self.refresh_manual_widths()
+        self.refresh_dynamic_overlay()
+        self.update_context_panel()
+
     def begin_adjust_width_range(self) -> None:
         if self.active_width_measurement() is None:
             self.context_text.set("请先在地图上单击一个人工宽度区间。")
             return
+        self._clear_width_pointer_action()
         self.remeasure_interval_id = None
+        self.width_interaction_mode = "adjust_range"
         self.context_text.set("拖动选中区间的橙色或红色端点，松开后应用新范围。")
         self.refresh_manual_widths()
         self.update_context_panel()
@@ -4008,10 +4051,9 @@ class GeometryEditorApp:
         if active is None:
             self.context_text.set("请先在地图上单击一个人工宽度区间。")
             return
+        self._clear_width_pointer_action()
         self.remeasure_interval_id = str(active.get("measurement_id", ""))
-        self.width_drag_start = None
-        self.width_drag_current = None
-        self.width_preview = None
+        self.width_interaction_mode = "remeasure"
         self.context_text.set("请再次跨道路拖动；只更新宽度，保留当前作用范围。")
         self.update_context_panel()
 
@@ -4028,9 +4070,8 @@ class GeometryEditorApp:
         )
         self.active_width_measurement_id = None
         self.remeasure_interval_id = None
-        self.width_range_drag_handle = None
-        self.width_range_drag_original = None
-        self.width_range_drag_preview = None
+        self._clear_width_pointer_action()
+        self.width_interaction_mode = "select"
         self.saved_var.set("尚未保存")
         self.context_text.set("已删除该段人工宽度，当前范围恢复使用自动测宽结果。")
         self._manual_widths_changed()
@@ -4058,7 +4099,19 @@ class GeometryEditorApp:
     def mouse_motion(self, event) -> None:
         self.mouse_status = self.source_point(event)
         if self.mode.get() == "measure_width":
-            cursor = "hand2" if self.width_range_handle_at(*self.mouse_status) is not None else "crosshair"
+            interaction = getattr(self, "width_interaction_mode", "select")
+            if interaction in {"measure", "remeasure"}:
+                cursor = "crosshair"
+            elif interaction == "adjust_range":
+                cursor = (
+                    "hand2" if self.width_range_handle_at(*self.mouse_status) is not None
+                    else "arrow"
+                )
+            else:
+                cursor = (
+                    "hand2" if self.manual_width_interval_at(*self.mouse_status) is not None
+                    else "arrow"
+                )
             self.canvas.configure(cursor=cursor)
         elif self.mode.get() == "surface_add":
             self.canvas.configure(cursor="pencil")
@@ -4151,15 +4204,27 @@ class GeometryEditorApp:
     def cancel_drawing(self) -> None:
         self.draft = []
         self.width_draft = []
-        self.width_drag_start = None
-        self.width_drag_current = None
+        if self.mode.get() == "measure_width":
+            self._clear_width_pointer_action()
+            self.remeasure_interval_id = None
+            self.width_interaction_mode = (
+                "adjust_range" if self.active_width_measurement() is not None else "select"
+            )
+            self.context_text.set(
+                "已取消当前操作。可继续调整选中区间。"
+                if self.active_width_measurement() is not None
+                else "已取消当前操作。请选择已有人工宽度或点击“新建测宽”。"
+            )
+        else:
+            self.width_drag_start = None
+            self.width_drag_current = None
         self.interval_draft = []
         self.interval_measurement_id = None
         self.lasso = []
         self.lasso_active = False
         self._remove_lasso_canvas()
         self.width_preview = None
-        self.pending_width_interval_id = None
+        self.refresh_manual_widths()
         self.refresh_dynamic_overlay()
         self.update_context_panel()
 
@@ -4196,6 +4261,9 @@ class GeometryEditorApp:
                 self.remeasure_interval_id = None
             elif int(selected.get("target_chain_id", -1)) != int(measurement.get("target_chain_id", -2)):
                 messagebox.showwarning("测宽未保存", "重新测宽必须落在当前人工区间所在的道路链上。")
+                self._clear_width_pointer_action()
+                self.remeasure_interval_id = None
+                self.width_interaction_mode = "adjust_range"
                 self.update_context_panel()
                 return
             else:
@@ -4213,8 +4281,13 @@ class GeometryEditorApp:
         )
         self.active_width_measurement_id = str(measurement.get("measurement_id", ""))
         self.remeasure_interval_id = None
+        self.active_pointer_action = None
+        self.width_interaction_mode = "adjust_range"
         self.saved_var.set("尚未保存")
-        self.context_text.set("已更新当前道路段的人工宽度。")
+        self.context_text.set(
+            f"已测得 {float(measurement['width_units']):.2f} m。"
+            "拖动两端控制点可调整作用范围；如需再次测宽，请点击“新建测宽”。"
+        )
         self._manual_widths_changed()
         self.refresh_manual_widths()
         self.refresh_dynamic_overlay()
@@ -4224,9 +4297,8 @@ class GeometryEditorApp:
         if self.active_width_measurement() is None:
             return
         self.active_width_measurement_id = None
-        self.width_range_drag_handle = None
-        self.width_range_drag_original = None
-        self.width_range_drag_preview = None
+        self._clear_width_pointer_action()
+        self.width_interaction_mode = "select"
         self.context_text.set("人工宽度区间已保留在当前编辑状态。")
         self.refresh_manual_widths()
         self.update_context_panel()
@@ -4243,6 +4315,7 @@ class GeometryEditorApp:
             messagebox.showinfo("请先测宽", "请先跨道路拖动一次，得到需要应用的人工宽度。")
             return
         self.interval_measurement_id = str(measurement.get("measurement_id", ""))
+        self._clear_width_pointer_action()
         self.interval_draft = []
         self.width_drag_start = None
         self.width_drag_current = None
@@ -4278,6 +4351,7 @@ class GeometryEditorApp:
             self.doc.manual_widths, interval, self.doc,
         )
         self.active_width_measurement_id = str(interval.get("measurement_id", ""))
+        self.width_interaction_mode = "adjust_range"
         self.interval_draft = []
         self.interval_measurement_id = None
         self.saved_var.set("尚未保存")
@@ -4315,7 +4389,8 @@ class GeometryEditorApp:
             self.width_range_drag_original = None
             self.width_range_drag_preview = None
             self.remeasure_interval_id = None
-            self.pending_width_interval_id = None
+            self.active_pointer_action = None
+            self.width_interaction_mode = "select"
             self.full_refresh()
 
     def redo(self) -> None:
@@ -4334,7 +4409,8 @@ class GeometryEditorApp:
             self.width_range_drag_original = None
             self.width_range_drag_preview = None
             self.remeasure_interval_id = None
-            self.pending_width_interval_id = None
+            self.active_pointer_action = None
+            self.width_interaction_mode = "select"
             self.full_refresh()
 
     def change_tile(self, _event=None) -> None:
@@ -4353,7 +4429,8 @@ class GeometryEditorApp:
         self.width_range_drag_original = None
         self.width_range_drag_preview = None
         self.remeasure_interval_id = None
-        self.pending_width_interval_id = None
+        self.active_pointer_action = None
+        self.width_interaction_mode = "select"
         self._last_background_view = None
         self._background_scrollregion = None
         self.full_refresh()

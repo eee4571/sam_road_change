@@ -34,6 +34,7 @@ from geometry_editor import (  # noqa: E402
     create_normal_width_measurement,
     delete_manual_width_interval,
     effective_width_surface_preview,
+    load_documents,
     load_manual_widths,
     manual_width_interval_overlaps,
     manual_width_preview_geometry,
@@ -54,6 +55,11 @@ class _Variable:
 
 class _Event:
     def __init__(self, rc): self.rc = rc
+
+
+class _Canvas:
+    def __init__(self): self.options = {}
+    def configure(self, **kwargs): self.options.update(kwargs)
 
 
 class ManualWidthOverrideTests(unittest.TestCase):
@@ -114,6 +120,34 @@ class ManualWidthOverrideTests(unittest.TestCase):
             for row in rows if row.get("source") == "manual_interval_width"
         )
 
+    def _interaction_app(self, document: GeometryDocument | None = None) -> GeometryEditorApp:
+        app = GeometryEditorApp.__new__(GeometryEditorApp)
+        app.documents, app.document_index = [document or self.document], 0
+        app.mode, app.zoom = _Variable("measure_width"), 1.0
+        app.width_interaction_mode, app.active_pointer_action = "select", None
+        app.active_width_measurement_id = None
+        app.width_range_drag_handle = None
+        app.width_range_drag_original = None
+        app.width_range_drag_preview = None
+        app.width_drag_start = app.width_drag_current = app.width_preview = None
+        app.interval_measurement_id, app.interval_draft = None, []
+        app.remeasure_interval_id = None
+        app.width_draft, app.draft = [], []
+        app.space_pressed = app.space_panning = False
+        app.surface_stroke_active, app.drag_node = False, None
+        app.lasso_active, app.lasso = False, []
+        app.selected_edge_ids = set()
+        app.context_text, app.saved_var = _Variable(), _Variable()
+        app.canvas = _Canvas()
+        app.source_point = lambda event: event.rc
+        app.refresh_manual_widths = lambda: None
+        app.refresh_dynamic_overlay = lambda: None
+        app.update_context_panel = lambda: None
+        app.update_status = lambda: None
+        app._show_unsaved = lambda: None
+        app._remove_lasso_canvas = lambda: None
+        return app
+
     def test_drag_events_create_one_measurement(self) -> None:
         app = GeometryEditorApp.__new__(GeometryEditorApp)
         app.documents, app.document_index = [self.document], 0
@@ -121,6 +155,8 @@ class ManualWidthOverrideTests(unittest.TestCase):
         app.interval_measurement_id, app.interval_draft = None, []
         app.width_draft, app.width_drag_start, app.width_drag_current = [], None, None
         app.width_preview = None
+        app.width_interaction_mode, app.active_pointer_action = "measure", None
+        app.remeasure_interval_id = None
         app.surface_stroke_active, app.drag_node, app.lasso = False, None, []
         app.space_pressed, app.space_panning, app.lasso_active = False, False, False
         app.saved_var, app.context_text = _Variable(), _Variable()
@@ -466,9 +502,10 @@ class ManualWidthOverrideTests(unittest.TestCase):
         app.width_range_drag_handle = None
         app.width_range_drag_original = None
         app.width_range_drag_preview = None
+        app.width_interaction_mode, app.active_pointer_action = "adjust_range", None
         app.width_drag_start = app.width_drag_current = app.width_preview = None
         app.interval_measurement_id, app.interval_draft = None, []
-        app.remeasure_interval_id = app.pending_width_interval_id = None
+        app.remeasure_interval_id = None
         app.space_pressed = app.space_panning = False
         app.surface_stroke_active, app.drag_node = False, None
         app.lasso_active, app.lasso = False, []
@@ -486,6 +523,139 @@ class ManualWidthOverrideTests(unittest.TestCase):
         app.mouse_release(_Event((50, 80)))
         self.assertEqual(self._profile(self.document.manual_widths), [(20, 80, 16), (80, 100, 12)])
         self.assertEqual(len(self.document.undo_stack), 1)
+
+    def test_adjust_range_click_away_from_handle_never_starts_measurement(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_press(_Event((10, 10)))
+        self.assertIsNone(app.active_pointer_action)
+        self.assertIsNone(app.width_drag_start)
+        self.assertIsNone(app.width_drag_current)
+        self.assertIsNone(app.width_preview)
+
+    def test_adjust_range_handle_routes_only_to_range_drag(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_press(_Event((50, 80)))
+        self.assertEqual(app.active_pointer_action, "range_end_drag")
+        self.assertEqual(app.width_range_drag_handle, "end")
+        self.assertIsNone(app.width_drag_start)
+        app.mouse_drag(_Event((50, 90)))
+        self.assertIsNotNone(app.width_range_drag_preview)
+        self.assertEqual(len(self.document.manual_widths), 1)
+
+    def test_adjust_range_near_miss_never_becomes_width_measurement(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_press(_Event((50, 95)))
+        app.mouse_drag(_Event((35, 95)))
+        app.mouse_release(_Event((35, 95)))
+        self.assertNotEqual(app.active_pointer_action, "width_measure")
+        self.assertIsNone(app.width_drag_start)
+        self.assertEqual(len(self.document.manual_widths), 1)
+
+    def test_measure_state_drag_creates_new_width(self) -> None:
+        app = self._interaction_app()
+        app.width_interaction_mode = "measure"
+        app.mouse_press(_Event((42, 50)))
+        self.assertEqual(app.active_pointer_action, "width_measure")
+        app.mouse_drag(_Event((58, 50)))
+        app.mouse_release(_Event((58, 50)))
+        self.assertEqual(len(self.document.manual_widths), 1)
+
+    def test_remeasure_updates_width_but_preserves_range(self) -> None:
+        interval = self._interval(20, 80, 12, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.begin_remeasure_width()
+        original_range = (
+            interval["range_start_position"], interval["range_end_position"],
+        )
+        app.mouse_press(_Event((40, 50)))
+        app.mouse_drag(_Event((60, 50)))
+        app.mouse_release(_Event((60, 50)))
+        updated = app.active_width_measurement()
+        self.assertEqual(
+            (updated["range_start_position"], updated["range_end_position"]),
+            original_range,
+        )
+        self.assertAlmostEqual(updated["width_px"], 20.0)
+
+    def test_select_state_click_interval_only_selects(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.mouse_press(_Event((50, 50)))
+        self.assertEqual(app.active_width_measurement_id, "MW00001")
+        self.assertEqual(app.active_pointer_action, "interval_select")
+        self.assertIsNone(app.width_drag_start)
+        app.mouse_release(_Event((50, 50)))
+        self.assertIsNone(app.active_pointer_action)
+        self.assertEqual(len(self.document.manual_widths), 1)
+
+    def test_new_measurement_finishes_in_adjust_range_state(self) -> None:
+        app = self._interaction_app()
+        app.begin_new_width_measurement()
+        app.mouse_press(_Event((42, 50)))
+        app.mouse_drag(_Event((58, 50)))
+        app.mouse_release(_Event((58, 50)))
+        self.assertEqual(app.width_interaction_mode, "adjust_range")
+        self.assertIsNotNone(app.active_width_measurement())
+
+    def test_range_drag_finishes_in_adjust_range_state(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_press(_Event((50, 80)))
+        app.mouse_drag(_Event((50, 90)))
+        app.mouse_release(_Event((50, 90)))
+        self.assertEqual(app.width_interaction_mode, "adjust_range")
+        self.assertIsNone(app.active_pointer_action)
+
+    def test_width_cursor_reflects_interaction_state(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "measure"
+        app.mouse_motion(_Event((10, 10)))
+        self.assertEqual(app.canvas.options["cursor"], "crosshair")
+        app.width_interaction_mode = "remeasure"
+        app.mouse_motion(_Event((10, 10)))
+        self.assertEqual(app.canvas.options["cursor"], "crosshair")
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_motion(_Event((50, 80)))
+        self.assertEqual(app.canvas.options["cursor"], "hand2")
+        app.mouse_motion(_Event((10, 10)))
+        self.assertEqual(app.canvas.options["cursor"], "arrow")
+
+    def test_escape_clears_width_gesture_and_returns_to_safe_state(self) -> None:
+        interval = self._interval(20, 80, 16, "MW00001")
+        self.document.manual_widths = [interval]
+        app = self._interaction_app()
+        app.active_width_measurement_id = "MW00001"
+        app.width_interaction_mode = "adjust_range"
+        app.mouse_press(_Event((50, 80)))
+        app.mouse_drag(_Event((50, 90)))
+        self.assertIsNotNone(app.width_range_drag_preview)
+        app.cancel_drawing()
+        self.assertEqual(app.width_interaction_mode, "adjust_range")
+        self.assertIsNone(app.active_pointer_action)
+        self.assertIsNone(app.width_drag_start)
+        self.assertIsNone(app.width_range_drag_handle)
+        self.assertIsNone(app.width_range_drag_preview)
 
     def test_preview_shrinks_when_manual_width_changes_12_to_6(self) -> None:
         auto = np.zeros((120, 120), dtype=np.uint8)
@@ -665,6 +835,65 @@ class ManualWidthOverrideTests(unittest.TestCase):
             "manual_12m_surface_px": wide_area,
             "deleted_override_surface_px": automatic_area,
             "real_outputs_modified": False,
+        }, ensure_ascii=False))
+
+    def test_real_area1_2021_width_pointer_routing(self) -> None:
+        if os.environ.get("SAMROAD_REAL_WIDTH_UI_VERIFY") != "1":
+            self.skipTest("set SAMROAD_REAL_WIDTH_UI_VERIFY=1 for the real pointer-routing verification")
+        period = Path(
+            "project/04_成果输出/run_20260818_231625/grids/area1/periods/2021"
+        ).resolve()
+        run_root = period / "runs/roads"
+        review = run_root / "width_review"
+        edited = run_root / "centerline_edit"
+        centerlines = run_root / "products/road_centerlines.shp"
+        surfaces = run_root / "products/road_surfaces.shp"
+        if not all(path.exists() for path in (review, edited, centerlines, surfaces)):
+            self.skipTest("run_20260818_231625 area1/2021 is not available")
+
+        document = load_documents(review, edited, centerlines, surfaces)[0]
+        interval = next(
+            row for row in document.manual_widths
+            if row.get("source") == "manual_interval_width"
+        )
+        app = self._interaction_app(document)
+        app.active_width_measurement_id = str(interval["measurement_id"])
+        app.width_interaction_mode = "adjust_range"
+        start = (
+            float(interval["range_start_row"]),
+            float(interval["range_start_col"]),
+        )
+
+        # Repeated clicks on both sides of the 14-screen-pixel hit boundary
+        # may drag/select/do nothing, but must never become a width measure.
+        routed_actions = []
+        for offset in (0.0, 13.0, 15.0, -13.0, -15.0):
+            point = (start[0] + offset, start[1])
+            app.mouse_press(_Event(point))
+            routed_actions.append(app.active_pointer_action)
+            self.assertNotEqual(app.active_pointer_action, "width_measure")
+            self.assertIsNone(app.width_drag_start)
+            app.mouse_drag(_Event((point[0] + 6.0, point[1] + 6.0)))
+            self.assertIsNone(app.width_preview)
+            app.cancel_drawing()
+
+        app.begin_new_width_measurement()
+        measure_start = (float(interval["start_row"]), float(interval["start_col"]))
+        measure_end = (float(interval["end_row"]), float(interval["end_col"]))
+        with mock.patch("geometry_editor.messagebox.showwarning") as warning:
+            app.mouse_press(_Event(measure_start))
+            self.assertEqual(app.active_pointer_action, "width_measure")
+            app.mouse_drag(_Event(measure_end))
+            app.mouse_release(_Event(measure_end))
+        warning.assert_not_called()
+        self.assertEqual(app.width_interaction_mode, "adjust_range")
+        self.assertIsNotNone(app.active_width_measurement())
+        print(json.dumps({
+            "real_period": str(period),
+            "measurement_id": str(interval["measurement_id"]),
+            "near_handle_actions": routed_actions,
+            "new_measurement_state": app.width_interaction_mode,
+            "formal_outputs_modified": False,
         }, ensure_ascii=False))
 
 
