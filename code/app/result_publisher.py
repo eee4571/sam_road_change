@@ -111,6 +111,15 @@ class ProjectLayout:
     def legacy_full_run_root(self, run_id: object) -> Path:
         return self.legacy_results_root / safe_name(run_id)
 
+    def existing_full_run_root(self, run_id: object) -> Path | None:
+        """Return the resumable run root, preferring the current task layout."""
+        current = self.full_run_root(run_id)
+        legacy = self.legacy_full_run_root(run_id)
+        for candidate in (current, legacy):
+            if (candidate / "job_state.json").is_file():
+                return candidate
+        return None
+
     @property
     def legacy_latest_pipeline_path(self) -> Path:
         return self.legacy_results_root / "latest_pipeline.json"

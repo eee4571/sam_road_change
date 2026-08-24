@@ -100,7 +100,9 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                     raise RuntimeError("interrupted")
                 return self._complete_fake_stage(workspace, label)
 
-            with patch.object(user_pipeline, "run_command", side_effect=interrupted), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+            with patch.object(user_pipeline, "run_command", side_effect=interrupted), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "interrupted"):
                     user_pipeline.extract(args)
             self.assertEqual(first_calls, ["道路提取", "道路面提取"])
@@ -120,7 +122,9 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                 resumed_calls.append(label)
                 return self._complete_fake_stage(workspace, label)
 
-            with patch.object(user_pipeline, "run_command", side_effect=resumed), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+            with patch.object(user_pipeline, "run_command", side_effect=resumed), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
                 result = user_pipeline.extract(args)
 
             self.assertNotIn("道路提取", resumed_calls)
@@ -142,7 +146,9 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                 calls.append(label)
                 return self._complete_fake_stage(workspace, label)
 
-            with patch.object(user_pipeline, "run_command", side_effect=fake_run), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
                 user_pipeline.extract(args)
 
             self.assertEqual(calls[0], "道路面提取")
@@ -162,7 +168,9 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                 calls.append(label)
                 return self._complete_fake_stage(workspace, label)
 
-            with patch.object(user_pipeline, "run_command", side_effect=fake_run), patch.object(user_pipeline, "_write_valid_observation_area", return_value=None):
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
                 user_pipeline.extract(args)
 
             self.assertEqual(calls[0], "道路提取")
@@ -742,6 +750,168 @@ class ValidationInputTests(unittest.TestCase):
 
 
 class OneClickPipelineTests(unittest.TestCase):
+    def _legacy_full_run_fixture(self, root: Path, *, status: str) -> tuple[argparse.Namespace, dict, Path, Path]:
+        project = root / "project"
+        source = project / "input"
+        output = project / "成果输出"
+        source.mkdir(parents=True)
+        layout = {"g": {"2021": source / "2021.tif", "2022": source / "2022.tif"}}
+        for periods in layout.values():
+            for path in periods.values():
+                path.touch()
+        args = argparse.Namespace(
+            mode="grid", source_root=str(source), output_root=str(output), run_id="legacy_run",
+            checkpoint="model.ckpt", config="config.yaml", device="cpu",
+            pixel_size="0", rescale="off", absolute="1", ratio="0.1", tolerance="3",
+            truth_type_field="", continue_on_error=True, resume=True,
+        )
+        spec = user_pipeline._task_input_spec("grid", layout, "", {}, args)
+        spec["pipeline_version"] = "legacy-layout-version"
+        job_root = project / "04_成果输出" / "legacy_run"
+        period_results = []
+        for period in layout["g"]:
+            workspace = job_root / "grids" / "g" / "periods" / period
+            products = workspace / "products"
+            products.mkdir(parents=True)
+            center = products / "road_centerlines.shp"
+            surface = products / "road_surfaces.shp"
+            gpkg = products / "roads.gpkg"
+            for path in (center, surface, gpkg):
+                path.touch()
+            result_path = workspace / "latest_result.json"
+            result = {
+                "centerlines": str(center), "surfaces": str(surface), "gpkg": str(gpkg),
+            }
+            user_pipeline.write_json(result_path, result)
+            period_results.append({
+                "grid": "g", "period": period, "status": "completed",
+                "result": str(result_path), **result,
+            })
+        change_root = job_root / "grids" / "g" / "changes" / "2021_to_2022"
+        change_root.mkdir(parents=True)
+        summary = change_root / "change_summary.json"
+        changes = change_root / "road_changes.shp"
+        user_pipeline.write_json(summary, {})
+        changes.touch()
+        temporal_root = job_root / "grids" / "g" / "05_长时序成果"
+        temporal_root.mkdir(parents=True)
+        temporal = {"grid": "g", "status": "completed"}
+        for key, name in (
+            ("life_shp", "road_life.shp"), ("observations_shp", "road_obs.shp"),
+            ("events_shp", "road_event.shp"), ("event_parts_shp", "event_parts.shp"),
+            ("lineage_shp", "road_lineage.shp"), ("review_shp", "road_review.shp"),
+        ):
+            path = temporal_root / name
+            path.touch()
+            temporal[key] = str(path)
+        evaluation_csv = job_root / "evaluation_summary.csv"
+        evaluation_json = job_root / "evaluation_summary.json"
+        evaluation_csv.touch()
+        user_pipeline.write_json(evaluation_json, {})
+        manifest = {
+            "pipeline_version": "legacy-layout-version", "run_id": "legacy_run",
+            "project_root": str(project), "output_root": str(project / "04_成果输出"),
+            "job_root": str(job_root), "mode": "grid", "input_spec": spec,
+            "status": status, "attempt": 1, "period_results": period_results,
+            "change_results": [{
+                "grid": "g", "before_period": "2021", "after_period": "2022",
+                "status": "completed", "output": str(change_root), "summary": str(summary),
+                "layers": {"changes": str(changes)},
+            }],
+            "temporal_results": [temporal],
+            "evaluation_summary": {"csv": str(evaluation_csv), "json": str(evaluation_json)},
+            "failures": [], "elapsed_seconds": 12.0,
+        }
+        user_pipeline.write_json(job_root / "job_state.json", manifest)
+        user_pipeline.write_json(job_root / "pipeline_result.json", manifest)
+        return args, layout, job_root, output
+
+    def test_legacy_running_resume_uses_legacy_root_without_creating_new_run(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args, layout, job_root, output = self._legacy_full_run_fixture(Path(raw), status="running")
+            current_root = output.parent / "_work" / "tasks" / "runs" / "legacy_run"
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout), \
+                    patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract") as extract_mock, \
+                    patch.object(user_pipeline, "change") as change_mock, \
+                    patch.object(user_pipeline, "build_temporal_outputs") as temporal_mock, \
+                    patch.object(user_pipeline, "aggregate_change_evaluations") as evaluation_mock:
+                result = user_pipeline.run_all(args)
+
+            self.assertEqual(Path(result["job_root"]), job_root)
+            self.assertFalse(current_root.exists())
+            prepare_mock.assert_not_called(); extract_mock.assert_not_called(); change_mock.assert_not_called()
+            temporal_mock.assert_not_called(); evaluation_mock.assert_not_called()
+            self.assertTrue((output / "g" / "01_单期道路" / "2021" / "road_centerlines.shp").is_file())
+            self.assertTrue((output / "g" / "02_变化检测" / "2021_to_2022" / "road_changes.shp").is_file())
+            self.assertTrue((output / "g" / "03_长时序" / "road_life.shp").is_file())
+            self.assertTrue((output / "g" / "04_精度评价" / "evaluation_summary.json").is_file())
+
+    def test_completed_legacy_run_republishes_idempotently_without_computation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args, layout, job_root, output = self._legacy_full_run_fixture(Path(raw), status="completed")
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout), \
+                    patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract") as extract_mock, \
+                    patch.object(user_pipeline, "change") as change_mock, \
+                    patch.object(user_pipeline, "build_temporal_outputs") as temporal_mock, \
+                    patch.object(user_pipeline, "aggregate_change_evaluations") as evaluation_mock:
+                first = user_pipeline.run_all(args)
+                first_index = user_pipeline.read_json(output / "result_index.json")
+                second = user_pipeline.run_all(args)
+                second_index = user_pipeline.read_json(output / "result_index.json")
+
+            self.assertEqual(Path(first["job_root"]), job_root)
+            self.assertEqual(Path(second["job_root"]), job_root)
+            prepare_mock.assert_not_called(); extract_mock.assert_not_called(); change_mock.assert_not_called()
+            temporal_mock.assert_not_called(); evaluation_mock.assert_not_called()
+            self.assertEqual(set(first_index["areas"]), {"g"})
+            self.assertEqual(set(second_index["areas"]["g"]["periods"]), {"2021", "2022"})
+            self.assertEqual(set(second_index["areas"]["g"]["changes"]), {"2021_to_2022"})
+            self.assertEqual(
+                first_index["areas"]["g"]["periods"]["2021"]["centerlines"],
+                second_index["areas"]["g"]["periods"]["2021"]["centerlines"],
+            )
+
+    def test_resume_prefers_current_state_and_rejects_bad_legacy_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            layout = user_pipeline.ProjectLayout.from_output(output)
+            current = layout.full_run_root("same_run")
+            legacy = layout.legacy_full_run_root("same_run")
+            current.mkdir(parents=True); legacy.mkdir(parents=True)
+            user_pipeline.write_json(current / "job_state.json", {"run_id": "same_run", "job_root": str(current)})
+            (legacy / "job_state.json").write_text("{broken", encoding="utf-8")
+            self.assertEqual(
+                user_pipeline._resolve_full_run_job_root(layout, "same_run", resume=True), current,
+            )
+
+            (current / "job_state.json").unlink()
+            selected = user_pipeline._resolve_full_run_job_root(layout, "same_run", resume=True)
+            with self.assertRaisesRegex(ValueError, "JSON 损坏"):
+                user_pipeline._read_full_run_resume_state(selected / "job_state.json", "same_run", selected)
+            user_pipeline.write_json(legacy / "job_state.json", {
+                "run_id": "different_run", "job_root": str(legacy),
+            })
+            with self.assertRaisesRegex(ValueError, "run_id 不一致"):
+                user_pipeline._read_full_run_resume_state(legacy / "job_state.json", "same_run", legacy)
+            user_pipeline.write_json(legacy / "job_state.json", {
+                "run_id": "same_run", "job_root": str(project / "missing_old_location"),
+            })
+            with self.assertRaisesRegex(ValueError, "job_root.*不一致"):
+                user_pipeline._read_full_run_resume_state(legacy / "job_state.json", "same_run", legacy)
+
+    def test_corrupt_legacy_resume_fails_before_creating_current_run(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args, layout, job_root, output = self._legacy_full_run_fixture(Path(raw), status="running")
+            (job_root / "job_state.json").write_text("{broken", encoding="utf-8")
+            current_root = output.parent / "_work" / "tasks" / "runs" / "legacy_run"
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout):
+                with self.assertRaisesRegex(ValueError, "JSON 损坏"):
+                    user_pipeline.run_all(args)
+            self.assertFalse(current_root.exists())
+
     def test_extracts_each_period_and_compares_adjacent_periods(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

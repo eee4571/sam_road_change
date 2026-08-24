@@ -168,6 +168,33 @@ class ResultPublisherTests(unittest.TestCase):
             self.assertTrue({"区域A", "单期道路", "2021", "中心线"}.issubset(labels))
             self.assertFalse((root / "04_成果输出" / "result_index.json").exists())
 
+    def test_opening_legacy_project_only_writes_read_only_available_index(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            run = project / "04_成果输出" / "run_old"
+            center = make_shapefile(run / "grids" / "区域A" / "periods" / "2021", "center", "legacy")
+            manifest_path = run / "pipeline_result.json"
+            manifest_path.write_text(json.dumps({
+                "run_id": "run_old", "project_root": str(project), "job_root": str(run),
+                "status": "completed", "period_results": [{
+                    "grid": "区域A", "period": "2021", "centerlines": str(center),
+                }],
+                "change_results": [], "temporal_results": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            legacy_files = {path.relative_to(run) for path in run.rglob("*") if path.is_file()}
+
+            manifest, available = discover_project_result_context(project, output, persist=True)
+
+            self.assertEqual(len(manifest["period_results"]), 1)
+            self.assertEqual(available, project / "_work" / "tasks" / "available_results.json")
+            self.assertTrue(available.is_file())
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                legacy_files,
+                {path.relative_to(run) for path in run.rglob("*") if path.is_file()},
+            )
+
     def test_old_standalone_period_and_change_tasks_are_aggregated_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             output = Path(raw) / "04_成果输出"

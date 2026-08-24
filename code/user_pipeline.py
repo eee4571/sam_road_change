@@ -337,6 +337,50 @@ def project_layout(output_root: Path | str, project_root_value: Path | str | Non
     )
 
 
+def _resolve_full_run_job_root(
+    layout: ProjectLayout, run_id: str, *, resume: bool,
+) -> Path:
+    """Choose a full-run workspace without creating a directory before resume validation."""
+    current = layout.full_run_root(run_id)
+    if not resume:
+        return current
+    existing = layout.existing_full_run_root(run_id)
+    if existing is not None:
+        return existing
+    legacy = layout.legacy_full_run_root(run_id)
+    raise FileNotFoundError(
+        "找不到可续跑的任务状态。已依次检查：\n"
+        f"- {current / 'job_state.json'}\n"
+        f"- {legacy / 'job_state.json'}"
+    )
+
+
+def _read_full_run_resume_state(state_path: Path, run_id: str, job_root: Path) -> dict:
+    """Read and validate the selected state before any run directory is created."""
+    try:
+        prior = read_json(state_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"任务状态 JSON 损坏或无法读取：{state_path}：{exc}") from exc
+    if not isinstance(prior, dict):
+        raise ValueError(f"任务状态 JSON 根节点必须是对象：{state_path}")
+    state_run_id = str(prior.get("run_id") or "").strip()
+    if state_run_id != run_id:
+        raise ValueError(
+            f"任务状态 run_id 不一致：请求 {run_id}，状态记录 {state_run_id or '（缺失）'}：{state_path}"
+        )
+    recorded_root_value = str(prior.get("job_root") or "").strip()
+    if recorded_root_value:
+        recorded_root = Path(recorded_root_value).expanduser()
+        if not recorded_root.is_absolute():
+            recorded_root = state_path.parent / recorded_root
+        if recorded_root.resolve() != job_root.resolve():
+            raise ValueError(
+                "任务状态中的 job_root 与找到的任务目录不一致，不能静默迁移或从头运行："
+                f"记录为 {recorded_root.resolve()}，实际为 {job_root.resolve()}"
+            )
+    return prior
+
+
 def natural_key(value: str) -> tuple:
     """Sort validated calendar periods first and custom names naturally."""
     return period_sort_key(value)
@@ -2866,7 +2910,8 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
 
 def _period_result_ready(entry: dict) -> bool:
     """Return whether a prior period result is complete enough to resume from."""
-    if str(entry.get("status") or "").casefold() in {"stale", "failed", "running"}:
+    status = str(entry.get("status") or "").casefold()
+    if status and status != "completed":
         return False
     try:
         result_path = Path(str(entry.get("result") or "")).expanduser()
@@ -2883,10 +2928,40 @@ def _period_result_ready(entry: dict) -> bool:
 
 def _change_result_ready(entry: dict) -> bool:
     """A no-change run may omit a GPKG, so the summary is the stable marker."""
-    if str(entry.get("status") or "").casefold() in {"stale", "failed", "running"}:
+    status = str(entry.get("status") or "").casefold()
+    if status and status != "completed":
         return False
     try:
         return Path(str(entry.get("summary") or "")).expanduser().is_file()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _temporal_result_ready(entry: dict) -> bool:
+    """Return whether every formal long-term output is still available."""
+    status = str(entry.get("status") or "").casefold()
+    if status and status != "completed":
+        return False
+    try:
+        return all(
+            Path(str(entry.get(key) or "")).expanduser().is_file()
+            for key in (
+                "life_shp", "observations_shp", "events_shp",
+                "event_parts_shp", "lineage_shp", "review_shp",
+            )
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _evaluation_summary_ready(summary: object) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    try:
+        return all(
+            Path(str(summary.get(key) or "")).expanduser().is_file()
+            for key in ("csv", "json")
+        )
     except (OSError, ValueError, TypeError):
         return False
 
@@ -3565,23 +3640,26 @@ def run_all(args: argparse.Namespace) -> dict:
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = clean_name(args.run_id.strip() or time.strftime("run_%Y%m%d_%H%M%S"))
     layout = project_layout(output_root)
-    layout.ensure_project_directories()
-    job_root = layout.full_run_root(run_id)
     resume = bool(getattr(args, "resume", False))
+    job_root = _resolve_full_run_job_root(layout, run_id, resume=resume)
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     if job_root.exists() and not resume:
         raise FileExistsError(f"任务目录已存在：{job_root}。如需继续，请使用 --resume。")
-    job_root.mkdir(parents=True, exist_ok=True)
 
     input_spec = _task_input_spec(mode, grids, validation_area, truth_by_pair, args)
     prior = {}
     state_path = job_root / "job_state.json"
     invalidation = {"periods": [], "changes": [], "threshold_changed": False, "truth_changed": False, "reuse_all": False}
     if resume:
-        if not state_path.is_file():
-            raise FileNotFoundError(f"找不到可续跑的任务状态：{state_path}")
-        prior = read_json(state_path)
-        invalidation = dependency_invalidation_plan(prior.get("input_spec") or {}, input_spec)
+        prior = _read_full_run_resume_state(state_path, run_id, job_root)
+        prior_input_spec = dict(prior.get("input_spec") or {})
+        if job_root == layout.legacy_full_run_root(run_id):
+            # A storage-layout upgrade alone must not invalidate completed inference.
+            prior_input_spec["pipeline_version"] = input_spec.get("pipeline_version")
+        invalidation = dependency_invalidation_plan(prior_input_spec, input_spec)
+    layout.ensure_project_directories()
+    if not resume:
+        job_root.mkdir(parents=True, exist_ok=False)
 
     invalid_periods = {tuple(value) for value in invalidation["periods"]}
     invalid_changes = {tuple(value) for value in invalidation["changes"]}
@@ -3600,17 +3678,51 @@ def run_all(args: argparse.Namespace) -> dict:
         for entry in prior.get("change_results", []) if isinstance(entry, dict)
         and (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period"))) not in invalid_changes
     }
+    expected_periods = {
+        (str(grid), str(period))
+        for grid, periods in grids.items() for period in periods
+    }
+    expected_changes = {
+        (str(grid), str(before), str(after))
+        for grid, periods in grids.items()
+        for before, after in zip(list(periods), list(periods)[1:])
+    }
+    expected_temporal_grids = {str(grid) for grid in grids}
+    prior_temporal = {
+        str(entry.get("grid")): entry
+        for entry in prior.get("temporal_results", []) if isinstance(entry, dict)
+    }
+    periods_ready = (
+        set(prior_periods) == expected_periods
+        and all(_period_result_ready(entry) for entry in prior_periods.values())
+    )
+    changes_ready = (
+        set(prior_changes) == expected_changes
+        and all(_change_result_ready(entry) for entry in prior_changes.values())
+    )
+    temporal_ready = (
+        set(prior_temporal) == expected_temporal_grids
+        and all(_temporal_result_ready(entry) for entry in prior_temporal.values())
+    )
+    reuse_completed_downstream = bool(
+        resume and invalidation["reuse_all"]
+        and periods_ready and changes_ready and temporal_ready
+    )
     if resume and invalidation["reuse_all"] and prior.get("status") in {"completed", "completed_with_errors"}:
-        periods_ready = all(_period_result_ready(entry) for entry in prior_periods.values())
-        changes_ready = all(_change_result_ready(entry) for entry in prior_changes.values())
-        if periods_ready and changes_ready:
+        if periods_ready and changes_ready and temporal_ready:
             prior["attempt"] = int(prior.get("attempt", 0) or 0) + 1
             prior["resumed_at"] = now_text()
             prior["last_reused_at"] = now_text()
             prior["reuse_count"] = int(prior.get("reuse_count", 0) or 0) + 1
-            ResultPublisher(output_root).publish_manifest(
+            prior["job_root"] = str(job_root)
+            prior["project_root"] = str(layout.project_root)
+            prior["output_root"] = str(output_root)
+            publisher = ResultPublisher(output_root)
+            publisher.publish_manifest(
                 prior, source_manifest=job_root / "pipeline_result.json",
             )
+            _write_task_report(prior, job_root)
+            publisher.publish_reports(job_root)
             _persist_pipeline(prior, job_root, output_root)
             emit(
                 "complete", stage="all", manifest=str(job_root / "pipeline_result.json"),
@@ -3892,9 +4004,18 @@ def run_all(args: argparse.Namespace) -> dict:
             "pipeline", stage="长时序道路汇总", status="running",
             completed=total_work, total=total_work,
         )
-        manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
-        for entry in manifest["temporal_results"]:
-            entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
+        if reuse_completed_downstream:
+            manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
+            emit(
+                "pipeline", stage="长时序道路汇总", status="skipped",
+                reason="续跑复用已完成且完整的长时序成果",
+                temporal_grid_count=len(manifest["temporal_results"]),
+                completed=total_work, total=total_work,
+            )
+        else:
+            manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+            for entry in manifest["temporal_results"]:
+                entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
         emit(
             "pipeline", stage="长时序道路汇总", status="complete",
             temporal_grid_count=len(manifest["temporal_results"]),
@@ -3903,7 +4024,10 @@ def run_all(args: argparse.Namespace) -> dict:
         manifest["completed_at"] = now_text()
         manifest["status"] = "completed_with_errors" if manifest["failures"] else "completed"
         update_elapsed()
-        aggregate_change_evaluations(manifest, job_root)
+        if reuse_completed_downstream and _evaluation_summary_ready(prior.get("evaluation_summary")):
+            manifest["evaluation_summary"] = prior["evaluation_summary"]
+        else:
+            aggregate_change_evaluations(manifest, job_root)
         publisher = ResultPublisher(output_root)
         publisher.publish_manifest(
             manifest, source_manifest=job_root / "pipeline_result.json",

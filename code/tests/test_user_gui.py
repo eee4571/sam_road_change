@@ -228,6 +228,23 @@ class UserGuiInputCommandTests(unittest.TestCase):
             self.assertTrue(resume)
             self.assertEqual(resolved, state)
 
+    def test_automatic_run_uses_legacy_state_and_prefers_current_when_both_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            legacy = project / "04_成果输出" / "shared_run" / "job_state.json"
+            current = project / "_work" / "tasks" / "runs" / "shared_run" / "job_state.json"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text('{"run_id":"shared_run","status":"running"}', encoding="utf-8")
+
+            run_id, resume, resolved = gui.resolve_automatic_run(output, "shared_run")
+            self.assertEqual((run_id, resume, resolved), ("shared_run", True, legacy))
+
+            current.parent.mkdir(parents=True)
+            current.write_text('{"run_id":"shared_run","status":"running"}', encoding="utf-8")
+            run_id, resume, resolved = gui.resolve_automatic_run(output, "shared_run")
+            self.assertEqual((run_id, resume, resolved), ("shared_run", True, current))
+
     def test_data_check_and_runtime_preflight_are_separate_commands(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw); area = root / "area.shp"; area.touch()

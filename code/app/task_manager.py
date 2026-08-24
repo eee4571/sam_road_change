@@ -43,10 +43,9 @@ def unfinished_task_state(output_root: Path | str, active_task: dict | None) -> 
         state_path = Path(state_value).expanduser()
     else:
         output = Path(output_root).expanduser()
-        state_path = ProjectLayout.from_output(output).full_run_root(run_id) / "job_state.json"
-        legacy = ProjectLayout.from_output(output).legacy_full_run_root(run_id) / "job_state.json"
-        if not state_path.is_file() and legacy.is_file():
-            state_path = legacy
+        layout = ProjectLayout.from_output(output)
+        job_root = layout.existing_full_run_root(run_id) or layout.full_run_root(run_id)
+        state_path = job_root / "job_state.json"
     if not state_path.is_file():
         return None
     try:
@@ -90,12 +89,8 @@ def mark_task_cancelled(output_root: Path | str, run_id: str) -> dict | None:
         return None
     output = Path(output_root).expanduser()
     layout = ProjectLayout.from_output(output)
-    job_root = layout.full_run_root(run_id)
+    job_root = layout.existing_full_run_root(run_id) or layout.full_run_root(run_id)
     state_path = job_root / "job_state.json"
-    legacy_job_root = layout.legacy_full_run_root(run_id)
-    if not state_path.is_file() and (legacy_job_root / "job_state.json").is_file():
-        job_root = legacy_job_root
-        state_path = job_root / "job_state.json"
     if not state_path.is_file():
         return None
     try:
@@ -105,7 +100,8 @@ def mark_task_cancelled(output_root: Path | str, run_id: str) -> dict | None:
         manifest["status"] = "cancelled"
         manifest["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         latest = (
-            layout.legacy_latest_pipeline_path if job_root == legacy_job_root
+            layout.legacy_latest_pipeline_path
+            if job_root == layout.legacy_full_run_root(run_id)
             else layout.latest_pipeline_path
         )
         for target in (state_path, job_root / "pipeline_result.json", latest):
@@ -291,10 +287,9 @@ def resolve_automatic_run(
     active = active_task if isinstance(active_task, dict) else {}
     run_id = str(requested_run_id or active.get("run_id") or generated_run_id or time.strftime("run_%Y%m%d_%H%M%S")).strip()
     output = Path(output_root).expanduser()
-    state = ProjectLayout.from_output(output).full_run_root(run_id) / "job_state.json"
-    legacy = ProjectLayout.from_output(output).legacy_full_run_root(run_id) / "job_state.json"
-    if not state.is_file() and legacy.is_file():
-        state = legacy
+    layout = ProjectLayout.from_output(output)
+    job_root = layout.existing_full_run_root(run_id) or layout.full_run_root(run_id)
+    state = job_root / "job_state.json"
     return run_id, state.is_file(), state
 
 def find_period_result(item: dict[str, str]) -> Path | None:
