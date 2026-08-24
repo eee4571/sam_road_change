@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 import cv2
 import numpy as np
@@ -1312,6 +1313,11 @@ def reconstruct_surface_from_widths(
     resolved_widths[protected_widths] = initial_widths[protected_widths]
     if config.regular_surface:
         support_widths = resolved_widths.copy()
+    edge_drawing_started = time.perf_counter()
+    # Non-regular mode still needs exact per-edge masks for selective boundary
+    # replacement.  Regular mode is purely width driven: retaining one full
+    # raster per edge can consume tens of GiB for a dense 4096 px tile, while
+    # the union can be rendered directly into the shared canvas.
     edge_corridors: list[np.ndarray | None] = [None] * len(graph_edges)
     profiled_edge_count = 0
     fallback_edge_count = 0
@@ -1338,16 +1344,16 @@ def reconstruct_surface_from_widths(
         ]
         if config.preserve_reference_surface and not config.regular_surface and not boundary_rows and grades_by_edge.get(edge_id) == "C":
             continue
-        edge_surface = np.zeros(shape, dtype=np.uint8)
         if config.regular_surface:
             _draw_buffer_edge(
-                edge_surface,
+                surface,
                 nodes[int(src_idx)],
                 nodes[int(dst_idx)],
                 fallback_width,
                 config.width_scale,
             )
         else:
+            edge_surface = np.zeros(shape, dtype=np.uint8)
             _draw_asymmetric_edge(
                 edge_surface,
                 nodes[int(src_idx)],
@@ -1357,8 +1363,8 @@ def reconstruct_surface_from_widths(
                 probability_gradient,
                 config,
             )
-        surface |= edge_surface
-        edge_corridors[edge_id] = edge_surface
+            surface |= edge_surface
+            edge_corridors[edge_id] = edge_surface
 
     regular_join_count = 0
     regular_junction_join_count = 0
@@ -1370,12 +1376,14 @@ def reconstruct_surface_from_widths(
             surface, nodes, graph_edges, resolved_widths, config.width_scale, config.junction_min_degree
         )
     width_corridors = surface.copy()
-    support_corridors = np.zeros(shape, dtype=np.uint8)
-    for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
-        support_width = float(support_widths[edge_id])
-        if config.regular_surface:
-            _draw_buffer_edge(support_corridors, nodes[int(src_idx)], nodes[int(dst_idx)], support_width, config.width_scale)
-        else:
+    if config.regular_surface:
+        # In regular mode support_widths and resolved_widths are identical, so
+        # rebuilding thousands of the same edge buffers is unnecessary.
+        support_corridors = width_corridors.copy()
+    else:
+        support_corridors = np.zeros(shape, dtype=np.uint8)
+        for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
+            support_width = float(support_widths[edge_id])
             _draw_variable_edge(
                 support_corridors,
                 nodes[int(src_idx)],
@@ -1383,26 +1391,11 @@ def reconstruct_surface_from_widths(
                 [(0.0, support_width), (1.0, support_width)],
                 config.width_scale,
             )
-    if config.regular_surface:
-        _fill_regular_chain_joins(
-            support_corridors, nodes, graph_edges, support_widths, config.width_scale
-        )
-        _fill_regular_junction_joins(
-            support_corridors, nodes, graph_edges, support_widths, config.width_scale, config.junction_min_degree
-        )
     authoritative_corridors = width_corridors.copy()
-    for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
-        if edge_corridors[edge_id] is not None:
-            continue
-        if config.regular_surface:
-            _draw_buffer_edge(
-                authoritative_corridors,
-                nodes[int(src_idx)],
-                nodes[int(dst_idx)],
-                float(resolved_widths[edge_id]),
-                config.width_scale,
-            )
-        else:
+    if not config.regular_surface:
+        for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
+            if edge_corridors[edge_id] is not None:
+                continue
             _draw_variable_edge(
                 authoritative_corridors,
                 nodes[int(src_idx)],
@@ -1413,13 +1406,8 @@ def reconstruct_surface_from_widths(
                 ],
                 config.width_scale,
             )
-    if config.regular_surface:
-        _fill_regular_chain_joins(
-            authoritative_corridors, nodes, graph_edges, resolved_widths, config.width_scale
-        )
-        _fill_regular_junction_joins(
-            authoritative_corridors, nodes, graph_edges, resolved_widths, config.width_scale, config.junction_min_degree
-        )
+    edge_surface_drawing_seconds = time.perf_counter() - edge_drawing_started
+    junction_parallel_started = time.perf_counter()
     junction_repairs = np.zeros(shape, dtype=np.uint8)
     parallel_repairs = np.zeros(shape, dtype=np.uint8)
     local_gap_repairs = np.zeros(shape, dtype=np.uint8)
@@ -1569,6 +1557,8 @@ def reconstruct_surface_from_widths(
             surface, nodes, graph_edges, resolved_widths, config
         )
 
+    junction_parallel_seconds = time.perf_counter() - junction_parallel_started
+    morphology_started = time.perf_counter()
     if config.close_kernel > 1 and np.any(surface):
         size = max(3, int(config.close_kernel) | 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
@@ -1616,34 +1606,60 @@ def reconstruct_surface_from_widths(
     surface |= parallel_repairs
     boundary_smooth_added = ((surface > 0) & (pre_smooth_surface == 0)).astype(np.uint8)
     boundary_smooth_removed = ((pre_smooth_surface > 0) & (surface == 0)).astype(np.uint8)
+    morphology_boundary_seconds = time.perf_counter() - morphology_started
 
     # Hard final contract: every retained centerline edge must lie inside a
     # road-width surface, regardless of confidence grade or earlier pruning.
+    coverage_started = time.perf_counter()
     forced_coverage_repairs = np.zeros(shape, dtype=np.uint8)
     forced_coverage_edge_ids: list[int] = []
-    for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
-        start = nodes[int(src_idx)]
-        end = nodes[int(dst_idx)]
-        edge_line = _edge_centerline_mask(shape, start, end)
-        if not np.any((edge_line > 0) & (surface == 0)):
-            continue
-        corridor = edge_corridors[edge_id]
-        if corridor is None:
-            corridor = np.zeros(shape, dtype=np.uint8)
-            width = max(float(resolved_widths[edge_id]), config.minimum_render_width_px)
-            _draw_variable_edge(
-                corridor, start, end, [(0.0, width), (1.0, width)], config.width_scale
-            )
-        forced_coverage_repairs |= corridor
-        forced_coverage_edge_ids.append(edge_id)
-    surface |= forced_coverage_repairs
-
     final_centerline = np.zeros(shape, dtype=np.uint8)
     for src_idx, dst_idx in graph_edges.tolist():
-        final_centerline |= _edge_centerline_mask(
-            shape, nodes[int(src_idx)], nodes[int(dst_idx)]
+        start, end = nodes[int(src_idx)], nodes[int(dst_idx)]
+        cv2.line(
+            final_centerline,
+            (int(round(float(start[1]))), int(round(float(start[0])))),
+            (int(round(float(end[1]))), int(round(float(end[0])))),
+            1, 1, cv2.LINE_8,
         )
     uncovered_centerline = ((final_centerline > 0) & (surface == 0)).astype(np.uint8)
+    if np.any(uncovered_centerline):
+        height, width = shape
+        for edge_id, (src_idx, dst_idx) in enumerate(graph_edges.tolist()):
+            start, end = nodes[int(src_idx)], nodes[int(dst_idx)]
+            row0 = max(0, int(np.floor(min(start[0], end[0]))) - 1)
+            row1 = min(height, int(np.ceil(max(start[0], end[0]))) + 2)
+            col0 = max(0, int(np.floor(min(start[1], end[1]))) - 1)
+            col1 = min(width, int(np.ceil(max(start[1], end[1]))) + 2)
+            if row0 >= row1 or col0 >= col1 or not np.any(uncovered_centerline[row0:row1, col0:col1]):
+                continue
+            local_line = np.zeros((row1 - row0, col1 - col0), dtype=np.uint8)
+            cv2.line(
+                local_line,
+                (int(round(float(start[1]))) - col0, int(round(float(start[0]))) - row0),
+                (int(round(float(end[1]))) - col0, int(round(float(end[0]))) - row0),
+                1, 1, cv2.LINE_8,
+            )
+            if not np.any((local_line > 0) & (uncovered_centerline[row0:row1, col0:col1] > 0)):
+                continue
+            corridor = edge_corridors[edge_id]
+            if corridor is not None:
+                forced_coverage_repairs |= corridor
+            elif config.regular_surface:
+                _draw_buffer_edge(
+                    forced_coverage_repairs, start, end,
+                    max(float(resolved_widths[edge_id]), config.minimum_render_width_px),
+                    config.width_scale,
+                )
+            else:
+                width_value = max(float(resolved_widths[edge_id]), config.minimum_render_width_px)
+                _draw_variable_edge(
+                    forced_coverage_repairs, start, end,
+                    [(0.0, width_value), (1.0, width_value)], config.width_scale,
+                )
+            forced_coverage_edge_ids.append(edge_id)
+        surface |= forced_coverage_repairs
+        uncovered_centerline = ((final_centerline > 0) & (surface == 0)).astype(np.uint8)
     if np.any(uncovered_centerline):
         # This should only be reachable for degenerate rasterization cases.
         emergency = cv2.dilate(
@@ -1653,6 +1669,7 @@ def reconstruct_surface_from_widths(
         forced_coverage_repairs |= emergency
         surface |= emergency
         uncovered_centerline = ((final_centerline > 0) & (surface == 0)).astype(np.uint8)
+    centerline_coverage_seconds = time.perf_counter() - coverage_started
 
     added = ((surface > 0) & (original_reference == 0)).astype(np.uint8)
     removed = ((original_reference > 0) & (surface == 0)).astype(np.uint8)
@@ -1663,6 +1680,10 @@ def reconstruct_surface_from_widths(
         metadata={
             "status": "ok" if np.any(surface) else "empty_width_surface",
             "profiled_edge_count": profiled_edge_count,
+            "edge_surface_drawing_seconds": float(edge_surface_drawing_seconds),
+            "junction_parallel_processing_seconds": float(junction_parallel_seconds),
+            "morphology_boundary_processing_seconds": float(morphology_boundary_seconds),
+            "centerline_coverage_seconds": float(centerline_coverage_seconds),
             "fallback_edge_count": fallback_edge_count,
             **fallback_metadata,
             **chain_width_metadata,

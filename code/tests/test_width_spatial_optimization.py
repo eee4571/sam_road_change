@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,8 @@ from graph_spatial_context import (  # noqa: E402
     points_within_radius_of_references,
 )
 import finalize_review_results  # noqa: E402
+import production_workflow  # noqa: E402
+import width_surface_reconstruction  # noqa: E402
 from parallel_utils import resolve_worker_count, spawn_map  # noqa: E402
 
 
@@ -106,7 +109,7 @@ class WidthSpatialOptimizationTests(unittest.TestCase):
                     raise MemoryError("serial allocation still failed")
                 return {"tile": summary_path.stem, "profiling": {"total_seconds": 1.0}}
 
-            with mock.patch.object(finalize_review_results, "finalize_one", side_effect=fake_finalize):
+            with mock.patch.object(finalize_review_results, "_finalize_one_atomic", side_effect=fake_finalize):
                 recovered, remaining = finalize_review_results._retry_memory_failures_serially(
                     argparse.Namespace(), root, root / "final", {}, root / "decisions.csv", failures,
                 )
@@ -116,6 +119,196 @@ class WidthSpatialOptimizationTests(unittest.TestCase):
             self.assertEqual(len(remaining), 1)
             self.assertTrue(remaining[0]["serial_memory_retry"])
             self.assertEqual(remaining[0]["parallel_error"], "out of memory")
+
+    def test_regular_surface_does_not_allocate_one_full_canvas_per_edge(self) -> None:
+        shape = (160, 160)
+        nodes = np.asarray(
+            [[20.0 + index % 100, 10.0 + (index * 7) % 130] for index in range(121)],
+            dtype=np.float32,
+        )
+        edges = np.asarray([(index, index + 1) for index in range(120)], dtype=np.int32)
+        widths = [
+            {"edge_id": index, "width_px": 8.0, "quality_grade": "A", "source": "remeasured"}
+            for index in range(len(edges))
+        ]
+        original_zeros = np.zeros
+        full_canvas_allocations = 0
+
+        def tracked_zeros(requested_shape, *args, **kwargs):
+            nonlocal full_canvas_allocations
+            if isinstance(requested_shape, tuple) and requested_shape == shape:
+                full_canvas_allocations += 1
+            return original_zeros(requested_shape, *args, **kwargs)
+
+        with mock.patch.object(width_surface_reconstruction.np, "zeros", side_effect=tracked_zeros):
+            result = width_surface_reconstruction.reconstruct_surface_from_widths(
+                shape, nodes, edges, widths, [],
+                config=width_surface_reconstruction.WidthSurfaceConfig(
+                    regular_surface=True, close_kernel=1, boundary_smooth_sigma_px=0.0,
+                ),
+            )
+        self.assertLess(full_canvas_allocations, 20)
+        self.assertEqual(0, result.metadata["uncovered_centerline_px"])
+        self.assertIn("edge_surface_drawing_seconds", result.metadata)
+
+    def test_regular_shared_canvas_matches_legacy_per_edge_union(self) -> None:
+        shape = (120, 180)
+        nodes = np.asarray(
+            [[25.0, 15.0], [25.0, 70.0], [90.0, 105.0], [90.0, 165.0]],
+            dtype=np.float32,
+        )
+        edges = np.asarray([[0, 1], [2, 3]], dtype=np.int32)
+        widths = [
+            {"edge_id": 0, "width_px": 8.0, "quality_grade": "A", "source": "remeasured"},
+            {"edge_id": 1, "width_px": 14.0, "quality_grade": "A", "source": "remeasured"},
+        ]
+        result = width_surface_reconstruction.reconstruct_surface_from_widths(
+            shape, nodes, edges, widths, [],
+            config=width_surface_reconstruction.WidthSurfaceConfig(
+                regular_surface=True, close_kernel=1, boundary_smooth_sigma_px=0.0,
+            ),
+        )
+        legacy_union = np.zeros(shape, dtype=np.uint8)
+        for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+            edge_canvas = np.zeros(shape, dtype=np.uint8)
+            width_surface_reconstruction._draw_buffer_edge(
+                edge_canvas, nodes[src_idx], nodes[dst_idx],
+                result.metadata["resolved_widths_px"][edge_id], 1.0,
+            )
+            legacy_union |= edge_canvas
+        np.testing.assert_array_equal(legacy_union, result.surface)
+
+    def test_finalize_identity_adopts_reuses_and_invalidates_one_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output, final = root / "review", root / "final"
+            output.mkdir(); final.mkdir()
+            source = output / "v0001_summary.json"
+            source.write_text('{"graph": "v0001.p"}', encoding="utf-8")
+            (output / "v0001.p").write_bytes(b"graph-a")
+            optimized = {
+                "outputs": {
+                    "optimized_graph": "v0001_optimized_graph.p",
+                    "optimized_edges": "v0001_optimized_edges.csv",
+                    "optimized_road_surface": "v0001_optimized_road_surface.png",
+                    "optimized_width_samples": "v0001_optimized_width_samples.csv",
+                    "optimized_width_segments": "v0001_optimized_width_segments.csv",
+                },
+            }
+            for name in optimized["outputs"].values():
+                (final / name).write_bytes(b"complete")
+            (final / "v0001_optimized_summary.json").write_text(json.dumps(optimized), encoding="utf-8")
+            args = argparse.Namespace(edited_dir="", workers=0, only_stem=[], surface_width_scale=1.0)
+            decisions = output / "review_decisions.csv"
+
+            action, _, _ = finalize_review_results._inspect_finalized_slice(
+                args, output, final, source, decisions,
+            )
+            self.assertEqual("adopt", action)
+            action, _, _ = finalize_review_results._inspect_finalized_slice(
+                args, output, final, source, decisions,
+            )
+            self.assertEqual("reuse", action)
+            incomplete = final / ".v0001_finalize_incomplete"
+            incomplete.write_text("interrupted", encoding="utf-8")
+            action, _, _ = finalize_review_results._inspect_finalized_slice(
+                args, output, final, source, decisions,
+            )
+            self.assertEqual("rebuild", action)
+            incomplete.unlink()
+            (output / "v0001.p").write_bytes(b"graph-b")
+            action, _, _ = finalize_review_results._inspect_finalized_slice(
+                args, output, final, source, decisions,
+            )
+            self.assertEqual("rebuild", action)
+
+    def test_finalize_identity_ignores_other_slice_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw)
+            summary = output / "v0001_summary.json"
+            summary.write_text("{}", encoding="utf-8")
+            decisions = output / "review_decisions.csv"
+            decisions.write_text(
+                "stem,item_type,item_id,decision\n"
+                "v0001,candidate_centerline,one,accept\n",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(edited_dir="", workers=0, only_stem=[])
+            original = finalize_review_results._build_finalize_identity(
+                args, output, summary, decisions,
+            )["digest"]
+            decisions.write_text(
+                "stem,item_type,item_id,decision\n"
+                "v0001,candidate_centerline,one,accept\n"
+                "v0002,candidate_centerline,two,reject\n",
+                encoding="utf-8",
+            )
+            unrelated = finalize_review_results._build_finalize_identity(
+                args, output, summary, decisions,
+            )["digest"]
+            self.assertEqual(original, unrelated)
+            decisions.write_text(
+                "stem,item_type,item_id,decision\n"
+                "v0001,candidate_centerline,one,reject\n",
+                encoding="utf-8",
+            )
+            changed = finalize_review_results._build_finalize_identity(
+                args, output, summary, decisions,
+            )["digest"]
+            self.assertNotEqual(original, changed)
+
+    def test_surface_assembly_and_export_checkpoint_avoid_unconditional_union(self) -> None:
+        from rasterio import Affine
+        from shapely.geometry import box
+
+        with mock.patch.object(production_workflow, "unary_union", side_effect=AssertionError("unexpected union")):
+            geometry = production_workflow._assemble_surface_polygons(
+                [box(0, 0, 10, 10), box(20, 0, 30, 10)], 1.0, 1.0,
+            )
+        self.assertEqual("MultiPolygon", geometry.geom_type)
+
+        with tempfile.TemporaryDirectory() as raw:
+            final = Path(raw)
+            mask_source = final / "v0001_surface.png"
+            mask_source.write_bytes(b"surface-a")
+            summary = final / "v0001_optimized_summary.json"
+            summary.write_text(json.dumps({
+                "outputs": {"optimized_road_surface": mask_source.name},
+            }), encoding="utf-8")
+            identity = production_workflow._build_export_surface_identity(final, None)
+            cache = final / "_export_cache"
+            mask = np.zeros((12, 14), dtype=np.uint8); mask[2:8, 3:10] = 1
+            transform = Affine(1, 0, 0, 0, -1, 12)
+            production_workflow._save_export_mask_cache(cache, identity, mask, transform)
+            production_workflow._save_export_geometry_cache(cache, geometry)
+            production_workflow._save_export_gap_cache(
+                cache,
+                [{"global_id": np.int64(7), "width_map": 9.0, "geometry": geometry.boundary.geoms[0]}],
+                1,
+            )
+            loaded_mask, loaded_transform, loaded_geometry = production_workflow._load_export_surface_cache(
+                cache, identity,
+            )
+            np.testing.assert_array_equal(mask, loaded_mask)
+            self.assertEqual(transform, loaded_transform)
+            self.assertTrue(loaded_geometry.equals(geometry))
+            loaded_lines, loaded_gap_count = production_workflow._load_export_gap_cache(cache)
+            self.assertEqual(1, loaded_gap_count)
+            self.assertEqual(7, loaded_lines[0]["global_id"])
+            self.assertTrue(loaded_lines[0]["geometry"].equals(geometry.boundary.geoms[0]))
+            self.assertEqual(
+                production_workflow.EXPORT_SURFACE_PARAMETERS,
+                identity["parameters"],
+            )
+            (cache / "final_surface_geometry.wkb").write_bytes(b"damaged")
+            loaded_mask, _, loaded_geometry = production_workflow._load_export_surface_cache(
+                cache, identity,
+            )
+            np.testing.assert_array_equal(mask, loaded_mask)
+            self.assertIsNone(loaded_geometry)
+            mask_source.write_bytes(b"surface-b")
+            changed = production_workflow._build_export_surface_identity(final, None)
+            self.assertIsNone(production_workflow._load_export_surface_cache(cache, changed)[0])
 
     def test_worker_count_is_conservative_and_explicitly_controllable(self) -> None:
         self.assertEqual(resolve_worker_count(0, 6, automatic_limit=2), 2)

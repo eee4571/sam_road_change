@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
+import os
 import pickle
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,6 +29,9 @@ from width_surface_reconstruction import (
     _regular_corridor_widths,
     reconstruct_surface_from_widths,
 )
+
+
+FINALIZE_IDENTITY_VERSION = 2
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -1393,6 +1400,21 @@ def finalize_one(
             "surface_reconstruction_core_seconds": float(max(
                 0.0, surface_reconstruction_seconds - surface_auxiliary_write_seconds,
             )),
+            "edge_surface_drawing_seconds": float(
+                (width_surface.metadata if width_surface is not None else {}).get(
+                    "edge_surface_drawing_seconds", 0.0,
+                )
+            ),
+            "junction_parallel_processing_seconds": float(
+                (width_surface.metadata if width_surface is not None else {}).get(
+                    "junction_parallel_processing_seconds", 0.0,
+                )
+            ),
+            "morphology_boundary_processing_seconds": float(
+                (width_surface.metadata if width_surface is not None else {}).get(
+                    "morphology_boundary_processing_seconds", 0.0,
+                )
+            ),
             "visualization_file_writing_seconds": float(visualization_file_writing_seconds),
             "total_seconds": float(time.perf_counter() - finalize_started),
         },
@@ -1430,12 +1452,184 @@ def finalize_one(
     return optimized_summary
 
 
+def _file_identity(path: Path) -> dict:
+    """Return a relocation-independent content identity for one dependency."""
+    if not path.is_file():
+        return {"name": path.name, "missing": True}
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    return {"name": path.name, "size": int(stat.st_size), "sha256": digest.hexdigest()}
+
+
+def _resolve_summary_path(summary_path: Path, value: object) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.is_absolute() else summary_path.parent / path
+
+
+def _finalize_dependency_paths(
+    args: argparse.Namespace, output_dir: Path, summary_path: Path, decisions_path: Path,
+) -> list[Path]:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    stem = summary_path.name.removesuffix("_summary.json")
+    paths = [summary_path]
+    for key in ("graph", "prepared_graph", "image"):
+        path = _resolve_summary_path(summary_path, summary.get(key))
+        if path is not None:
+            paths.append(path)
+    for suffix in (
+        "edge_widths.csv", "candidate_centerlines.csv", "surface_only_regions.csv",
+        "surface_only.png", "molra_clean_mask.png", "road_probability.png", "review_demo.png",
+    ):
+        paths.append(output_dir / f"{stem}_{suffix}")
+    edited_value = str(getattr(args, "edited_dir", "") or "").strip()
+    if edited_value:
+        edited_dir = Path(edited_value)
+        for suffix in (
+            "edited_graph.p", "reconstructed_road_surface.png", "manual_widths.json",
+            "manual_surface_add.png", "manual_surface_remove.png", "surface_added.png",
+            "surface_removed.png", "surface_uncertain.png",
+        ):
+            paths.append(edited_dir / f"{stem}_{suffix}")
+    return list(dict.fromkeys(path for path in paths if path.is_file()))
+
+
+def _slice_decisions_identity(decisions_path: Path, stem: str) -> list[dict]:
+    """Return only review decisions that can affect this slice."""
+    # Blank-stem rows are legacy/global fallbacks used by ``decision_for``.
+    # Re-keying first mirrors ``decisions_by_key`` for duplicate CSV rows:
+    # the last row wins.
+    relevant = {
+        (
+            str(row.get("stem", "")),
+            str(row.get("item_type", "")),
+            str(row.get("item_id", "")),
+        ): {str(key): str(value) for key, value in sorted(row.items())}
+        for row in read_csv(decisions_path)
+        if str(row.get("stem", "")) in {"", stem}
+    }
+    return [relevant[key] for key in sorted(relevant)]
+
+
+def _build_finalize_identity(
+    args: argparse.Namespace, output_dir: Path, summary_path: Path, decisions_path: Path,
+) -> dict:
+    # Directory locations are represented by the content identities below;
+    # excluding them keeps a copied project eligible for resume.
+    ignored = {"output_dir", "final_dir", "edited_dir", "only_stem", "workers"}
+    parameters = {
+        key: value for key, value in sorted(vars(args).items())
+        if key not in ignored
+    }
+    stem = summary_path.name.removesuffix("_summary.json")
+    payload = {
+        "version": FINALIZE_IDENTITY_VERSION,
+        "algorithm": "regular-width-surface-finalize-v2",
+        "stem": stem,
+        "parameters": parameters,
+        "review_decisions": _slice_decisions_identity(decisions_path, stem),
+        "dependencies": [
+            _file_identity(path)
+            for path in _finalize_dependency_paths(args, output_dir, summary_path, decisions_path)
+        ],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    payload["digest"] = hashlib.sha256(encoded).hexdigest()
+    return payload
+
+
+def _finalized_paths_complete(final_dir: Path, optimized_summary: dict) -> bool:
+    outputs = optimized_summary.get("outputs")
+    if not isinstance(outputs, dict):
+        return False
+    required = {
+        "optimized_graph", "optimized_edges", "optimized_road_surface",
+        "optimized_width_samples", "optimized_width_segments",
+    }
+    if not required <= set(outputs):
+        return False
+    for key, value in outputs.items():
+        if not value:
+            continue
+        path = Path(str(value))
+        path = path if path.is_absolute() else final_dir / path
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+    return True
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _inspect_finalized_slice(
+    args: argparse.Namespace, output_dir: Path, final_dir: Path,
+    summary_path: Path, decisions_path: Path,
+) -> tuple[str, dict | None, dict]:
+    stem = summary_path.name.removesuffix("_summary.json")
+    identity = _build_finalize_identity(args, output_dir, summary_path, decisions_path)
+    summary_output = final_dir / f"{stem}_optimized_summary.json"
+    identity_path = final_dir / f"{stem}_finalize_identity.json"
+    incomplete_path = final_dir / f".{stem}_finalize_incomplete"
+    try:
+        optimized = json.loads(summary_output.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "rebuild", None, identity
+    if incomplete_path.exists() or not _finalized_paths_complete(final_dir, optimized):
+        return "rebuild", None, identity
+    try:
+        recorded = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        recorded = None
+    if isinstance(recorded, dict):
+        return ("reuse", optimized, identity) if recorded.get("digest") == identity["digest"] else ("rebuild", None, identity)
+    # Legacy finalization has no identity marker. Complete outputs are accepted
+    # once and receive a marker so later dependency changes can be detected.
+    _atomic_write_json(identity_path, identity)
+    return "adopt", optimized, identity
+
+
+def _finalize_one_atomic(
+    args: argparse.Namespace, output_dir: Path, final_dir: Path, summary_path: Path,
+    decisions: dict[tuple[str, str, str], dict], decisions_path: Path,
+) -> dict:
+    """Build a slice privately and publish its completion marker last."""
+    stem = summary_path.name.removesuffix("_summary.json")
+    identity = _build_finalize_identity(args, output_dir, summary_path, decisions_path)
+    incomplete_path = final_dir / f".{stem}_finalize_incomplete"
+    incomplete_path.write_text(identity["digest"], encoding="utf-8")
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{stem}_finalize_", dir=final_dir))
+    try:
+        optimized = finalize_one(args, output_dir, temporary_dir, summary_path, decisions, decisions_path)
+        if not _finalized_paths_complete(temporary_dir, optimized):
+            raise RuntimeError(f"Finalized outputs are incomplete for {stem}")
+        summary_name = f"{stem}_optimized_summary.json"
+        for source in sorted(temporary_dir.iterdir(), key=lambda path: path.name == summary_name):
+            if source.is_file():
+                os.replace(source, final_dir / source.name)
+        _atomic_write_json(final_dir / f"{stem}_finalize_identity.json", identity)
+        incomplete_path.unlink(missing_ok=True)
+        return optimized
+    finally:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+
+
 def _finalize_one_worker(payload: tuple[dict, str, str, str, dict, str]) -> dict:
     """Spawn-safe one-slice finalizer."""
     args_values, output_value, final_value, summary_value, decisions, decisions_value = payload
     summary_path = Path(summary_value)
     try:
-        result = finalize_one(
+        result = _finalize_one_atomic(
             argparse.Namespace(**args_values),
             Path(output_value),
             Path(final_value),
@@ -1491,7 +1685,7 @@ def _retry_memory_failures_serially(
         gc.collect()
         try:
             recovered.append(
-                finalize_one(args, output_dir, final_dir, summary_path, decisions, decisions_path)
+                _finalize_one_atomic(args, output_dir, final_dir, summary_path, decisions, decisions_path)
             )
             print(f"[memory-retry] Serial retry succeeded: {summary_path}")
         except Exception as exc:
@@ -1583,17 +1777,39 @@ def main() -> int:
     success_count = 0
     failures = []
     optimized_summaries = []
+    reused_count = 0
+    adopted_legacy_count = 0
     parallel_failure_count = 0
     serial_memory_retry_count = 0
     serial_memory_retry_success_count = 0
-    worker_count = resolve_worker_count(args.workers, len(summary_paths))
-    print(f"Finalize slice workers: {worker_count or 1}; slice count: {len(summary_paths)}")
+    pending_summary_paths = []
+    for summary_path in summary_paths:
+        action, optimized, _identity = _inspect_finalized_slice(
+            args, output_dir, final_dir, summary_path, decisions_path,
+        )
+        if action == "rebuild":
+            pending_summary_paths.append(summary_path)
+            continue
+        optimized_summaries.append(optimized or {})
+        success_count += 1
+        if action == "adopt":
+            adopted_legacy_count += 1
+            print(f"[finalize-resume] Adopted complete legacy finalization for {summary_path.name}.")
+        else:
+            reused_count += 1
+            print(f"[finalize-resume] Reusing completed finalization for {summary_path.name}.")
+    worker_count = resolve_worker_count(args.workers, len(pending_summary_paths))
+    print(
+        f"Finalize slice workers: {worker_count or 1}; slice count: {len(summary_paths)}; "
+        f"reused: {reused_count}; adopted legacy: {adopted_legacy_count}; "
+        f"rebuild: {len(pending_summary_paths)}"
+    )
     if worker_count <= 1:
-        for index, summary_path in enumerate(summary_paths, start=1):
-            print(f"[{index}/{len(summary_paths)}] Finalizing {summary_path.name}")
+        for index, summary_path in enumerate(pending_summary_paths, start=1):
+            print(f"[{index}/{len(pending_summary_paths)}] Finalizing {summary_path.name}")
             try:
                 optimized_summaries.append(
-                    finalize_one(args, output_dir, final_dir, summary_path, decisions, decisions_path)
+                    _finalize_one_atomic(args, output_dir, final_dir, summary_path, decisions, decisions_path)
                 )
                 success_count += 1
             except Exception as exc:
@@ -1609,7 +1825,7 @@ def main() -> int:
                 dict(vars(args)), str(output_dir), str(final_dir), str(summary_path),
                 decisions, str(decisions_path),
             )
-            for summary_path in summary_paths
+            for summary_path in pending_summary_paths
         ]
         results = spawn_map(_finalize_one_worker, payloads, worker_count)
         parallel_failures = []
@@ -1650,6 +1866,9 @@ def main() -> int:
         "success_count": success_count,
         "failure_count": len(failures),
         "workers": int(worker_count),
+        "reused_count": int(reused_count),
+        "adopted_legacy_count": int(adopted_legacy_count),
+        "rebuilt_count": int(len(pending_summary_paths)),
         "parallel_failure_count": int(parallel_failure_count),
         "serial_memory_retry_count": int(serial_memory_retry_count),
         "serial_memory_retry_success_count": int(serial_memory_retry_success_count),
@@ -1668,8 +1887,7 @@ def main() -> int:
             "wall_seconds": float(time.perf_counter() - batch_started),
         },
     }
-    with open(final_dir / "batch_optimized_summary.json", "w", encoding="utf-8") as file:
-        json.dump(batch_summary, file, indent=2, ensure_ascii=False)
+    _atomic_write_json(final_dir / "batch_optimized_summary.json", batch_summary)
     print(json.dumps(batch_summary, ensure_ascii=False, indent=2))
     return 1 if failures else 0
 

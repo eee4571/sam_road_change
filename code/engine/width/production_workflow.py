@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import heapq
 import json
+import os
 import pickle
 import sys
 import time
@@ -18,7 +20,8 @@ import rasterio
 from rasterio.features import rasterize, shapes
 from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, reproject
-from shapely.geometry import LineString, Point, Polygon, box, shape
+from shapely import wkb
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box, shape
 from shapely.ops import linemerge, snap, substring, unary_union
 from shapely.strtree import STRtree
 
@@ -307,6 +310,38 @@ def _clean_surface(geometry, min_area: float, min_hole_area: float):
     return result if result.is_valid else result.buffer(0)
 
 
+def _assemble_surface_polygons(
+    polygons: list, min_area: float, min_hole_area: float, simplify_tolerance: float = 0.0,
+):
+    """Clean non-overlapping raster polygons without an unconditional union."""
+    cleaned = []
+    for polygon in polygons:
+        if polygon is None or polygon.is_empty or polygon.geom_type != "Polygon" or polygon.area < min_area:
+            continue
+        holes = [ring.coords for ring in polygon.interiors if Polygon(ring).area >= min_hole_area]
+        candidate = Polygon(polygon.exterior.coords, holes)
+        if simplify_tolerance > 0:
+            candidate = candidate.simplify(float(simplify_tolerance), preserve_topology=True)
+        if not candidate.is_valid:
+            candidate = candidate.buffer(0)
+        if candidate is not None and not candidate.is_empty:
+            if candidate.geom_type == "Polygon":
+                cleaned.append(candidate)
+            elif candidate.geom_type == "MultiPolygon":
+                cleaned.extend(part for part in candidate.geoms if not part.is_empty)
+    if not cleaned:
+        return None
+    result = cleaned[0] if len(cleaned) == 1 else MultiPolygon(cleaned)
+    if result.is_valid:
+        return result
+    try:
+        from shapely import coverage_union_all
+        result = coverage_union_all(cleaned)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        result = unary_union(cleaned)
+    return result if result.is_valid else result.buffer(0)
+
+
 def _weighted_median(values: list[float], weights: list[float]) -> float:
     if not values:
         return 0.0
@@ -361,6 +396,8 @@ def _probability_guided_gap_path(
     road_surface,
     pixel_size: float,
     lateral_margin_px: int = 28,
+    surface_mask: np.ndarray | None = None,
+    surface_transform=None,
 ) -> tuple[LineString | None, dict]:
     """Trace one automatic endpoint connector along a local probability ridge."""
     if probability is None or transform is None or probability.size == 0:
@@ -391,7 +428,21 @@ def _probability_guided_gap_path(
     signal = np.clip(local / local_reference, 0.0, 1.0)
     signal = np.sqrt(signal, dtype=np.float32)
     local_transform = transform * rasterio.Affine.translation(col0, row0)
-    if road_surface is not None and not road_surface.is_empty:
+    if surface_mask is not None and surface_transform is not None:
+        surface = np.zeros(local.shape, dtype=np.uint8)
+        source_inverse = ~surface_transform
+        source_col, source_row = source_inverse * (local_transform.c, local_transform.f)
+        source_row, source_col = int(round(source_row)), int(round(source_col))
+        src_row0, src_col0 = max(0, source_row), max(0, source_col)
+        src_row1 = min(surface_mask.shape[0], source_row + local.shape[0])
+        src_col1 = min(surface_mask.shape[1], source_col + local.shape[1])
+        if src_row0 < src_row1 and src_col0 < src_col1:
+            dst_row0, dst_col0 = src_row0 - source_row, src_col0 - source_col
+            surface[
+                dst_row0:dst_row0 + src_row1 - src_row0,
+                dst_col0:dst_col0 + src_col1 - src_col0,
+            ] = (surface_mask[src_row0:src_row1, src_col0:src_col1] > 0).astype(np.uint8)
+    elif road_surface is not None and not road_surface.is_empty:
         surface = rasterize(
             [(road_surface, 1)],
             out_shape=local.shape,
@@ -511,9 +562,13 @@ def _connect_surface_supported_global_gaps(
     min_alignment: float = 0.50,
     min_surface_support: float = 0.95,
     ambiguity_ratio: float = 1.20,
+    surface_mask: np.ndarray | None = None,
+    surface_transform=None,
 ) -> tuple[list[dict], int]:
     """Automatically repair endpoint-to-endpoint and endpoint-to-edge gaps."""
-    has_surface = road_surface is not None and not road_surface.is_empty
+    has_surface_geometry = road_surface is not None and not road_surface.is_empty
+    has_surface_mask = surface_mask is not None and surface_transform is not None and np.any(surface_mask)
+    has_surface = has_surface_geometry or has_surface_mask
     has_probability = centerline_probability is not None and centerline_transform is not None
     if not centerlines or (not has_surface and not has_probability) or max_gap_px <= 0:
         return centerlines, 0
@@ -557,7 +612,53 @@ def _connect_surface_supported_global_gaps(
     dangling = [node for node, degree in graph.degree() if degree == 1 and node in endpoint_directions]
     max_gap = max_gap_px * pixel_size
     proposals: list[tuple] = []
-    surface_with_tolerance = road_surface.buffer(0.75 * pixel_size) if has_surface else None
+    surface_with_tolerance = road_surface.buffer(0.75 * pixel_size) if has_surface_geometry else None
+    mask_with_tolerance = (
+        cv2.dilate((surface_mask > 0).astype(np.uint8), np.ones((3, 3), dtype=np.uint8))
+        if has_surface_mask else None
+    )
+    mask_inverse = ~surface_transform if has_surface_mask else None
+
+    def surface_supports(point) -> bool:
+        if surface_with_tolerance is not None:
+            return bool(surface_with_tolerance.covers(point))
+        col, row = mask_inverse * (float(point.x), float(point.y))
+        row, col = int(round(row)), int(round(col))
+        return bool(
+            0 <= row < mask_with_tolerance.shape[0]
+            and 0 <= col < mask_with_tolerance.shape[1]
+            and mask_with_tolerance[row, col]
+        )
+
+    def straight_surface_support(start_coordinate, end_coordinate, distance: float) -> float:
+        sample_count = max(3, int(np.ceil(distance / pixel_size)) + 1)
+        if surface_with_tolerance is None and mask_with_tolerance is not None and mask_inverse is not None:
+            fractions = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+            start_xy = np.asarray(start_coordinate, dtype=np.float64)
+            end_xy = np.asarray(end_coordinate, dtype=np.float64)
+            coordinates = start_xy[None, :] + fractions[:, None] * (end_xy - start_xy)[None, :]
+            cols = np.rint(
+                mask_inverse.a * coordinates[:, 0]
+                + mask_inverse.b * coordinates[:, 1]
+                + mask_inverse.c
+            ).astype(np.int64)
+            rows = np.rint(
+                mask_inverse.d * coordinates[:, 0]
+                + mask_inverse.e * coordinates[:, 1]
+                + mask_inverse.f
+            ).astype(np.int64)
+            valid = (
+                (rows >= 0) & (rows < mask_with_tolerance.shape[0])
+                & (cols >= 0) & (cols < mask_with_tolerance.shape[1])
+            )
+            supported = np.zeros(sample_count, dtype=bool)
+            supported[valid] = mask_with_tolerance[rows[valid], cols[valid]] > 0
+            return float(np.mean(supported))
+        straight_connector = LineString([start_coordinate, end_coordinate])
+        return float(np.mean([
+            surface_supports(straight_connector.interpolate(index / (sample_count - 1), normalized=True))
+            for index in range(sample_count)
+        ]))
     spatial_cells: dict[tuple[int, int], list[int]] = {}
     for endpoint_index, endpoint in enumerate(dangling):
         cell = (int(np.floor(endpoint[0] / max_gap)), int(np.floor(endpoint[1] / max_gap)))
@@ -590,11 +691,7 @@ def _connect_surface_supported_global_gaps(
             if alignment < min_alignment:
                 continue
             straight_connector = LineString([start_coordinate, end_coordinate])
-            sample_count = max(3, int(np.ceil(distance / pixel_size)) + 1)
-            support = float(np.mean([
-                surface_with_tolerance.covers(straight_connector.interpolate(index / (sample_count - 1), normalized=True))
-                for index in range(sample_count)
-            ])) if surface_with_tolerance is not None else 0.0
+            support = straight_surface_support(start_coordinate, end_coordinate, distance) if has_surface else 0.0
             connector, probability_evidence = _probability_guided_gap_path(
                 start_coordinate,
                 end_coordinate,
@@ -602,6 +699,8 @@ def _connect_surface_supported_global_gaps(
                 centerline_transform,
                 road_surface,
                 pixel_size,
+                surface_mask=surface_mask,
+                surface_transform=surface_transform,
             ) if has_probability else (None, {})
             probability_supported = connector is not None
             if support < min_surface_support and not probability_supported:
@@ -640,11 +739,31 @@ def _connect_surface_supported_global_gaps(
     # component, trace the probability ridge to its projection, and later
     # split that target line at the exact contact coordinate.
     edge_proposals: list[tuple] = []
+    part_tree = STRtree(parts) if parts else None
+    part_identity_indices: dict[int, list[int]] = defaultdict(list)
+    part_wkb_indices: dict[bytes, list[int]] = defaultdict(list)
+    if part_tree is not None:
+        for part_index, part in enumerate(parts):
+            part_identity_indices[id(part)].append(part_index)
+            part_wkb_indices[part.wkb].append(part_index)
     for start in dangling:
         start_coordinate = endpoint_coordinates[start]
         start_point = Point(start_coordinate)
-        valid_by_component: dict[int, tuple] = {}
-        for part_index, part in enumerate(parts):
+        candidates_by_component: dict[int, list[tuple]] = defaultdict(list)
+        candidate_indices = _stable_strtree_candidate_indices(
+            part_tree,
+            box(
+                start_coordinate[0] - max_gap, start_coordinate[1] - max_gap,
+                start_coordinate[0] + max_gap, start_coordinate[1] + max_gap,
+            ),
+            parts,
+            part_identity_indices,
+            part_wkb_indices,
+        ) if part_tree is not None else None
+        if candidate_indices is None:
+            candidate_indices = range(len(parts))
+        for part_index in candidate_indices:
+            part = parts[part_index]
             target_component = part_component_id.get(part_index)
             if target_component is None or target_component == component_id[start]:
                 continue
@@ -660,55 +779,65 @@ def _connect_surface_supported_global_gaps(
             alignment = float(np.dot(endpoint_directions[start], delta / distance))
             if alignment < min_alignment:
                 continue
-            straight_connector = LineString([start_coordinate, end])
-            sample_count = max(3, int(np.ceil(distance / pixel_size)) + 1)
-            support = float(np.mean([
-                surface_with_tolerance.covers(straight_connector.interpolate(index / (sample_count - 1), normalized=True))
-                for index in range(sample_count)
-            ])) if surface_with_tolerance is not None else 0.0
-            connector, probability_evidence = _probability_guided_gap_path(
-                start_coordinate,
-                end,
-                centerline_probability,
-                centerline_transform,
-                road_surface,
-                pixel_size,
-                lateral_margin_px=max(28, min(64, int(np.ceil(distance / pixel_size * 0.40)))),
-            ) if has_probability else (None, {})
-            probability_supported = connector is not None
-            if support < min_surface_support and not probability_supported:
-                continue
-            if not probability_supported and alignment < 0.85:
-                continue
-            connector = connector if probability_supported else straight_connector
-            probability_score = float(probability_evidence.get("center_probability_normalized_mean", 0.0))
-            score = (
-                0.35 * max(support, probability_score)
-                + 0.35 * alignment
-                + 0.20 * (1.0 - distance / max_gap)
-                + 0.10 * (1.0 - float(probability_evidence.get("path_ratio", 1.0)))
+            candidates_by_component[target_component].append(
+                (distance, part_index, end, alignment)
             )
-            evidence = {
-                **probability_evidence,
-                "straight_surface_support_ratio": support,
-                "direction_alignment": alignment,
-                "target_kind": "edge",
-                "target_part_index": part_index,
-                "evidence_mode": (
-                    "centerline_probability_astar_to_edge_and_surface"
-                    if probability_supported and support >= min_surface_support
-                    else "centerline_probability_astar_to_edge"
-                    if probability_supported
-                    else "continuous_surface_to_edge"
-                ),
-            }
-            proposal = (
-                score, distance, start, end, connector, evidence,
-                component_id[start], target_component,
-            )
-            previous = valid_by_component.get(target_component)
-            if previous is None or distance < previous[1]:
+
+        # The old implementation ran surface sampling and probability A* for
+        # every nearby edge, then retained only the nearest valid edge in each
+        # target component.  Distance-ordered lazy validation is equivalent:
+        # stop at the first valid edge per component and avoid all farther A*.
+        valid_by_component: dict[int, tuple] = {}
+        for target_component, raw_candidates in candidates_by_component.items():
+            for distance, part_index, end, alignment in sorted(
+                raw_candidates, key=lambda item: (item[0], item[1]),
+            ):
+                straight_connector = LineString([start_coordinate, end])
+                support = straight_surface_support(start_coordinate, end, distance) if has_surface else 0.0
+                connector, probability_evidence = _probability_guided_gap_path(
+                    start_coordinate,
+                    end,
+                    centerline_probability,
+                    centerline_transform,
+                    road_surface,
+                    pixel_size,
+                    lateral_margin_px=max(28, min(64, int(np.ceil(distance / pixel_size * 0.40)))),
+                    surface_mask=surface_mask,
+                    surface_transform=surface_transform,
+                ) if has_probability else (None, {})
+                probability_supported = connector is not None
+                if support < min_surface_support and not probability_supported:
+                    continue
+                if not probability_supported and alignment < 0.85:
+                    continue
+                connector = connector if probability_supported else straight_connector
+                probability_score = float(probability_evidence.get("center_probability_normalized_mean", 0.0))
+                score = (
+                    0.35 * max(support, probability_score)
+                    + 0.35 * alignment
+                    + 0.20 * (1.0 - distance / max_gap)
+                    + 0.10 * (1.0 - float(probability_evidence.get("path_ratio", 1.0)))
+                )
+                evidence = {
+                    **probability_evidence,
+                    "straight_surface_support_ratio": support,
+                    "direction_alignment": alignment,
+                    "target_kind": "edge",
+                    "target_part_index": part_index,
+                    "evidence_mode": (
+                        "centerline_probability_astar_to_edge_and_surface"
+                        if probability_supported and support >= min_surface_support
+                        else "centerline_probability_astar_to_edge"
+                        if probability_supported
+                        else "continuous_surface_to_edge"
+                    ),
+                }
+                proposal = (
+                    score, distance, start, end, connector, evidence,
+                    component_id[start], target_component,
+                )
                 valid_by_component[target_component] = proposal
+                break
         choices = sorted(valid_by_component.values(), key=lambda item: item[1])
         if not choices:
             continue
@@ -887,6 +1016,37 @@ def _merge_global_gap_surfaces(road_surface, centerlines: list[dict], pixel_size
         parts.insert(0, road_surface)
     merged = unary_union(parts).buffer(0)
     return merged, len(connectors), max(0.0, float(merged.area) - original_area)
+
+
+def _rasterize_global_gap_surfaces(
+    surface_mask: np.ndarray, transform, centerlines: list[dict], pixel_size: float,
+) -> tuple[np.ndarray, int, float]:
+    """Burn connector buffers into the mosaic before its sole final polygonize."""
+    connectors = []
+    pixel_size = max(float(pixel_size), 1e-9)
+    for row in centerlines:
+        if row.get("fusion_sta") != "global_gap_repair":
+            continue
+        geometry = row.get("geometry")
+        try:
+            width_map = float(row.get("width_map", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            width_map = 0.0
+        if geometry is None or geometry.is_empty or width_map <= 0:
+            continue
+        connectors.append(geometry.buffer(
+            max(0.5 * width_map, 1.5 * pixel_size), cap_style=2, join_style=2,
+        ))
+    if not connectors:
+        return surface_mask, 0, 0.0
+    before = int(np.count_nonzero(surface_mask))
+    merged = rasterize(
+        ((geometry, 1) for geometry in connectors), out_shape=surface_mask.shape,
+        transform=transform, fill=0, dtype=np.uint8,
+    )
+    result = np.maximum((surface_mask > 0).astype(np.uint8), merged)
+    added_area = max(0, int(np.count_nonzero(result)) - before) * pixel_size * pixel_size
+    return result, len(connectors), float(added_area)
 
 
 def _stable_strtree_candidate_indices(
@@ -1301,6 +1461,165 @@ def _write_final_visualization(
     }
 
 
+EXPORT_SURFACE_CACHE_VERSION = 3
+EXPORT_SURFACE_PARAMETERS = {
+    "minimum_polygon_area_px": 50.0,
+    "minimum_hole_area_px": 25.0,
+    "simplify_tolerance_px": 0.25,
+    "gap_buffer_minimum_radius_px": 1.5,
+    "global_gap_maximum_px": 192.0,
+    "global_gap_minimum_alignment": 0.50,
+    "global_gap_minimum_surface_support": 0.95,
+    "global_gap_ambiguity_ratio": 1.20,
+}
+
+
+def _export_file_identity(path: Path) -> dict:
+    if not path.is_file():
+        return {"name": path.name, "missing": True}
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"name": path.name, "size": int(path.stat().st_size), "sha256": digest.hexdigest()}
+
+
+def _build_export_surface_identity(final_dir: Path, stitched_centerlines: Path | None) -> dict:
+    dependencies = []
+    for summary_path in summaries(final_dir, optimized=True):
+        dependencies.append(_export_file_identity(summary_path))
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        surface_value = str((summary.get("outputs") or {}).get("optimized_road_surface", "") or "")
+        if surface_value:
+            surface_path = Path(surface_value)
+            dependencies.append(_export_file_identity(
+                surface_path if surface_path.is_absolute() else final_dir / surface_path
+            ))
+    if stitched_centerlines is not None:
+        dependencies.append(_export_file_identity(stitched_centerlines))
+    payload = {
+        "version": EXPORT_SURFACE_CACHE_VERSION,
+        "algorithm": "raster-first-final-surface-v3",
+        "parameters": EXPORT_SURFACE_PARAMETERS,
+        "dependencies": dependencies,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload["digest"] = hashlib.sha256(encoded).hexdigest()
+    return payload
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _load_export_surface_cache(cache_dir: Path, identity: dict):
+    try:
+        recorded = json.loads((cache_dir / "identity.json").read_text(encoding="utf-8"))
+        transform_values = json.loads((cache_dir / "surface_transform.json").read_text(encoding="utf-8"))
+        if recorded.get("digest") != identity.get("digest"):
+            return None, None, None
+        mask = np.load(cache_dir / "fused_surface_mask.npy", allow_pickle=False)
+        if mask.ndim != 2 or mask.size == 0:
+            return None, None, None
+        transform = rasterio.Affine(*[float(value) for value in transform_values])
+        geometry_path = cache_dir / "final_surface_geometry.wkb"
+        geometry = None
+        if geometry_path.is_file():
+            try:
+                geometry = wkb.loads(geometry_path.read_bytes())
+                if geometry is None or geometry.is_empty or not geometry.is_valid:
+                    geometry = None
+            except Exception:
+                # A damaged geometry checkpoint should not discard an intact
+                # fused raster; polygonization can resume from the mask.
+                geometry = None
+        return (mask > 0).astype(np.uint8), transform, geometry
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None, None, None
+
+
+def _save_export_mask_cache(cache_dir: Path, identity: dict, mask: np.ndarray, transform) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    mask_path = cache_dir / "fused_surface_mask.npy"
+    temporary_mask = cache_dir / f".{mask_path.name}.{os.getpid()}.tmp"
+    with temporary_mask.open("wb") as file:
+        np.save(file, (mask > 0).astype(np.uint8), allow_pickle=False)
+    os.replace(temporary_mask, mask_path)
+    (cache_dir / "final_surface_geometry.wkb").unlink(missing_ok=True)
+    (cache_dir / "global_gap_centerlines.json").unlink(missing_ok=True)
+    _atomic_json(cache_dir / "surface_transform.json", list(transform)[:6])
+    _atomic_json(cache_dir / "identity.json", identity)
+
+
+def _save_export_geometry_cache(cache_dir: Path, geometry) -> None:
+    if geometry is None or geometry.is_empty:
+        return
+    path = cache_dir / "final_surface_geometry.wkb"
+    temporary = cache_dir / f".{path.name}.{os.getpid()}.tmp"
+    temporary.write_bytes(geometry.wkb)
+    os.replace(temporary, path)
+
+
+def _checkpoint_json_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _checkpoint_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_checkpoint_json_value(item) for item in value]
+    return value
+
+
+def _save_export_gap_cache(cache_dir: Path, centerlines: list[dict], gap_count: int) -> None:
+    payload = {
+        "gap_count": int(gap_count),
+        "centerlines": [
+            {
+                "geometry_wkb": row["geometry"].wkb_hex,
+                "properties": _checkpoint_json_value({
+                    key: value for key, value in row.items() if key != "geometry"
+                }),
+            }
+            for row in centerlines
+            if row.get("geometry") is not None and not row["geometry"].is_empty
+        ],
+    }
+    _atomic_json(cache_dir / "global_gap_centerlines.json", payload)
+
+
+def _load_export_gap_cache(cache_dir: Path) -> tuple[list[dict] | None, int]:
+    try:
+        payload = json.loads(
+            (cache_dir / "global_gap_centerlines.json").read_text(encoding="utf-8")
+        )
+        records = payload.get("centerlines")
+        if not isinstance(records, list):
+            return None, 0
+        centerlines = []
+        for record in records:
+            properties = record.get("properties")
+            geometry_hex = str(record.get("geometry_wkb", ""))
+            if not isinstance(properties, dict) or not geometry_hex:
+                return None, 0
+            geometry = wkb.loads(bytes.fromhex(geometry_hex))
+            if geometry is None or geometry.is_empty:
+                return None, 0
+            centerlines.append({**properties, "geometry": geometry})
+        return centerlines, int(payload.get("gap_count", 0))
+    except Exception:
+        return None, 0
+
+
 def _write_final_width_visualization(
     width_segments: gpd.GeoDataFrame,
     road_corridors: gpd.GeoDataFrame,
@@ -1377,6 +1696,14 @@ def export_final_products(
     road_chain_conversion_seconds = 0.0
     surface_polygonize_seconds = 0.0
     surface_union_clean_seconds = 0.0
+    final_surface_polygonize_seconds = 0.0
+    surface_geometry_clean_seconds = 0.0
+    gap_surface_merge_seconds = 0.0
+    global_gap_detection_seconds = 0.0
+    global_gap_checkpoint_load_seconds = 0.0
+    global_gap_checkpoint_write_seconds = 0.0
+    surface_checkpoint_load_seconds = 0.0
+    surface_checkpoint_write_seconds = 0.0
     width_sampling_segment_conversion_seconds = 0.0
     centerlines: list[dict] = []
     road_surfaces: list[dict] = []
@@ -1506,11 +1833,14 @@ def export_final_products(
                     tile_surface_geometries.append(shape(geom))
         surface_polygonize_seconds += time.perf_counter() - polygonize_started
         union_clean_started = time.perf_counter()
-        combined_surface = unary_union(tile_surface_geometries) if tile_surface_geometries else None
+        combined_surface = _assemble_surface_polygons(
+            tile_surface_geometries,
+            50.0 * pixel_size * pixel_size,
+            25.0 * pixel_size * pixel_size,
+            simplify_tolerance=max(0.0, 0.25 * pixel_size),
+        )
         if combined_surface is not None and not combined_surface.is_empty:
-            combined_surface = _clean_surface(combined_surface.buffer(0), 50.0 * pixel_size * pixel_size, 25.0 * pixel_size * pixel_size)
-            if combined_surface is not None:
-                road_surfaces.append({"tile_stem": stem, "source": "sammolra_structural_repair", "geometry": combined_surface})
+            road_surfaces.append({"tile_stem": stem, "source": "sammolra_structural_repair", "geometry": combined_surface})
             surface_sources.append({
                 "tile_stem": stem,
                 "mask": mask,
@@ -1598,49 +1928,91 @@ def export_final_products(
     fused_centerlines = _fuse_centerline_records(centerlines, source_contexts, canonical_network, match_tolerance)
     centerline_fusion_seconds = time.perf_counter() - centerline_fusion_started
     surface_fusion_started = time.perf_counter()
-    fused_surface_mask, fused_surface_transform, _ = _fuse_surface_masks(surface_sources, crs)
+    cache_dir = final_dir / "_export_cache"
+    cache_identity = _build_export_surface_identity(final_dir, stitched_centerlines)
+    checkpoint_started = time.perf_counter()
+    fused_surface_mask, fused_surface_transform, cached_surface_geometry = _load_export_surface_cache(
+        cache_dir, cache_identity,
+    )
+    surface_checkpoint_load_seconds += time.perf_counter() - checkpoint_started
+    surface_checkpoint_reused = fused_surface_mask is not None
+    if fused_surface_mask is None:
+        fused_surface_mask, fused_surface_transform, _ = _fuse_surface_masks(surface_sources, crs)
+        checkpoint_started = time.perf_counter()
+        if fused_surface_mask is not None and fused_surface_transform is not None:
+            _save_export_mask_cache(cache_dir, cache_identity, fused_surface_mask, fused_surface_transform)
+        surface_checkpoint_write_seconds += time.perf_counter() - checkpoint_started
     fused_centerline_probability, fused_centerline_transform, _ = _fuse_surface_masks(
         centerline_probability_sources,
         crs,
         continuous=True,
     )
     surface_mosaic_seconds = time.perf_counter() - surface_fusion_started
-    polygonize_started = time.perf_counter()
-    fused_surface_geometries = []
-    if fused_surface_mask is not None and np.any(fused_surface_mask):
-        fused_surface_geometries = [
-            shape(geometry)
-            for geometry, value in shapes(
-                fused_surface_mask,
-                mask=fused_surface_mask > 0,
-                transform=fused_surface_transform,
-            )
-            if value
-        ]
-    surface_polygonize_seconds += time.perf_counter() - polygonize_started
-    union_clean_started = time.perf_counter()
-    fused_surface_geometry = unary_union(fused_surface_geometries).buffer(0) if fused_surface_geometries else None
-    if fused_surface_geometry is not None:
-        pixel_area = float(np.median(pixel_sizes)) ** 2 if pixel_sizes else 1.0
-        fused_surface_geometry = _clean_surface(fused_surface_geometry, 50.0 * pixel_area, 25.0 * pixel_area)
-    if canonical_is_authoritative:
-        global_gap_count = 0
-    else:
-        fused_centerlines, global_gap_count = _connect_surface_supported_global_gaps(
-            fused_centerlines,
-            fused_surface_geometry,
-            float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
-            centerline_probability=fused_centerline_probability,
-            centerline_transform=fused_centerline_transform,
-        )
-    fused_surface_geometry, global_gap_surface_count, global_gap_surface_added_area = _merge_global_gap_surfaces(
-        fused_surface_geometry,
-        fused_centerlines,
-        float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
+    gap_checkpoint_started = time.perf_counter()
+    cached_gap_centerlines, cached_gap_count = (
+        _load_export_gap_cache(cache_dir) if surface_checkpoint_reused else (None, 0)
     )
+    global_gap_checkpoint_load_seconds = time.perf_counter() - gap_checkpoint_started
+    global_gap_checkpoint_reused = cached_gap_centerlines is not None
+    if cached_gap_centerlines is not None:
+        fused_centerlines, global_gap_count = cached_gap_centerlines, cached_gap_count
+    else:
+        gap_detection_started = time.perf_counter()
+        if canonical_is_authoritative:
+            global_gap_count = 0
+        else:
+            fused_centerlines, global_gap_count = _connect_surface_supported_global_gaps(
+                fused_centerlines,
+                None,
+                float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
+                centerline_probability=fused_centerline_probability,
+                centerline_transform=fused_centerline_transform,
+                surface_mask=fused_surface_mask,
+                surface_transform=fused_surface_transform,
+            )
+        global_gap_detection_seconds = time.perf_counter() - gap_detection_started
+        gap_checkpoint_started = time.perf_counter()
+        _save_export_gap_cache(cache_dir, fused_centerlines, global_gap_count)
+        global_gap_checkpoint_write_seconds = time.perf_counter() - gap_checkpoint_started
+        surface_checkpoint_write_seconds += global_gap_checkpoint_write_seconds
+    gap_merge_started = time.perf_counter()
+    if fused_surface_mask is not None:
+        final_surface_mask, global_gap_surface_count, global_gap_surface_added_area = _rasterize_global_gap_surfaces(
+            fused_surface_mask, fused_surface_transform, fused_centerlines,
+            float(np.median(pixel_sizes)) if pixel_sizes else 1.0,
+        )
+    else:
+        final_surface_mask, global_gap_surface_count, global_gap_surface_added_area = fused_surface_mask, 0, 0.0
+    gap_surface_merge_seconds = time.perf_counter() - gap_merge_started
+    fused_surface_geometry = cached_surface_geometry
+    if fused_surface_geometry is None:
+        polygonize_started = time.perf_counter()
+        fused_surface_geometries = []
+        if final_surface_mask is not None and np.any(final_surface_mask):
+            fused_surface_geometries = [
+                shape(geometry)
+                for geometry, value in shapes(
+                    final_surface_mask,
+                    mask=final_surface_mask > 0,
+                    transform=fused_surface_transform,
+                )
+                if value
+            ]
+        final_surface_polygonize_seconds = time.perf_counter() - polygonize_started
+        clean_started = time.perf_counter()
+        pixel_size_value = float(np.median(pixel_sizes)) if pixel_sizes else 1.0
+        pixel_area = pixel_size_value ** 2
+        fused_surface_geometry = _assemble_surface_polygons(
+            fused_surface_geometries, 50.0 * pixel_area, 25.0 * pixel_area,
+            simplify_tolerance=max(0.0, 0.25 * pixel_size_value),
+        )
+        surface_geometry_clean_seconds = time.perf_counter() - clean_started
+        checkpoint_started = time.perf_counter()
+        _save_export_geometry_cache(cache_dir, fused_surface_geometry)
+        surface_checkpoint_write_seconds += time.perf_counter() - checkpoint_started
     fused_surfaces = ([{"source": "sammolra_feathered_surface_fusion_with_global_gap_buffers", "geometry": fused_surface_geometry}]
                       if fused_surface_geometry is not None and not fused_surface_geometry.is_empty else [])
-    surface_union_clean_seconds += time.perf_counter() - union_clean_started
+    surface_union_clean_seconds += surface_geometry_clean_seconds + gap_surface_merge_seconds
     surface_fusion_seconds = time.perf_counter() - surface_fusion_started
 
     exported_centerlines = []
@@ -1753,13 +2125,26 @@ def export_final_products(
             "centerline_fusion_seconds": float(centerline_fusion_seconds),
             "surface_fusion_seconds": float(surface_fusion_seconds),
             "surface_mosaic_seconds": float(surface_mosaic_seconds),
+            "global_surface_raster_fusion_seconds": float(surface_mosaic_seconds),
             "surface_polygonize_seconds": float(surface_polygonize_seconds),
+            "tile_surface_polygonize_seconds": float(surface_polygonize_seconds),
+            "final_surface_polygonize_seconds": float(final_surface_polygonize_seconds),
+            "surface_geometry_clean_seconds": float(surface_geometry_clean_seconds),
+            "gap_surface_merge_seconds": float(gap_surface_merge_seconds),
+            "global_gap_detection_seconds": float(global_gap_detection_seconds),
+            "global_gap_checkpoint_load_seconds": float(global_gap_checkpoint_load_seconds),
+            "global_gap_checkpoint_write_seconds": float(global_gap_checkpoint_write_seconds),
             "surface_union_clean_seconds": float(surface_union_clean_seconds),
+            "surface_checkpoint_load_seconds": float(surface_checkpoint_load_seconds),
+            "surface_checkpoint_write_seconds": float(surface_checkpoint_write_seconds),
             "width_sampling_segment_conversion_seconds": float(
                 width_sampling_segment_conversion_seconds
             ),
             "vector_writing_seconds": float(vector_writing_seconds),
             "visualization_seconds": float(visualization_seconds),
+            "file_writing_seconds": float(
+                vector_writing_seconds + visualization_seconds + surface_checkpoint_write_seconds
+            ),
             "total_seconds": float(time.perf_counter() - export_started),
         },
         "fusion": {
@@ -1767,6 +2152,8 @@ def export_final_products(
             "canonical_network_authoritative": canonical_is_authoritative,
             "match_tolerance": match_tolerance,
             "global_endpoint_snapping": False,
+            "surface_checkpoint_reused": bool(surface_checkpoint_reused),
+            "global_gap_checkpoint_reused": bool(global_gap_checkpoint_reused),
             "global_surface_gap_count": global_gap_count,
             "global_gap_surface_count": global_gap_surface_count,
             "global_gap_surface_added_area": global_gap_surface_added_area,
