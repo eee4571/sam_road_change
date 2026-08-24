@@ -10,20 +10,43 @@ import threading
 import time
 from pathlib import Path
 
+
+def _rebase_editor_summary_path(path: Path, summary_path: Path) -> Path | None:
+    """Map a stale path from an old result root into the current run tree."""
+    for current_run in summary_path.parents:
+        if not current_run.name.casefold().startswith("run_"):
+            continue
+        for index, part in enumerate(path.parts):
+            if part.casefold() != current_run.name.casefold():
+                continue
+            candidate = current_run.joinpath(*path.parts[index + 1:])
+            if candidate.is_file():
+                return candidate.resolve()
+    sibling = summary_path.parent / path.name
+    if sibling.is_file():
+        return sibling.resolve()
+    return None
+
+
 def _resolve_editor_summary_path(value: object, summary_path: Path) -> Path:
     """Resolve a geometry-editor summary path using the editor's path rules.
 
-    Current summaries use absolute paths.  The fallback for old summaries keeps
-    the useful ``summary_dir``-relative form before resolving from the process
-    working directory, matching how the bundled editor consumes these fields.
+    Current summaries use absolute paths. Older summaries may retain absolute
+    paths under the former ``04_成果输出/run_*`` tree after the run was moved to
+    ``_work/tasks/runs/run_*``. Resolve those paths read-only against the run
+    containing the summary before falling back to the frozen value.
     """
     raw = str(value or "").strip()
     path = Path(raw).expanduser()
-    if path.is_absolute():
+    if path.is_file():
         return path.resolve()
-    summary_relative = (summary_path.parent / path).resolve()
-    if summary_relative.is_file():
-        return summary_relative
+    if not path.is_absolute():
+        summary_relative = (summary_path.parent / path).resolve()
+        if summary_relative.is_file():
+            return summary_relative
+    rebased = _rebase_editor_summary_path(path, summary_path)
+    if rebased is not None:
+        return rebased
     return path.resolve()
 
 def collect_geometry_editor_inputs(review_dir: Path | str) -> list[dict[str, object]]:

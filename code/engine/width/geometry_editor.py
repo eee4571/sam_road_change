@@ -61,6 +61,41 @@ CACHE_LOCK_NAME = "cache.lock"
 SHAPEFILE_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
 
 
+def resolve_review_summary_path(value: object, summary_path: Path) -> Path:
+    """Resolve an input path, including summaries frozen before a run move."""
+    path = Path(str(value or "").strip()).expanduser()
+    if path.is_file():
+        return path.resolve()
+    if not path.is_absolute():
+        summary_relative = summary_path.parent / path
+        if summary_relative.is_file():
+            return summary_relative.resolve()
+    for current_run in summary_path.parents:
+        if not current_run.name.casefold().startswith("run_"):
+            continue
+        for index, part in enumerate(path.parts):
+            if part.casefold() != current_run.name.casefold():
+                continue
+            candidate = current_run.joinpath(*path.parts[index + 1:])
+            if candidate.is_file():
+                return candidate.resolve()
+    sibling = summary_path.parent / path.name
+    if sibling.is_file():
+        return sibling.resolve()
+    return path.resolve()
+
+
+def load_review_summary(summary_path: Path) -> dict:
+    """Load one summary and resolve the file inputs without rewriting it."""
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise ValueError(f"复核摘要不是 JSON 对象：{summary_path}")
+    for key in ("image", "prepared_graph", "graph"):
+        if summary.get(key):
+            summary[key] = str(resolve_review_summary_path(summary[key], summary_path))
+    return summary
+
+
 def imread_unicode(path: str | Path, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray | None:
     """Read an image through Unicode-safe bytes while preserving OpenCV flags.
 
@@ -1655,7 +1690,7 @@ def _review_summary_rows(review_dir: Path) -> list[tuple[str, dict]]:
             continue
         rows.append((
             summary_path.name.removesuffix("_summary.json"),
-            json.loads(summary_path.read_text(encoding="utf-8")),
+            load_review_summary(summary_path),
         ))
     return rows
 
@@ -2068,7 +2103,7 @@ def load_documents(
         stem = summary_path.name.removesuffix("_summary.json")
         if progress:
             progress(f"正在读取切片 {stem}…")
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = load_review_summary(summary_path)
         image = imread_unicode(Path(summary["image"]), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"Cannot read image for {stem}: {summary.get('image')}")

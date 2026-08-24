@@ -656,6 +656,38 @@ class UserGuiArtifactTests(unittest.TestCase):
                 Path(command[command.index("--ready-file") + 1]), ready_file.resolve(),
             )
 
+    def test_geometry_editor_preflight_rebases_paths_from_legacy_result_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            run_name = "run_20260818_231625"
+            period = (
+                project / "_work" / "tasks" / "runs" / run_name
+                / "grids" / "area1" / "periods" / "2021"
+            )
+            review = period / "runs" / "roads" / "width_review"
+            review.mkdir(parents=True)
+            image = period / "images" / "v0001.tif"
+            image.parent.mkdir()
+            image.touch()
+            graph = review / "v0001_prepared_graph.p"
+            graph.touch()
+            legacy_period = (
+                project / "04_成果输出" / run_name
+                / "grids" / "area1" / "periods" / "2021"
+            )
+            (review / "v0001_summary.json").write_text(json.dumps({
+                "image": str(legacy_period / "images" / image.name),
+                "prepared_graph": str(
+                    legacy_period / "runs" / "roads" / "width_review" / graph.name
+                ),
+            }), encoding="utf-8")
+
+            inputs = gui.collect_geometry_editor_inputs(review)
+
+            self.assertEqual(inputs[0]["image"], image.resolve())
+            self.assertEqual(inputs[0]["prepared_graph"], graph.resolve())
+            self.assertEqual(gui.geometry_editor_diagnostics(review), [])
+
     def test_geometry_editor_process_stays_starting_until_ready_file_exists(self) -> None:
         process = mock.Mock()
         process.poll.return_value = None

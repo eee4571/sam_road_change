@@ -68,6 +68,38 @@ class GeometryEditorCacheTests(unittest.TestCase):
             timings=timings,
         )[0]
 
+    def test_summary_loader_rebases_inputs_from_legacy_result_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            run_name = "run_20260818_231625"
+            period = (
+                project / "_work" / "tasks" / "runs" / run_name
+                / "grids" / "area1" / "periods" / "2021"
+            )
+            review = period / "runs" / "roads" / "width_review"
+            review.mkdir(parents=True)
+            image = period / "images" / "v0001.tif"
+            image.parent.mkdir()
+            image.touch()
+            graph = review / "v0001_prepared_graph.p"
+            graph.touch()
+            legacy_period = (
+                project / "04_成果输出" / run_name
+                / "grids" / "area1" / "periods" / "2021"
+            )
+            summary_path = review / "v0001_summary.json"
+            summary_path.write_text(json.dumps({
+                "image": str(legacy_period / "images" / image.name),
+                "graph": str(
+                    legacy_period / "runs" / "roads" / "width_review" / graph.name
+                ),
+            }), encoding="utf-8")
+
+            rows = editor._review_summary_rows(review)
+
+            self.assertEqual(Path(rows[0][1]["image"]), image.resolve())
+            self.assertEqual(Path(rows[0][1]["graph"]), graph.resolve())
+
     def test_file_fingerprint_is_stable_and_changes_with_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "source.bin"
