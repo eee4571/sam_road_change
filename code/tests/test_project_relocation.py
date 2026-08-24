@@ -9,6 +9,7 @@ from app.project_relocation import (
     BACKUP_SUFFIX,
     active_old_path_references,
     build_relocation_plan,
+    repair_task_batch_lists,
     relocate_state_files,
 )
 from dependency_identity import (
@@ -119,6 +120,64 @@ class ProjectRelocationTests(unittest.TestCase):
             relocate_state_files(state, plan)
         self.assertEqual(state_path.read_bytes(), original)
         self.assertFalse(state_path.with_name(state_path.name + BACKUP_SUFFIX).exists())
+
+    def test_batch_list_is_rebased_to_current_images_atomically_and_idempotently(self):
+        temporary, _state, _state_path, _project, _output, job, _old_project, old_job = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        period = job / "grids" / "g" / "periods" / "2022"
+        images = period / "images"
+        images.mkdir(parents=True)
+        for name in ("v0001.tif", "v0002.tif"):
+            (images / name).write_bytes(name.encode("ascii"))
+        listing = period / "batches" / "grid_tiles.txt"
+        listing.parent.mkdir()
+        listing.write_text(
+            "\n".join(str(old_job / "grids" / "g" / "periods" / "2022" / "images" / name)
+                      for name in ("v0001.tif", "v0002.tif")) + "\n",
+            encoding="utf-8-sig",
+        )
+
+        first = repair_task_batch_lists(job)
+        second = repair_task_batch_lists(job)
+
+        self.assertEqual((first.modified_lists, first.modified_paths), (1, 2))
+        self.assertEqual((second.modified_lists, second.modified_paths), (0, 0))
+        self.assertEqual(
+            listing.read_text(encoding="utf-8-sig").splitlines(),
+            [str((images / name).resolve()) for name in ("v0001.tif", "v0002.tif")],
+        )
+        self.assertTrue(listing.read_bytes().startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(len(list(listing.parent.glob("grid_tiles.txt.pre_relocation.bak"))), 1)
+
+    def test_batch_list_relocation_does_not_require_old_directory(self):
+        temporary, _state, _state_path, _project, _output, job, _old_project, _old_job = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        period = job / "grids" / "g" / "periods" / "2022"
+        image = period / "images" / "v0001.tif"
+        image.parent.mkdir(parents=True); image.write_bytes(b"image")
+        listing = period / "batches" / "grid_tiles.txt"
+        listing.parent.mkdir()
+        listing.write_text("Z:\\deleted-project\\images\\v0001.tif\n", encoding="utf-8-sig")
+
+        result = repair_task_batch_lists(job)
+
+        self.assertEqual(result.modified_paths, 1)
+        self.assertEqual(listing.read_text(encoding="utf-8-sig").strip(), str(image.resolve()))
+
+    def test_batch_list_missing_current_image_stops_without_rewrite(self):
+        temporary, _state, _state_path, _project, _output, job, _old_project, _old_job = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        listing = job / "grids" / "g" / "periods" / "2022" / "batches" / "grid_tiles.txt"
+        listing.parent.mkdir(parents=True)
+        original = "Z:\\other-project\\images\\missing.tif\n"
+        listing.write_text(original, encoding="utf-8-sig")
+
+        with self.assertRaisesRegex(FileNotFoundError, "不会回退读取其他项目") as raised:
+            repair_task_batch_lists(job)
+
+        self.assertIn("missing.tif", str(raised.exception))
+        self.assertEqual(listing.read_text(encoding="utf-8-sig"), original)
+        self.assertFalse(listing.with_name(listing.name + BACKUP_SUFFIX).exists())
 
     def test_gui_preview_reports_frozen_period_and_legacy_slice_candidate_read_only(self):
         temporary, state, state_path, project, output, job, _old_project, old_job = self.fixture()

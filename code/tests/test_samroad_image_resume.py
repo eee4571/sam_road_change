@@ -14,6 +14,7 @@ from engine.samroad.image_resume import (
     build_batch_identity,
     ensure_unique_output_stems,
     marker_summaries,
+    relocate_task_image_markers,
     required_image_outputs,
 )
 
@@ -193,6 +194,37 @@ class ImageResumeTests(unittest.TestCase):
         self.assertEqual(decision["action"], "skip")
         self.assertEqual(decision["origin"], "legacy_adopted")
         self.assertTrue(manager.marker_path(image).is_file())
+
+    def test_marker_absolute_prefix_change_is_rebound_and_reused(self) -> None:
+        job = self.root / "copied-project" / "04_成果输出" / "run_copy"
+        period = job / "grids" / "g" / "periods" / "2022"
+        image = period / "images" / "v0001.tif"
+        image.parent.mkdir(parents=True); image.write_bytes(b"same-image")
+        output = period / "runs" / "roads" / "inference" / "road_graphs" / "grid_tiles"
+        manager = ImageResumeManager(output, self.identity, enabled=True)
+        recovery = write_required_outputs(output, image)
+        marker = manager.complete(image, recovery, {"image": str(image), "tile": image.stem})
+        current_marker = manager.marker_path(image)
+        old_image = self.root / "deleted-project" / "04_成果输出" / "run_copy" / Path(
+            "grids/g/periods/2022/images/v0001.tif"
+        )
+        marker["input"]["path"] = str(old_image)
+        marker.pop("task_image", None)
+        marker["image_key"] = "v0001-old-absolute-hash"
+        marker["summary"]["recovery_summary"]["image"] = str(old_image)
+        legacy_marker = current_marker.with_name("v0001-old-absolute-hash.completed.json")
+        legacy_marker.write_text(json.dumps(marker), encoding="utf-8")
+        current_marker.unlink()
+
+        result = relocate_task_image_markers(job)
+        resumed = ImageResumeManager(output, self.identity, enabled=True).inspect(image)
+
+        self.assertEqual((result.checked_markers, result.updated_markers, result.invalid_markers), (1, 1, 0))
+        self.assertFalse(legacy_marker.exists())
+        self.assertTrue(manager.marker_path(image).is_file())
+        self.assertEqual(resumed["action"], "skip")
+        self.assertEqual(resumed["marker"]["input"]["path"], str(image.resolve()))
+        self.assertEqual(resumed["marker"]["task_image"]["relative_path"], "images/v0001.tif")
 
     def test_changed_input_invalidates_only_that_image(self) -> None:
         first, second = self.image("first"), self.image("second")

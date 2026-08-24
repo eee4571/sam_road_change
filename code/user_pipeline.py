@@ -35,8 +35,10 @@ from app.result_publisher import (
 from app.project_relocation import (
     active_old_path_references,
     build_relocation_plan,
+    repair_task_batch_lists,
     relocate_state_files,
 )
+from engine.samroad.image_resume import relocate_task_image_markers
 from dependency_identity import (
     dependency_identity_equal,
     effective_config_identity,
@@ -3829,6 +3831,23 @@ def run_all(args: argparse.Namespace) -> dict:
         prior = _read_full_run_resume_state(
             state_path, run_id, job_root, layout=layout, output_root=output_root,
         )
+        batch_repair = repair_task_batch_lists(job_root)
+        marker_repair = relocate_task_image_markers(job_root)
+        if batch_repair.modified_lists:
+            print(
+                f"[项目路径检查] 已自动修正 {batch_repair.modified_lists} 个影像清单，"
+                f"共 {batch_repair.modified_paths} 条路径。",
+                flush=True,
+            )
+            print("[项目路径检查] 当前任务只使用当前项目中的文件。", flush=True)
+        elif marker_repair.updated_markers:
+            print(
+                f"[项目路径检查] 已自动更新 {marker_repair.updated_markers} 个切片完成标记。",
+                flush=True,
+            )
+            print("[项目路径检查] 当前任务只使用当前项目中的文件。", flush=True)
+        else:
+            print("[项目路径检查] 当前任务路径完整，无需修正。", flush=True)
         prior_input_spec = _enrich_relocated_input_spec(
             dict(prior.get("input_spec") or {}), job_root,
         )

@@ -14,6 +14,7 @@ import pickle
 import struct
 import time
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 import sys
@@ -71,14 +72,42 @@ def build_batch_identity(
     }
 
 
-def stable_image_key(image_path: Path | str) -> str:
+def _task_image_identity(image_path: Path | str) -> dict | None:
     source = _resolved(image_path)
-    safe_stem = "".join(
+    images_root = source.parent
+    period_root = images_root.parent
+    if (
+        images_root.name.casefold() != "images"
+        or period_root.parent.name.casefold() != "periods"
+    ):
+        return None
+    return {
+        "grid": period_root.parent.parent.name,
+        "period": period_root.name,
+        "relative_path": source.relative_to(period_root).as_posix(),
+        "filename": source.name,
+        "size": int(source.stat().st_size),
+        "mtime_ns": int(source.stat().st_mtime_ns),
+    }
+
+
+def _safe_stem(image_path: Path | str) -> str:
+    source = _resolved(image_path)
+    return "".join(
         character if character.isalnum() or character in "-_" else "_"
         for character in source.stem
     ).strip("._-") or "image"
-    digest = hashlib.sha256(_path_text(source).encode("utf-8")).hexdigest()[:16]
-    return f"{safe_stem}-{digest}"
+
+
+def stable_image_key(image_path: Path | str) -> str:
+    source = _resolved(image_path)
+    task_identity = _task_image_identity(source)
+    identity_text = (
+        "\0".join(str(task_identity[key]).casefold() for key in ("grid", "period", "relative_path"))
+        if task_identity is not None else _path_text(source)
+    )
+    digest = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:16]
+    return f"{_safe_stem(source)}-{digest}"
 
 
 def ensure_unique_output_stems(image_paths) -> None:
@@ -358,6 +387,19 @@ class ImageResumeManager:
     def marker_path(self, image_path: Path | str) -> Path:
         return self.resume_dir / f"{stable_image_key(image_path)}.completed.json"
 
+    def _marker_candidates(self, image_path: Path | str) -> list[Path]:
+        image = _resolved(image_path)
+        expected = self.marker_path(image)
+        candidates = [expected]
+        if self.resume_dir.is_dir():
+            candidates.extend(
+                path for path in sorted(
+                    self.resume_dir.glob(f"{_safe_stem(image)}-*.completed.json"), key=str,
+                )
+                if path != expected
+            )
+        return candidates
+
     def _output_records(self, stem: str) -> tuple[list[dict] | None, str]:
         records = []
         for spec in required_image_outputs(self.output_dir, stem):
@@ -376,6 +418,15 @@ class ImageResumeManager:
     def _validate_marker(self, marker: dict, image_path: Path) -> tuple[bool, str]:
         if marker.get("schema_version") not in SUPPORTED_MARKER_SCHEMAS:
             return False, "unsupported marker schema"
+        stored_task = marker.get("task_image")
+        current_task = _task_image_identity(image_path)
+        if isinstance(stored_task, dict):
+            if current_task is None or any(
+                str(stored_task.get(key) or "").casefold()
+                != str(current_task.get(key) or "").casefold()
+                for key in ("grid", "period", "relative_path", "filename")
+            ):
+                return False, "task-relative image identity changed"
         if not _same_identity(marker.get("input"), file_identity(image_path)):
             return False, "input image identity changed"
         if not dependency_identity_equal(
@@ -419,16 +470,41 @@ class ImageResumeManager:
         image = _resolved(image_path)
         if not self.enabled:
             return {"action": "process", "reason": "image resume is disabled"}
-        marker_path = self.marker_path(image)
-        if marker_path.is_file():
+        for marker_path in self._marker_candidates(image):
+            if not marker_path.is_file():
+                continue
             marker, reason = _read_json_object(marker_path)
             if marker is None:
                 return {"action": "process", "reason": f"invalid marker JSON: {reason}"}
             valid, reason = self._validate_marker(marker, image)
             if valid:
+                marker = self._relocate_marker(marker_path, marker, image)
                 return {"action": "skip", "origin": "marker", "marker": marker}
             return {"action": "process", "reason": reason}
         return self._adopt_legacy(image)
+
+    def _relocate_marker(self, source: Path, marker: dict, image: Path) -> dict:
+        target = self.marker_path(image)
+        task_identity = _task_image_identity(image)
+        updated = dict(marker)
+        updated["image_key"] = stable_image_key(image)
+        updated["input"] = {**dict(updated.get("input") or {}), "path": str(image)}
+        if task_identity is not None:
+            updated["task_image"] = task_identity
+        summary = dict(updated.get("summary") or {})
+        for name in ("recovery_summary", "profile_decision"):
+            row = summary.get(name)
+            if isinstance(row, dict):
+                row = dict(row)
+                if "image" in row:
+                    row["image"] = str(image)
+                summary[name] = row
+        updated["summary"] = summary
+        if source != target or updated != marker:
+            self._atomic_json(target, updated)
+            if source != target:
+                source.unlink(missing_ok=True)
+        return updated
 
     def _adopt_legacy(self, image: Path) -> dict:
         compatible, reason = _legacy_batch_compatible(
@@ -474,7 +550,7 @@ class ImageResumeManager:
         if backup_dir.is_dir():
             self._restore_backup(backup_dir)
         manifest_path = backup_dir / "backup_manifest.json"
-        candidates = [self.marker_path(image), *all_image_outputs(self.output_dir, image.stem)]
+        candidates = [*self._marker_candidates(image), *all_image_outputs(self.output_dir, image.stem)]
         existing = [path for path in candidates if path.is_file()]
         backup_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
@@ -583,6 +659,9 @@ class ImageResumeManager:
             "origin": origin,
             "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        task_identity = _task_image_identity(image)
+        if task_identity is not None:
+            marker["task_image"] = task_identity
         target = self.marker_path(image)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
@@ -606,6 +685,109 @@ class ImageResumeManager:
         )
         self._discard_backup(image)
         return marker
+
+
+@dataclass(frozen=True)
+class TaskMarkerRelocationResult:
+    checked_markers: int
+    updated_markers: int
+    invalid_markers: int
+
+
+def _marker_period_root(marker_path: Path) -> Path | None:
+    for parent in marker_path.parents:
+        if parent.parent.name.casefold() == "periods":
+            return parent
+    return None
+
+
+def _recorded_outputs_valid(marker: dict, output_dir: Path) -> bool:
+    outputs = marker.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        return False
+    for row in outputs:
+        if not isinstance(row, dict):
+            return False
+        relative = Path(str(row.get("path") or ""))
+        if relative.is_absolute() or relative.drive or ".." in relative.parts:
+            return False
+        path = (output_dir / relative).resolve()
+        try:
+            path.relative_to(output_dir.resolve())
+            if path.stat().st_size != int(row.get("size", -1)):
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+        valid, _reason = validate_output(path, str(row.get("kind") or ""))
+        if not valid:
+            return False
+    return True
+
+
+def relocate_task_image_markers(job_root: Path | str) -> TaskMarkerRelocationResult:
+    """Rebind valid copied markers to current task-relative image identities."""
+    root = _resolved(job_root)
+    checked = updated_count = invalid = 0
+    for marker_path in sorted(root.rglob("*.completed.json"), key=str):
+        if marker_path.parent.name != ".resume":
+            continue
+        checked += 1
+        marker, _reason = _read_json_object(marker_path)
+        period_root = _marker_period_root(marker_path)
+        if marker is None or period_root is None:
+            invalid += 1
+            continue
+        input_row = marker.get("input") if isinstance(marker.get("input"), dict) else {}
+        filename = Path(str(input_row.get("path") or "")).name
+        if not filename:
+            task_row = marker.get("task_image") if isinstance(marker.get("task_image"), dict) else {}
+            filename = str(task_row.get("filename") or "")
+        image = (period_root / "images" / filename).resolve()
+        try:
+            image.relative_to(root)
+            current_identity = file_identity(image, sha256=bool(input_row.get("sha256")))
+        except (OSError, ValueError):
+            invalid += 1
+            continue
+        if not _same_identity(input_row, current_identity):
+            invalid += 1
+            continue
+        current_task = _task_image_identity(image)
+        stored_task = marker.get("task_image")
+        if isinstance(stored_task, dict) and (
+            current_task is None or any(
+                str(stored_task.get(key) or "").casefold()
+                != str(current_task.get(key) or "").casefold()
+                for key in ("grid", "period", "relative_path", "filename")
+            )
+        ):
+            invalid += 1
+            continue
+        output_dir = marker_path.parent.parent.resolve()
+        if not _recorded_outputs_valid(marker, output_dir):
+            invalid += 1
+            continue
+        target = marker_path.parent / f"{stable_image_key(image)}.completed.json"
+        if target != marker_path and target.is_file():
+            invalid += 1
+            continue
+        migrated = dict(marker)
+        migrated["image_key"] = stable_image_key(image)
+        migrated["input"] = {**input_row, "path": str(image)}
+        if current_task is not None:
+            migrated["task_image"] = current_task
+        summary = dict(migrated.get("summary") or {})
+        for name in ("recovery_summary", "profile_decision"):
+            row = summary.get(name)
+            if isinstance(row, dict) and "image" in row:
+                summary[name] = {**row, "image": str(image)}
+        migrated["summary"] = summary
+        if target != marker_path or migrated != marker:
+            ImageResumeManager._atomic_json(target, migrated)
+            if target != marker_path:
+                marker_path.unlink(missing_ok=True)
+            updated_count += 1
+    return TaskMarkerRelocationResult(checked, updated_count, invalid)
 
 
 def marker_summaries(marker: dict) -> tuple[dict, dict]:

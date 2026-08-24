@@ -7,7 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 BACKUP_SUFFIX = ".pre_relocation.bak"
@@ -336,3 +336,112 @@ def rebase_project_owned_tree(value, old_root: Path | str, new_root: Path | str)
         return str(target)
 
     return visit(value)
+
+
+@dataclass(frozen=True)
+class BatchListRepairResult:
+    checked_lists: int
+    modified_lists: int
+    modified_paths: int
+    checked_json: int
+
+
+def _path_basename(value: str) -> str:
+    """Return a filename for either Windows or POSIX absolute path text."""
+    windows_name = PureWindowsPath(value).name
+    posix_name = Path(value.replace("\\", "/")).name
+    return windows_name or posix_name
+
+
+def _validate_active_task_json(job_root: Path) -> int:
+    candidates = {job_root / "job_state.json", job_root / "pipeline_result.json"}
+    for name in ("period_state.json", "latest_result.json", "input_manifest.json"):
+        candidates.update(job_root.glob(f"grids/*/periods/*/{name}"))
+    checked = 0
+    for path in sorted(candidates, key=str):
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"当前任务活动 JSON 损坏或无法读取：{path}：{exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"当前任务活动 JSON 根节点必须是对象：{path}")
+        checked += 1
+    return checked
+
+
+def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
+    """Rebase current-run batch lists to their sibling ``images`` directory.
+
+    Every list is preflighted before any file is changed, so a missing copied
+    image cannot leave the task half migrated.  Lists remain UTF-8 with BOM and
+    keep their original line order and count.
+    """
+    root = _resolved(job_root)
+    if not root.is_dir():
+        raise ValueError(f"当前任务目录不存在：{root}")
+    checked_json = _validate_active_task_json(root)
+    plans: list[tuple[Path, str, str, int]] = []
+    missing: list[Path] = []
+    list_paths = sorted(root.glob("grids/*/periods/*/batches/*.txt"), key=str)
+    for list_path in list_paths:
+        try:
+            original = list_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"影像清单无法按 utf-8-sig 读取：{list_path}：{exc}") from exc
+        period_root = list_path.parent.parent.resolve()
+        images_root = (period_root / "images").resolve()
+        if _relative_to(images_root, root) is None:
+            raise ValueError(f"影像清单映射目录逃出当前任务：{images_root}")
+        lines = original.splitlines()
+        rewritten: list[str] = []
+        changed_paths = 0
+        for line in lines:
+            text = line.strip()
+            if not text:
+                rewritten.append(line)
+                continue
+            filename = _path_basename(text)
+            if not filename or filename in {".", ".."}:
+                raise ValueError(f"影像清单包含无效路径：{list_path}：{text}")
+            target = (images_root / filename).resolve()
+            if _relative_to(target, images_root) is None or _relative_to(target, root) is None:
+                raise ValueError(f"影像清单映射目标逃出当前任务：{text} -> {target}")
+            try:
+                valid = target.is_file() and target.stat().st_size > 0
+            except OSError:
+                valid = False
+            if not valid:
+                missing.append(target)
+            target_text = str(target)
+            rewritten.append(target_text)
+            if text != target_text:
+                changed_paths += 1
+        trailing_newline = original.endswith(("\n", "\r"))
+        replacement = "\n".join(rewritten) + ("\n" if trailing_newline else "")
+        plans.append((list_path, original, replacement, changed_paths))
+    if missing:
+        details = "\n".join(f"- {path}" for path in sorted(set(missing), key=str))
+        raise FileNotFoundError(
+            "复制后的当前项目缺少影像清单所需文件；不会回退读取其他项目，也不会重新切片：\n"
+            + details
+        )
+    modified_lists = 0
+    modified_paths = 0
+    for list_path, original, replacement, changed_paths in plans:
+        if replacement == original:
+            continue
+        _backup_once(list_path)
+        temporary = list_path.with_name(f".{list_path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(replacement, encoding="utf-8-sig")
+            os.replace(temporary, list_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        modified_lists += 1
+        modified_paths += changed_paths
+    return BatchListRepairResult(
+        checked_lists=len(plans), modified_lists=modified_lists,
+        modified_paths=modified_paths, checked_json=checked_json,
+    )
