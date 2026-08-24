@@ -15,8 +15,9 @@ from tkinter import ttk
 from app.backend_client import BackendClient, BackendEvent
 from app.editor_manager import EditorManager
 from app.project_manager import ProjectManager
+from app.result_publisher import ProjectLayout
 from app.task_manager import TaskManager, structured_task_status
-from gui.common_widgets import (CONTROL_METRICS, LAYOUT_METRICS, PREVIEW_LABELS, UI, WORKFLOW_STEPS, configure_window_geometry, format_percentage)
+from gui.common_widgets import (CONTROL_METRICS, LAYOUT_METRICS, PREVIEW_LABELS, UI, WORKFLOW_STEPS, bind_dynamic_wrap, configure_window_geometry, format_percentage, treeview_metrics)
 from gui.data_page import DataPage
 from gui.run_page import RunPage
 from gui.edit_page import EditPage
@@ -379,7 +380,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("SuccessNote.TLabel", foreground=UI["green"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 9))
         style.configure("WarningNote.TLabel", foreground=UI["amber"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"), padding=(18, 8))
-        style.configure("Hint.TLabel", foreground=UI["muted"], background=UI["card"], wraplength=920)
+        style.configure("Hint.TLabel", foreground=UI["muted"], background=UI["card"])
         style.configure("Success.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("HeaderReady.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("HeaderIdle.TLabel", foreground=UI["muted"], background=UI["card"], font=("Microsoft YaHei UI", 9))
@@ -392,10 +393,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("Modern.Horizontal.TProgressbar", background=UI["blue"], troughcolor="#DEDAD0", borderwidth=1, thickness=9)
         style.configure("TLabelframe", background=UI["card"], bordercolor=UI["line_strong"], relief="groove", borderwidth=1)
         style.configure("TLabelframe.Label", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9, "bold"))
+        tree_metrics = treeview_metrics(self.root, ("Microsoft YaHei UI", 9))
         style.configure(
             "Data.Treeview", background=UI["card"], fieldbackground=UI["card"],
-            foreground=UI["ink"], rowheight=23, borderwidth=1,
-            font=("Microsoft YaHei UI", 9),
+            foreground=UI["ink"], rowheight=tree_metrics["rowheight"], borderwidth=1,
+            font=tree_metrics["font"],
         )
         style.map(
             "Data.Treeview", background=[("selected", UI["blue"])],
@@ -403,7 +405,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         )
         style.configure(
             "Data.Treeview.Heading", background="#E3DFD5", foreground=UI["ink"],
-            relief="raised", padding=(6, 4), font=("Microsoft YaHei UI", 9),
+            relief="raised", padding=tree_metrics["heading_padding"], font=("Microsoft YaHei UI", 9, "bold"),
         )
         style.map("Data.Treeview.Heading", background=[("active", UI["blue_soft"])])
 
@@ -490,7 +492,9 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         ttk.Separator(self.root).pack(fill=X)
         footer = ttk.Frame(self.root, padding=(10, 6), style="Footer.TFrame")
         footer.pack(fill=X)
-        ttk.Label(footer, textvariable=self.status, style="FooterStatus.TLabel", wraplength=760).pack(side=LEFT, fill=X, expand=True)
+        footer_status = ttk.Label(footer, textvariable=self.status, style="FooterStatus.TLabel")
+        footer_status.pack(side=LEFT, fill=X, expand=True)
+        bind_dynamic_wrap(footer_status, footer, minimum=240, padding=180)
         self.footer_next = ttk.Button(footer, text="下一步", command=self._go_next)
         self.footer_next.pack(side=RIGHT)
         self.footer_back = ttk.Button(footer, text="上一步", command=self._go_back)
@@ -511,10 +515,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         log_header = ttk.Frame(self.shared_log_shell)
         log_header.pack(fill=X)
         self.shared_log_status = StringVar(value="日志尚未开始")
-        ttk.Label(
+        log_status = ttk.Label(
             log_header, textvariable=self.shared_log_status, style="CardMuted.TLabel",
-            wraplength=720,
-        ).pack(side=LEFT, fill=X, expand=True, padx=(16, 12))
+        )
+        log_status.pack(side=LEFT, fill=X, expand=True, padx=(16, 12))
+        bind_dynamic_wrap(log_status, log_header, minimum=180, padding=220)
         ttk.Button(
             log_header, text="复制全部", style="Compact.TButton", command=self.copy_all_logs,
         ).pack(side=RIGHT, padx=(0, 7))
@@ -979,34 +984,44 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             try:
                 output_value = args[args.index("--output-root") + 1]
                 run_name = args[args.index("--run-id") + 1] if "--run-id" in args else time.strftime("run_%Y%m%d_%H%M%S")
-                log_dir = Path(output_value).expanduser() / "_logs"
+                layout = (
+                    ProjectLayout.from_project(self.project_root_path, output_value)
+                    if self.project_root_path else ProjectLayout.from_output(output_value)
+                )
+                log_dir = layout.logs_root
                 log_dir.mkdir(parents=True, exist_ok=True)
                 self.active_log_path = log_dir / f"{run_name}.log"
             except (ValueError, IndexError, OSError):
                 self.active_log_path = None
         elif args and args[0] == "apply-edits":
             try:
-                if "--pipeline-manifest" in args:
-                    log_root = Path(args[args.index("--pipeline-manifest") + 1]).expanduser().resolve().parent
-                else:
-                    log_root = Path(args[args.index("--result") + 1]).expanduser().resolve().parent
-                log_dir = log_root / "_logs"
+                log_dir = (
+                    ProjectLayout.from_project(self.project_root_path, self.vars["output_root"].get()).logs_root
+                    if self.project_root_path else
+                    ProjectLayout.from_output(self.vars["output_root"].get()).logs_root
+                )
                 log_dir.mkdir(parents=True, exist_ok=True)
                 self.active_log_path = log_dir / f"人工编辑重建_{time.strftime('%Y%m%d_%H%M%S')}.log"
             except (ValueError, IndexError, OSError):
                 self.active_log_path = None
         elif args and args[0] in {"evaluate-existing", "evaluate-all-existing"}:
             try:
-                log_root = Path(args[args.index("--pipeline-manifest") + 1]).expanduser().resolve().parent
-                log_dir = log_root / "_logs"
+                log_dir = (
+                    ProjectLayout.from_project(self.project_root_path, self.vars["output_root"].get()).logs_root
+                    if self.project_root_path else
+                    ProjectLayout.from_output(self.vars["output_root"].get()).logs_root
+                )
                 log_dir.mkdir(parents=True, exist_ok=True)
                 self.active_log_path = log_dir / f"精度评价_{time.strftime('%Y%m%d_%H%M%S')}.log"
             except (ValueError, IndexError, OSError):
                 self.active_log_path = None
         elif args:
             try:
-                log_root = Path(self.vars["output_root"].get()).expanduser().resolve()
-                log_dir = log_root / "_logs"
+                log_dir = (
+                    ProjectLayout.from_project(self.project_root_path, self.vars["output_root"].get()).logs_root
+                    if self.project_root_path else
+                    ProjectLayout.from_output(self.vars["output_root"].get()).logs_root
+                )
                 log_dir.mkdir(parents=True, exist_ok=True)
                 self.active_log_path = log_dir / f"{_safe_task_name(args[0])}_{time.strftime('%Y%m%d_%H%M%S')}.log"
             except OSError:

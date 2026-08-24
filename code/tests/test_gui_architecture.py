@@ -92,7 +92,7 @@ class ProjectManagerArchitectureTests(unittest.TestCase):
                 "change_results": [],
             }
             items = manager.result_items(manifest, root)
-            center_item = next(item for item in items if item["label"] == "道路中心线")
+            center_item = next(item for item in items if item["label"] == "中心线")
             self.assertEqual(center_item["status"], "已生成")
             self.assertEqual(Path(center_item["path"]), center.resolve())
 

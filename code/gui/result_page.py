@@ -9,7 +9,11 @@ from pathlib import Path
 from tkinter import END, Toplevel, filedialog, messagebox
 
 from app.project_manager import TemporalAttributePager, _manifest_path
-from .common_widgets import configure_window_geometry, format_percentage
+from app.result_publisher import ProjectLayout
+from .common_widgets import (
+    Tooltip, bind_dynamic_wrap,
+    configure_window_geometry, format_percentage,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
@@ -32,7 +36,9 @@ class ResultPage:
         for label, variable in (("影像期次：", self.result_period_count), ("变化检测任务：", self.result_change_count), ("验证区：", self.result_area_count), ("可人工编辑：", self.result_review_count)):
             ttk.Label(metrics, text=label).pack(side=LEFT)
             ttk.Label(metrics, textvariable=variable).pack(side=LEFT, padx=(0, 10))
-        ttk.Label(result_card, textvariable=self.result_status, wraplength=620).pack(fill=X, pady=(0, 5))
+        result_status_label = ttk.Label(result_card, textvariable=self.result_status)
+        result_status_label.pack(fill=X, pady=(0, 5))
+        bind_dynamic_wrap(result_status_label, result_card, minimum=260, padding=20)
         browser = ttk.Frame(result_card)
         browser.pack(fill=BOTH, expand=True, pady=(0, 5))
         self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=10, style="Data.Treeview")
@@ -41,9 +47,14 @@ class ResultPage:
         self.result_tree.column("#0", width=620, minwidth=320, stretch=True)
         self.result_tree.column("status", width=140, minwidth=100, stretch=False)
         tree_scroll = ttk.Scrollbar(browser, orient="vertical", command=self.result_tree.yview)
-        self.result_tree.configure(yscrollcommand=tree_scroll.set)
-        self.result_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        tree_scroll.pack(side=RIGHT, fill="y")
+        tree_xscroll = ttk.Scrollbar(browser, orient="horizontal", command=self.result_tree.xview)
+        self.result_tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=tree_xscroll.set)
+        self.result_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        tree_xscroll.grid(row=1, column=0, sticky="ew")
+        browser.grid_rowconfigure(0, weight=1)
+        browser.grid_columnconfigure(0, weight=1)
+        self.result_tree_tooltip = Tooltip(self.result_tree, self._result_tree_tooltip_text)
         self.result_tree.bind("<Double-1>", lambda _event: self.open_selected_result())
         result_actions = ttk.Frame(result_card)
         result_actions.pack(fill=X)
@@ -53,11 +64,13 @@ class ResultPage:
 
         evaluation_card = ttk.LabelFrame(page, text="精度评价", padding=LAYOUT_METRICS["card_padding"])
         evaluation_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(
+        evaluation_hint = ttk.Label(
             evaluation_card,
             text="根据真值数据中的变化类型，对新增、变化和灭失道路进行精度评价，并汇总各验证区及相邻影像期次的评价结果。中心线位置偏差仅统计新增和灭失道路；宽度变化道路不纳入中心线偏差统计。",
-            style="Hint.TLabel", wraplength=620,
-        ).pack(anchor="w", pady=(0, 6))
+            style="Hint.TLabel",
+        )
+        evaluation_hint.pack(anchor="w", fill=X, pady=(0, 6))
+        bind_dynamic_wrap(evaluation_hint, evaluation_card, minimum=260, padding=20)
         pair_row = ttk.Frame(evaluation_card)
         pair_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(pair_row, text="待评价结果", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
@@ -75,9 +88,11 @@ class ResultPage:
             command=self.supplement_evaluation_truth,
         ).pack(side=LEFT, padx=(8, 0))
         self.evaluation_truth_summary = StringVar(value="总体评价会按区域和相邻期次分别匹配真值，不使用上方单个路径代替全部真值。")
-        ttk.Label(
-            evaluation_card, textvariable=self.evaluation_truth_summary, style="CardMuted.TLabel", wraplength=980,
-        ).pack(anchor="w", fill=X, pady=(0, 5))
+        truth_summary_label = ttk.Label(
+            evaluation_card, textvariable=self.evaluation_truth_summary, style="CardMuted.TLabel",
+        )
+        truth_summary_label.pack(anchor="w", fill=X, pady=(0, 5))
+        bind_dynamic_wrap(truth_summary_label, evaluation_card, minimum=260, padding=20)
         self.evaluation_advanced_toggle = ttk.Button(evaluation_card, text="评价高级设置...", command=self._toggle_evaluation_advanced)
         self.evaluation_advanced_toggle.pack(anchor="w", pady=(4, 4))
         options_row = ttk.Frame(evaluation_card)
@@ -91,7 +106,9 @@ class ResultPage:
         action_row = ttk.Frame(evaluation_card)
         action_row.pack(fill=X)
         self.evaluation_status = StringVar(value="请先载入或生成包含变化检测的任务结果。")
-        ttk.Label(action_row, textvariable=self.evaluation_status, style="Hint.TLabel", wraplength=760).pack(side=LEFT, fill=X, expand=True)
+        evaluation_status_label = ttk.Label(action_row, textvariable=self.evaluation_status, style="Hint.TLabel")
+        evaluation_status_label.pack(side=LEFT, fill=X, expand=True)
+        bind_dynamic_wrap(evaluation_status_label, action_row, minimum=220, padding=280)
         self.run_evaluation_button = ttk.Button(
             action_row, text="评价当前结果", command=self.run_result_evaluation,
         )
@@ -116,20 +133,46 @@ class ResultPage:
             ("可评价变化对：", self.result_evaluable_count),
         )):
             ttk.Label(summary, text=label, width=15).grid(row=row, column=0, sticky="nw", pady=2)
-            ttk.Label(summary, textvariable=variable, wraplength=390).grid(row=row, column=1, sticky="nw", pady=2)
+            summary_value = ttk.Label(summary, textvariable=variable)
+            summary_value.grid(row=row, column=1, sticky="nw", pady=2)
+            bind_dynamic_wrap(summary_value, summary, minimum=160, padding=150)
         summary.grid_columnconfigure(1, weight=1)
 
     def _latest_manifest(self) -> tuple[dict | None, Path | None]:
         if self.loaded_manifest_path is not None and self.loaded_manifest_path.is_file():
             latest = self.loaded_manifest_path
         else:
-            latest = Path(self.vars["output_root"].get().strip()) / "latest_pipeline.json"
+            latest = self.project_manager.latest_manifest_path(
+                self.vars["output_root"].get().strip(), self.project_root_path,
+            )
         if not latest.is_file():
+            result_index = Path(self.vars["output_root"].get().strip()) / "result_index.json"
+            if result_index.is_file():
+                return ({
+                    "result_index": str(result_index),
+                    "output_root": str(result_index.parent),
+                    "project_root": self.project_root_path,
+                    "period_results": [], "change_results": [], "temporal_results": [],
+                    "status": "completed",
+                }, result_index)
+            legacy, legacy_path = self.project_manager.legacy_results(
+                self.vars["output_root"].get().strip(),
+            )
+            if legacy is not None and legacy_path is not None:
+                return legacy, legacy_path
             return None, latest
         try:
             value = json.loads(latest.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None, latest
+        if isinstance(value, dict) and isinstance(value.get("areas"), dict):
+            value = {
+                "result_index": str(latest),
+                "output_root": str(latest.parent),
+                "project_root": str(value.get("project_root") or self.project_root_path),
+                "period_results": [], "change_results": [], "temporal_results": [],
+                "status": "completed",
+            }
         return (value, latest) if isinstance(value, dict) else (None, latest)
 
     def _refresh_result_availability(self) -> None:
@@ -160,16 +203,26 @@ class ResultPage:
         base_dir = latest.parent
         self.review_items = self.project_manager.review_items(manifest, base_dir)
         self.temporal_items = self.project_manager.temporal_items(manifest, base_dir)
+        index = self.project_manager.result_index(self.vars["output_root"].get().strip())
+        indexed_areas = (index or {}).get("areas") or {}
         self.results_available = bool(
             manifest.get("period_results") or manifest.get("change_results")
-            or self.review_items or self.temporal_items
+            or self.review_items or self.temporal_items or indexed_areas
         )
         area_names = {
             str(entry.get("grid") or "validation")
             for entry in (manifest.get("period_results", []) or []) if isinstance(entry, dict)
         }
-        period_count = len(manifest.get("period_results", []) or [])
-        change_count = len(manifest.get("change_results", []) or [])
+        if indexed_areas:
+            area_names.update(str(name) for name in indexed_areas)
+        period_count = len(manifest.get("period_results", []) or []) or sum(
+            len(value.get("periods") or {}) for value in indexed_areas.values()
+            if isinstance(value, dict)
+        )
+        change_count = len(manifest.get("change_results", []) or []) or sum(
+            len(value.get("changes") or {}) for value in indexed_areas.values()
+            if isinstance(value, dict)
+        )
         message = (
             f"本次任务包含 {len(area_names)} 个验证区、{period_count} 个影像期次，"
             f"已生成 {change_count} 组变化检测成果。"
@@ -229,6 +282,14 @@ class ResultPage:
             if len(next_pending) == len(pending):
                 break
             pending = next_pending
+
+    def _result_tree_tooltip_text(self, _event=None) -> str:
+        if not hasattr(self, "result_tree"):
+            return ""
+        y = self.result_tree.winfo_pointery() - self.result_tree.winfo_rooty()
+        row = self.result_tree.identify_row(y)
+        path = self.result_tree_paths.get(row)
+        return str(path) if path is not None else ""
 
     def open_selected_result(self) -> None:
         if not hasattr(self, "result_tree"):
@@ -431,11 +492,8 @@ class ResultPage:
             messagebox.showinfo("暂无成果", f"尚未找到最新成果索引：\n{latest}", parent=self.root)
             return
         self._refresh_result_availability()
-        try:
-            job_root = Path(str(manifest["job_root"]))
-        except (KeyError, TypeError, ValueError):
-            job_root = latest
-        self._open(job_root)
+        output_root = Path(str(manifest.get("output_root") or self.vars["output_root"].get())).expanduser()
+        self._open(output_root)
 
     def load_existing_results(self) -> None:
         """Attach the GUI to an existing saved run without executing inference."""
@@ -451,11 +509,16 @@ class ResultPage:
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             messagebox.showerror("无法读取已有结果", str(exc), parent=self.root)
             return
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("period_results"), list):
-            messagebox.showerror("不是任务结果索引", "请选择 latest_pipeline.json 或 pipeline_result.json。", parent=self.root)
+        is_pipeline = isinstance(manifest, dict) and isinstance(manifest.get("period_results"), list)
+        is_result_index = isinstance(manifest, dict) and isinstance(manifest.get("areas"), dict)
+        if not is_pipeline and not is_result_index:
+            messagebox.showerror("不是任务结果索引", "请选择 result_index.json、latest_pipeline.json 或 pipeline_result.json。", parent=self.root)
             return
         self.loaded_manifest_path = path
-        self.vars["output_root"].set(str(path.parent if path.name == "latest_pipeline.json" else Path(manifest.get("job_root", path.parent)).parent))
+        output = str(manifest.get("output_root") or (path.parent if is_result_index else "")).strip()
+        if not output:
+            output = str(path.parent if path.name == "latest_pipeline.json" else Path(manifest.get("job_root", path.parent)).parent)
+        self.vars["output_root"].set(output)
         self.current_project.set(f"已有结果：{manifest.get('run_id', path.parent.name)}")
         self.preflight_passed = True
         self._refresh_result_availability()
@@ -468,7 +531,9 @@ class ResultPage:
             messagebox.showinfo("暂无报告", "尚未找到最新任务索引。", parent=self.root)
             return
         job_root = Path(str(manifest.get("job_root") or latest.parent)).expanduser()
-        report = job_root / "task_report.csv"
+        report = Path(str(manifest.get("output_root") or self.vars["output_root"].get())) / "task_report.csv"
+        if not report.is_file():
+            report = job_root / "task_report.csv"
         if not report.is_file():
             messagebox.showinfo(
                 "暂无报告", f"该任务尚未生成报告，可能仍在运行或来自旧版本：\n{report}", parent=self.root,
@@ -691,7 +756,11 @@ class ResultPage:
             job_root / "task_report.json",
             job_root / "task_report.csv",
         ]
-        log_path = Path(self.vars["output_root"].get().strip()) / "_logs" / f"{manifest.get('run_id')}.log"
+        layout = (
+            ProjectLayout.from_project(self.project_root_path, self.vars["output_root"].get().strip())
+            if self.project_root_path else ProjectLayout.from_output(self.vars["output_root"].get().strip())
+        )
+        log_path = layout.logs_root / f"{manifest.get('run_id')}.log"
         candidates.append(log_path)
         diagnostics = {
             "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),

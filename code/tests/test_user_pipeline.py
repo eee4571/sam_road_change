@@ -778,8 +778,9 @@ class OneClickPipelineTests(unittest.TestCase):
                 self.assertEqual(period_result["review"]["manual_item_count"], 0)
             for change_result in result["change_results"]:
                 self.assertEqual(change_result["previews"], {})
-            self.assertTrue((output / "latest_pipeline.json").is_file())
-            latest = user_pipeline.read_json(output / "latest_pipeline.json")
+            latest_path = root / "_work" / "tasks" / "latest_pipeline.json"
+            self.assertTrue(latest_path.is_file())
+            latest = user_pipeline.read_json(latest_path)
             self.assertEqual(len(latest["period_results"]), 5)
             self.assertIn("previews", latest["period_results"][0])
             self.assertIn("review", latest["period_results"][0])

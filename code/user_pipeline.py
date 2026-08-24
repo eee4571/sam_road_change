@@ -28,6 +28,7 @@ from input_catalog import (
     period_sort_key,
     read_path_list,
 )
+from app.result_publisher import ProjectLayout, ResultPublisher
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -319,6 +320,14 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
 def clean_name(value: str) -> str:
     value = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value.strip())
     return value.strip("._-") or "workspace"
+
+
+def project_layout(output_root: Path | str, project_root_value: Path | str | None = None) -> ProjectLayout:
+    """Resolve all user/output/work paths through one project-level policy."""
+    return (
+        ProjectLayout.from_project(project_root_value, output_root)
+        if project_root_value is not None else ProjectLayout.from_output(output_root)
+    )
 
 
 def natural_key(value: str) -> tuple:
@@ -894,7 +903,8 @@ def extract_project_period(args: argparse.Namespace) -> dict:
         raise ValueError(f"区域 {args.area_id} 中不存在期次：{args.period}")
 
     output_root = Path(discovered["output_root"])
-    task_root = output_root / "period_extractions" / clean_name(args.area_id) / clean_name(args.period) / clean_name(args.run_id)
+    layout = project_layout(output_root, discovered["project_root"])
+    task_root = layout.period_task_root(args.area_id, args.period, args.run_id)
     state_path = task_root / "period_task.json"
     workspace = task_root / "workspace"
     normalized_root = task_root / "normalized_input"
@@ -953,6 +963,11 @@ def extract_project_period(args: argparse.Namespace) -> dict:
                 grid=args.area_id, period=args.period, resume=resume,
                 pipeline_state=str(state_path),
             ))
+        published = ResultPublisher(
+            output_root, project_root=discovered["project_root"],
+        ).publish_period(args.area_id, args.period, result, run_id=args.run_id)
+        if published:
+            result["published"] = published
         state.update({"status": "completed", "result": str(result_path), "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
         write_json(state_path, state)
         emit("complete", stage="extract-project-period", area_id=args.area_id, period=args.period, state=str(state_path), resumed=resume, **result)
@@ -988,7 +1003,8 @@ def extract_project_all(args: argparse.Namespace) -> dict:
         for period in available_areas[area_id]["periods"]
     ]
     output_root = Path(discovered["output_root"])
-    batch_root = output_root / "batch_extractions" / clean_name(run_id)
+    layout = project_layout(output_root, discovered["project_root"])
+    batch_root = layout.batch_task_root(run_id)
     state_path = batch_root / "batch_extract_task.json"
     resume = bool(getattr(args, "resume", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
@@ -1062,9 +1078,11 @@ def extract_project_all(args: argparse.Namespace) -> dict:
                 continue
 
             unit_state_path = (
-                output_root / "period_extractions" / clean_name(area_id) /
-                clean_name(period) / clean_name(run_id) / "period_task.json"
+                layout.period_task_root(area_id, period, run_id) / "period_task.json"
             )
+            legacy_unit_state_path = layout.legacy_period_task_root(
+                area_id, period, run_id,
+            ) / "period_task.json"
             unit_started = time.monotonic()
             emit(
                 "pipeline", stage="批量道路提取", status="running", area_id=area_id,
@@ -1078,9 +1096,12 @@ def extract_project_all(args: argparse.Namespace) -> dict:
                     junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                     resume=resume and unit_state_path.is_file(),
                 ))
+                completed_state_path = (
+                    unit_state_path if unit_state_path.is_file() else legacy_unit_state_path
+                )
                 entry = {
                     "area_id": area_id, "period": period, "status": "completed",
-                    "state": str(unit_state_path), "result": unit_state.get("result"),
+                    "state": str(completed_state_path), "result": unit_state.get("result"),
                     "elapsed_seconds": elapsed_seconds(unit_started),
                 }
                 state["succeeded"] += 1
@@ -1181,7 +1202,10 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         args.after_state, discovered["project_root"], args.area_id, args.after_period,
     )
     output_root = Path(discovered["output_root"])
-    task_root = output_root / "period_changes" / clean_name(args.area_id) / f"{clean_name(args.before_period)}_to_{clean_name(args.after_period)}" / args.run_id
+    layout = project_layout(output_root, discovered["project_root"])
+    task_root = layout.change_task_root(
+        args.area_id, args.before_period, args.after_period, args.run_id,
+    )
     state_path = task_root / "change_task.json"
     products = task_root / "products"
     truth_entry = next((item for item in area.get("truths", []) if item["before"] == args.before_period and item["after"] == args.after_period), None)
@@ -1226,7 +1250,7 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 validation_area=area["validation_area"], truth_type_field="",
             ))
         summary_data = read_json(Path(result["summary"])) if Path(result["summary"]).is_file() else {}
-        result["layers"] = {
+        result["layers"] = {**dict(result.get("layers") or {}),
             "added": str(products / "added_roads.shp"), "removed": str(products / "removed_roads.shp"),
             "widened": str(products / "widened_road_parts.shp"), "narrowed": str(products / "narrowed_road_parts.shp"),
         }
@@ -1234,6 +1258,13 @@ def change_project_periods(args: argparse.Namespace) -> dict:
             kind: {"feature_count": int(summary_data.get(f"{kind}_feature_count", 0) or 0), "length_m": float(summary_data.get(f"{kind}_length_m", 0) or 0), "area_m2": float(summary_data.get(f"{kind}_area_m2", 0) or 0)}
             for kind in ("added", "removed", "widened", "narrowed")
         }
+        published = ResultPublisher(
+            output_root, project_root=discovered["project_root"],
+        ).publish_change(
+            args.area_id, args.before_period, args.after_period, result, run_id=args.run_id,
+        )
+        if published:
+            result["published"] = published
         state.update({"status": "completed", "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
         write_json(state_path, state)
         emit("complete", stage="change-project-periods", area_id=args.area_id, before_period=args.before_period, after_period=args.after_period, state=str(state_path), resumed=resume, **result)
@@ -2534,14 +2565,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
 
     job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
     aggregate = aggregate_change_evaluations(manifest, job_root)
-    targets = {
-        manifest_path,
-        job_root / "job_state.json",
-        job_root / "pipeline_result.json",
-        job_root.parent / "latest_pipeline.json",
-    }
-    for target in targets:
-        write_json(target, manifest)
+    _persist_existing_pipeline(manifest, manifest_path)
 
     overall = rows[0]
     result = {
@@ -2606,6 +2630,7 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
     manifest = read_json(manifest_path)
     job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
     aggregate = aggregate_change_evaluations(manifest, job_root)
+    _persist_existing_pipeline(manifest, manifest_path)
     overall = next((row for row in aggregate.get("metrics", []) if row.get("class") == "all"), {})
     result = {
         "evaluated_task_count": completed,
@@ -2816,14 +2841,7 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
             )
         write_json(result_path, result)
 
-        manifest_paths = {pipeline_manifest}
-        job_root_value = pipeline.get("job_root")
-        if job_root_value:
-            job_root = Path(job_root_value).expanduser().resolve()
-            manifest_paths.add(job_root / "pipeline_result.json")
-            manifest_paths.add(job_root.parent / "latest_pipeline.json")
-        for manifest_target in manifest_paths:
-            write_json(manifest_target, pipeline)
+        _persist_existing_pipeline(pipeline, pipeline_manifest)
     progress_completed = progress_total
     emit(
         "apply-edits", stage="人工编辑增量重建", status="complete",
@@ -3205,17 +3223,36 @@ def _persist_pipeline(manifest: dict, job_root: Path, output_root: Path) -> None
     manifest["updated_at"] = now_text()
     write_json(job_root / "job_state.json", manifest)
     write_json(job_root / "pipeline_result.json", manifest)
-    write_json(output_root / "latest_pipeline.json", manifest)
+    layout = project_layout(output_root, manifest.get("project_root"))
+    write_json(layout.latest_pipeline_path, manifest)
 
 
 def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
-    job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
+    job_value = str(manifest.get("job_root") or "").strip()
+    job_root = Path(job_value or manifest_path.parent).expanduser().resolve()
+    output_value = str(manifest.get("output_root") or "").strip()
+    output_root = Path(
+        output_value or (job_root.parent if job_value else manifest_path.parent)
+    ).expanduser().resolve()
+    project_value = str(manifest.get("project_root") or "").strip()
+    if not project_value:
+        project_value = str(
+            output_root.parent
+            if output_root.name.startswith("04_") or job_value
+            else output_root
+        )
+        manifest["project_root"] = project_value
+    manifest.setdefault("output_root", str(output_root))
+    publisher = ResultPublisher(output_root, project_root=project_value)
+    publisher.publish_manifest(manifest, source_manifest=manifest_path)
     _write_task_report(manifest, job_root)
-    _persist_pipeline(manifest, job_root, job_root.parent)
+    publisher.publish_reports(job_root)
+    _persist_pipeline(manifest, job_root, output_root)
+    latest_path = project_layout(output_root, manifest.get("project_root")).latest_pipeline_path
     if manifest_path.resolve() not in {
         (job_root / "job_state.json").resolve(),
         (job_root / "pipeline_result.json").resolve(),
-        (job_root.parent / "latest_pipeline.json").resolve(),
+        latest_path.resolve(),
     }:
         write_json(manifest_path, manifest)
 
@@ -3393,33 +3430,36 @@ def build_temporal_outputs(manifest: dict, job_root: Path | None = None) -> list
 def _write_task_report(manifest: dict, job_root: Path) -> None:
     rows = []
     for entry in manifest.get("period_results", []):
+        published = entry.get("published") if isinstance(entry.get("published"), dict) else {}
         rows.append({
             "type": "period",
             "grid": entry.get("grid", ""),
             "scope": entry.get("period", ""),
             "status": "complete",
             "elapsed_seconds": entry.get("elapsed_seconds", ""),
-            "output": entry.get("gpkg", ""),
+            "output": published.get("centerlines") or entry.get("centerlines", ""),
             "message": "",
         })
     for entry in manifest.get("change_results", []):
+        published = entry.get("published") if isinstance(entry.get("published"), dict) else {}
         rows.append({
             "type": "change",
             "grid": entry.get("grid", ""),
             "scope": f"{entry.get('before_period', '')} -> {entry.get('after_period', '')}",
             "status": "complete",
             "elapsed_seconds": entry.get("elapsed_seconds", ""),
-            "output": entry.get("output", ""),
+            "output": published.get("changes") or entry.get("output", ""),
             "message": "",
         })
     for entry in manifest.get("temporal_results", []):
+        published = entry.get("published") if isinstance(entry.get("published"), dict) else {}
         rows.append({
             "type": "temporal",
             "grid": entry.get("grid", ""),
             "scope": f"{entry.get('period_count', 0)} 期长时序道路",
             "status": "complete",
             "elapsed_seconds": entry.get("elapsed_seconds", ""),
-            "output": entry.get("life_shp", ""),
+            "output": published.get("life_shp") or entry.get("life_shp", ""),
             "message": "",
         })
     for entry in manifest.get("failures", []):
@@ -3511,7 +3551,9 @@ def run_all(args: argparse.Namespace) -> dict:
         )
     output_root.mkdir(parents=True, exist_ok=True)
     run_id = clean_name(args.run_id.strip() or time.strftime("run_%Y%m%d_%H%M%S"))
-    job_root = output_root / run_id
+    layout = project_layout(output_root)
+    layout.ensure_project_directories()
+    job_root = layout.full_run_root(run_id)
     resume = bool(getattr(args, "resume", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     if job_root.exists() and not resume:
@@ -3553,6 +3595,9 @@ def run_all(args: argparse.Namespace) -> dict:
             prior["resumed_at"] = now_text()
             prior["last_reused_at"] = now_text()
             prior["reuse_count"] = int(prior.get("reuse_count", 0) or 0) + 1
+            ResultPublisher(output_root).publish_manifest(
+                prior, source_manifest=job_root / "pipeline_result.json",
+            )
             _persist_pipeline(prior, job_root, output_root)
             emit(
                 "complete", stage="all", manifest=str(job_root / "pipeline_result.json"),
@@ -3565,6 +3610,9 @@ def run_all(args: argparse.Namespace) -> dict:
     manifest = {
         "pipeline_version": PIPELINE_VERSION,
         "run_id": run_id,
+        "project_root": str(layout.project_root),
+        "output_root": str(output_root),
+        "result_index": str(layout.result_index_path),
         "mode": mode,
         "source_root": str(source_root) if source_root is not None else "",
         "validation_area": (
@@ -3657,6 +3705,11 @@ def run_all(args: argparse.Namespace) -> dict:
                     entry = prior_entry
                     manifest["period_results"].append(entry)
                     result_by_period[(grid_name, period)] = entry
+                    published = ResultPublisher(output_root).publish_period(
+                        grid_name, period, entry, run_id=run_id,
+                    )
+                    if published:
+                        entry["published"] = published
                     manifest["processed_work"] += 1
                     progress(
                         "道路提取", status="skipped", grid=grid_name, period=period,
@@ -3797,6 +3850,11 @@ def run_all(args: argparse.Namespace) -> dict:
                     }
                     entry["elapsed_seconds"] = elapsed_seconds(unit_started)
                     manifest["change_results"].append(entry)
+                    published = ResultPublisher(output_root).publish_change(
+                        grid_name, before_period, after_period, entry, run_id=run_id,
+                    )
+                    if published:
+                        entry["published"] = published
                 except Exception as exc:
                     failure = {
                         "type": "change", "grid": grid_name,
@@ -3833,7 +3891,12 @@ def run_all(args: argparse.Namespace) -> dict:
         manifest["status"] = "completed_with_errors" if manifest["failures"] else "completed"
         update_elapsed()
         aggregate_change_evaluations(manifest, job_root)
+        publisher = ResultPublisher(output_root)
+        publisher.publish_manifest(
+            manifest, source_manifest=job_root / "pipeline_result.json",
+        )
         _write_task_report(manifest, job_root)
+        publisher.publish_reports(job_root)
         _persist_pipeline(manifest, job_root, output_root)
         emit(
             "complete", stage="all", manifest=str(job_root / "pipeline_result.json"),
@@ -3850,6 +3913,7 @@ def run_all(args: argparse.Namespace) -> dict:
         manifest["failed_at"] = now_text()
         update_elapsed()
         _write_task_report(manifest, job_root)
+        ResultPublisher(output_root).publish_reports(job_root)
         _persist_pipeline(manifest, job_root, output_root)
         raise
 

@@ -10,7 +10,10 @@ from app.project_manager import natural_key
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS
+from .common_widgets import (
+    LAYOUT_METRICS, PathDisplay, Tooltip, attach_treeview_tooltip,
+    bind_dynamic_wrap,
+)
 
 class DataPage:
     def _build_data_page(self, page: ttk.Frame) -> None:
@@ -27,11 +30,15 @@ class DataPage:
         self.project_name_display = StringVar(value="尚未打开项目")
         self.project_path_display = StringVar(value="尚未选择项目目录")
         ttk.Label(project_meta, text="项目路径：", width=12).grid(row=0, column=0, sticky="w")
-        ttk.Label(project_meta, textvariable=self.project_path_display, width=1).grid(row=0, column=1, sticky="ew")
+        self.project_path_field = PathDisplay(project_meta, textvariable=self.project_path_display, width=1)
+        self.project_path_field.grid(row=0, column=1, sticky="ew")
         ttk.Label(project_meta, text="外部数据源：", width=12).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(project_meta, textvariable=self.data_source_display, width=1).grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        self.data_source_field = PathDisplay(project_meta, textvariable=self.data_source_display, width=1)
+        self.data_source_field.grid(row=1, column=1, sticky="ew", pady=(4, 0))
         ttk.Label(project_meta, text="扫描状态：", width=12).grid(row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(project_meta, textvariable=self.project_scan_summary, width=1).grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        self.project_scan_label = ttk.Label(project_meta, textvariable=self.project_scan_summary, width=1)
+        self.project_scan_label.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        bind_dynamic_wrap(self.project_scan_label, project_meta, minimum=220, padding=120)
         project_meta.grid_columnconfigure(1, weight=1)
         quick_actions = ttk.Frame(project_card)
         quick_actions.pack(fill=X, pady=(6, 0))
@@ -61,7 +68,8 @@ class DataPage:
         area_row = ttk.Frame(config_card)
         area_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(area_row, text="验证区 SHP：", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
-        ttk.Label(area_row, textvariable=self.project_validation_path, anchor="w").pack(side=LEFT, fill=X, expand=True)
+        self.project_validation_field = PathDisplay(area_row, textvariable=self.project_validation_path)
+        self.project_validation_field.pack(side=LEFT, fill=X, expand=True)
         ttk.Button(area_row, text="选择...", command=self.replace_project_validation_area).pack(side=LEFT, padx=(5, 0))
         self.project_config_container = ttk.Frame(config_card)
         self.project_config_container.pack(fill=X, pady=(6, 5))
@@ -130,13 +138,16 @@ class DataPage:
         summary_box.grid_columnconfigure(1, weight=1)
         ttk.Separator(summary_box).grid(row=6, column=0, columnspan=2, sticky="ew", pady=8)
         ttk.Label(summary_box, text="当前输入：", style="CardMuted.TLabel").grid(row=7, column=0, sticky="nw")
-        self.input_summary_label = ttk.Label(summary_box, textvariable=self.input_summary, wraplength=420)
+        self.input_summary_label = ttk.Label(summary_box, textvariable=self.input_summary)
         self.input_summary_label.grid(row=7, column=1, sticky="nw")
-        ttk.Label(
+        bind_dynamic_wrap(self.input_summary_label, summary_box, minimum=180, padding=160)
+        input_hint = ttk.Label(
             summary_box,
             text="提示：开始处理前会再次检查影像范围、CRS、波段及数据有效性。",
-            style="CardMuted.TLabel", wraplength=420,
-        ).grid(row=8, column=0, columnspan=2, sticky="nw", pady=(10, 0))
+            style="CardMuted.TLabel",
+        )
+        input_hint.grid(row=8, column=0, columnspan=2, sticky="nw", pady=(10, 0))
+        bind_dynamic_wrap(input_hint, summary_box, minimum=220, padding=20)
         self._refresh_data_summary()
 
     def _refresh_data_summary(self) -> None:
@@ -178,9 +189,13 @@ class DataPage:
             self.project_period_tree.heading(column, text=title, anchor="w")
             self.project_period_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")
         period_scroll = ttk.Scrollbar(period_frame, orient="vertical", command=self.project_period_tree.yview)
-        self.project_period_tree.configure(yscrollcommand=period_scroll.set)
-        self.project_period_tree.pack(side=LEFT, fill=X, expand=True)
-        period_scroll.pack(side=RIGHT, fill="y")
+        period_xscroll = ttk.Scrollbar(period_frame, orient="horizontal", command=self.project_period_tree.xview)
+        self.project_period_tree.configure(yscrollcommand=period_scroll.set, xscrollcommand=period_xscroll.set)
+        self.project_period_tree.grid(row=0, column=0, sticky="nsew")
+        period_scroll.grid(row=0, column=1, sticky="ns")
+        period_xscroll.grid(row=1, column=0, sticky="ew")
+        period_frame.grid_columnconfigure(0, weight=1)
+        attach_treeview_tooltip(self.project_period_tree)
         self.project_period_tree.bind("<Double-1>", lambda _event: self.replace_selected_project_period())
         period_actions = ttk.Frame(self.project_config_container)
         period_actions.pack(fill=X, pady=(3, 6))
@@ -202,9 +217,13 @@ class DataPage:
             self.project_truth_tree.heading(column, text=title, anchor="w")
             self.project_truth_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")
         truth_scroll = ttk.Scrollbar(truth_frame, orient="vertical", command=self.project_truth_tree.yview)
-        self.project_truth_tree.configure(yscrollcommand=truth_scroll.set)
-        self.project_truth_tree.pack(side=LEFT, fill=X, expand=True)
-        truth_scroll.pack(side=RIGHT, fill="y")
+        truth_xscroll = ttk.Scrollbar(truth_frame, orient="horizontal", command=self.project_truth_tree.xview)
+        self.project_truth_tree.configure(yscrollcommand=truth_scroll.set, xscrollcommand=truth_xscroll.set)
+        self.project_truth_tree.grid(row=0, column=0, sticky="nsew")
+        truth_scroll.grid(row=0, column=1, sticky="ns")
+        truth_xscroll.grid(row=1, column=0, sticky="ew")
+        truth_frame.grid_columnconfigure(0, weight=1)
+        attach_treeview_tooltip(self.project_truth_tree)
         self.project_truth_tree.bind("<Double-1>", lambda _event: self.set_selected_project_truth())
         truth_actions = ttk.Frame(self.project_config_container)
         truth_actions.pack(fill=X, pady=(3, 6))
@@ -212,15 +231,22 @@ class DataPage:
         ttk.Button(truth_actions, text="移除真值", style="Compact.TButton", command=self.remove_selected_project_truth).pack(side=LEFT, padx=(4, 0))
 
         ttk.Label(self.project_config_container, text="待确认候选").pack(anchor="w", pady=(2, 3))
+        candidate_frame = ttk.Frame(self.project_config_container)
+        candidate_frame.pack(fill=X)
         self.project_candidate_tree = ttk.Treeview(
-            self.project_config_container, columns=("kind", "path"), show="headings",
+            candidate_frame, columns=("kind", "path"), show="headings",
             height=3, style="Data.Treeview",
         )
         self.project_candidate_tree.heading("kind", text="类型", anchor="w")
         self.project_candidate_tree.heading("path", text="路径", anchor="w")
         self.project_candidate_tree.column("kind", width=70, stretch=False, anchor="w")
         self.project_candidate_tree.column("path", width=760, stretch=True, anchor="w")
-        self.project_candidate_tree.pack(fill=X)
+        candidate_xscroll = ttk.Scrollbar(candidate_frame, orient="horizontal", command=self.project_candidate_tree.xview)
+        self.project_candidate_tree.configure(xscrollcommand=candidate_xscroll.set)
+        self.project_candidate_tree.grid(row=0, column=0, sticky="nsew")
+        candidate_xscroll.grid(row=1, column=0, sticky="ew")
+        candidate_frame.grid_columnconfigure(0, weight=1)
+        attach_treeview_tooltip(self.project_candidate_tree)
 
     def _selected_tree_iid(tree) -> str:
         selected = tree.selection()
@@ -736,7 +762,10 @@ class DataPage:
             messagebox.showerror("项目已存在", f"目标文件夹不是空文件夹：\n{root}", parent=self.root)
             return
         try:
-            for child in ("04_成果输出", "_logs"):
+            for child in (
+                "04_成果输出", "_work/tasks", "_work/cache",
+                "_work/editor_cache", "_logs",
+            ):
                 (root / child).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("无法新建项目", str(exc), parent=self.root)

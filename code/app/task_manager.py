@@ -10,6 +10,7 @@ from pathlib import Path
 
 from input_catalog import period_order_manifest, period_sort_key
 from app.project_manager import USER_IMAGE_LIST_SUFFIX, USER_VECTOR_SUFFIX, atomic_write_json
+from app.result_publisher import ProjectLayout
 
 def structured_task_status(payload: dict) -> str | None:
     """Build the primary period-stage display without parsing plain log text."""
@@ -38,7 +39,14 @@ def unfinished_task_state(output_root: Path | str, active_task: dict | None) -> 
     if not run_id:
         return None
     state_value = str(active.get("state") or "").strip()
-    state_path = Path(state_value).expanduser() if state_value else Path(output_root).expanduser() / _safe_task_name(run_id) / "job_state.json"
+    if state_value:
+        state_path = Path(state_value).expanduser()
+    else:
+        output = Path(output_root).expanduser()
+        state_path = ProjectLayout.from_output(output).full_run_root(run_id) / "job_state.json"
+        legacy = ProjectLayout.from_output(output).legacy_full_run_root(run_id) / "job_state.json"
+        if not state_path.is_file() and legacy.is_file():
+            state_path = legacy
     if not state_path.is_file():
         return None
     try:
@@ -81,8 +89,13 @@ def mark_task_cancelled(output_root: Path | str, run_id: str) -> dict | None:
     if not run_id:
         return None
     output = Path(output_root).expanduser()
-    job_root = output / run_id
+    layout = ProjectLayout.from_output(output)
+    job_root = layout.full_run_root(run_id)
     state_path = job_root / "job_state.json"
+    legacy_job_root = layout.legacy_full_run_root(run_id)
+    if not state_path.is_file() and (legacy_job_root / "job_state.json").is_file():
+        job_root = legacy_job_root
+        state_path = job_root / "job_state.json"
     if not state_path.is_file():
         return None
     try:
@@ -91,7 +104,11 @@ def mark_task_cancelled(output_root: Path | str, run_id: str) -> dict | None:
             return None
         manifest["status"] = "cancelled"
         manifest["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        for target in (state_path, job_root / "pipeline_result.json", output / "latest_pipeline.json"):
+        latest = (
+            layout.legacy_latest_pipeline_path if job_root == legacy_job_root
+            else layout.latest_pipeline_path
+        )
+        for target in (state_path, job_root / "pipeline_result.json", latest):
             atomic_write_json(target, manifest)
         period_state_value = str(manifest.get("period_state") or "").strip()
         if period_state_value:
@@ -273,7 +290,11 @@ def resolve_automatic_run(
     """Choose a new or resumable task without exposing resume as a task type."""
     active = active_task if isinstance(active_task, dict) else {}
     run_id = str(requested_run_id or active.get("run_id") or generated_run_id or time.strftime("run_%Y%m%d_%H%M%S")).strip()
-    state = Path(output_root).expanduser() / _safe_task_name(run_id) / "job_state.json"
+    output = Path(output_root).expanduser()
+    state = ProjectLayout.from_output(output).full_run_root(run_id) / "job_state.json"
+    legacy = ProjectLayout.from_output(output).legacy_full_run_root(run_id) / "job_state.json"
+    if not state.is_file() and legacy.is_file():
+        state = legacy
     return run_id, state.is_file(), state
 
 def find_period_result(item: dict[str, str]) -> Path | None:
@@ -473,10 +494,7 @@ class TaskManager:
             "--pixel-size", str(pixel_size), "--rescale", str(rescale),
             "--junction-node-mode", str(junction_node_mode),
         ]
-        state = (
-            Path(output_root).expanduser() / "batch_extractions" /
-            _safe_task_name(run_id) / "batch_extract_task.json"
-        )
+        state = ProjectLayout.from_output(output_root).batch_task_root(run_id) / "batch_extract_task.json"
         if state.is_file():
             args.append("--resume")
         if continue_on_error:
@@ -495,11 +513,9 @@ class TaskManager:
             "--pixel-size", str(pixel_size), "--rescale", str(rescale),
             "--junction-node-mode", str(junction_node_mode),
         ]
-        state = (
-            Path(output_root).expanduser() / "period_extractions" /
-            _safe_task_name(area_id) / _safe_task_name(period) /
-            _safe_task_name(run_id) / "period_task.json"
-        )
+        state = ProjectLayout.from_output(output_root).period_task_root(
+            area_id, period, run_id,
+        ) / "period_task.json"
         if state.is_file():
             args.append("--resume")
         return args
@@ -552,9 +568,9 @@ class TaskManager:
                 if str(truth_type_field).strip():
                     args.extend(("--truth-type-field", str(truth_type_field).strip()))
                 return args
-        base = Path(output_root).expanduser() / "period_extractions" / _safe_task_name(area_id)
-        before_state = base / _safe_task_name(before) / _safe_task_name(run_id) / "period_task.json"
-        after_state = base / _safe_task_name(after) / _safe_task_name(run_id) / "period_task.json"
+        layout = ProjectLayout.from_output(output_root)
+        before_state = layout.period_task_root(area_id, before, run_id) / "period_task.json"
+        after_state = layout.period_task_root(area_id, after, run_id) / "period_task.json"
         if not before_state.is_file() or not after_state.is_file():
             raise ValueError("所选前后期尚无分步提取状态。请先重跑并完成两个期次。")
         args = [
@@ -565,11 +581,7 @@ class TaskManager:
             "--absolute", str(absolute), "--ratio", str(ratio),
             "--tolerance", str(tolerance),
         ]
-        change_state = (
-            Path(output_root).expanduser() / "period_changes" / _safe_task_name(area_id) /
-            f"{_safe_task_name(before)}_to_{_safe_task_name(after)}" /
-            str(run_id) / "change_task.json"
-        )
+        change_state = layout.change_task_root(area_id, before, after, run_id) / "change_task.json"
         if change_state.is_file():
             args.append("--resume")
         return args

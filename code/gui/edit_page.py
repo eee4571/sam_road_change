@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS
+from .common_widgets import LAYOUT_METRICS, PathDisplay, bind_dynamic_wrap
 
 class EditPage:
     def _editor_service(self) -> EditorManager:
@@ -42,12 +42,16 @@ class EditPage:
         status_row = ttk.Frame(review_card)
         status_row.pack(fill=X, pady=3)
         ttk.Label(status_row, text="当前状态：", width=14).pack(side=LEFT)
-        ttk.Label(status_row, textvariable=self.review_status, anchor="w", wraplength=520).pack(side=LEFT, fill=X, expand=True)
+        review_status_label = ttk.Label(status_row, textvariable=self.review_status, anchor="w")
+        review_status_label.pack(side=LEFT, fill=X, expand=True)
+        bind_dynamic_wrap(review_status_label, status_row, minimum=180, padding=130)
         edit_row = ttk.Frame(review_card)
         edit_row.pack(fill=X, pady=3)
         ttk.Label(edit_row, text="项目编辑目录：", width=14).pack(side=LEFT)
-        ttk.Label(edit_row, textvariable=self.review_edit_directory, anchor="w").pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(review_card, textvariable=self.review_detail, wraplength=620).pack(anchor="w", fill=X, pady=(3, 6))
+        PathDisplay(edit_row, textvariable=self.review_edit_directory).pack(side=LEFT, fill=X, expand=True)
+        review_detail_label = ttk.Label(review_card, textvariable=self.review_detail)
+        review_detail_label.pack(anchor="w", fill=X, pady=(3, 6))
+        bind_dynamic_wrap(review_detail_label, review_card, minimum=220, padding=20)
         actions = ttk.Frame(review_card)
         actions.pack(fill=X)
         self.launch_review_button = ttk.Button(actions, text="打开编辑工作台", style="Hero.TButton", command=self.launch_selected_review_editor)
@@ -70,9 +74,9 @@ class EditPage:
         )
         self.review_cancel_button.pack(side=RIGHT)
         self.review_cancel_button.state(["disabled"])
-        ttk.Label(
-            self.review_task_frame, textvariable=self.run_status, wraplength=620,
-        ).pack(anchor="w", fill=X, pady=(5, 6))
+        review_run_status = ttk.Label(self.review_task_frame, textvariable=self.run_status)
+        review_run_status.pack(anchor="w", fill=X, pady=(5, 6))
+        bind_dynamic_wrap(review_run_status, self.review_task_frame, minimum=220, padding=20)
         self.review_progress = ttk.Progressbar(
             self.review_task_frame, mode="determinate", maximum=1, value=0,
             style="Modern.Horizontal.TProgressbar",
@@ -91,13 +95,19 @@ class EditPage:
         summary = ttk.LabelFrame(self.step_summaries[2], text="编辑任务信息", padding=LAYOUT_METRICS["card_padding"])
         summary.pack(fill=BOTH, expand=True)
         ttk.Label(summary, text="当前对象：", width=12).grid(row=0, column=0, sticky="nw", pady=2)
-        ttk.Label(summary, textvariable=self.review_selection, wraplength=400).grid(row=0, column=1, sticky="nw", pady=2)
+        selection_label = ttk.Label(summary, textvariable=self.review_selection)
+        selection_label.grid(row=0, column=1, sticky="nw", pady=2)
         ttk.Label(summary, text="对象状态：", width=12).grid(row=1, column=0, sticky="nw", pady=2)
-        ttk.Label(summary, textvariable=self.review_status, wraplength=400).grid(row=1, column=1, sticky="nw", pady=2)
+        status_label = ttk.Label(summary, textvariable=self.review_status)
+        status_label.grid(row=1, column=1, sticky="nw", pady=2)
         ttk.Label(summary, text="编辑目录：", width=12).grid(row=2, column=0, sticky="nw", pady=2)
-        ttk.Label(summary, textvariable=self.review_edit_directory, wraplength=400).grid(row=2, column=1, sticky="nw", pady=2)
+        directory_label = ttk.Label(summary, textvariable=self.review_edit_directory)
+        directory_label.grid(row=2, column=1, sticky="nw", pady=2)
         ttk.Label(summary, text="说明：", width=12).grid(row=3, column=0, sticky="nw", pady=2)
-        ttk.Label(summary, textvariable=self.review_detail, wraplength=400).grid(row=3, column=1, sticky="nw", pady=2)
+        detail_label = ttk.Label(summary, textvariable=self.review_detail)
+        detail_label.grid(row=3, column=1, sticky="nw", pady=2)
+        for label in (selection_label, status_label, directory_label, detail_label):
+            bind_dynamic_wrap(label, summary, minimum=160, padding=130)
         summary.grid_columnconfigure(1, weight=1)
 
     def open_optional_review(self) -> None:

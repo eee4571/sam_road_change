@@ -12,6 +12,9 @@ import time
 from pathlib import Path
 
 from input_catalog import period_sort_key
+from app.result_publisher import (
+    ProjectLayout, read_result_index, result_index_from_manifest,
+)
 USER_VECTOR_SUFFIX = ".shp"
 
 USER_IMAGE_LIST_SUFFIX = ".txt"
@@ -26,7 +29,7 @@ SCAN_PROGRESS_TIME_INTERVAL = 0.3
 
 SCAN_EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".git", ".github", "env", ".venv", "venv", "__pycache__",
-    "04_成果输出", "_logs", ".editor_cache", "models", ".runtime",
+    "04_成果输出", "_work", "_logs", ".editor_cache", "models", ".runtime",
     "runtime", "node_modules", "tmp", "temp", ".cache",
     "cache", "caches", "_cache", "_tmp", "temporary",
 })
@@ -217,6 +220,71 @@ def read_project_config(project_root: Path | str) -> dict:
         raise ValueError(f"项目配置根节点必须是 JSON 对象：{path}")
     return value
 
+
+def discover_legacy_result_manifest(output_root: Path | str) -> tuple[dict | None, Path | None]:
+    """Read old run/task manifests without moving or rewriting their products."""
+    output = Path(output_root).expanduser().resolve()
+    if not output.is_dir():
+        return None, None
+    pipeline_candidates = sorted(
+        {
+            *output.glob("*/pipeline_result.json"),
+            *output.glob("*/job_state.json"),
+            *output.glob("runs/*/pipeline_result.json"),
+        },
+        key=lambda path: (path.stat().st_mtime_ns, str(path)), reverse=True,
+    )
+    for path in pipeline_candidates:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and isinstance(value.get("period_results"), list):
+            return value, path
+
+    periods: dict[tuple[str, str], dict] = {}
+    for path in output.glob("period_extractions/*/*/*/period_task.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        result = state.get("result_manifest") if isinstance(state.get("result_manifest"), dict) else {}
+        spec = state.get("input_spec") if isinstance(state.get("input_spec"), dict) else {}
+        area = str(spec.get("area_id") or path.parents[2].name)
+        period = str(spec.get("period") or path.parents[1].name)
+        if state.get("status") == "completed" and result:
+            periods[(area, period)] = {
+                "grid": area, "period": period, "result": state.get("result", ""),
+                "status": "completed", **result,
+            }
+    changes: dict[tuple[str, str, str], dict] = {}
+    for path in output.glob("period_changes/*/*/*/change_task.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        result = state.get("result_manifest") if isinstance(state.get("result_manifest"), dict) else {}
+        spec = state.get("input_spec") if isinstance(state.get("input_spec"), dict) else {}
+        area = str(spec.get("area_id") or path.parents[2].name)
+        before = str(spec.get("before_period") or "前期")
+        after = str(spec.get("after_period") or "后期")
+        if state.get("status") == "completed" and result:
+            changes[(area, before, after)] = {
+                "grid": area, "before_period": before, "after_period": after,
+                "status": "completed", **result,
+            }
+    if not periods and not changes:
+        return None, None
+    return ({
+        "pipeline_version": "legacy-read-only",
+        "output_root": str(output),
+        "job_root": str(output),
+        "status": "completed",
+        "period_results": list(periods.values()),
+        "change_results": list(changes.values()),
+        "temporal_results": [],
+    }, output / "legacy_results.virtual.json")
+
 def external_source_signature(source_dir: Path | str) -> dict[str, int]:
     """Return a cheap source fingerprint; explicit rescans remain authoritative."""
     root = Path(source_dir).expanduser().resolve()
@@ -367,64 +435,84 @@ class TemporalAttributePager:
         return self.frame.iloc[self._filtered_positions[start:stop]]
 
 def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
-    """Build one stable result-browser model for new and historical manifests."""
+    """Build the business-only result tree from the unified index or a legacy manifest."""
+    index_path = _manifest_path(manifest.get("result_index"), base_dir)
+    index = read_result_index(index_path) if index_path is not None else None
+    if index is None:
+        index = result_index_from_manifest(manifest, base_dir)
     items: list[dict[str, str]] = []
-    area_nodes: set[str] = set()
 
-    def add(node_id: str, parent: str, label: str, path_value: object = "") -> None:
+    def add(node_id: str, parent: str, label: str, path_value: object = "", status: str | None = None) -> None:
         path = _manifest_path(path_value, base_dir)
         exists = bool(path and path.exists())
         items.append({
             "id": node_id, "parent": parent, "label": label,
             "path": str(path) if path is not None else "",
-            "status": "已生成" if exists else "未生成",
+            "status": status if status is not None else ("已生成" if exists else "未生成"),
         })
 
-    def ensure_area(area: str) -> str:
-        node = f"area:{area}"
-        if node not in area_nodes:
-            area_nodes.add(node)
-            items.append({"id": node, "parent": "", "label": area, "path": "", "status": ""})
-        return node
-
-    for index, entry in enumerate(manifest.get("period_results", []) or []):
-        if not isinstance(entry, dict):
-            continue
-        area = str(entry.get("grid") or "validation")
-        parent = ensure_area(area)
-        period = str(entry.get("period") or f"期次 {index + 1}")
-        period_id = f"{parent}:period:{period}"
-        items.append({"id": period_id, "parent": parent, "label": period, "path": "", "status": str(entry.get("status") or "")})
-        add(f"{period_id}:centerline", period_id, "道路中心线", entry.get("centerlines"))
-        add(f"{period_id}:surface", period_id, "道路面", entry.get("surfaces"))
-        add(f"{period_id}:width", period_id, "道路宽度", entry.get("gpkg"))
-    for index, entry in enumerate(manifest.get("change_results", []) or []):
-        if not isinstance(entry, dict):
-            continue
-        area = str(entry.get("grid") or "validation")
-        parent = ensure_area(area)
-        before, after = str(entry.get("before_period") or "前期"), str(entry.get("after_period") or "后期")
-        pair_id = f"{parent}:change:{before}:{after}:{index}"
-        items.append({"id": pair_id, "parent": parent, "label": f"{before} → {after}", "path": "", "status": str(entry.get("status") or "")})
-        add(f"{pair_id}:result", pair_id, "变化检测数据", entry.get("gpkg") or entry.get("summary") or entry.get("output"))
-        previews = entry.get("previews") if isinstance(entry.get("previews"), dict) else {}
-        add(f"{pair_id}:formal-preview", pair_id, "最终变化结果", previews.get("change"))
-        add(f"{pair_id}:review-preview", pair_id, "待复核变化", previews.get("review_change"))
-    temporal_by_area = {
-        str(entry.get("grid") or "validation"): entry
-        for entry in (manifest.get("temporal_results", []) or []) if isinstance(entry, dict)
+    product_labels = {
+        "centerlines": "中心线", "surfaces": "道路面",
+        "width_segments": "道路宽度", "corridors": "道路走廊",
     }
-    for area_node in sorted(area_nodes):
-        area = area_node.removeprefix("area:")
-        temporal = temporal_by_area.get(area, {})
-        add(f"{area_node}:temporal", area_node, "长时序道路成果", temporal.get("life_shp"))
-    job_root = _manifest_path(manifest.get("job_root"), base_dir)
-    report = job_root / "task_report.csv" if job_root is not None else None
-    items.append({
-        "id": "task-report", "parent": "", "label": "任务报告",
-        "path": str(report) if report is not None else "",
-        "status": "已生成" if report is not None and report.is_file() else "未生成",
-    })
+    change_labels = {
+        "changes": "全部变化", "added": "新增道路", "removed": "灭失道路",
+        "widened": "拓宽道路部分", "narrowed": "变窄道路部分",
+    }
+    temporal_labels = {
+        "life_shp": "道路生命史", "observations_shp": "道路观测",
+        "events_shp": "道路事件", "event_parts_shp": "事件范围",
+        "lineage_shp": "道路谱系", "review_shp": "待复核道路",
+    }
+    evaluation_labels = {"csv": "评价汇总表", "json": "评价汇总数据"}
+    for area, area_value in sorted((index.get("areas") or {}).items(), key=lambda row: natural_key(row[0])):
+        if not isinstance(area_value, dict):
+            continue
+        area_id = f"area:{area}"
+        add(area_id, "", str(area), status="")
+
+        period_group = f"{area_id}:periods"
+        add(period_group, area_id, "单期道路", status="")
+        periods = area_value.get("periods") if isinstance(area_value.get("periods"), dict) else {}
+        for period, products in sorted(periods.items(), key=lambda row: natural_key(row[0])):
+            period_id = f"{period_group}:{period}"
+            add(period_id, period_group, str(period), status="")
+            if isinstance(products, dict):
+                for key, label in product_labels.items():
+                    if products.get(key):
+                        add(f"{period_id}:{key}", period_id, label, products.get(key))
+
+        change_group = f"{area_id}:changes"
+        add(change_group, area_id, "变化检测", status="")
+        changes = area_value.get("changes") if isinstance(area_value.get("changes"), dict) else {}
+        for pair, products in sorted(changes.items(), key=lambda row: natural_key(row[0])):
+            if not isinstance(products, dict):
+                continue
+            before = str(products.get("before_period") or pair.split("_to_", 1)[0])
+            after = str(products.get("after_period") or (pair.split("_to_", 1)[1] if "_to_" in pair else "后期"))
+            pair_id = f"{change_group}:{pair}"
+            add(pair_id, change_group, f"{before} → {after}", status="")
+            for key, label in change_labels.items():
+                if products.get(key):
+                    add(f"{pair_id}:{key}", pair_id, label, products.get(key))
+
+        temporal_group = f"{area_id}:temporal"
+        add(temporal_group, area_id, "长时序道路", status="")
+        temporal = area_value.get("temporal") if isinstance(area_value.get("temporal"), dict) else {}
+        for key, label in temporal_labels.items():
+            if temporal.get(key):
+                add(f"{temporal_group}:{key}", temporal_group, label, temporal.get(key))
+
+        evaluation_group = f"{area_id}:evaluation"
+        add(evaluation_group, area_id, "精度评价", status="")
+        evaluation = area_value.get("evaluation") if isinstance(area_value.get("evaluation"), dict) else {}
+        for key, label in evaluation_labels.items():
+            if evaluation.get(key):
+                add(f"{evaluation_group}:{key}", evaluation_group, label, evaluation.get(key))
+
+    report = index.get("task_report") if isinstance(index.get("task_report"), dict) else {}
+    if report.get("csv"):
+        add("task-report", "", "任务报告", report.get("csv"))
     return items
 
 def discover_validation_project(project_dir: Path | str) -> dict:
@@ -575,6 +663,29 @@ class ProjectManager:
     @staticmethod
     def result_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
         return collect_result_tree_items(manifest, base_dir)
+
+    @staticmethod
+    def latest_manifest_path(output_root: Path | str, project_root: Path | str | None = None) -> Path:
+        """Prefer the new internal task index, retaining the legacy output fallback."""
+        layout = (
+            ProjectLayout.from_project(project_root, output_root)
+            if project_root else ProjectLayout.from_output(output_root)
+        )
+        if layout.latest_pipeline_path.is_file():
+            return layout.latest_pipeline_path
+        legacy_latest = Path(output_root).expanduser().resolve() / "latest_pipeline.json"
+        if legacy_latest.is_file():
+            return legacy_latest
+        _manifest, legacy_path = discover_legacy_result_manifest(output_root)
+        return legacy_path or legacy_latest
+
+    @staticmethod
+    def legacy_results(output_root: Path | str) -> tuple[dict | None, Path | None]:
+        return discover_legacy_result_manifest(output_root)
+
+    @staticmethod
+    def result_index(output_root: Path | str) -> dict | None:
+        return read_result_index(Path(output_root).expanduser().resolve() / "result_index.json")
 
     @staticmethod
     def review_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:

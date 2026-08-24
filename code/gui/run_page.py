@@ -7,7 +7,7 @@ from tkinter import messagebox
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS
+from .common_widgets import LAYOUT_METRICS, bind_dynamic_wrap
 
 class RunPage:
     def _build_run_page(self, page: ttk.Frame) -> None:
@@ -15,7 +15,9 @@ class RunPage:
         run_card = ttk.LabelFrame(page, text="运行任务", padding=LAYOUT_METRICS["card_padding"])
         run_card.pack(fill=X)
         self.preflight_summary = StringVar(value="开始处理时会自动检查以下内容；发现问题将立即停止并说明原因。")
-        ttk.Label(run_card, textvariable=self.preflight_summary, wraplength=620).pack(anchor="w", fill=X, pady=(0, 5))
+        preflight_label = ttk.Label(run_card, textvariable=self.preflight_summary)
+        preflight_label.pack(anchor="w", fill=X, pady=(0, 5))
+        bind_dynamic_wrap(preflight_label, run_card, minimum=220, padding=20)
         checklist = ttk.Frame(run_card)
         checklist.pack(fill=X, pady=(0, 6))
         self.preflight_check_labels = []
@@ -41,7 +43,9 @@ class RunPage:
         progress_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
         ttk.Label(progress_card, text="当前阶段：").pack(anchor="w")
         self.run_status = StringVar(value="等待开始任务。")
-        ttk.Label(progress_card, textvariable=self.run_status, wraplength=620).pack(fill=X, pady=(2, 5))
+        run_status_label = ttk.Label(progress_card, textvariable=self.run_status)
+        run_status_label.pack(fill=X, pady=(2, 5))
+        bind_dynamic_wrap(run_status_label, progress_card, minimum=220, padding=20)
         ttk.Label(progress_card, text="总体进度").pack(anchor="w", pady=(0, 3))
         self.progress = ttk.Progressbar(progress_card, mode="determinate", maximum=1, value=0, style="Modern.Horizontal.TProgressbar")
         self.progress.pack(fill=X)
@@ -66,7 +70,9 @@ class RunPage:
         for column in (1, 3, 5):
             selectors.grid_columnconfigure(column, weight=1)
         self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
-        ttk.Label(stage_card, textvariable=self.affected_pairs_summary, wraplength=620).pack(anchor="w", fill=X, pady=(0, 5))
+        affected_label = ttk.Label(stage_card, textvariable=self.affected_pairs_summary)
+        affected_label.pack(anchor="w", fill=X, pady=(0, 5))
+        bind_dynamic_wrap(affected_label, stage_card, minimum=220, padding=20)
         stage_actions = ttk.Frame(stage_card)
         stage_actions.pack(fill=X)
         road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=(7, 5))
@@ -100,7 +106,9 @@ class RunPage:
             ("任务状态：", self.run_status),
         )):
             ttk.Label(summary_card, text=label, width=12).grid(row=row, column=0, sticky="nw", pady=2)
-            ttk.Label(summary_card, textvariable=variable, wraplength=400).grid(row=row, column=1, sticky="nw", pady=2)
+            value_label = ttk.Label(summary_card, textvariable=variable)
+            value_label.grid(row=row, column=1, sticky="nw", pady=2)
+            bind_dynamic_wrap(value_label, summary_card, minimum=160, padding=130)
         summary_card.grid_columnconfigure(1, weight=1)
         run_settings_shell = ttk.Frame(summary_card)
         run_settings_shell.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))

@@ -238,9 +238,9 @@ class UserGuiInputCommandTests(unittest.TestCase):
             "period_results": [{"grid": "north", "period": "2022", "centerlines": "missing.shp"}],
             "change_results": [],
         })
-        centerline = next(item for item in items if item["label"] == "道路中心线")
+        centerline = next(item for item in items if item["label"] == "中心线")
         self.assertEqual(centerline["status"], "未生成")
-        self.assertIn("长时序道路成果", {item["label"] for item in items})
+        self.assertIn("长时序道路", {item["label"] for item in items})
 
     def test_accuracy_evaluation_is_a_runnable_result_step(self) -> None:
         data_source = inspect.getsource(gui.UserApp._build_data_page)
@@ -573,12 +573,8 @@ class UserGuiArtifactTests(unittest.TestCase):
                 [item["category"] for item in items],
                 ["最终变化结果", "待复核变化"],
             )
-            preview_nodes = {
-                item["label"]: item for item in tree
-                if item["label"] in {"最终变化结果", "待复核变化"}
-            }
-            self.assertEqual(preview_nodes["最终变化结果"]["path"], str(formal.resolve()))
-            self.assertEqual(preview_nodes["待复核变化"]["path"], str(review.resolve()))
+            self.assertFalse({"最终变化结果", "待复核变化"} & {item["label"] for item in tree})
+            self.assertIn("变化检测", {item["label"] for item in tree})
 
     def test_collects_temporal_life_shp_for_attribute_table(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -784,8 +780,10 @@ class UserGuiArtifactTests(unittest.TestCase):
     def test_actual_run_2022_geometry_editor_paths_are_resolved(self) -> None:
         manifest_path = (
             Path(__file__).resolve().parents[2]
-            / "project" / "04_成果输出" / "latest_pipeline.json"
+            / "project" / "_work" / "tasks" / "latest_pipeline.json"
         )
+        if not manifest_path.is_file():
+            manifest_path = Path(__file__).resolve().parents[2] / "project" / "04_成果输出" / "latest_pipeline.json"
         if not manifest_path.is_file():
             self.skipTest(f"actual run manifest is unavailable: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
