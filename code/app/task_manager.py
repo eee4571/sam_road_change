@@ -11,6 +11,7 @@ from pathlib import Path
 from input_catalog import period_order_manifest, period_sort_key
 from app.project_manager import USER_IMAGE_LIST_SUFFIX, USER_VECTOR_SUFFIX, atomic_write_json
 from app.result_publisher import ProjectLayout
+from app.project_relocation import build_relocation_plan
 
 def structured_task_status(payload: dict) -> str | None:
     """Build the primary period-stage display without parsing plain log text."""
@@ -292,6 +293,102 @@ def resolve_automatic_run(
     state = job_root / "job_state.json"
     return run_id, state.is_file(), state
 
+
+def project_relocation_preview(
+    output_root: Path | str, run_id: str, project_root: Path | str,
+) -> dict | None:
+    """Build a read-only pre-run summary; the backend remains the only writer."""
+    output = Path(output_root).expanduser().resolve()
+    project = Path(project_root).expanduser().resolve()
+    layout = ProjectLayout.from_project(project, output)
+    job_root = layout.existing_full_run_root(run_id)
+    if job_root is None:
+        return None
+    state_path = job_root / "job_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取待续跑任务状态：{state_path}：{exc}") from exc
+    if not isinstance(state, dict):
+        raise ValueError(f"待续跑任务状态格式错误：{state_path}")
+    plan = build_relocation_plan(
+        state, state_path, run_id=run_id,
+        current_project_root=project, current_output_root=output,
+        current_job_root=job_root,
+    )
+    if plan is None:
+        return None
+    relocated = plan.relocate_tree(state)
+    completed: list[str] = []
+    for entry in relocated.get("period_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            result_path = Path(str(entry.get("result") or "")).expanduser()
+            result = plan.relocate_tree(json.loads(result_path.read_text(encoding="utf-8")))
+            ready = all(
+                Path(str(result.get(key) or "")).expanduser().is_file()
+                for key in ("centerlines", "surfaces", "gpkg")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            ready = False
+        if ready:
+            completed.append(f"{entry.get('grid')} / {entry.get('period')}")
+    all_periods = {
+        f"{path.parents[1].name} / {path.name}"
+        for path in job_root.glob("grids/*/periods/*") if path.is_dir()
+    }
+    incomplete = sorted(all_periods - set(completed))
+    legacy_candidates = 0
+    for label in incomplete:
+        grid, period = (part.strip() for part in label.split("/", 1))
+        graph_roots = job_root.glob(
+            f"grids/{grid}/periods/{period}/runs/*/inference/road_graphs/**/graph"
+        )
+        for graph_root in graph_roots:
+            for graph in graph_root.glob("*.p"):
+                stem = graph.stem
+                root = graph_root.parent
+                companions = (
+                    graph_root / f"{stem}_edge_scores.csv",
+                    graph_root / f"{stem}_weak_recovery.json",
+                    graph_root / f"{stem}_edge_candidates.csv",
+                    root / "mask" / f"{stem}_road.png",
+                    root / "mask" / f"{stem}_itsc.png",
+                    root / "mask" / f"{stem}_centerline_probability.png",
+                    root / "viz" / f"{stem}.png",
+                )
+                if graph.stat().st_size > 0 and all(
+                    path.is_file() and path.stat().st_size > 0 for path in companions
+                ):
+                    legacy_candidates += 1
+    return {
+        "old_project_root": str(plan.old_project_root),
+        "new_project_root": str(plan.new_project_root),
+        "completed_periods": sorted(completed),
+        "incomplete_periods": incomplete,
+        "legacy_slice_candidates": legacy_candidates,
+        "will_reinfer": bool(incomplete),
+    }
+
+
+def project_relocation_message(preview: dict) -> str:
+    completed = "、".join(preview.get("completed_periods") or []) or "无"
+    incomplete = "、".join(preview.get("incomplete_periods") or []) or "无"
+    inference = "会；仅对严格校验失败或尚未处理的切片推理" if preview.get("will_reinfer") else "不会"
+    return (
+        "检测到任务来自其他目录。\n"
+        "程序将把任务状态重定位到当前项目，并只使用当前项目中的成果。\n"
+        "迁移完成后不再依赖原目录。\n\n"
+        f"旧项目根目录：{preview.get('old_project_root')}\n"
+        f"当前项目根目录：{preview.get('new_project_root')}\n"
+        f"将复用的完整期次：{completed}\n"
+        f"将续跑的未完成期次：{incomplete}\n"
+        f"可接纳的旧切片候选：{preview.get('legacy_slice_candidates', 0)}（运行时严格验证）\n"
+        "缺失的外部输入：无（当前输入配置已通过检查）\n"
+        f"是否会发生重新推理：{inference}"
+    )
+
 def find_period_result(item: dict[str, str]) -> Path | None:
     """Resolve a period result even when an older GUI manifest omitted ``result``."""
     explicit = Path(str(item.get("result") or "")).expanduser()
@@ -448,6 +545,14 @@ class TaskManager:
             output_root, requested_run_id, active_task,
             generated_run_id=generated_run_id,
         )
+
+    @staticmethod
+    def relocation_preview(output_root, run_id, project_root):
+        return project_relocation_preview(output_root, run_id, project_root)
+
+    @staticmethod
+    def relocation_message(preview):
+        return project_relocation_message(preview)
 
     @staticmethod
     def unfinished_message(state):

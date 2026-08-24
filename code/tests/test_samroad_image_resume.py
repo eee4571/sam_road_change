@@ -147,7 +147,7 @@ class ImageResumeTests(unittest.TestCase):
         self.assertIn("performance_statistics", marker["summary"])
         self.assertEqual(list(manager.resume_dir.glob("*.tmp")), [])
 
-    def test_interruption_invalidates_only_current_image(self) -> None:
+    def test_interruption_restores_only_current_image_backup(self) -> None:
         first, second = self.image("first"), self.image("second")
         manager = self.manager()
         self.complete(manager, first)
@@ -159,10 +159,40 @@ class ImageResumeTests(unittest.TestCase):
         resumed = self.manager()
 
         self.assertEqual(resumed.inspect(first)["action"], "skip")
-        self.assertEqual(resumed.inspect(second)["action"], "process")
+        self.assertEqual(resumed.inspect(second)["action"], "skip")
         self.assertEqual(first_graph.read_bytes(), first_bytes)
         self.assertTrue(manager.marker_path(first).is_file())
-        self.assertFalse(manager.marker_path(second).exists())
+        self.assertTrue(manager.marker_path(second).is_file())
+
+    def test_successful_reprocessing_discards_backup_only_after_new_marker(self) -> None:
+        image = self.image("tile")
+        manager = self.manager()
+        self.complete(manager, image)
+        manager.prepare_for_processing(image)
+        self.assertTrue(any(manager.backup_root.rglob("backup_manifest.json")))
+
+        recovery = write_required_outputs(self.output, image, seconds=2.0)
+        manager.complete(image, recovery, {"tile": image.stem})
+
+        self.assertEqual(list(manager.backup_root.glob("*/backup_manifest.json")), [])
+        self.assertEqual(manager.inspect(image)["action"], "skip")
+
+    def test_legacy_adoption_accepts_relocated_resource_and_input_paths(self) -> None:
+        image = self.image("tile")
+        old_image = self.root / "old-project" / "images" / image.name
+        write_required_outputs(self.output, old_image)
+        metadata, state_path = self.legacy_context()
+        metadata["checkpoint"] = str(self.root / "old-runtime" / self.checkpoint.name)
+        metadata["config"] = str(self.root / "old-runtime" / self.config.name)
+
+        manager = self.manager(
+            legacy_metadata=metadata, pipeline_state=state_path,
+        )
+        decision = manager.inspect(image)
+
+        self.assertEqual(decision["action"], "skip")
+        self.assertEqual(decision["origin"], "legacy_adopted")
+        self.assertTrue(manager.marker_path(image).is_file())
 
     def test_changed_input_invalidates_only_that_image(self) -> None:
         first, second = self.image("first"), self.image("second")

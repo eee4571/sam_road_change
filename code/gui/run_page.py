@@ -237,6 +237,20 @@ class RunPage:
                 self._show_manual_inputs()
                 self._scroll_to_module(self.data_body)
             return
+        if should_resume and self.project_root_path:
+            try:
+                relocation = self.task_manager.relocation_preview(
+                    output, run_id, self.project_root_path,
+                )
+            except ValueError as exc:
+                messagebox.showerror("无法安全重定位任务", str(exc), parent=self.root)
+                return
+            if relocation and not messagebox.askokcancel(
+                "确认项目重定位",
+                self.task_manager.relocation_message(relocation),
+                parent=self.root,
+            ):
+                return
         order_text = self._period_order_confirmation()
         if order_text and not messagebox.askokcancel(
             "确认影像期次顺序",

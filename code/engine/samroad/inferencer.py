@@ -33,6 +33,7 @@ from input_catalog import read_path_list
 from image_resume import (
     ImageResumeManager,
     build_batch_identity,
+    effective_config_identity,
     ensure_unique_output_stems,
     marker_summaries,
 )
@@ -1249,6 +1250,15 @@ if __name__ == "__main__":
             legacy_metadata = value if isinstance(value, dict) else None
         except (OSError, UnicodeError, json.JSONDecodeError):
             legacy_metadata = None
+    if isinstance(legacy_metadata, dict):
+        saved_config = Path(base_output_dir) / 'config.yaml'
+        if saved_config.is_file():
+            try:
+                legacy_metadata['_saved_config_identity'] = effective_config_identity(
+                    saved_config, inspect_resources=False,
+                )
+            except (OSError, UnicodeError, ValueError):
+                pass
     metadata = {
         'checkpoint': str(checkpoint_path),
         'config': str(config_path),

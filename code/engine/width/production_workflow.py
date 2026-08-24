@@ -1372,6 +1372,12 @@ def export_final_products(
     stitched_centerlines: Path | None = None,
 ) -> dict:
     export_started = time.perf_counter()
+    graph_csv_read_seconds = 0.0
+    surface_raster_read_seconds = 0.0
+    road_chain_conversion_seconds = 0.0
+    surface_polygonize_seconds = 0.0
+    surface_union_clean_seconds = 0.0
+    width_sampling_segment_conversion_seconds = 0.0
     centerlines: list[dict] = []
     road_surfaces: list[dict] = []
     surface_sources: list[dict] = []
@@ -1388,6 +1394,7 @@ def export_final_products(
     source_contexts: dict[str, dict] = {}
     crs = None
     for summary_path in summaries(final_dir, optimized=True):
+        read_started = time.perf_counter()
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         stem = stem_from_summary(summary_path)
         image_path = Path(summary.get("image", ""))
@@ -1411,6 +1418,8 @@ def export_final_products(
         nodes, edges = load_graph(final_dir / summary["outputs"]["optimized_graph"])
         edge_rows = read_csv(final_dir / summary["outputs"]["optimized_edges"])
         edge_by_id = {int(row.get("final_edge_id", -1)): row for row in edge_rows if row.get("final_status") != "removed_by_review"}
+        graph_csv_read_seconds += time.perf_counter() - read_started
+        chain_conversion_started = time.perf_counter()
         tile_centerline_geometries = []
         for chain, points in _chain_segments(nodes, edges):
             widths = [float(edge_by_id.get(edge_id, {}).get("optimized_width_px", 0) or 0) for edge_id in chain.edge_ids]
@@ -1484,13 +1493,19 @@ def export_final_products(
                 midpoint = points[len(points) // 2]
                 x, y = rasterio.transform.xy(transform, midpoint[0], midpoint[1], offset="center")
                 issues.append({"tile_stem": stem, "issue": "width_unresolved", "severity": "high", "feature_id": f"chain:{chain.chain_id}", "geometry": Point(x, y)})
+        road_chain_conversion_seconds += time.perf_counter() - chain_conversion_started
         mask_path = final_dir / summary["outputs"].get("optimized_road_surface", "")
+        read_started = time.perf_counter()
         mask = _read_image(mask_path)
+        surface_raster_read_seconds += time.perf_counter() - read_started
         tile_surface_geometries = []
+        polygonize_started = time.perf_counter()
         if mask is not None:
             for geom, value in shapes((mask > 0).astype(np.uint8), mask=mask > 0, transform=transform):
                 if value:
                     tile_surface_geometries.append(shape(geom))
+        surface_polygonize_seconds += time.perf_counter() - polygonize_started
+        union_clean_started = time.perf_counter()
         combined_surface = unary_union(tile_surface_geometries) if tile_surface_geometries else None
         if combined_surface is not None and not combined_surface.is_empty:
             combined_surface = _clean_surface(combined_surface.buffer(0), 50.0 * pixel_size * pixel_size, 25.0 * pixel_size * pixel_size)
@@ -1503,6 +1518,7 @@ def export_final_products(
                 "shape": mask.shape,
                 "source": str(mask_path),
             })
+        surface_union_clean_seconds += time.perf_counter() - union_clean_started
         probability_candidates = [final_dir / f"{stem}_centerline_probability.png"]
         source_output_dir = str(summary.get("source_output_dir", "") or "").strip()
         if source_output_dir:
@@ -1542,15 +1558,27 @@ def export_final_products(
             for geom, value in shapes((audit_mask > 0).astype(np.uint8), mask=audit_mask > 0, transform=transform):
                 if value:
                     records.append({"tile_stem": stem, "source_raster": str(audit_path), "geometry": shape(geom)})
-        for row in read_csv(final_dir / summary["outputs"].get("optimized_width_samples", "")):
+        read_started = time.perf_counter()
+        width_sample_rows = read_csv(
+            final_dir / summary["outputs"].get("optimized_width_samples", "")
+        )
+        width_segment_rows = read_csv(
+            final_dir / summary["outputs"].get("optimized_width_segments", "")
+        )
+        graph_csv_read_seconds += time.perf_counter() - read_started
+        width_conversion_started = time.perf_counter()
+        for row in width_sample_rows:
             x, y = rasterio.transform.xy(transform, float(row.get("row_used", row.get("row", 0))), float(row.get("col_used", row.get("col", 0))), offset="center")
             record = {"tile_stem": stem, **{key: value for key, value in row.items() if key not in {"geometry"}}, "geometry": Point(x, y)}
             width_samples.append(record)
             # Sampling flags remain in final_width_samples for traceability. They are
             # automatic rejection reasons, not tasks requiring another manual review.
-        for row in read_csv(final_dir / summary["outputs"].get("optimized_width_segments", "")):
+        for row in width_segment_rows:
             points = [(float(row["start_row"]), float(row["start_col"])), (float(row["end_row"]), float(row["end_col"]))]
             width_segments.append({"tile_stem": stem, **row, "geometry": _world_line(points, transform)})
+        width_sampling_segment_conversion_seconds += (
+            time.perf_counter() - width_conversion_started
+        )
 
     canonical_network = None
     canonical_is_authoritative = False
@@ -1576,6 +1604,8 @@ def export_final_products(
         crs,
         continuous=True,
     )
+    surface_mosaic_seconds = time.perf_counter() - surface_fusion_started
+    polygonize_started = time.perf_counter()
     fused_surface_geometries = []
     if fused_surface_mask is not None and np.any(fused_surface_mask):
         fused_surface_geometries = [
@@ -1587,6 +1617,8 @@ def export_final_products(
             )
             if value
         ]
+    surface_polygonize_seconds += time.perf_counter() - polygonize_started
+    union_clean_started = time.perf_counter()
     fused_surface_geometry = unary_union(fused_surface_geometries).buffer(0) if fused_surface_geometries else None
     if fused_surface_geometry is not None:
         pixel_area = float(np.median(pixel_sizes)) ** 2 if pixel_sizes else 1.0
@@ -1608,6 +1640,7 @@ def export_final_products(
     )
     fused_surfaces = ([{"source": "sammolra_feathered_surface_fusion_with_global_gap_buffers", "geometry": fused_surface_geometry}]
                       if fused_surface_geometry is not None and not fused_surface_geometry.is_empty else [])
+    surface_union_clean_seconds += time.perf_counter() - union_clean_started
     surface_fusion_seconds = time.perf_counter() - surface_fusion_started
 
     exported_centerlines = []
@@ -1629,6 +1662,7 @@ def export_final_products(
             geometry=[], crs=crs,
         )
     )
+    width_conversion_started = time.perf_counter()
     measured_segment_frame = (
         gpd.GeoDataFrame(width_segments, geometry="geometry", crs=crs)
         if width_segments else None
@@ -1642,6 +1676,9 @@ def export_final_products(
     standardized_corridors = build_corridors(standardized_width_segments)
     standardized_width_rows = standardized_width_segments.to_dict("records")
     standardized_corridor_rows = standardized_corridors.to_dict("records")
+    width_sampling_segment_conversion_seconds += (
+        time.perf_counter() - width_conversion_started
+    )
 
     layers = {
         "final_centerlines": exported_centerlines, "final_road_surfaces": fused_surfaces,
@@ -1710,8 +1747,17 @@ def export_final_products(
         "visualization": visualization_report,
         "width_visualization": width_visualization_report,
         "profiling": {
+            "graph_csv_read_seconds": float(graph_csv_read_seconds),
+            "surface_raster_read_seconds": float(surface_raster_read_seconds),
+            "road_chain_conversion_seconds": float(road_chain_conversion_seconds),
             "centerline_fusion_seconds": float(centerline_fusion_seconds),
             "surface_fusion_seconds": float(surface_fusion_seconds),
+            "surface_mosaic_seconds": float(surface_mosaic_seconds),
+            "surface_polygonize_seconds": float(surface_polygonize_seconds),
+            "surface_union_clean_seconds": float(surface_union_clean_seconds),
+            "width_sampling_segment_conversion_seconds": float(
+                width_sampling_segment_conversion_seconds
+            ),
             "vector_writing_seconds": float(vector_writing_seconds),
             "visualization_seconds": float(visualization_seconds),
             "total_seconds": float(time.perf_counter() - export_started),

@@ -32,6 +32,17 @@ from app.result_publisher import (
     LEGACY_RESULT_DIRECTORY_NAME, RESULT_DIRECTORY_NAME,
     ProjectLayout, ResultPublisher, shapefile_has_records,
 )
+from app.project_relocation import (
+    active_old_path_references,
+    build_relocation_plan,
+    relocate_state_files,
+)
+from dependency_identity import (
+    dependency_identity_equal,
+    effective_config_identity,
+    ordinary_file_identity_equal,
+    stable_file_identity,
+)
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -355,7 +366,10 @@ def _resolve_full_run_job_root(
     )
 
 
-def _read_full_run_resume_state(state_path: Path, run_id: str, job_root: Path) -> dict:
+def _read_full_run_resume_state(
+    state_path: Path, run_id: str, job_root: Path, *,
+    layout: ProjectLayout | None = None, output_root: Path | None = None,
+) -> dict:
     """Read and validate the selected state before any run directory is created."""
     try:
         prior = read_json(state_path)
@@ -374,9 +388,36 @@ def _read_full_run_resume_state(state_path: Path, run_id: str, job_root: Path) -
         if not recorded_root.is_absolute():
             recorded_root = state_path.parent / recorded_root
         if recorded_root.resolve() != job_root.resolve():
-            raise ValueError(
-                "任务状态中的 job_root 与找到的任务目录不一致，不能静默迁移或从头运行："
-                f"记录为 {recorded_root.resolve()}，实际为 {job_root.resolve()}"
+            if layout is None or output_root is None:
+                raise ValueError(
+                    "任务状态中的 job_root 与找到的任务目录不一致，且没有当前项目上下文，"
+                    "不能安全重定位或从头运行："
+                    f"记录为 {recorded_root.resolve()}，实际为 {job_root.resolve()}"
+                )
+            plan = build_relocation_plan(
+                prior, state_path, run_id=run_id,
+                current_project_root=layout.project_root,
+                current_output_root=output_root,
+                current_job_root=job_root,
+            )
+            if plan is None:
+                raise ValueError(
+                    "任务状态路径不一致，但无法建立经过边界校验的项目重定位方案："
+                    f"记录为 {recorded_root.resolve()}，实际为 {job_root.resolve()}"
+                )
+            prior, written = relocate_state_files(prior, plan)
+            unresolved = active_old_path_references(
+                prior, (plan.old_project_root, plan.old_output_root, plan.old_job_root),
+            )
+            if unresolved:
+                raise ValueError(
+                    "项目重定位后仍有活动状态引用旧项目路径，已停止续跑：\n"
+                    + "\n".join(f"- {value}" for value in unresolved[:20])
+                )
+            print(
+                f"[续跑] 已将复制项目的任务状态重定位到当前目录；"
+                f"备份并更新 {len(written)} 个 JSON 文件。",
+                flush=True,
             )
     return prior
 
@@ -3025,13 +3066,10 @@ def _task_input_spec(
             "source_mtime_ns": source_mtime,
         }
 
+    hash_cache = project_layout(Path(args.output_root)).cache_root / "dependency_hashes.json"
+
     def file_fingerprint(value: str | Path) -> dict:
-        path = Path(value).expanduser()
-        try:
-            stat = path.stat()
-            return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-        except OSError:
-            return {"path": str(path), "size": None, "mtime_ns": None}
+        return stable_file_identity(value)
 
     return {
         "pipeline_version": PIPELINE_VERSION,
@@ -3049,8 +3087,16 @@ def _task_input_spec(
             "\u0000".join(str(value) for value in key): file_fingerprint(path)
             for key, path in truth_by_pair.items()
         },
-        "checkpoint": file_fingerprint(args.checkpoint),
-        "config": file_fingerprint(args.config),
+        "checkpoint": stable_file_identity(
+            args.checkpoint, content_hash=True, cache_path=hash_cache,
+        ),
+        "config": (
+            effective_config_identity(
+                args.config, hash_resources=True, cache_path=hash_cache,
+            )
+            if Path(args.config).expanduser().is_file()
+            else file_fingerprint(args.config)
+        ),
         "device": str(args.device),
         "pixel_size": str(args.pixel_size),
         "rescale": str(args.rescale),
@@ -3071,27 +3117,54 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
         for grid, periods in current_grids.items()
         for period in (periods or {})
     }
-    extraction_keys = (
-        "pipeline_version", "mode", "validation_area", "checkpoint", "config",
-        "device", "pixel_size", "rescale", "junction_node_mode",
+    scalar_extraction_keys = (
+        "pipeline_version", "mode", "device", "pixel_size", "rescale",
+        "junction_node_mode",
     )
-    invalidate_all_extraction = any(prior.get(key) != current.get(key) for key in extraction_keys)
+
+    def identity_tree_equal(previous, latest) -> bool:
+        if isinstance(previous, dict) and isinstance(latest, dict):
+            if "path" in previous or "path" in latest:
+                return ordinary_file_identity_equal(previous, latest)
+            if set(previous) != set(latest):
+                return False
+            return all(identity_tree_equal(previous[key], latest[key]) for key in previous)
+        if isinstance(previous, list) and isinstance(latest, list):
+            return len(previous) == len(latest) and all(
+                identity_tree_equal(first, second)
+                for first, second in zip(previous, latest)
+            )
+        return previous == latest
+
+    invalidate_all_extraction = (
+        any(prior.get(key) != current.get(key) for key in scalar_extraction_keys)
+        or not identity_tree_equal(prior.get("validation_area"), current.get("validation_area"))
+        or not dependency_identity_equal(
+            prior.get("checkpoint"), current.get("checkpoint"), kind="checkpoint",
+        )
+        or not dependency_identity_equal(
+            prior.get("config"), current.get("config"), kind="config",
+        )
+    )
     changed_periods = set(all_periods if invalidate_all_extraction else ())
     if not invalidate_all_extraction:
         prior_grids = prior.get("grids") or {}
         for grid, periods in current_grids.items():
             previous = prior_grids.get(grid) or {}
             for period, fingerprint in (periods or {}).items():
-                if previous.get(period) != fingerprint:
+                if not identity_tree_equal(previous.get(period), fingerprint):
                     changed_periods.add((str(grid), str(period)))
         for grid, periods in prior_grids.items():
             for period in (periods or {}):
                 if period not in (current_grids.get(grid) or {}):
                     changed_periods.add((str(grid), str(period)))
     threshold_changed = any(prior.get(key) != current.get(key) for key in ("absolute", "ratio", "tolerance"))
-    truth_changed = any(
-        prior.get(key) != current.get(key)
-        for key in ("truths", "truth_type_field", "evaluation_enabled")
+    truth_changed = (
+        not identity_tree_equal(prior.get("truths"), current.get("truths"))
+        or any(
+            prior.get(key) != current.get(key)
+            for key in ("truth_type_field", "evaluation_enabled")
+        )
     )
     changed_pairs = set()
     for grid, periods in current_grids.items():
@@ -3104,8 +3177,106 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
         "changes": sorted(changed_pairs),
         "threshold_changed": threshold_changed,
         "truth_changed": truth_changed,
-        "reuse_all": not changed_periods and not changed_pairs and prior == current,
+        "reuse_all": not changed_periods and not changed_pairs,
     }
+
+
+def _enrich_relocated_input_spec(input_spec: dict, job_root: Path) -> dict:
+    """Add stable identities obtainable from a copied task's frozen runtime files."""
+    enriched = dict(input_spec)
+    config = dict(enriched.get("config") or {})
+    if not config.get("effective_sha256"):
+        candidates = sorted(
+            job_root.glob("grids/*/periods/*/runs/*/inference/road_graphs/config.yaml"),
+            key=str,
+        )
+        for candidate in candidates:
+            try:
+                saved_identity = effective_config_identity(
+                    candidate, inspect_resources=False,
+                )
+            except (OSError, UnicodeError, ValueError):
+                continue
+            config.update({
+                "effective_sha256": saved_identity["effective_sha256"],
+                "effective_key_count": saved_identity["effective_key_count"],
+                "identity_source": str(candidate),
+            })
+            break
+    if config:
+        enriched["config"] = config
+    return enriched
+
+
+def _refresh_resume_external_paths(
+    prior: dict, *, grids: dict[str, dict[str, Path]],
+    validation_area: str | dict[str, str], truth_by_pair: dict[tuple, Path],
+    source_root: Path | None, input_spec: dict, historical_input_spec: dict,
+) -> None:
+    """Keep old external paths only as provenance; never as active resume inputs."""
+    provenance = dict(prior.get("provenance") or {})
+    provenance.setdefault("historical_input_spec", historical_input_spec)
+    provenance.setdefault("historical_external_paths", {
+        "source_root": prior.get("source_root"),
+        "validation_area": prior.get("validation_area"),
+        "validation_areas": prior.get("validation_areas"),
+    })
+    provenance["historical_only"] = True
+    prior["provenance"] = provenance
+    prior["input_spec"] = input_spec
+    prior["source_root"] = str(source_root) if source_root is not None else ""
+    prior["validation_area"] = (
+        next(iter(validation_area.values()))
+        if isinstance(validation_area, dict) and len(validation_area) == 1
+        else validation_area
+    )
+    prior["validation_areas"] = validation_area if isinstance(validation_area, dict) else {}
+    for entry in prior.get("period_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        source = (grids.get(str(entry.get("grid"))) or {}).get(str(entry.get("period")))
+        if source is None:
+            continue
+        entry["source"] = str(source)
+        analysis_text = str(entry.get("analysis_source") or "").strip()
+        if not analysis_text or not Path(analysis_text).expanduser().exists():
+            entry["analysis_source"] = str(source)
+    for entry in prior.get("change_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        key = (
+            str(entry.get("grid")), str(entry.get("before_period")),
+            str(entry.get("after_period")),
+        )
+        entry["truth"] = str(truth_by_pair.get(key, ""))
+
+
+def _refresh_relocated_runtime_metadata(job_root: Path, args: argparse.Namespace) -> None:
+    """Remove active references to old runtime locations from copied metadata."""
+    current = {
+        "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+        "config": str(Path(args.config).expanduser().resolve()),
+    }
+    for path in job_root.glob(
+        "grids/*/periods/*/runs/*/inference/road_graphs/inference_metadata.json"
+    ):
+        try:
+            metadata = read_json(path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        historical = {
+            key: metadata.get(key) for key in current
+            if metadata.get(key) and metadata.get(key) != current[key]
+        }
+        if historical:
+            provenance = dict(metadata.get("provenance") or {})
+            provenance.setdefault("historical_runtime_paths", historical)
+            provenance["historical_only"] = True
+            metadata["provenance"] = provenance
+        metadata.update(current)
+        write_json(path, metadata)
 
 
 def check_runtime_environment(args: argparse.Namespace, output_root: Path) -> dict:
@@ -3655,27 +3826,56 @@ def run_all(args: argparse.Namespace) -> dict:
     state_path = job_root / "job_state.json"
     invalidation = {"periods": [], "changes": [], "threshold_changed": False, "truth_changed": False, "reuse_all": False}
     if resume:
-        prior = _read_full_run_resume_state(state_path, run_id, job_root)
-        prior_input_spec = dict(prior.get("input_spec") or {})
+        prior = _read_full_run_resume_state(
+            state_path, run_id, job_root, layout=layout, output_root=output_root,
+        )
+        prior_input_spec = _enrich_relocated_input_spec(
+            dict(prior.get("input_spec") or {}), job_root,
+        )
+        comparison_input_spec = dict(prior_input_spec)
         if job_root == layout.legacy_full_run_root(run_id):
             # A storage-layout upgrade alone must not invalidate completed inference.
-            prior_input_spec["pipeline_version"] = input_spec.get("pipeline_version")
-        invalidation = dependency_invalidation_plan(prior_input_spec, input_spec)
+            comparison_input_spec["pipeline_version"] = input_spec.get("pipeline_version")
+        invalidation = dependency_invalidation_plan(comparison_input_spec, input_spec)
+        _refresh_resume_external_paths(
+            prior, grids=grids, validation_area=validation_area,
+            truth_by_pair=truth_by_pair, source_root=source_root,
+            input_spec=input_spec, historical_input_spec=prior_input_spec,
+        )
+        _refresh_relocated_runtime_metadata(job_root, args)
     layout.ensure_project_directories()
     if not resume:
         job_root.mkdir(parents=True, exist_ok=False)
 
-    invalid_periods = {tuple(value) for value in invalidation["periods"]}
-    invalid_changes = {tuple(value) for value in invalidation["changes"]}
+    raw_prior_periods = {
+        (str(entry.get("grid")), str(entry.get("period"))): entry
+        for entry in prior.get("period_results", []) if isinstance(entry, dict)
+    }
+    frozen_periods = {
+        key for key, entry in raw_prior_periods.items() if _period_result_ready(entry)
+    }
+    invalid_periods = {
+        tuple(value) for value in invalidation["periods"]
+        if tuple(value) not in frozen_periods
+    }
+    invalid_changes = {
+        tuple(value) for value in invalidation["changes"]
+        if invalidation["threshold_changed"] or invalidation["truth_changed"]
+        or (tuple(value)[0], tuple(value)[1]) in invalid_periods
+        or (tuple(value)[0], tuple(value)[2]) in invalid_periods
+    }
+    invalidation["periods"] = sorted(invalid_periods)
+    invalidation["changes"] = sorted(invalid_changes)
+    invalidation["frozen_periods"] = sorted(frozen_periods)
+    invalidation["reuse_all"] = not invalid_periods and not invalid_changes
 
     planned_period_count = sum(len(periods) for periods in grids.values())
     planned_change_count = sum(max(0, len(periods) - 1) for periods in grids.values())
     total_work = planned_period_count + planned_change_count
     previous_elapsed = float(prior.get("elapsed_seconds", 0) or 0)
     prior_periods = {
-        (entry.get("grid"), entry.get("period")): entry
-        for entry in prior.get("period_results", []) if isinstance(entry, dict)
-        and (str(entry.get("grid")), str(entry.get("period"))) not in invalid_periods
+        key: entry for key, entry in raw_prior_periods.items()
+        if key not in invalid_periods
     }
     prior_changes = {
         (entry.get("grid"), entry.get("before_period"), entry.get("after_period")): entry
@@ -3721,7 +3921,13 @@ def run_all(args: argparse.Namespace) -> dict:
             prior["job_root"] = str(job_root)
             prior["project_root"] = str(layout.project_root)
             prior["output_root"] = str(output_root)
-            publisher = ResultPublisher(output_root)
+            provenance = dict(prior.get("provenance") or {})
+            provenance.setdefault("historical_input_spec", prior_input_spec)
+            provenance["historical_only"] = True
+            prior["provenance"] = provenance
+            prior["input_spec"] = input_spec
+            prior["invalidation_plan"] = invalidation
+            publisher = ResultPublisher(output_root, project_root=layout.project_root)
             publisher.publish_manifest(
                 prior, source_manifest=job_root / "pipeline_result.json",
             )
@@ -3753,6 +3959,12 @@ def run_all(args: argparse.Namespace) -> dict:
         "evaluation_enabled": not bool(getattr(args, "no_evaluation", False)),
         "job_root": str(job_root),
         "input_spec": input_spec,
+        "provenance": {
+            **dict(prior.get("provenance") or {}),
+            "historical_input_spec": prior_input_spec if resume else {},
+            "historical_only": bool(resume),
+        },
+        "relocation_history": list(prior.get("relocation_history") or []),
         "invalidation_plan": invalidation,
         "status": "running",
         "attempt": int(prior.get("attempt", 0) or 0) + 1,
@@ -3831,7 +4043,14 @@ def run_all(args: argparse.Namespace) -> dict:
                 workspace = job_root / "grids" / safe_grid / "periods" / safe_period
                 prior_entry = prior_periods.get((grid_name, period))
                 if resume and prior_entry and _period_result_ready(prior_entry):
-                    entry = prior_entry
+                    entry = dict(prior_entry)
+                    entry_provenance = dict(entry.get("provenance") or {})
+                    entry_provenance.update({
+                        "frozen_completed_result": True,
+                        "historical_input_spec": prior_input_spec,
+                        "historical_only": True,
+                    })
+                    entry["provenance"] = entry_provenance
                     manifest["period_results"].append(entry)
                     result_by_period[(grid_name, period)] = entry
                     published = ResultPublisher(output_root).publish_period(
@@ -3840,11 +4059,13 @@ def run_all(args: argparse.Namespace) -> dict:
                     if published:
                         entry["published"] = published
                     manifest["processed_work"] += 1
+                    message = f"[续跑] {period} 期已有完整成果，已验证并复用。"
+                    print(message, flush=True)
                     progress(
                         "道路提取", status="skipped", grid=grid_name, period=period,
                         grid_index=grid_index, grid_total=len(grids),
                         period_index=period_index, period_total=len(periods),
-                        reason="已完成且成果完整",
+                        reason=message,
                     )
                     _persist_pipeline(manifest, job_root, output_root)
                     continue

@@ -919,6 +919,89 @@ class OneClickPipelineTests(unittest.TestCase):
                 second_index["areas"]["g"]["periods"]["2021"]["centerlines"],
             )
 
+    def test_completed_period_is_frozen_while_incomplete_period_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            args, layout, job_root, output = self._legacy_full_run_fixture(Path(raw), status="cancelled")
+            state_path = job_root / "job_state.json"
+            state = user_pipeline.read_json(state_path)
+            state["period_results"] = [
+                entry for entry in state["period_results"] if entry["period"] == "2021"
+            ]
+            state["change_results"] = []
+            state["temporal_results"] = []
+            user_pipeline.write_json(state_path, state)
+            user_pipeline.write_json(job_root / "pipeline_result.json", state)
+            args.device = "changed-device"
+            result_2022 = user_pipeline.read_json(
+                job_root / "grids" / "g" / "periods" / "2022" / "latest_result.json"
+            )
+
+            def changed_result(call_args):
+                target = Path(call_args.output)
+                target.mkdir(parents=True, exist_ok=True)
+                summary = target / "change_summary.json"
+                user_pipeline.write_json(summary, {})
+                return {"output": str(target), "summary": str(summary)}
+
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout), \
+                    patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract", return_value=result_2022) as extract_mock, \
+                    patch.object(user_pipeline, "change", side_effect=changed_result), \
+                    patch.object(user_pipeline, "build_temporal_outputs", return_value=[]), \
+                    patch.object(user_pipeline, "aggregate_change_evaluations"), \
+                    patch.object(user_pipeline.ResultPublisher, "publish_period", return_value={}), \
+                    patch.object(user_pipeline.ResultPublisher, "publish_change", return_value={}), \
+                    patch.object(user_pipeline.ResultPublisher, "publish_manifest"), \
+                    patch.object(user_pipeline.ResultPublisher, "publish_reports"):
+                result = user_pipeline.run_all(args)
+
+            prepare_mock.assert_called_once()
+            extract_mock.assert_called_once()
+            self.assertTrue(extract_mock.call_args.args[0].workspace.endswith("2022"))
+            by_period = {entry["period"]: entry for entry in result["period_results"]}
+            self.assertTrue(by_period["2021"]["provenance"]["frozen_completed_result"])
+            self.assertEqual(result["invalidation_plan"]["frozen_periods"], [("g", "2021")])
+
+    def test_copied_completed_project_relocates_then_republishes_without_computation(self) -> None:
+        from app.project_relocation import active_old_path_references
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, layout, job_root, output = self._legacy_full_run_fixture(root, status="completed")
+            project = output.parent.resolve()
+            old_project = (root / "old-machine" / "project").resolve()
+
+            def old_paths(value):
+                if isinstance(value, dict):
+                    return {key: old_paths(child) for key, child in value.items()}
+                if isinstance(value, list):
+                    return [old_paths(child) for child in value]
+                if isinstance(value, str) and value.startswith(str(project)):
+                    return str(old_project / Path(value).relative_to(project))
+                return value
+
+            for path in [job_root / "job_state.json", job_root / "pipeline_result.json", *job_root.rglob("*.json")]:
+                if path.name.endswith(".bak"):
+                    continue
+                payload = user_pipeline.read_json(path)
+                user_pipeline.write_json(path, old_paths(payload))
+
+            with patch.object(user_pipeline, "discover_grid_periods", return_value=layout), \
+                    patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract") as extract_mock, \
+                    patch.object(user_pipeline, "change") as change_mock, \
+                    patch.object(user_pipeline, "build_temporal_outputs") as temporal_mock, \
+                    patch.object(user_pipeline, "aggregate_change_evaluations") as evaluation_mock:
+                result = user_pipeline.run_all(args)
+
+            prepare_mock.assert_not_called(); extract_mock.assert_not_called(); change_mock.assert_not_called()
+            temporal_mock.assert_not_called(); evaluation_mock.assert_not_called()
+            self.assertEqual(result["job_root"], str(job_root.resolve()))
+            self.assertEqual(active_old_path_references(result, (old_project,)), [])
+            self.assertTrue((job_root / "job_state.json.pre_relocation.bak").is_file())
+            index = user_pipeline.read_json(output / "result_index.json")
+            self.assertEqual(set(index["areas"]["g"]["periods"]), {"2021", "2022"})
+
     def test_resume_prefers_current_state_and_rejects_bad_legacy_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"

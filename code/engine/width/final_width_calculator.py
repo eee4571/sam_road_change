@@ -8,6 +8,7 @@ from typing import Callable
 
 import numpy as np
 
+from graph_spatial_context import points_within_radius_of_references
 from molra_centerline_width import build_width_change_segments, sample_widths_by_normal
 
 
@@ -96,12 +97,11 @@ def calculate_final_widths(request: FinalWidthRequest) -> FinalWidthResult:
         adjacency[int(dst_idx)].append(edge_id)
     degrees = np.asarray([len(items) for items in adjacency], dtype=np.int32)
     junction_nodes = np.where(degrees >= 3)[0]
-    junction_near_node = np.zeros(len(request.nodes_rc), dtype=bool)
-    if junction_nodes.size:
-        distances = np.linalg.norm(
-            request.nodes_rc[:, None, :] - request.nodes_rc[junction_nodes][None, :, :], axis=2
-        )
-        junction_near_node = np.min(distances, axis=1) <= float(config.junction_buffer_px)
+    junction_near_node = points_within_radius_of_references(
+        request.nodes_rc,
+        request.nodes_rc[junction_nodes],
+        float(config.junction_buffer_px),
+    )
 
     edge_widths = []
     for edge_id in range(edge_count):

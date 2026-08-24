@@ -17,6 +17,7 @@ from app.result_publisher import (
     ProjectLayout, atomic_write_json as write_result_json,
     read_result_index, result_index_from_manifest,
 )
+from app.project_relocation import rebase_project_owned_tree
 USER_VECTOR_SUFFIX = ".shp"
 
 USER_IMAGE_LIST_SUFFIX = ".txt"
@@ -543,22 +544,7 @@ def _rebase_project_tree(value, recorded_root: object, project_root: Path):
     old_root = Path(recorded_text).expanduser()
     if not old_root.is_absolute():
         return value
-    old_root = old_root.resolve()
-
-    def visit(item):
-        if isinstance(item, dict):
-            return {key: visit(child) for key, child in item.items()}
-        if isinstance(item, list):
-            return [visit(child) for child in item]
-        if not isinstance(item, str) or not item.strip():
-            return item
-        path = Path(item).expanduser()
-        if not path.is_absolute():
-            return item
-        relative = _path_within(path.resolve(), old_root)
-        return str((project_root / relative).resolve()) if relative is not None else item
-
-    return visit(value)
+    return rebase_project_owned_tree(value, old_root, project_root)
 
 
 def discover_project_result_context(

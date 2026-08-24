@@ -18,6 +18,7 @@ from final_width_calculator import (
     validate_width_result,
 )
 from molra_centerline_width import graph_topology_metrics
+from parallel_utils import resolve_worker_count, spawn_map
 from width_surface_reconstruction import (
     WidthSurfaceConfig,
     _regular_corridor_widths,
@@ -730,6 +731,7 @@ def finalize_one(
     decisions_path: Path,
 ) -> dict:
     finalize_started = time.perf_counter()
+    graph_and_decisions_load_started = time.perf_counter()
     with open(summary_path, "r", encoding="utf-8") as file:
         summary = json.load(file)
     stem = summary_path.name.removesuffix("_summary.json")
@@ -780,6 +782,8 @@ def finalize_one(
     surface_labels = None
     if surface_only_mask is not None:
         _, surface_labels = cv2.connectedComponents(surface_only_mask.astype(np.uint8), connectivity=8)
+    graph_and_decisions_load_seconds = time.perf_counter() - graph_and_decisions_load_started
+    candidate_centerline_processing_started = time.perf_counter()
 
     candidate_decisions_by_region: dict[str, list[str]] = {}
     for candidate in candidate_rows:
@@ -989,6 +993,10 @@ def finalize_one(
             auto_surface_count += 1
 
     estimated_count = 0
+    candidate_centerline_processing_seconds = (
+        time.perf_counter() - candidate_centerline_processing_started
+    )
+    final_graph_build_started = time.perf_counter()
 
     # The original graph can be noded while candidates are accepted.  Reorder
     # active provenance records to the actual graph order before final IDs and
@@ -1020,6 +1028,7 @@ def finalize_one(
 
     if active_edge_id != len(final_edges):
         raise RuntimeError(f"Final edge-table mismatch: active_rows={active_edge_id}, graph_edges={len(final_edges)}")
+    final_graph_build_seconds = time.perf_counter() - final_graph_build_started
     candidate_analysis_seconds = time.perf_counter() - candidate_analysis_started
     final_width_measurement_started = time.perf_counter()
     pixel_size = as_float(summary, "pixel_size", 1.0)
@@ -1064,6 +1073,7 @@ def finalize_one(
         row["optimized_width_source"] = str(measured.get("source", width_result.algorithm))
         row["optimized_quality_grade"] = str(measured.get("quality_grade", "C"))
         row["final_status"] = str(measured.get("status", "width_unresolved"))
+    final_width_core_seconds = time.perf_counter() - final_width_measurement_started
     manual_width_path = edited_dir / f"{stem}_manual_widths.json" if edited_dir else None
     manual_width_edge_count = 0
     # The production pipeline now has one authoritative surface policy:
@@ -1071,6 +1081,7 @@ def finalize_one(
     # Keep the exported centerline attributes consistent with the regular
     # Buffer surface: every edge in one uninterrupted chain shares a
     # single robust median width.
+    chain_width_propagation_started = time.perf_counter()
     corridor_reliable = np.asarray(
         [
             as_float(row, "optimized_width_px") > 0
@@ -1098,6 +1109,7 @@ def finalize_one(
         active_records[int(edge_id)]["optimized_width_units"] = float(chain_width) * pixel_size
         width_result.edge_widths[int(edge_id)]["width_px"] = float(chain_width)
         width_result.edge_widths[int(edge_id)]["width_units"] = float(chain_width) * pixel_size
+    chain_width_propagation_seconds = time.perf_counter() - chain_width_propagation_started
     # Manual boundary measurements are authoritative and therefore applied
     # after automatic corridor regularisation, immediately before surface rebuild.
     manual_width_edge_count = apply_manual_width_overrides(
@@ -1109,6 +1121,7 @@ def finalize_one(
     final_width_measurement_seconds = time.perf_counter() - final_width_measurement_started
 
     surface_reconstruction_started = time.perf_counter()
+    surface_auxiliary_write_seconds = 0.0
     width_surface = None
     if clean_mask is not None and len(final_edges_np):
         width_surface = reconstruct_surface_from_widths(
@@ -1155,8 +1168,10 @@ def finalize_one(
                     and not str(active_records[edge_id].get("optimized_width_source", "")).startswith("manual_")
                 ):
                     active_records[edge_id]["optimized_width_source"] = "junction_aware_surface_fallback"
+        surface_write_started = time.perf_counter()
         write_image(final_dir / f"{stem}_width_surface_added.png", width_surface.added.astype(np.uint8) * 255)
         write_image(final_dir / f"{stem}_width_surface_removed.png", width_surface.removed.astype(np.uint8) * 255)
+        surface_auxiliary_write_seconds += time.perf_counter() - surface_write_started
 
     # Surface painting/erasing is the last authoritative edit. Apply it after
     # automatic width-buffer reconstruction so later stages cannot undo what
@@ -1173,6 +1188,7 @@ def finalize_one(
             clean_mask[manual_surface_remove > 0] = 0
     surface_reconstruction_seconds = time.perf_counter() - surface_reconstruction_started
 
+    visualization_file_writing_started = time.perf_counter()
     sample_fields = list(final_width_samples[0].keys()) if final_width_samples else []
     write_csv(final_dir / f"{stem}_optimized_width_samples.csv", final_width_samples, sample_fields)
     segment_fields = list(final_width_segments[0].keys()) if final_width_segments else []
@@ -1289,6 +1305,10 @@ def finalize_one(
             out_path=final_dir / f"{stem}_fusion_comparison.png",
             color_mode="source",
         )
+    visualization_file_writing_seconds = (
+        time.perf_counter() - visualization_file_writing_started
+        + surface_auxiliary_write_seconds
+    )
 
     base_sources = {"samroad", "weak_recovered", "manual_edited"}
     removed_original_count = sum(1 for row in edge_records if row["source"] in base_sources and row["final_status"] == "removed_by_review")
@@ -1312,6 +1332,15 @@ def finalize_one(
             auto_surface_rule_counts[rule] = auto_surface_rule_counts.get(rule, 0) + 1
             if str(candidate.get("long_road_evidence", "")).strip().lower() in {"1", "true", "yes"}:
                 auto_long_surface_count += 1
+    topology_started = time.perf_counter()
+    input_topology = summary.get("original_topology")
+    if not isinstance(input_topology, dict):
+        input_topology = graph_topology_metrics(nodes_np, edges_np)
+    prepared_topology = summary.get("prepared_topology")
+    if not isinstance(prepared_topology, dict):
+        prepared_topology = graph_topology_metrics(nodes_np, edges_np)
+    optimized_topology = graph_topology_metrics(final_nodes_np, final_edges_np)
+    final_graph_build_seconds += time.perf_counter() - topology_started
     optimized_summary = {
         "source_output_dir": str(output_dir),
         "image": summary.get("image", ""),
@@ -1352,9 +1381,18 @@ def finalize_one(
             "junction_cleanup_seconds": float(
                 (summary.get("profiling") or {}).get("junction_cleanup_seconds", 0.0)
             ),
+            "graph_and_decisions_load_seconds": float(graph_and_decisions_load_seconds),
             "candidate_analysis_seconds": float(candidate_analysis_seconds),
+            "candidate_centerline_processing_seconds": float(candidate_centerline_processing_seconds),
+            "final_graph_build_seconds": float(final_graph_build_seconds),
+            "final_width_core_seconds": float(final_width_core_seconds),
             "final_width_measurement_seconds": float(final_width_measurement_seconds),
+            "chain_width_propagation_seconds": float(chain_width_propagation_seconds),
             "surface_reconstruction_seconds": float(surface_reconstruction_seconds),
+            "surface_reconstruction_core_seconds": float(max(
+                0.0, surface_reconstruction_seconds - surface_auxiliary_write_seconds,
+            )),
+            "visualization_file_writing_seconds": float(visualization_file_writing_seconds),
             "total_seconds": float(time.perf_counter() - finalize_started),
         },
         "final_surface_stage": "regular_buffer_surface",
@@ -1362,9 +1400,9 @@ def finalize_one(
         "unresolved_review_width_count": 0,
         "unresolved_added_width_edge_count": unresolved_added_count,
         "global_median_width_fallback_count": 0,
-        "input_topology": summary.get("original_topology", graph_topology_metrics(nodes_np, edges_np)),
-        "prepared_topology": summary.get("prepared_topology", graph_topology_metrics(nodes_np, edges_np)),
-        "optimized_topology": graph_topology_metrics(final_nodes_np, final_edges_np),
+        "input_topology": input_topology,
+        "prepared_topology": prepared_topology,
+        "optimized_topology": optimized_topology,
         "optimized_width_sample_count": len(final_width_samples),
         "optimized_width_segment_count": len(final_width_segments),
         "pixel_size": pixel_size,
@@ -1391,7 +1429,29 @@ def finalize_one(
     return optimized_summary
 
 
+def _finalize_one_worker(payload: tuple[dict, str, str, str, dict, str]) -> dict:
+    """Spawn-safe one-slice finalizer."""
+    args_values, output_value, final_value, summary_value, decisions, decisions_value = payload
+    summary_path = Path(summary_value)
+    try:
+        result = finalize_one(
+            argparse.Namespace(**args_values),
+            Path(output_value),
+            Path(final_value),
+            summary_path,
+            decisions,
+            Path(decisions_value),
+        )
+        return {"ok": True, "summary": result}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "failure": {"summary": str(summary_path), "error": str(exc)},
+        }
+
+
 def main() -> int:
+    batch_started = time.perf_counter()
     parser = argparse.ArgumentParser(description="Apply review decisions to SAMRoad/SAM_MLoRA width outputs.")
     parser.add_argument("--output-dir", required=True, help="Directory containing review_decisions.csv and *_summary.json.")
     parser.add_argument("--final-dir", default="", help="Output directory. Default: <output-dir>/finalized_review.")
@@ -1421,6 +1481,10 @@ def main() -> int:
     parser.add_argument(
         "--only-stem", action="append", default=[],
         help="只重算指定切片 stem；可重复传入。未提供时保持原来的全量重算。",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Parallel slice workers. 0 uses a conservative automatic maximum of 2; 1 is serial.",
     )
     args = parser.parse_args()
 
@@ -1461,24 +1525,54 @@ def main() -> int:
             raise RuntimeError(f"Manual review is incomplete: {len(remaining)} of {len(required)} required items remain.")
     success_count = 0
     failures = []
-    for index, summary_path in enumerate(summary_paths, start=1):
-        print(f"[{index}/{len(summary_paths)}] Finalizing {summary_path.name}")
-        try:
-            finalize_one(args, output_dir, final_dir, summary_path, decisions, decisions_path)
-            success_count += 1
-        except Exception as exc:
-            failures.append({"summary": str(summary_path), "error": str(exc)})
-            print(f"Failed: {summary_path} -> {exc}")
+    optimized_summaries = []
+    worker_count = resolve_worker_count(args.workers, len(summary_paths))
+    print(f"Finalize slice workers: {worker_count or 1}; slice count: {len(summary_paths)}")
+    if worker_count <= 1:
+        for index, summary_path in enumerate(summary_paths, start=1):
+            print(f"[{index}/{len(summary_paths)}] Finalizing {summary_path.name}")
+            try:
+                optimized_summaries.append(
+                    finalize_one(args, output_dir, final_dir, summary_path, decisions, decisions_path)
+                )
+                success_count += 1
+            except Exception as exc:
+                failures.append({"summary": str(summary_path), "error": str(exc)})
+                print(f"Failed: {summary_path} -> {exc}")
+    else:
+        payloads = [
+            (
+                dict(vars(args)), str(output_dir), str(final_dir), str(summary_path),
+                decisions, str(decisions_path),
+            )
+            for summary_path in summary_paths
+        ]
+        results = spawn_map(_finalize_one_worker, payloads, worker_count)
+        for result in results:
+            if result["ok"]:
+                success_count += 1
+                optimized_summaries.append(result["summary"])
+            else:
+                failures.append(result["failure"])
+                print(f"Failed: {result['failure']['summary']} -> {result['failure']['error']}")
     batch_summary = {
         "source_output_dir": str(output_dir),
         "final_dir": str(final_dir),
         "slice_count": len(summary_paths),
         "success_count": success_count,
         "failure_count": len(failures),
+        "workers": int(worker_count),
         "failures": failures,
         "slices": [summary_path.name.removesuffix("_summary.json") for summary_path in summary_paths],
         "partial_rebuild": bool(requested_stems),
         "requested_stems": sorted(requested_stems),
+        "profiling": {
+            "slice_total_seconds": float(sum(
+                (summary.get("profiling") or {}).get("total_seconds", 0.0)
+                for summary in optimized_summaries
+            )),
+            "wall_seconds": float(time.perf_counter() - batch_started),
+        },
     }
     with open(final_dir / "batch_optimized_summary.json", "w", encoding="utf-8") as file:
         json.dump(batch_summary, file, indent=2, ensure_ascii=False)

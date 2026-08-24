@@ -16,6 +16,20 @@ import time
 import zlib
 from pathlib import Path
 
+import sys
+
+
+CODE_ROOT = Path(__file__).resolve().parents[2]
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
+
+from dependency_identity import (  # noqa: E402
+    dependency_identity_equal,
+    effective_config_identity,
+    ordinary_file_identity_equal,
+    stable_file_identity,
+)
+
 
 MARKER_SCHEMA_VERSION = 1
 SUPPORTED_MARKER_SCHEMAS = {MARKER_SCHEMA_VERSION}
@@ -51,8 +65,8 @@ def build_batch_identity(
 ) -> dict:
     """Fingerprint model/config once per process, never once per image."""
     return {
-        "checkpoint": file_identity(checkpoint, sha256=False),
-        "config": file_identity(config, sha256=True),
+        "checkpoint": stable_file_identity(checkpoint, content_hash=False),
+        "config": effective_config_identity(config),
         "parameters": json.loads(json.dumps(parameters, sort_keys=True, default=str)),
     }
 
@@ -223,7 +237,7 @@ def validate_output(path: Path | str, kind: str, *, headers=()) -> tuple[bool, s
 
 
 def _same_identity(stored: object, current: dict) -> bool:
-    return isinstance(stored, dict) and stored == current
+    return ordinary_file_identity_equal(stored, current)
 
 
 def _read_json_object(path: Path) -> tuple[dict | None, str]:
@@ -235,19 +249,18 @@ def _read_json_object(path: Path) -> tuple[dict | None, str]:
     return (value, "") if isinstance(value, dict) else (None, "JSON root is not an object")
 
 
-def _state_file_identity(state: dict, key: str) -> dict | None:
-    spec = state.get("input_spec") if isinstance(state.get("input_spec"), dict) else {}
+def _state_file_identity(state: dict, key: str, *, historical: bool = False) -> dict | None:
+    provenance = state.get("provenance") if isinstance(state.get("provenance"), dict) else {}
+    historical_spec = (
+        provenance.get("historical_input_spec")
+        if isinstance(provenance.get("historical_input_spec"), dict) else {}
+    )
+    current = state.get("input_spec") if isinstance(state.get("input_spec"), dict) else {}
+    spec = historical_spec if historical and historical_spec else current
     value = spec.get(key) if isinstance(spec.get(key), dict) else None
     if not value:
         return None
-    try:
-        return {
-            "path": str(_resolved(value["path"])),
-            "size": int(value["size"]),
-            "mtime_ns": int(value["mtime_ns"]),
-        }
-    except (KeyError, OSError, TypeError, ValueError):
-        return None
+    return dict(value)
 
 
 def load_pipeline_identities(path: Path | str | None) -> dict:
@@ -256,14 +269,15 @@ def load_pipeline_identities(path: Path | str | None) -> dict:
     state, _reason = _read_json_object(_resolved(path))
     if state is None:
         return {}
-    return {
+    identities = {
         key: identity for key in ("checkpoint", "config")
         if (identity := _state_file_identity(state, key)) is not None
     }
-
-
-def _identity_without_hash(identity: dict) -> dict:
-    return {key: identity.get(key) for key in ("path", "size", "mtime_ns")}
+    identities.update({
+        f"historical_{key}": identity for key in ("checkpoint", "config")
+        if (identity := _state_file_identity(state, key, historical=True)) is not None
+    })
+    return identities
 
 
 def _legacy_batch_compatible(
@@ -273,18 +287,28 @@ def _legacy_batch_compatible(
         return False, "legacy inference_metadata.json is missing or invalid"
     recorded_identity = legacy_metadata.get("resume_identity")
     if isinstance(recorded_identity, dict):
-        return (
-            (True, "") if recorded_identity == batch_identity
-            else (False, "legacy inference identity changed")
-        )
+        if not dependency_identity_equal(
+            recorded_identity.get("checkpoint"), batch_identity.get("checkpoint"),
+            kind="checkpoint",
+        ):
+            return False, "legacy checkpoint identity changed"
+        if not dependency_identity_equal(
+            recorded_identity.get("config"), batch_identity.get("config"), kind="config",
+        ):
+            return False, "legacy config identity changed"
+        if recorded_identity.get("parameters") != batch_identity.get("parameters"):
+            return False, "legacy inference parameters changed"
+        return True, ""
     for key in ("checkpoint", "config"):
         metadata_path = legacy_metadata.get(key)
-        if not metadata_path or _path_text(metadata_path) != _path_text(batch_identity[key]["path"]):
-            return False, f"legacy {key} path changed"
-        state_identity = pipeline_identities.get(key)
+        if not metadata_path:
+            return False, f"legacy {key} path is unavailable"
+        state_identity = pipeline_identities.get(f"historical_{key}") or pipeline_identities.get(key)
+        if key == "config" and isinstance(legacy_metadata.get("_saved_config_identity"), dict):
+            state_identity = legacy_metadata["_saved_config_identity"]
         if state_identity is None:
             return False, f"legacy {key} fingerprint is unavailable"
-        if _identity_without_hash(batch_identity[key]) != state_identity:
+        if not dependency_identity_equal(state_identity, batch_identity[key], kind=key):
             return False, f"legacy {key} fingerprint changed"
     parameter_checks = {
         "device": "device",
@@ -312,7 +336,24 @@ class ImageResumeManager:
         self.enabled = bool(enabled)
         self.legacy_metadata = legacy_metadata
         self.pipeline_identities = load_pipeline_identities(pipeline_state)
+        for key in ("checkpoint", "config"):
+            pipeline_identity = self.pipeline_identities.get(key)
+            if pipeline_identity and dependency_identity_equal(
+                pipeline_identity, self.batch_identity.get(key), kind=key,
+            ):
+                self.batch_identity[key] = {
+                    **self.batch_identity[key],
+                    **{
+                        name: value for name, value in pipeline_identity.items()
+                        if name in {
+                            "sha256", "effective_sha256", "effective_key_count",
+                            "resource_identities",
+                        }
+                    },
+                }
         self.resume_dir = self.output_dir / ".resume"
+        self.backup_root = self.resume_dir / "backups"
+        self._restore_pending_backups()
 
     def marker_path(self, image_path: Path | str) -> Path:
         return self.resume_dir / f"{stable_image_key(image_path)}.completed.json"
@@ -337,9 +378,13 @@ class ImageResumeManager:
             return False, "unsupported marker schema"
         if not _same_identity(marker.get("input"), file_identity(image_path)):
             return False, "input image identity changed"
-        if not _same_identity(marker.get("checkpoint"), self.batch_identity["checkpoint"]):
+        if not dependency_identity_equal(
+            marker.get("checkpoint"), self.batch_identity["checkpoint"], kind="checkpoint",
+        ):
             return False, "checkpoint identity changed"
-        if not _same_identity(marker.get("config"), self.batch_identity["config"]):
+        if not dependency_identity_equal(
+            marker.get("config"), self.batch_identity["config"], kind="config",
+        ):
             return False, "config identity changed"
         if marker.get("parameters") != self.batch_identity.get("parameters"):
             return False, "inference parameters changed"
@@ -399,7 +444,7 @@ class ImageResumeManager:
         if recovery is None:
             return {"action": "process", "reason": f"legacy recovery summary invalid: {reason}"}
         recorded_image = str(recovery.get("image") or "").strip()
-        if not recorded_image or _path_text(recorded_image) != _path_text(image):
+        if not recorded_image or Path(recorded_image).name.casefold() != image.name.casefold():
             return {"action": "process", "reason": "legacy recovery summary input path changed"}
         if str(recovery.get("tile") or "") != image.stem:
             return {"action": "process", "reason": "legacy recovery summary stem changed"}
@@ -425,9 +470,93 @@ class ImageResumeManager:
 
     def prepare_for_processing(self, image_path: Path | str) -> None:
         image = _resolved(image_path)
-        self.marker_path(image).unlink(missing_ok=True)
-        for path in all_image_outputs(self.output_dir, image.stem):
+        backup_dir = self.backup_root / stable_image_key(image)
+        if backup_dir.is_dir():
+            self._restore_backup(backup_dir)
+        manifest_path = backup_dir / "backup_manifest.json"
+        candidates = [self.marker_path(image), *all_image_outputs(self.output_dir, image.stem)]
+        existing = [path for path in candidates if path.is_file()]
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": 1,
+            "image": str(image),
+            "files": [path.relative_to(self.output_dir).as_posix() for path in existing],
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._atomic_json(manifest_path, manifest)
+        try:
+            for path in existing:
+                relative = path.relative_to(self.output_dir)
+                target = backup_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, target)
+        except Exception:
+            self._restore_backup(backup_dir)
+            raise
+
+    @staticmethod
+    def _atomic_json(path: Path, value: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _restore_backup(self, backup_dir: Path) -> None:
+        manifest, _reason = _read_json_object(backup_dir / "backup_manifest.json")
+        if manifest is None:
+            return
+        for relative_text in manifest.get("files", []):
+            relative = Path(str(relative_text))
+            if relative.is_absolute() or relative.drive or ".." in relative.parts:
+                continue
+            source = (backup_dir / relative).resolve()
+            target = (self.output_dir / relative).resolve()
+            try:
+                source.relative_to(backup_dir.resolve())
+                target.relative_to(self.output_dir)
+            except ValueError:
+                continue
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+        self._remove_empty_backup(backup_dir)
+
+    def _restore_pending_backups(self) -> None:
+        if not self.backup_root.is_dir():
+            return
+        for backup_dir in sorted(self.backup_root.iterdir(), key=lambda path: path.name):
+            if backup_dir.is_dir():
+                self._restore_backup(backup_dir)
+
+    def _remove_empty_backup(self, backup_dir: Path) -> None:
+        manifest = backup_dir / "backup_manifest.json"
+        manifest.unlink(missing_ok=True)
+        for directory in sorted(
+            (path for path in backup_dir.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts), reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            backup_dir.rmdir()
+        except OSError:
+            pass
+
+    def _discard_backup(self, image: Path) -> None:
+        backup_dir = self.backup_root / stable_image_key(image)
+        if not backup_dir.is_dir():
+            return
+        for path in sorted(
+            (path for path in backup_dir.rglob("*") if path.is_file()),
+            key=lambda path: len(path.parts), reverse=True,
+        ):
             path.unlink(missing_ok=True)
+        self._remove_empty_backup(backup_dir)
 
     def _write_marker(
         self, image: Path, outputs: list[dict], recovery_summary: dict,
@@ -472,9 +601,11 @@ class ImageResumeManager:
         if outputs is None:
             self.marker_path(image).unlink(missing_ok=True)
             raise RuntimeError(f"Cannot mark image complete; required output validation failed: {reason}")
-        return self._write_marker(
+        marker = self._write_marker(
             image, outputs, dict(recovery_summary), dict(profile_decision), origin="inferred",
         )
+        self._discard_backup(image)
+        return marker
 
 
 def marker_summaries(marker: dict) -> tuple[dict, dict]:

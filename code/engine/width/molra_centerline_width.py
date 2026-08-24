@@ -9,12 +9,19 @@ import pickle
 import sys
 import time
 from collections import deque
+from functools import wraps
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 
+from graph_spatial_context import (
+    GraphSpatialContext,
+    PointGridIndex,
+    find_vertical_divided_anchor_pair as find_vertical_divided_anchor_pair_indexed,
+)
+from parallel_utils import resolve_worker_count, spawn_map
 from topology_optimizer import candidate_path_for_graph, optimize_divided_road_junctions, read_topology_candidates
 
 
@@ -28,6 +35,23 @@ DEFAULT_MOLRA_SAM = RUNTIME_MODELS_ROOT / "sam_molra" / "sam_vit_b_01ec64.pth"
 DEFAULT_MOLRA_WEIGHT = RUNTIME_MODELS_ROOT / "sam_molra" / "adapter.th"
 IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 MASK_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+
+
+def _accumulate_profile(field: str):
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            profiling = kwargs.get("profiling")
+            started = time.perf_counter()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                if profiling is not None:
+                    profiling[field] = float(
+                        profiling.get(field, 0.0) + time.perf_counter() - started
+                    )
+        return measured
+    return decorate
 
 
 def add_sam_molra_path() -> None:
@@ -402,36 +426,21 @@ def _find_vertical_divided_anchor_pair(
     min_spacing_px: float = 8.0,
     max_spacing_px: float = 30.0,
     lateral_search_px: float = 45.0,
+    node_index: PointGridIndex | None = None,
 ) -> tuple[int, int] | None:
-    candidates = []
-    for first_idx in range(nodes_rc.shape[0]):
-        first = nodes_rc[first_idx]
-        first_distance = side * float(first[0] - center[0])
-        if not min_distance_px <= first_distance <= max_distance_px:
-            continue
-        if abs(float(first[1] - center[1])) > lateral_search_px:
-            continue
-        for second_idx in range(first_idx + 1, nodes_rc.shape[0]):
-            second = nodes_rc[second_idx]
-            second_distance = side * float(second[0] - center[0])
-            spacing = abs(float(second[1] - first[1]))
-            if not min_distance_px <= second_distance <= max_distance_px:
-                continue
-            if abs(float(second[1] - center[1])) > lateral_search_px:
-                continue
-            if abs(float(second[0] - first[0])) > max_row_difference_px:
-                continue
-            if not min_spacing_px <= spacing <= max_spacing_px:
-                continue
-            first_rc = np.rint(first).astype(np.int32)
-            second_rc = np.rint(second).astype(np.int32)
-            probability = float(center_probability[first_rc[0], first_rc[1]] + center_probability[second_rc[0], second_rc[1]])
-            outward_distance = 0.5 * (first_distance + second_distance)
-            lateral_center = abs(float(0.5 * (first[1] + second[1]) - center[1]))
-            score = outward_distance + 0.7 * lateral_center - 20.0 * probability
-            ordered = (first_idx, second_idx) if first[1] <= second[1] else (second_idx, first_idx)
-            candidates.append((score, ordered))
-    return min(candidates)[1] if candidates else None
+    return find_vertical_divided_anchor_pair_indexed(
+        nodes_rc,
+        center_probability,
+        center,
+        side,
+        min_distance_px=min_distance_px,
+        max_distance_px=max_distance_px,
+        max_row_difference_px=max_row_difference_px,
+        min_spacing_px=min_spacing_px,
+        max_spacing_px=max_spacing_px,
+        lateral_search_px=lateral_search_px,
+        node_index=node_index,
+    )
 
 
 def _probability_guided_vertical_path(
@@ -707,6 +716,7 @@ def restore_divided_corridors_through_junctions(
     """Replace a vertical Y-merge with two probability-guided through lanes."""
     if edges.size == 0 or not cleanup_rows:
         return nodes_rc, edges, []
+    anchor_node_index = PointGridIndex.build(nodes_rc, 32.0)
     for cleanup in cleanup_rows:
         if cleanup.get("action") != "remove_weak_short_cycle_edge":
             continue
@@ -716,8 +726,12 @@ def restore_divided_corridors_through_junctions(
         if abs(float(vector[1])) < 1.5 * abs(float(vector[0])):
             continue
         center = 0.5 * (start + end)
-        north_pair = _find_vertical_divided_anchor_pair(nodes_rc, center_probability, center, -1)
-        south_pair = _find_vertical_divided_anchor_pair(nodes_rc, center_probability, center, 1)
+        north_pair = _find_vertical_divided_anchor_pair(
+            nodes_rc, center_probability, center, -1, node_index=anchor_node_index,
+        )
+        south_pair = _find_vertical_divided_anchor_pair(
+            nodes_rc, center_probability, center, 1, node_index=anchor_node_index,
+        )
         if north_pair is None or south_pair is None:
             continue
         north_pair = tuple(sorted(north_pair, key=lambda node_idx: float(nodes_rc[node_idx, 1])))
@@ -1210,11 +1224,20 @@ def graph_bridge_edge_ids(node_count: int, edges: np.ndarray) -> set[int]:
     return bridges
 
 
-def graph_topology_metrics(nodes_rc: np.ndarray, edges: np.ndarray) -> dict:
+def graph_topology_metrics(
+    nodes_rc: np.ndarray, edges: np.ndarray,
+    graph_context: GraphSpatialContext | None = None,
+) -> dict:
     node_count = int(nodes_rc.shape[0])
     edge_count = int(edges.shape[0])
-    degrees, _ = graph_degrees(edge_count, node_count, edges)
-    component_ids = graph_component_ids(node_count, edges)
+    if graph_context is None:
+        degrees, _node_edges = graph_degrees(edge_count, node_count, edges)
+        component_ids = graph_component_ids(node_count, edges)
+        bridge_edge_count = len(graph_bridge_edge_ids(node_count, edges))
+    else:
+        degrees = graph_context.degrees
+        component_ids = graph_context.component_ids
+        bridge_edge_count = len(graph_context.bridge_edge_ids)
     component_sizes = np.bincount(component_ids, minlength=int(component_ids.max()) + 1) if node_count else np.asarray([])
     return {
         "node_count": node_count,
@@ -1224,70 +1247,16 @@ def graph_topology_metrics(nodes_rc: np.ndarray, edges: np.ndarray) -> dict:
         "endpoint_count": int(np.count_nonzero(degrees == 1)),
         "isolated_node_count": int(np.count_nonzero(degrees == 0)),
         "junction_node_count": int(np.count_nonzero(degrees >= 3)),
-        "bridge_edge_count": len(graph_bridge_edge_ids(node_count, edges)),
+        "bridge_edge_count": bridge_edge_count,
     }
 
 
-def build_road_chains(nodes_rc: np.ndarray, edges: np.ndarray) -> list[dict]:
-    degrees, node_edges = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
-    component_ids = graph_component_ids(nodes_rc.shape[0], edges)
-    visited: set[int] = set()
-    chains: list[dict] = []
-
-    def trace(start_node: int, first_edge: int) -> tuple[list[int], list[int]]:
-        node_path = [start_node]
-        edge_path = []
-        current_node = start_node
-        current_edge = first_edge
-        while current_edge not in visited:
-            visited.add(current_edge)
-            edge_path.append(current_edge)
-            src_idx, dst_idx = (int(value) for value in edges[current_edge])
-            next_node = dst_idx if src_idx == current_node else src_idx
-            node_path.append(next_node)
-            if degrees[next_node] != 2:
-                break
-            next_edges = [edge_id for edge_id in node_edges[next_node] if edge_id not in visited]
-            if not next_edges:
-                break
-            current_node, current_edge = next_node, next_edges[0]
-        return node_path, edge_path
-
-    semantic_nodes = np.where(degrees != 2)[0].tolist()
-    for node_idx in semantic_nodes:
-        for edge_id in node_edges[node_idx]:
-            if edge_id in visited:
-                continue
-            node_path, edge_path = trace(node_idx, edge_id)
-            if edge_path:
-                chains.append({"node_path": node_path, "edge_path": edge_path})
-    for edge_id in range(edges.shape[0]):
-        if edge_id in visited:
-            continue
-        node_path, edge_path = trace(int(edges[edge_id, 0]), edge_id)
-        if edge_path:
-            chains.append({"node_path": node_path, "edge_path": edge_path})
-
-    rows = []
-    for chain_id, chain in enumerate(chains):
-        points = [nodes_rc[node_idx] for node_idx in chain["node_path"]]
-        length = float(sum(np.linalg.norm(b - a) for a, b in zip(points[:-1], points[1:])))
-        start_idx, end_idx = chain["node_path"][0], chain["node_path"][-1]
-        rows.append(
-            {
-                "road_chain_id": chain_id,
-                "component_id": int(component_ids[start_idx]),
-                "start_node_idx": start_idx,
-                "end_node_idx": end_idx,
-                "start_degree": int(degrees[start_idx]),
-                "end_degree": int(degrees[end_idx]),
-                "micro_edge_count": len(chain["edge_path"]),
-                "length_px": length,
-                "edge_ids": ";".join(str(value) for value in chain["edge_path"]),
-                "polyline_points_json": json.dumps([[float(point[0]), float(point[1])] for point in points], separators=(",", ":")),
-            }
-        )
-    return rows
+def build_road_chains(
+    nodes_rc: np.ndarray, edges: np.ndarray,
+    graph_context: GraphSpatialContext | None = None,
+) -> list[dict]:
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges)
+    return context.build_road_chain_rows()
 
 
 def annotate_edge_topology(
@@ -1298,11 +1267,13 @@ def annotate_edge_topology(
     center_probability: np.ndarray | None = None,
     topology_probabilities: np.ndarray | None = None,
     auto_retain_center_probability: float = 0.6,
+    graph_context: GraphSpatialContext | None = None,
 ) -> None:
-    degrees, _ = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
-    component_ids = graph_component_ids(nodes_rc.shape[0], edges)
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges)
+    degrees = context.degrees
+    component_ids = context.component_ids
     component_sizes = np.bincount(component_ids, minlength=int(component_ids.max()) + 1) if component_ids.size else np.asarray([])
-    bridge_ids = graph_bridge_edge_ids(nodes_rc.shape[0], edges)
+    bridge_ids = context.bridge_edge_ids
     for row in edge_rows:
         edge_id = int(row["edge_id"])
         src_idx, dst_idx = (int(value) for value in edges[edge_id])
@@ -1379,9 +1350,11 @@ def build_edge_surface_evidence(
     binary: np.ndarray,
     supported_ratio: float = 0.8,
     missing_ratio: float = 0.05,
+    graph_context: GraphSpatialContext | None = None,
 ) -> list[dict]:
     """Describe line/surface agreement without estimating road width."""
-    lengths = edge_lengths(nodes_rc, edges)
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges)
+    lengths = context.edge_lengths
     rows: list[dict] = []
     surface = binary.astype(np.float32)
     for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
@@ -1480,9 +1453,13 @@ def _network_attachment_vetoes(hard_veto_reasons: list[str]) -> list[str]:
 
 
 def _candidate_endpoint_edge_match(
-    points: np.ndarray, nodes_rc: np.ndarray, edges: np.ndarray, max_distance_px: float
+    points: np.ndarray, nodes_rc: np.ndarray, edges: np.ndarray, max_distance_px: float,
+    graph_context: GraphSpatialContext | None = None,
 ) -> dict:
     """Find a non-parallel endpoint-to-edge (T) attachment, if one exists."""
+    context = graph_context or GraphSpatialContext.build(
+        nodes_rc, edges, cell_size=max_distance_px,
+    )
     best: dict | None = None
     for endpoint_position in (0, 1):
         endpoint = points[endpoint_position]
@@ -1491,7 +1468,8 @@ def _candidate_endpoint_edge_match(
         local_norm = float(np.linalg.norm(local_direction))
         if local_norm <= 0:
             continue
-        for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+        for edge_id in context.edge_index.query_point_radius(endpoint, max_distance_px):
+            src_idx, dst_idx = edges[edge_id]
             start, end = nodes_rc[int(src_idx)], nodes_rc[int(dst_idx)]
             projection, ratio, distance = point_segment_projection(endpoint, start, end)
             if not 0.08 <= ratio <= 0.92 or distance > max_distance_px:
@@ -1547,7 +1525,9 @@ def _candidate_hard_vetoes(
     protected_endpoints: set[int],
     region_candidate_count: int,
     image_shape: tuple[int, int] | None,
+    graph_context: GraphSpatialContext | None = None,
 ) -> list[str]:
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges)
     reasons: list[str] = []
     support = _candidate_float(row, "surface_support_ratio")
     half_width = _candidate_float(row, "median_half_width_px")
@@ -1578,7 +1558,10 @@ def _candidate_hard_vetoes(
     if edges.size and points.shape[0] > 2:
         # Ignore the endpoints: a true connector legitimately touches the graph.
         for point in points[1:-1]:
-            for src_idx, dst_idx in edges.tolist():
+            for edge_id in context.edge_index.query_point_radius(
+                point, max(3.0, half_width),
+            ):
+                src_idx, dst_idx = edges[edge_id]
                 projection, ratio, distance = point_segment_projection(point, nodes_rc[int(src_idx)], nodes_rc[int(dst_idx)])
                 tangent = nodes_rc[int(dst_idx)] - nodes_rc[int(src_idx)]
                 direction = points[-1] - points[0]
@@ -1593,8 +1576,8 @@ def _candidate_hard_vetoes(
     # prohibited even when the geometry itself appears straight.
     for endpoint in (points[0], points[-1]):
         if nodes_rc.size:
-            nearest = int(np.argmin(np.linalg.norm(nodes_rc - endpoint, axis=1)))
-            if nearest in protected_endpoints and float(np.linalg.norm(nodes_rc[nearest] - endpoint)) <= 120.0:
+            distance, nearest = context.nearest_node(endpoint)
+            if nearest in protected_endpoints and distance <= 120.0:
                 reasons.append("protected_divided_carriageway")
                 break
     return sorted(set(reasons))
@@ -1615,10 +1598,16 @@ def annotate_candidate_graph_matches(
     surface_extension_max_half_width_px: float = 14.0,
     center_probability: np.ndarray | None = None,
     image_shape: tuple[int, int] | None = None,
+    graph_context: GraphSpatialContext | None = None,
 ) -> None:
-    component_ids = graph_component_ids(nodes_rc.shape[0], edges)
-    protected_endpoints = divided_road_endpoint_ids(nodes_rc, edges)
-    outward_vectors = endpoint_outward_vectors(nodes_rc, edges)
+    context = graph_context or GraphSpatialContext.build(
+        nodes_rc, edges, cell_size=max(snap_px, surface_extension_max_distance_px),
+    )
+    component_ids = context.component_ids
+    protected_endpoints = divided_road_endpoint_ids(
+        nodes_rc, edges, graph_context=context,
+    )
+    outward_vectors = context.outward_vectors
     surface_region_candidate_counts: dict[str, int] = {}
     for candidate in candidate_rows:
         if candidate.get("candidate_type") == "surface_skeleton":
@@ -1631,9 +1620,7 @@ def annotate_candidate_graph_matches(
         matched: list[int] = []
         distances: list[float] = []
         for endpoint in endpoints:
-            distance_values = np.linalg.norm(nodes_rc - endpoint, axis=1)
-            node_idx = int(np.argmin(distance_values))
-            distance = float(distance_values[node_idx])
+            distance, node_idx = context.nearest_node(endpoint)
             matched.append(node_idx if distance <= snap_px else -1)
             distances.append(distance)
         matched_components = {int(component_ids[node_idx]) for node_idx in matched if node_idx >= 0}
@@ -1660,14 +1647,9 @@ def annotate_candidate_graph_matches(
             candidate_length_px = float(np.linalg.norm(np.diff(candidate_points, axis=0), axis=1).sum())
         relaxed_matches: list[tuple[int, int, float]] = []
         for endpoint_position, endpoint in enumerate(endpoints):
-            nearby = [
-                (float(np.linalg.norm(nodes_rc[node_idx] - endpoint)), node_idx)
-                for node_idx in outward_vectors
-            ]
-            if nearby:
-                distance, node_idx = min(nearby)
-                if distance <= surface_extension_max_distance_px:
-                    relaxed_matches.append((endpoint_position, node_idx, distance))
+            distance, node_idx = context.nearest_endpoint(endpoint)
+            if node_idx >= 0 and distance <= surface_extension_max_distance_px:
+                relaxed_matches.append((endpoint_position, node_idx, distance))
         # A long candidate can have both ends inside the attachment radius of
         # the same dangling endpoint.  Collapse only that ambiguous case.  Two
         # different endpoint matches must be retained because they may bridge
@@ -1695,14 +1677,18 @@ def annotate_candidate_graph_matches(
         region_id = str(row.get("region_id", "") or "")
         surface_region_candidate_count = max(surface_region_candidate_counts.get(region_id, 1), int(round(_candidate_float(row, "surface_region_candidate_count", 0.0))))
         row["surface_region_candidate_count"] = surface_region_candidate_count
-        edge_match = _candidate_endpoint_edge_match(candidate_points, nodes_rc, edges, surface_extension_max_distance_px)
+        edge_match = _candidate_endpoint_edge_match(
+            candidate_points, nodes_rc, edges, surface_extension_max_distance_px,
+            graph_context=context,
+        )
         center_support = _candidate_probability(candidate_points, center_probability)
         direct_length = float(np.linalg.norm(candidate_points[-1] - candidate_points[0]))
         tortuosity = candidate_length_px / max(direct_length, 1.0)
         half_width = _candidate_float(row, "median_half_width_px")
         width_cv = _candidate_float(row, "width_cv")
         hard_veto_reasons = _candidate_hard_vetoes(
-            row, candidate_points, nodes_rc, edges, protected_endpoints, surface_region_candidate_count, image_shape
+            row, candidate_points, nodes_rc, edges, protected_endpoints,
+            surface_region_candidate_count, image_shape, graph_context=context,
         )
         connection_type = "isolated_simple_road"
         connection_score = 8.0
@@ -2008,13 +1994,18 @@ def divided_road_endpoint_ids(
     max_spacing_px: float = 40.0,
     min_parallel_cosine: float = 0.90,
     max_lateral_cosine: float = 0.55,
+    graph_context: GraphSpatialContext | None = None,
 ) -> set[int]:
     """Return dangling endpoints that form a plausible parallel-road pair."""
-    outward = endpoint_outward_vectors(nodes_rc, edges)
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges, cell_size=max_spacing_px)
+    outward = context.outward_vectors
     protected: set[int] = set()
     endpoint_ids = sorted(outward)
-    for position, first_idx in enumerate(endpoint_ids):
-        for second_idx in endpoint_ids[position + 1 :]:
+    endpoint_set = set(endpoint_ids)
+    for first_idx in endpoint_ids:
+        for second_idx in context.node_index.query_radius_box(nodes_rc[first_idx], max_spacing_px):
+            if second_idx <= first_idx or second_idx not in endpoint_set:
+                continue
             connector = nodes_rc[second_idx] - nodes_rc[first_idx]
             spacing = float(np.linalg.norm(connector))
             if not min_spacing_px <= spacing <= max_spacing_px:
@@ -2064,18 +2055,26 @@ def repair_endpoint_to_edge_junctions(
     outside_cost: float,
     sample_step_px: float,
     max_target_parallel_cosine: float = 0.75,
+    graph_context: GraphSpatialContext | None = None,
+    profiling: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     if max_distance_px <= 0 or edges.size == 0:
         return nodes_rc, edges, []
-    outward_vectors = endpoint_outward_vectors(nodes_rc, edges)
-    protected_endpoints = divided_road_endpoint_ids(nodes_rc, edges)
-    component_ids = graph_component_ids(nodes_rc.shape[0], edges)
+    context = graph_context or GraphSpatialContext.build(
+        nodes_rc, edges, cell_size=max_distance_px,
+    )
+    outward_vectors = context.outward_vectors
+    protected_endpoints = divided_road_endpoint_ids(
+        nodes_rc, edges, graph_context=context,
+    )
+    component_ids = context.component_ids
     proposals = []
     for endpoint_idx, outward in outward_vectors.items():
         if endpoint_idx in protected_endpoints:
             continue
         endpoint = nodes_rc[endpoint_idx]
-        for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
+        for edge_id in context.edge_index.query_point_radius(endpoint, max_distance_px):
+            src_idx, dst_idx = edges[edge_id]
             src_idx, dst_idx = int(src_idx), int(dst_idx)
             if endpoint_idx in {src_idx, dst_idx} or component_ids[endpoint_idx] == component_ids[src_idx]:
                 continue
@@ -2088,7 +2087,7 @@ def repair_endpoint_to_edge_junctions(
                 continue
             target_neighbors = []
             for target_node_idx in (src_idx, dst_idx):
-                for target_edge_id in range(edges.shape[0]):
+                for target_edge_id in context.node_edges[target_node_idx]:
                     if target_edge_id == edge_id:
                         continue
                     edge_src, edge_dst = (int(value) for value in edges[target_edge_id])
@@ -2112,6 +2111,7 @@ def repair_endpoint_to_edge_junctions(
                 outside_cost,
                 road_probability=road_probability,
                 center_probability=center_probability,
+                profiling=profiling,
             )
             if not path or support_ratio < min_surface_support:
                 continue
@@ -2166,6 +2166,7 @@ def repair_endpoint_to_edge_junctions(
     return compact_graph(final_nodes_array, final_edges_array) + (audit_rows,)
 
 
+@_accumulate_profile("a_star_path_search_seconds")
 def shortest_mask_path(
     binary: np.ndarray,
     start: tuple[float, float],
@@ -2177,6 +2178,7 @@ def shortest_mask_path(
     road_weight: float = 0.7,
     center_weight: float = 0.3,
     max_expansions: int = 250000,
+    profiling: dict | None = None,
 ) -> tuple[list[tuple[float, float]], float]:
     height, width = binary.shape
     start_rc = (int(round(start[0])), int(round(start[1])))
@@ -2253,22 +2255,32 @@ def build_endpoint_gap_candidates(
     max_path_ratio: float = 1.15,
     ambiguity_ratio: float = 1.20,
     excluded_endpoint_ids: set[int] | None = None,
+    graph_context: GraphSpatialContext | None = None,
+    profiling: dict | None = None,
 ) -> list[dict]:
     if max_gap_px <= 0:
         return []
     road_probability = road_probability if road_probability is not None else binary.astype(np.float32)
     center_probability = center_probability if center_probability is not None else np.zeros_like(road_probability)
-    outward_vectors = endpoint_outward_vectors(nodes_rc, edges)
-    protected_endpoints = divided_road_endpoint_ids(nodes_rc, edges)
+    context = graph_context or GraphSpatialContext.build(
+        nodes_rc, edges, cell_size=max_gap_px,
+    )
+    outward_vectors = context.outward_vectors
+    protected_endpoints = divided_road_endpoint_ids(
+        nodes_rc, edges, graph_context=context,
+    )
     excluded_endpoint_ids = excluded_endpoint_ids or set()
-    component_ids = graph_component_ids(nodes_rc.shape[0], edges)
+    component_ids = context.component_ids
     geometric_pairs: list[tuple[int, int, float, float]] = []
     endpoint_neighbors: dict[int, list[tuple[float, int]]] = {node_idx: [] for node_idx in outward_vectors}
     endpoint_ids = sorted(outward_vectors)
-    for position, start_idx in enumerate(endpoint_ids):
+    endpoint_set = set(endpoint_ids)
+    for start_idx in endpoint_ids:
         if start_idx in protected_endpoints or start_idx in excluded_endpoint_ids:
             continue
-        for end_idx in endpoint_ids[position + 1:]:
+        for end_idx in context.node_index.query_radius_box(nodes_rc[start_idx], max_gap_px):
+            if end_idx <= start_idx or end_idx not in endpoint_set:
+                continue
             if end_idx in protected_endpoints or end_idx in excluded_endpoint_ids:
                 continue
             if component_ids[start_idx] == component_ids[end_idx]:
@@ -2303,6 +2315,7 @@ def build_endpoint_gap_candidates(
                 outside_cost=outside_cost,
                 road_probability=road_probability,
                 center_probability=center_probability,
+                profiling=profiling,
         )
         if not path or support_ratio < min_surface_support:
             continue
@@ -2377,6 +2390,8 @@ def connect_surface_skeletons_by_mask_path(
     fallback_min_road_probability: float = 0.50,
     fallback_min_road_probability_q25: float = 0.10,
     fallback_max_path_ratio: float = 1.15,
+    graph_context: GraphSpatialContext | None = None,
+    profiling: dict | None = None,
 ) -> list[dict]:
     """Extend surface skeleton endpoints only along strongly supported road pixels.
 
@@ -2387,8 +2402,13 @@ def connect_surface_skeletons_by_mask_path(
     """
     if max_distance_px <= 0 or nodes_rc.size == 0 or edges.size == 0:
         return []
-    outward_vectors = endpoint_outward_vectors(nodes_rc, edges)
-    protected_endpoints = divided_road_endpoint_ids(nodes_rc, edges)
+    context = graph_context or GraphSpatialContext.build(
+        nodes_rc, edges, cell_size=max_distance_px,
+    )
+    outward_vectors = context.outward_vectors
+    protected_endpoints = divided_road_endpoint_ids(
+        nodes_rc, edges, graph_context=context,
+    )
     proposals: list[tuple[float, int, int, int, list[tuple[float, float]], float, float, float]] = []
     for candidate_index, candidate in enumerate(candidate_rows):
         if candidate.get("candidate_type") != "surface_skeleton":
@@ -2405,8 +2425,11 @@ def connect_surface_skeletons_by_mask_path(
                 continue
             candidate_outward /= candidate_norm
             geometric_matches = []
-            for node_idx, graph_outward in outward_vectors.items():
+            for node_idx in context.endpoint_ids_within(endpoint, max_distance_px):
                 if node_idx in protected_endpoints:
+                    continue
+                graph_outward = outward_vectors.get(node_idx)
+                if graph_outward is None:
                     continue
                 delta = nodes_rc[node_idx] - endpoint
                 distance = float(np.linalg.norm(delta))
@@ -2431,6 +2454,7 @@ def connect_surface_skeletons_by_mask_path(
                     center_probability=center_probability,
                     road_weight=0.85,
                     center_weight=0.15,
+                    profiling=profiling,
                 )
                 if len(path) < 2:
                     continue
@@ -2556,6 +2580,7 @@ def build_surface_skeleton_pair_connectors(
     min_road_probability: float = 0.30,
     min_road_probability_q25: float = 0.12,
     ambiguity_ratio: float = 1.20,
+    profiling: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Build A*-constrained links between facing endpoints of distinct skeleton regions."""
     endpoints: list[dict] = []
@@ -2589,8 +2614,14 @@ def build_surface_skeleton_pair_connectors(
 
     geometric_pairs: list[tuple[int, int, float, float]] = []
     endpoint_neighbors: dict[int, list[tuple[float, int]]] = {index: [] for index in range(len(endpoints))}
+    endpoint_index = PointGridIndex.build(
+        np.asarray([row["point"] for row in endpoints], dtype=np.float32).reshape(-1, 2),
+        max_distance_px,
+    )
     for first_index, first in enumerate(endpoints):
-        for second_index in range(first_index + 1, len(endpoints)):
+        for second_index in endpoint_index.query_radius_box(first["point"], max_distance_px):
+            if second_index <= first_index:
+                continue
             second = endpoints[second_index]
             if first["candidate_index"] == second["candidate_index"]:
                 continue
@@ -2635,6 +2666,7 @@ def build_surface_skeleton_pair_connectors(
             center_probability=center_probability,
             road_weight=0.85,
             center_weight=0.15,
+            profiling=profiling,
         )
         if len(path) < 2:
             continue
@@ -3062,11 +3094,13 @@ def analyze_surface_only_regions(
     min_area: int,
     min_candidate_skeleton_ratio: float,
     max_suspect_extent_ratio: float,
+    graph_context: GraphSpatialContext | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     road_buffer = graph_buffer_mask(binary.shape, nodes_rc, edges, centerline_buffer_px)
     surface_only = np.where((binary > 0) & (road_buffer == 0), 1, 0).astype(np.uint8)
     endpoint_mask = np.zeros(binary.shape, dtype=np.uint8)
-    degrees, _ = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
+    context = graph_context or GraphSpatialContext.build(nodes_rc, edges)
+    degrees = context.degrees
     endpoint_indices = np.where(degrees <= 1)[0]
     for node_idx in endpoint_indices.tolist():
         row, col = nodes_rc[node_idx]
@@ -3647,6 +3681,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-dir", default="", help="Road-surface mask folder for batch mode. Matched by image stem.")
     parser.add_argument("--output-dir", default=str(TOOL_DIR.parent / "runs" / "width_review"))
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Parallel slice workers. 0 uses a conservative automatic maximum of 2; 1 is serial.",
+    )
     parser.add_argument("--sam-pretrained-path", default=str(DEFAULT_MOLRA_SAM))
     parser.add_argument("--weight-path", default=str(DEFAULT_MOLRA_WEIGHT))
     parser.add_argument("--tile", type=int, default=1024)
@@ -3788,8 +3826,27 @@ def process_one(
     device: torch.device,
 ) -> dict:
     process_started = time.perf_counter()
+    profiling = {
+        "graph_load_seconds": 0.0,
+        "road_surface_read_cleanup_seconds": 0.0,
+        "road_probability_read_seconds": 0.0,
+        "centerline_probability_read_seconds": 0.0,
+        "topology_candidate_read_seconds": 0.0,
+        "divided_road_recovery_seconds": 0.0,
+        "junction_conflict_cleanup_seconds": 0.0,
+        "junction_endpoint_candidate_search_seconds": 0.0,
+        "surface_skeleton_candidate_analysis_seconds": 0.0,
+        "a_star_path_search_seconds": 0.0,
+        "graph_context_build_seconds": 0.0,
+        "road_chain_build_seconds": 0.0,
+        "file_writing_seconds": 0.0,
+    }
+    step_started = time.perf_counter()
     original_nodes_rc, original_edges = load_graph(graph_path)
+    original_topology = graph_topology_metrics(original_nodes_rc, original_edges)
+    profiling["graph_load_seconds"] = float(time.perf_counter() - step_started)
 
+    step_started = time.perf_counter()
     if mask_path is not None:
         raw_mask = read_mask(mask_path)
         mask_source = str(mask_path)
@@ -3805,6 +3862,7 @@ def process_one(
             image_size=args.image_size,
         )
         mask_source = "sam_molra"
+    profiling["road_surface_read_cleanup_seconds"] += float(time.perf_counter() - step_started)
 
     rgb = read_rgb_for_viz(image_path)
     if raw_mask.shape[:2] != rgb.shape[:2]:
@@ -3820,7 +3878,10 @@ def process_one(
         raise ValueError(f"Graph/image alignment failed: {invalid_nodes.size} graph nodes lie outside the {h}x{w} raster.")
     pixel_size, pixel_size_source = resolve_pixel_size(image_path, args.pixel_size)
 
+    step_started = time.perf_counter()
     binary = clean_mask(raw_mask, args.mask_threshold, args.close_kernel, args.open_kernel, args.min_area)
+    profiling["road_surface_read_cleanup_seconds"] += float(time.perf_counter() - step_started)
+    step_started = time.perf_counter()
     road_probability_path = Path(args.road_probability) if args.road_probability else auto_road_probability_path(mask_path, image_path.stem)
     if road_probability_path and road_probability_path.is_file():
         road_probability, road_probability_type = read_probability(road_probability_path, binary.shape)
@@ -3828,6 +3889,8 @@ def process_one(
     else:
         road_probability, road_probability_type = probability_from_u8(raw_mask)
         road_probability_source = mask_source
+    profiling["road_probability_read_seconds"] = float(time.perf_counter() - step_started)
+    step_started = time.perf_counter()
     center_probability_path = Path(args.centerline_probability) if args.centerline_probability else auto_centerline_probability_path(graph_path, image_path.stem)
     if center_probability_path and center_probability_path.is_file():
         center_probability, center_probability_type = read_probability(center_probability_path, binary.shape)
@@ -3836,15 +3899,23 @@ def process_one(
         center_probability = graph_buffer_mask(binary.shape, original_nodes_rc, original_edges, 2).astype(np.float32)
         center_probability_type = "graph_raster_fallback"
         center_probability_source = "rasterized_input_graph"
+    profiling["centerline_probability_read_seconds"] = float(
+        time.perf_counter() - step_started
+    )
+    step_started = time.perf_counter()
     original_topology_probabilities, topology_probability_source = load_edge_topology_probabilities(
         graph_path, original_nodes_rc, original_edges
     )
+    profiling["topology_candidate_read_seconds"] += float(time.perf_counter() - step_started)
 
     nodes_rc, edges = original_nodes_rc, original_edges
     divided_road_repair_rows: list[dict] = []
     topology_candidate_path = candidate_path_for_graph(graph_path)
     if args.restore_divided_roads:
+        step_started = time.perf_counter()
         topology_candidate_rows = read_topology_candidates(topology_candidate_path)
+        profiling["topology_candidate_read_seconds"] += float(time.perf_counter() - step_started)
+        step_started = time.perf_counter()
         edges, divided_road_repair_rows = optimize_divided_road_junctions(
             nodes_rc,
             edges,
@@ -3855,6 +3926,7 @@ def process_one(
             max_pair_spacing_px=args.divided_road_max_spacing_px,
             min_pair_score=args.divided_road_min_pair_score,
         )
+        profiling["divided_road_recovery_seconds"] += float(time.perf_counter() - step_started)
     spur_rows: list[dict] = []
     if args.prune_spurs:
         nodes_rc, edges, spur_rows = prune_low_evidence_spurs(
@@ -3875,6 +3947,10 @@ def process_one(
     )
     junction_repair_rows: list[dict] = []
     if args.repair_junctions:
+        step_started = time.perf_counter()
+        repair_context = GraphSpatialContext.build(
+            nodes_rc, edges, cell_size=args.junction_repair_max_distance_px,
+        )
         nodes_rc, edges, junction_repair_rows = repair_endpoint_to_edge_junctions(
             binary,
             road_probability,
@@ -3888,6 +3964,11 @@ def process_one(
             outside_cost=args.auto_gap_outside_cost,
             sample_step_px=args.candidate_sample_step_px,
             max_target_parallel_cosine=args.junction_repair_max_parallel_cosine,
+            graph_context=repair_context,
+            profiling=profiling,
+        )
+        profiling["junction_endpoint_candidate_search_seconds"] += float(
+            time.perf_counter() - step_started
         )
     junction_cleanup_rows: list[dict] = []
     junction_cleanup_started = time.perf_counter()
@@ -3902,8 +3983,10 @@ def process_one(
             min_probability_margin=args.junction_cleanup_min_probability_margin,
         )
     junction_cleanup_seconds = time.perf_counter() - junction_cleanup_started
+    profiling["junction_conflict_cleanup_seconds"] = float(junction_cleanup_seconds)
     divided_junction_rows: list[dict] = []
     if args.restore_divided_junction_corridors:
+        step_started = time.perf_counter()
         nodes_rc, edges, divided_junction_rows = restore_divided_corridors_through_junctions(
             nodes_rc,
             edges,
@@ -3911,10 +3994,27 @@ def process_one(
             junction_cleanup_rows,
             sample_step_px=args.candidate_sample_step_px,
         )
+        profiling["divided_road_recovery_seconds"] += float(time.perf_counter() - step_started)
     if args.centerline_buffer_px > 0:
         binary = binary & graph_buffer_mask(binary.shape, nodes_rc, edges, args.centerline_buffer_px)
 
-    edge_rows = build_edge_surface_evidence(nodes_rc, edges, binary)
+    step_started = time.perf_counter()
+    graph_context = GraphSpatialContext.build(
+        nodes_rc,
+        edges,
+        cell_size=max(
+            32.0,
+            args.junction_repair_max_distance_px,
+            args.auto_gap_max_distance_px,
+            args.surface_connector_max_distance_px,
+            args.surface_extension_max_distance_px,
+            args.candidate_graph_snap_px,
+        ),
+    )
+    profiling["graph_context_build_seconds"] = float(time.perf_counter() - step_started)
+    edge_rows = build_edge_surface_evidence(
+        nodes_rc, edges, binary, graph_context=graph_context,
+    )
     edge_provenance = load_edge_provenance(graph_path, nodes_rc, edges)
     for row, provenance in zip(edge_rows, edge_provenance):
         row.update(provenance)
@@ -3929,7 +4029,9 @@ def process_one(
         center_probability=center_probability,
         topology_probabilities=prepared_topology_probabilities,
         auto_retain_center_probability=args.auto_retain_center_probability,
+        graph_context=graph_context,
     )
+    step_started = time.perf_counter()
     surface_only, surface_only_rows = analyze_surface_only_regions(
         binary=binary,
         nodes_rc=nodes_rc,
@@ -3939,6 +4041,7 @@ def process_one(
         min_area=args.surface_only_min_area,
         min_candidate_skeleton_ratio=args.surface_only_min_skeleton_ratio,
         max_suspect_extent_ratio=args.surface_only_max_suspect_extent_ratio,
+        graph_context=graph_context,
     )
     candidate_lines = build_candidate_centerlines(
         surface_only=surface_only,
@@ -3948,6 +4051,10 @@ def process_one(
         simplify_epsilon_px=args.candidate_simplify_epsilon_px,
         min_half_width_px=args.candidate_min_half_width_px,
     )
+    profiling["surface_skeleton_candidate_analysis_seconds"] = float(
+        time.perf_counter() - step_started
+    )
+    candidate_search_started = time.perf_counter()
     surface_connector_rows: list[dict] = []
     if args.connect_surface_skeletons:
         surface_connector_rows = connect_surface_skeletons_by_mask_path(
@@ -3968,6 +4075,8 @@ def process_one(
             fallback_min_road_probability=args.surface_connector_fallback_min_road_probability,
             fallback_min_road_probability_q25=args.surface_connector_fallback_min_road_probability_q25,
             fallback_max_path_ratio=args.surface_connector_fallback_max_path_ratio,
+            graph_context=graph_context,
+            profiling=profiling,
         )
     endpoint_gap_candidates = []
     if args.auto_connect_gaps:
@@ -3991,6 +4100,8 @@ def process_one(
             path_margin_px=args.auto_gap_path_margin_px,
             outside_cost=args.auto_gap_outside_cost,
             sample_step_px=args.candidate_sample_step_px,
+            graph_context=graph_context,
+            profiling=profiling,
         )
     for candidate in endpoint_gap_candidates:
         candidate["candidate_id"] = len(candidate_lines)
@@ -4010,6 +4121,7 @@ def process_one(
         surface_extension_max_half_width_px=args.surface_extension_max_half_width_px,
         center_probability=center_probability,
         image_shape=binary.shape,
+        graph_context=graph_context,
     )
     surface_pair_connector_count = 0
     if args.connect_surface_skeleton_pairs:
@@ -4029,16 +4141,23 @@ def process_one(
             min_road_probability=args.surface_pair_min_road_probability,
             min_road_probability_q25=args.surface_pair_min_road_probability_q25,
             ambiguity_ratio=args.surface_pair_ambiguity_ratio,
+            profiling=profiling,
         )
         for candidate in pair_candidates:
             candidate["candidate_id"] = len(candidate_lines)
             candidate_lines.append(candidate)
         surface_pair_connector_count = len(pair_candidates)
         surface_connector_rows.extend(pair_audit_rows)
+    profiling["junction_endpoint_candidate_search_seconds"] += float(
+        time.perf_counter() - candidate_search_started
+    )
     conflict_rows = build_conflict_review_rows(edge_rows, surface_only_rows, candidate_lines)
-    road_chains = build_road_chains(nodes_rc, edges)
+    step_started = time.perf_counter()
+    road_chains = build_road_chains(nodes_rc, edges, graph_context=graph_context)
+    profiling["road_chain_build_seconds"] = float(time.perf_counter() - step_started)
 
     stem = image_path.stem
+    writing_started = time.perf_counter()
     prepared_graph_path = output_dir / f"{stem}_prepared_graph.p"
     save_graph(prepared_graph_path, nodes_rc, edges)
     cv2.imwrite(str(output_dir / f"{stem}_molra_raw_mask.png"), raw_mask)
@@ -4282,6 +4401,7 @@ def process_one(
             "target_spacing_px", "pair_score", "added_edge_count",
         ],
     )
+    profiling["file_writing_seconds"] = float(time.perf_counter() - writing_started)
 
     status_counts: dict[str, int] = {}
     for row in edge_rows:
@@ -4325,8 +4445,10 @@ def process_one(
         )),
         "width_segment_count": 0,
         "road_chain_count": len(road_chains),
-        "original_topology": graph_topology_metrics(original_nodes_rc, original_edges),
-        "prepared_topology": graph_topology_metrics(nodes_rc, edges),
+        "original_topology": original_topology,
+        "prepared_topology": graph_topology_metrics(
+            nodes_rc, edges, graph_context=graph_context,
+        ),
         "pruned_spur_count": len(spur_rows),
         "recentered_node_count": len(recenter_rows),
         "junction_cleanup_count": len(junction_cleanup_rows),
@@ -4341,6 +4463,8 @@ def process_one(
         "topology_probability_source": topology_probability_source,
         "prepared_topology_probability_source": prepared_topology_probability_source,
         "profiling": {
+            **profiling,
+            # Preserve the existing key consumed by older reports.
             "junction_cleanup_seconds": float(junction_cleanup_seconds),
             "total_seconds": float(time.perf_counter() - process_started),
         },
@@ -4402,12 +4526,39 @@ def process_one(
     return summary
 
 
+def _process_one_worker(payload: tuple[dict, str, str, str, str]) -> dict:
+    """Spawn-safe one-slice worker; every output name is stem-scoped."""
+    args_values, image_value, graph_value, mask_value, output_value = payload
+    image_path = Path(image_value)
+    graph_path = Path(graph_value)
+    mask_path = Path(mask_value) if mask_value else None
+    try:
+        summary = process_one(
+            argparse.Namespace(**args_values),
+            image_path,
+            graph_path,
+            mask_path,
+            Path(output_value),
+            resolve_device(str(args_values.get("device", "auto"))),
+        )
+        return {"ok": True, "summary": summary}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "failure": {
+                "image": str(image_path),
+                "graph": str(graph_path),
+                "mask": str(mask_path or ""),
+                "error": str(exc),
+            },
+        }
+
+
 def main() -> int:
+    batch_started = time.perf_counter()
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = resolve_device(args.device)
-
     if args.image_dir:
         mask_dir = Path(args.mask_dir) if args.mask_dir else None
         jobs = build_batch_jobs(Path(args.image_dir), Path(args.graph_dir), mask_dir)
@@ -4416,20 +4567,50 @@ def main() -> int:
 
     summaries = []
     failures = []
-    for index, (image_path, graph_path, mask_path) in enumerate(jobs, start=1):
-        print(f"[{index}/{len(jobs)}] Processing {image_path.name}")
-        try:
-            summaries.append(process_one(args, image_path, graph_path, mask_path, output_dir, device))
-        except Exception as exc:
-            failures.append({"image": str(image_path), "graph": str(graph_path), "mask": str(mask_path or ""), "error": str(exc)})
-            print(f"Failed: {image_path} -> {exc}")
+    worker_count = resolve_worker_count(args.workers, len(jobs))
+    if worker_count > 1 and any(mask_path is None or not mask_path.is_file() for _, _, mask_path in jobs):
+        print("Parallel width processing disabled because at least one slice would invoke SAM_MLoRA inference.")
+        worker_count = 1
+    print(f"Width slice workers: {worker_count or 1}; slice count: {len(jobs)}")
+    if worker_count <= 1:
+        device = resolve_device(args.device)
+        for index, (image_path, graph_path, mask_path) in enumerate(jobs, start=1):
+            print(f"[{index}/{len(jobs)}] Processing {image_path.name}")
+            try:
+                summaries.append(process_one(args, image_path, graph_path, mask_path, output_dir, device))
+            except Exception as exc:
+                failures.append({"image": str(image_path), "graph": str(graph_path), "mask": str(mask_path or ""), "error": str(exc)})
+                print(f"Failed: {image_path} -> {exc}")
+    else:
+        payloads = [
+            (
+                dict(vars(args)), str(image_path), str(graph_path),
+                str(mask_path) if mask_path is not None else "", str(output_dir),
+            )
+            for image_path, graph_path, mask_path in jobs
+        ]
+        results = spawn_map(_process_one_worker, payloads, worker_count)
+        for result in results:
+            if result["ok"]:
+                summaries.append(result["summary"])
+            else:
+                failures.append(result["failure"])
+                print(f"Failed: {result['failure']['image']} -> {result['failure']['error']}")
 
     batch_summary = {
         "output_dir": str(output_dir),
         "job_count": len(jobs),
         "success_count": len(summaries),
         "failure_count": len(failures),
+        "workers": int(worker_count),
         "failures": failures,
+        "profiling": {
+            "slice_total_seconds": float(sum(
+                (summary.get("profiling") or {}).get("total_seconds", 0.0)
+                for summary in summaries
+            )),
+            "wall_seconds": float(time.perf_counter() - batch_started),
+        },
     }
     # The production pipeline consumes this stable batch contract even when a
     # developer test contains exactly one image.
