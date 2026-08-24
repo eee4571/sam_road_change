@@ -220,6 +220,7 @@ class DataPage:
             truth_frame, columns=("pair", "path", "status"), show="headings",
             height=2, style="Data.Treeview",
         )
+        self._project_truth_pair_by_iid: dict[str, tuple[str, str]] = {}
         for column, title, width, stretch in (
             ("pair", "变化对", 125, False), ("path", "真值 SHP", 560, True),
             ("status", "状态", 85, False),
@@ -277,21 +278,29 @@ class DataPage:
 
     def _selected_truth_pair(self) -> tuple[str, str] | None:
         iid = self._selected_tree_iid(self.project_truth_tree)
-        values = self.project_truth_tree.item(iid, "values") if iid else ()
-        if not values or "→" not in str(values[0]):
+        if not iid:
             return None
-        before, after = (part.strip() for part in str(values[0]).split("→", 1))
-        return before, after
+        pair = getattr(self, "_project_truth_pair_by_iid", {}).get(iid)
+        if pair is not None:
+            return pair
+        if not iid.startswith("truth:"):
+            return None
+        parts = iid.split(":", 2)
+        return (parts[1], parts[2]) if len(parts) == 3 and all(parts[1:]) else None
 
     def set_selected_project_truth(self) -> None:
         pair = self._selected_truth_pair()
-        if pair:
-            self.set_project_truth(*pair)
+        if pair is None:
+            messagebox.showinfo("未选择变化对", "请先在变化真值列表中选择一个变化对。", parent=self.root)
+            return
+        self.set_project_truth(*pair)
 
     def remove_selected_project_truth(self) -> None:
         pair = self._selected_truth_pair()
-        if pair:
-            self.remove_project_truth(*pair)
+        if pair is None:
+            messagebox.showinfo("未选择变化对", "请先在变化真值列表中选择一个变化对。", parent=self.root)
+            return
+        self.remove_project_truth(*pair)
 
     def set_selected_txt_encoding(self) -> None:
         period = self._selected_tree_iid(self.project_period_tree)
@@ -335,6 +344,7 @@ class DataPage:
             children = tree.get_children()
             if children:
                 tree.delete(*children)
+        self._project_truth_pair_by_iid = {}
         if not region:
             if hasattr(self, "add_project_period_button"):
                 self.add_project_period_button.state(["disabled"])
@@ -361,6 +371,7 @@ class DataPage:
         for before, after in pairs:
             truth = truth_map.get((region, before, after), "")
             iid = f"truth:{before}:{after}"
+            self._project_truth_pair_by_iid[iid] = (before, after)
             self.project_truth_tree.insert(
                 "", END, iid=iid, values=(f"{before} - {after}", truth or "", "已配置" if truth else "未配置"),
             )

@@ -21,6 +21,60 @@ class UserGuiInputCommandTests(unittest.TestCase):
 
         self.assertEqual(app._selected_tree_iid(tree), "2021")
 
+    def test_truth_pair_selection_uses_stable_tree_row_data_not_display_separator(self) -> None:
+        tree = mock.Mock()
+        tree.selection.return_value = ("truth-row-1",)
+        tree.item.return_value = {"values": ("2021 - 2022", "", "未配置")}
+        app = object.__new__(gui.UserApp)
+        app.project_truth_tree = tree
+        app._project_truth_pair_by_iid = {"truth-row-1": ("2021", "2022")}
+        app.set_project_truth = mock.Mock()
+        app.remove_project_truth = mock.Mock()
+
+        app.set_selected_project_truth()
+        app.remove_selected_project_truth()
+
+        app.set_project_truth.assert_called_once_with("2021", "2022")
+        app.remove_project_truth.assert_called_once_with("2021", "2022")
+        tree.item.assert_not_called()
+
+    def test_truth_actions_explain_when_no_pair_is_selected(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.root = mock.Mock()
+        app.project_truth_tree = mock.Mock()
+        app.project_truth_tree.selection.return_value = ()
+        app.set_project_truth = mock.Mock()
+        app.remove_project_truth = mock.Mock()
+
+        with mock.patch("gui.data_page.messagebox.showinfo") as showinfo:
+            app.set_selected_project_truth()
+            app.remove_selected_project_truth()
+
+        self.assertEqual(showinfo.call_count, 2)
+        self.assertTrue(all(call.args[0] == "未选择变化对" for call in showinfo.call_args_list))
+        app.set_project_truth.assert_not_called()
+        app.remove_project_truth.assert_not_called()
+
+    def test_no_change_results_disable_all_evaluation_actions(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.evaluation_pair_combo = mock.Mock()
+        app.evaluation_pair = mock.Mock()
+        app.evaluation_status = mock.Mock()
+        app.result_evaluable_count = mock.Mock()
+        app.supplement_evaluation_truth_button = mock.Mock()
+        app.run_evaluation_button = mock.Mock()
+        app.run_total_evaluation_button = mock.Mock()
+
+        app._refresh_evaluation_results({"change_results": []})
+
+        for button in (
+            app.supplement_evaluation_truth_button,
+            app.run_evaluation_button,
+            app.run_total_evaluation_button,
+        ):
+            button.state.assert_called_once_with(["disabled"])
+        app.evaluation_status.set.assert_called_with("当前任务没有可评价的变化检测成果。")
+
     def test_harmless_tiff_warning_is_hidden_but_preserved_in_log_file(self) -> None:
         raw = "cv::TIFF_Warning TIFFReadDirectory: Unknown field with tag 33550\n"
         log_file = io.StringIO()

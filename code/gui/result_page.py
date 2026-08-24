@@ -78,10 +78,12 @@ class ResultPage:
         ttk.Label(truth_row, text="项目真值", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_truth = StringVar(value="")
         ttk.Label(truth_row, textvariable=self.evaluation_truth, style="CardMuted.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(
+        self.supplement_evaluation_truth_button = ttk.Button(
             truth_row, text="补充真值", style="Compact.TButton",
             command=self.supplement_evaluation_truth,
-        ).pack(side=LEFT, padx=(8, 0))
+        )
+        self.supplement_evaluation_truth_button.pack(side=LEFT, padx=(8, 0))
+        self.supplement_evaluation_truth_button.state(["disabled"])
         self.evaluation_truth_summary = StringVar(value="总体评价会按区域和相邻期次分别匹配真值，不使用上方单个路径代替全部真值。")
         truth_summary_label = ttk.Label(
             evaluation_card, textvariable=self.evaluation_truth_summary, style="CardMuted.TLabel",
@@ -162,7 +164,7 @@ class ResultPage:
                 self.evaluation_pair_combo.configure(values=())
                 self.evaluation_pair.set("")
                 self.evaluation_status.set("请先载入或生成包含变化检测的任务结果。")
-                self.run_evaluation_button.state(["disabled"])
+                self._set_evaluation_actions_enabled(False)
             self._populate_result_tree([], None)
             return
         base_dir = latest.parent
@@ -295,6 +297,17 @@ class ResultPage:
             return
         self._open(target)
 
+    def _set_evaluation_actions_enabled(self, enabled: bool) -> None:
+        state = ["!disabled"] if enabled else ["disabled"]
+        for name in (
+            "supplement_evaluation_truth_button",
+            "run_evaluation_button",
+            "run_total_evaluation_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.state(state)
+
     def _refresh_evaluation_results(self, manifest: dict) -> None:
         if not hasattr(self, "evaluation_pair_combo"):
             return
@@ -322,8 +335,7 @@ class ResultPage:
         if not labels:
             self.evaluation_pair.set("")
             self.evaluation_status.set("当前任务没有可评价的变化检测成果。")
-            self.run_evaluation_button.state(["disabled"])
-            self.run_total_evaluation_button.state(["disabled"])
+            self._set_evaluation_actions_enabled(False)
             return
         evaluated = sum(bool(entry.get("evaluation_metrics")) for entry in self.result_change_items)
         if evaluated:
@@ -363,8 +375,7 @@ class ResultPage:
             "上方路径只用于“评价当前结果”。"
         )
         self._evaluation_pair_changed()
-        self.run_evaluation_button.state(["!disabled"])
-        self.run_total_evaluation_button.state(["!disabled"])
+        self._set_evaluation_actions_enabled(True)
 
     def _evaluation_pair_changed(self, _event=None) -> None:
         if not self.result_change_items or not hasattr(self, "evaluation_pair_combo"):
@@ -388,11 +399,15 @@ class ResultPage:
 
     def supplement_evaluation_truth(self) -> None:
         if not self.result_change_items or not hasattr(self, "evaluation_pair_combo"):
+            messagebox.showinfo(
+                "暂无可评价成果", "当前没有可补充真值的变化检测成果。", parent=self.root,
+            )
             return
         try:
             index = list(self.evaluation_pair_combo["values"]).index(self.evaluation_pair.get())
             item = self.result_change_items[index]
         except (ValueError, IndexError):
+            messagebox.showinfo("未选择变化对", "请先选择一组待评价的变化检测成果。", parent=self.root)
             return
         path = self._select_path("shp")
         if not path:
@@ -430,19 +445,26 @@ class ResultPage:
         if manifest is None or latest is None:
             messagebox.showinfo("暂无成果", "请先载入或生成任务结果。", parent=self.root)
             return
+        if not self.result_change_items:
+            messagebox.showinfo("暂无可评价成果", "当前任务没有可评价的变化检测成果。", parent=self.root)
+            return
         if self.evaluation_truth.get().strip() in {"", "缺少真值"}:
             messagebox.showinfo("缺少真值", "请先为所选变化对补充真值。", parent=self.root)
             return
         try:
             index = list(self.evaluation_pair_combo["values"]).index(self.evaluation_pair.get())
             item = self.result_change_items[index]
+        except (ValueError, IndexError):
+            messagebox.showinfo("未选择变化对", "请先选择一组待评价的变化检测成果。", parent=self.root)
+            return
+        try:
             args = self.task_manager.build_evaluate_existing(
                 item, latest, self.evaluation_truth.get(),
                 truth_type_field=self.evaluation_type_field.get(),
                 validation_area=str(item.get("validation_area") or manifest.get("validation_area") or ""),
                 evaluation_tolerance=self.evaluation_tolerance.get(),
             )
-        except (ValueError, IndexError) as exc:
+        except ValueError as exc:
             messagebox.showerror("无法运行精度评价", str(exc), parent=self.root)
             return
         self.evaluation_status.set("正在读取检测结果并计算区域、类型和中心线精度指标…")
@@ -452,6 +474,9 @@ class ResultPage:
         manifest, latest = self._latest_manifest()
         if manifest is None or latest is None:
             messagebox.showinfo("暂无成果", "请先载入或生成任务结果。", parent=self.root)
+            return
+        if not self.result_change_items:
+            messagebox.showinfo("暂无可评价成果", "当前任务没有可评价的变化检测成果。", parent=self.root)
             return
         try:
             args = self.task_manager.build_evaluate_all(
