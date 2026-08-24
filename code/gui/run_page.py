@@ -7,65 +7,106 @@ from tkinter import messagebox
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS, UI
+from .common_widgets import LAYOUT_METRICS
 
 class RunPage:
     def _build_run_page(self, page: ttk.Frame) -> None:
         self.run_body = page
-        ttk.Label(page, text="自动处理", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(page, text="系统将在开始处理前检查项目数据和运行环境。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
-        content = ttk.Frame(page, style="Page.TFrame")
-        content.pack(fill=BOTH, expand=True)
-        run_card = ttk.Frame(content, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
-        run_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
-        ttk.Label(run_card, text="开始任务", style="CardTitle.TLabel").pack(anchor="w")
+        run_card = ttk.LabelFrame(page, text="运行任务", padding=LAYOUT_METRICS["card_padding"])
+        run_card.pack(fill=X)
         self.preflight_summary = StringVar(value="开始处理时会自动检查以下内容；发现问题将立即停止并说明原因。")
-        ttk.Label(run_card, textvariable=self.preflight_summary, style="Hint.TLabel", wraplength=480).pack(anchor="w", fill=X, pady=(5, 13))
-        checklist = ttk.Frame(run_card, style="Soft.TFrame", padding=(14, 8))
-        checklist.pack(fill=X, pady=(0, 14))
-        for label in ("项目结构与验证区", "影像期次与覆盖范围", "模型、参数与运行环境", "输出位置与磁盘空间"):
-            row = ttk.Frame(checklist, style="Soft.TFrame")
-            row.pack(fill=X, pady=4)
-            ttk.Label(row, text="○", foreground=UI["subtle"], background=UI["slate_soft"]).pack(side=LEFT, padx=(0, 9))
-            ttk.Label(row, text=label, foreground=UI["ink"], background=UI["slate_soft"]).pack(side=LEFT)
-            ttk.Label(row, text="开始前检查", foreground=UI["subtle"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 8)).pack(side=RIGHT)
+        ttk.Label(run_card, textvariable=self.preflight_summary, wraplength=620).pack(anchor="w", fill=X, pady=(0, 5))
+        checklist = ttk.Frame(run_card)
+        checklist.pack(fill=X, pady=(0, 6))
+        self.preflight_check_labels = []
+        for row_index, label in enumerate(("项目结构与验证区", "影像期次与覆盖范围", "模型、参数与运行环境", "输出位置与磁盘空间")):
+            ttk.Label(checklist, text=label).grid(row=row_index, column=0, sticky="w", pady=1)
+            state_label = ttk.Label(checklist, text="开始前检查", style="CardMuted.TLabel")
+            state_label.grid(row=row_index, column=1, sticky="e", pady=1)
+            self.preflight_check_labels.append(state_label)
+        checklist.grid_columnconfigure(0, weight=1)
         actions = ttk.Frame(run_card)
-        actions.pack(fill=X, pady=(2, 12))
+        actions.pack(fill=X)
         self.preflight_button = ttk.Button(actions, text="检查数据", command=self.preflight_inputs)
+        self.preflight_button.pack(side=LEFT)
         self.run_button = ttk.Button(
             actions, text="运行完整流程", style="Hero.TButton", command=self.run_all,
         )
         self.run_button.pack(side=RIGHT)
-        self.cancel_button = ttk.Button(actions, text="取消任务", style="Danger.TButton", command=self.cancel_task)
-        self.cancel_button.pack(side=RIGHT, padx=10)
+        self.cancel_button = ttk.Button(actions, text="取消任务", command=self.cancel_task)
+        self.cancel_button.pack(side=RIGHT, padx=5)
         self.cancel_button.state(["disabled"])
 
-        progress_card = ttk.Frame(run_card, style="Soft.TFrame", padding=(14, 11))
-        progress_card.pack(fill=X, pady=(8, 0))
-        ttk.Label(progress_card, text="正在处理", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        progress_card = ttk.LabelFrame(page, text="运行进度", padding=LAYOUT_METRICS["card_padding"])
+        progress_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
+        ttk.Label(progress_card, text="当前阶段：").pack(anchor="w")
         self.run_status = StringVar(value="等待开始任务。")
-        ttk.Label(progress_card, textvariable=self.run_status, style="PathText.TLabel", wraplength=470).pack(fill=X, pady=(0, 10))
-        ttk.Label(progress_card, text="总体进度", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(progress_card, textvariable=self.run_status, wraplength=620).pack(fill=X, pady=(2, 5))
+        ttk.Label(progress_card, text="总体进度").pack(anchor="w", pady=(0, 3))
         self.progress = ttk.Progressbar(progress_card, mode="determinate", maximum=1, value=0, style="Modern.Horizontal.TProgressbar")
         self.progress.pack(fill=X)
         self.progress_text = StringVar(value="0 / 0 · 已用时 00:00:00 · 剩余 --")
-        ttk.Label(progress_card, textvariable=self.progress_text, style="PathText.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(progress_card, textvariable=self.progress_text).pack(anchor="w", pady=(5, 0))
 
-        summary_card = ttk.Frame(content, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
-        summary_card.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0))
-        ttk.Label(summary_card, text="任务摘要", style="CardTitle.TLabel").pack(anchor="w")
-        self.run_destination_summary = StringVar(value=f"成果保存到：{self.vars['output_root'].get()}")
-        summary_body = ttk.Frame(summary_card, style="Soft.TFrame", padding=(14, 10))
-        summary_body.pack(fill=X, pady=(12, 12))
-        ttk.Label(summary_body, text="输入数据", style="PathTitle.TLabel").pack(anchor="w")
-        ttk.Label(summary_body, textvariable=self.input_summary, style="PathText.TLabel", wraplength=480).pack(anchor="w", fill=X, pady=(3, 10))
-        ttk.Label(summary_body, text="成果位置", style="PathTitle.TLabel").pack(anchor="w")
-        ttk.Label(summary_body, textvariable=self.run_destination_summary, style="PathText.TLabel", wraplength=480).pack(anchor="w", fill=X, pady=(3, 0))
-        self.run_settings_toggle = ttk.Button(
-            summary_card, text="›  输出位置与高级设置", style="Quiet.TButton", command=self._toggle_run_settings,
-        )
+        stage_card = ttk.LabelFrame(page, text="局部重跑", padding=LAYOUT_METRICS["card_padding"])
+        stage_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
+        selectors = ttk.Frame(stage_card)
+        selectors.pack(fill=X, pady=(0, 5))
+        ttk.Label(selectors, text="区域：").grid(row=0, column=0, sticky="w")
+        self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.stage_region, state="readonly", width=14)
+        self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(3, 7))
+        self.stage_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
+        ttk.Label(selectors, text="期次：").grid(row=0, column=2, sticky="w")
+        self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=12)
+        self.stage_period_combo.grid(row=0, column=3, sticky="ew", padx=(3, 7))
+        self.stage_period_combo.bind("<<ComboboxSelected>>", self._stage_period_changed)
+        ttk.Label(selectors, text="相邻变化对：").grid(row=0, column=4, sticky="w")
+        self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=16)
+        self.stage_pair_combo.grid(row=0, column=5, sticky="ew", padx=(3, 0))
+        for column in (1, 3, 5):
+            selectors.grid_columnconfigure(column, weight=1)
+        self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
+        ttk.Label(stage_card, textvariable=self.affected_pairs_summary, wraplength=620).pack(anchor="w", fill=X, pady=(0, 5))
+        stage_actions = ttk.Frame(stage_card)
+        stage_actions.pack(fill=X)
+        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=(7, 5))
+        road_actions.pack(side=LEFT, fill=X, expand=True, padx=(0, 3))
+        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=(7, 5))
+        change_actions.pack(side=LEFT, fill=X, expand=True, padx=(3, 0))
+        self.stage_buttons = []
+        for parent, text, command in (
+            (road_actions, "重跑该期", lambda: self.rerun_selected_period(False)),
+            (road_actions, "重跑并更新相关结果", lambda: self.rerun_selected_period(True)),
+            (change_actions, "重跑该变化对", lambda: self.rerun_selected_change(False)),
+            (change_actions, "重跑并更新长时序成果", lambda: self.rerun_selected_change(True)),
+        ):
+            button = ttk.Button(parent, text=text, command=command)
+            button.pack(side=LEFT, padx=(0, 4))
+            self.stage_buttons.append(button)
+        advanced_stage = ttk.Frame(stage_card)
+        advanced_stage.pack(fill=X, pady=(5, 0))
+        ttk.Label(advanced_stage, text="高级操作：").pack(side=LEFT)
+        batch_button = ttk.Button(advanced_stage, text="批量重跑全部道路提取", command=self.run_extract_all)
+        batch_button.pack(side=LEFT)
+        self.stage_buttons.append(batch_button)
+
+        summary_card = ttk.LabelFrame(self.step_summaries[1], text="任务摘要", padding=LAYOUT_METRICS["card_padding"])
+        summary_card.pack(fill=BOTH, expand=True)
+        self.run_destination_summary = StringVar(value=self.vars["output_root"].get())
+        for row, (label, variable) in enumerate((
+            ("输入数据：", self.input_summary),
+            ("成果位置：", self.run_destination_summary),
+            ("当前任务：", self.vars["run_id"]),
+            ("任务状态：", self.run_status),
+        )):
+            ttk.Label(summary_card, text=label, width=12).grid(row=row, column=0, sticky="nw", pady=2)
+            ttk.Label(summary_card, textvariable=variable, wraplength=400).grid(row=row, column=1, sticky="nw", pady=2)
+        summary_card.grid_columnconfigure(1, weight=1)
+        run_settings_shell = ttk.Frame(summary_card)
+        run_settings_shell.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.run_settings_toggle = ttk.Button(run_settings_shell, text="输出位置与高级设置...", command=self._toggle_run_settings)
         self.run_settings_toggle.pack(anchor="w")
-        self.run_settings_frame = ttk.Frame(summary_card, style="Card.TFrame")
+        self.run_settings_frame = ttk.Frame(run_settings_shell)
         self._field(self.run_settings_frame, "成果输出目录", "output_root", "dir")
         self._field(self.run_settings_frame, "手工任务名称", "run_id")
         run_options = ttk.Frame(self.run_settings_frame)
@@ -77,7 +118,7 @@ class RunPage:
             run_options, text="检查软件环境", style="Compact.TButton", command=lambda: self._command(["doctor"]),
         ).pack(side=RIGHT)
         self.advanced_toggle = ttk.Button(
-            self.run_settings_frame, text="▶ 高级参数（通常不需要修改）", command=self._toggle_advanced,
+            self.run_settings_frame, text="高级参数...", command=self._toggle_advanced,
         )
         self.advanced_toggle.pack(anchor="w", pady=(10, 2))
         self.advanced_frame = ttk.Frame(self.run_settings_frame)
@@ -112,53 +153,6 @@ class RunPage:
             style="Hint.TLabel",
         ).pack(side=LEFT, padx=(12, 0))
 
-        stage_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
-        stage_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(stage_card, text="局部重跑", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            stage_card,
-            text="重跑会主动废弃所选阶段的旧结果；选择更新相关结果时，系统按依赖顺序串行更新变化、评价、长时序成果和报告。",
-            style="Hint.TLabel", wraplength=1040,
-        ).pack(anchor="w", pady=(4, 10))
-        selectors = ttk.Frame(stage_card, style="Soft.TFrame", padding=(14, 10))
-        selectors.pack(fill=X, pady=(0, 10))
-        ttk.Label(selectors, text="区域", style="PathTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.stage_region, state="readonly", width=24)
-        self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(8, 18))
-        self.stage_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
-        ttk.Label(selectors, text="期次", style="PathTitle.TLabel").grid(row=0, column=2, sticky="w")
-        self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=22)
-        self.stage_period_combo.grid(row=0, column=3, sticky="ew", padx=(8, 18))
-        self.stage_period_combo.bind("<<ComboboxSelected>>", self._stage_period_changed)
-        ttk.Label(selectors, text="相邻变化对", style="PathTitle.TLabel").grid(row=0, column=4, sticky="w")
-        self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=25)
-        self.stage_pair_combo.grid(row=0, column=5, sticky="ew", padx=(8, 0))
-        for column in (1, 3, 5):
-            selectors.grid_columnconfigure(column, weight=1)
-        self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
-        ttk.Label(stage_card, textvariable=self.affected_pairs_summary, style="WarningNote.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(0, 10))
-        stage_actions = ttk.Frame(stage_card)
-        stage_actions.pack(fill=X)
-        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=(10, 8))
-        road_actions.pack(side=LEFT, fill=X, expand=True, padx=(0, 6))
-        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=(10, 8))
-        change_actions.pack(side=LEFT, fill=X, expand=True, padx=(6, 0))
-        self.stage_buttons = []
-        for parent, text, command, style in (
-            (road_actions, "重跑该期", lambda: self.rerun_selected_period(False), "Secondary.TButton"),
-            (road_actions, "重跑并更新相关结果", lambda: self.rerun_selected_period(True), "Primary.TButton"),
-            (change_actions, "重跑该变化对", lambda: self.rerun_selected_change(False), "Secondary.TButton"),
-            (change_actions, "重跑并更新长时序成果", lambda: self.rerun_selected_change(True), "Secondary.TButton"),
-        ):
-            button = ttk.Button(parent, text=text, style=style, command=command)
-            button.pack(side=LEFT, padx=(0, 8))
-            self.stage_buttons.append(button)
-        advanced_stage = ttk.Frame(stage_card)
-        advanced_stage.pack(fill=X, pady=(10, 0))
-        ttk.Label(advanced_stage, text="高级操作", style="CardMuted.TLabel").pack(side=LEFT)
-        batch_button = ttk.Button(advanced_stage, text="批量重跑全部道路提取", style="Compact.TButton", command=self.run_extract_all)
-        batch_button.pack(side=LEFT, padx=(10, 0))
-        self.stage_buttons.append(batch_button)
         self._refresh_stage_selectors()
 
     def _build_current_command(self, *, preflight_only: bool = False, data_check_only: bool = False) -> list[str]:

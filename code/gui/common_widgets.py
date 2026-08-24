@@ -39,18 +39,18 @@ UI = {
 }
 
 CONTROL_METRICS = {
-    "primary": {"font": ("Microsoft YaHei UI", 10, "bold"), "padding": (16, 9)},
-    "regular": {"font": ("Microsoft YaHei UI", 10), "padding": (12, 7)},
-    "compact": {"font": ("Microsoft YaHei UI", 9), "padding": (9, 6)},
+    "primary": {"font": ("Microsoft YaHei UI", 9, "bold"), "padding": (11, 6)},
+    "regular": {"font": ("Microsoft YaHei UI", 9), "padding": (9, 5)},
+    "compact": {"font": ("Microsoft YaHei UI", 9), "padding": (7, 4)},
 }
 
 LAYOUT_METRICS = {
-    "page_padding": (20, 16, 20, 18),
-    "card_padding": (18, 15),
-    "section_gap": 14,
-    "module_gap": 12,
-    "form_gap": 5,
-    "form_label_width": 16,
+    "page_padding": (10, 8, 10, 10),
+    "card_padding": (9, 8),
+    "section_gap": 8,
+    "module_gap": 7,
+    "form_gap": 4,
+    "form_label_width": 13,
     "content_wrap": 1040,
 }
 

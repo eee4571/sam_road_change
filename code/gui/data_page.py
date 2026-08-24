@@ -10,103 +10,75 @@ from app.project_manager import natural_key
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS, UI
+from .common_widgets import LAYOUT_METRICS
 
 class DataPage:
     def _build_data_page(self, page: ttk.Frame) -> None:
         self.data_body = page
-        heading = ttk.Frame(page, style="Page.TFrame")
-        heading.pack(fill=X, pady=(0, 13))
-        ttk.Label(heading, text="项目与数据管理", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(heading, text="按项目统一管理多个验证区、各期影像和变化真值。", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-
-        project_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
+        project_card = ttk.LabelFrame(page, text="项目与数据管理", padding=LAYOUT_METRICS["card_padding"])
         project_card.pack(fill=X)
-        project_head = ttk.Frame(project_card)
-        project_head.pack(fill=X)
-        ttk.Label(project_head, text="▣  项目与数据管理", style="CardTitle.TLabel").pack(side=LEFT)
-        ttk.Button(project_head, text="＋ 新建项目", style="Primary.TButton", command=self.create_project_folder).pack(side=RIGHT)
-        ttk.Button(project_head, text="打开项目", style="Secondary.TButton", command=self.import_project_folder).pack(side=RIGHT, padx=(0, 8))
-        ttk.Button(project_head, text="打开项目文件夹", style="Secondary.TButton", command=self.open_project_folder).pack(side=RIGHT, padx=(0, 8))
-        project_meta = ttk.Frame(project_card, style="Soft.TFrame", padding=(14, 10))
-        project_meta.pack(fill=X, pady=(12, 0))
+        project_actions = ttk.Frame(project_card)
+        project_actions.pack(fill=X, pady=(0, 6))
+        ttk.Button(project_actions, text="新建项目", command=self.create_project_folder).pack(side=LEFT)
+        ttk.Button(project_actions, text="打开项目", command=self.import_project_folder).pack(side=LEFT, padx=(5, 0))
+        ttk.Button(project_actions, text="打开项目文件夹", command=self.open_project_folder).pack(side=LEFT, padx=(5, 0))
+        project_meta = ttk.Frame(project_card)
+        project_meta.pack(fill=X)
         self.project_name_display = StringVar(value="尚未打开项目")
-        ttk.Label(project_meta, text="项目名称", width=14, style="PathTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(project_meta, textvariable=self.project_name_display, style="PathText.TLabel").grid(row=0, column=1, sticky="ew")
-        ttk.Label(project_meta, text="项目路径", width=14, style="PathTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.project_path_display = StringVar(value="尚未选择项目目录")
-        ttk.Label(project_meta, textvariable=self.project_path_display, style="PathText.TLabel", width=1).grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(project_meta, text="项目路径：", width=12).grid(row=0, column=0, sticky="w")
+        ttk.Label(project_meta, textvariable=self.project_path_display, width=1).grid(row=0, column=1, sticky="ew")
+        ttk.Label(project_meta, text="外部数据源：", width=12).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(project_meta, textvariable=self.data_source_display, width=1).grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Label(project_meta, text="扫描状态：", width=12).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(project_meta, textvariable=self.project_scan_summary, width=1).grid(row=2, column=1, sticky="ew", pady=(4, 0))
         project_meta.grid_columnconfigure(1, weight=1)
-
-        quick = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
-        quick.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(quick, text="▤  外部原始数据源", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(quick, text="只保存外部路径和映射；不会移动、复制或重命名原始数据。", style="CardMuted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["module_gap"]))
-        quick_actions = ttk.Frame(quick, style="Soft.TFrame", padding=(14, 12))
-        quick_actions.pack(fill=X)
-        ttk.Label(quick_actions, text="01", foreground=UI["blue"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 9, "bold"), padding=(9, 7)).grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
-        path_area = ttk.Frame(quick_actions, style="Soft.TFrame")
-        path_area.grid(row=0, column=1, rowspan=2, sticky="ew")
-        quick_actions.grid_columnconfigure(1, weight=1)
-        ttk.Label(path_area, text="已连接数据源", style="PathTitle.TLabel").pack(anchor="w")
-        ttk.Label(path_area, textvariable=self.data_source_display, style="PathText.TLabel", width=1).pack(anchor="w", fill=X, pady=(3, 0))
-        ttk.Button(
-            quick_actions, text="连接数据源", style="Primary.TButton",
-            command=self.connect_data_source,
-        ).grid(row=0, column=3, rowspan=2, sticky="e")
+        quick_actions = ttk.Frame(project_card)
+        quick_actions.pack(fill=X, pady=(6, 0))
+        ttk.Button(quick_actions, text="连接数据源", command=self.connect_data_source).pack(side=LEFT)
         self.scan_data_button = ttk.Button(
-            quick_actions, text="重新扫描", style="Secondary.TButton",
+            quick_actions, text="重新扫描",
             command=self.scan_data_sources,
         )
-        self.scan_data_button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 8))
+        self.scan_data_button.pack(side=LEFT, padx=(5, 0))
         self.cancel_scan_button = ttk.Button(
-            quick_actions, text="取消扫描", style="Compact.TButton",
+            quick_actions, text="取消扫描",
             command=self.cancel_data_source_scan,
         )
-        self.cancel_scan_button.grid(row=0, column=4, rowspan=2, sticky="e", padx=(0, 8))
+        self.cancel_scan_button.pack(side=LEFT, padx=(5, 0))
         self.cancel_scan_button.state(["disabled"])
         self.input_summary = StringVar(value="请选择项目目录；如需手工指定数据，可展开高级设置。")
-        summary_row = ttk.Frame(quick)
-        summary_row.pack(fill=X, pady=(13, 0))
-        self.input_summary_dot = ttk.Label(summary_row, text="●", foreground=UI["subtle"], background=UI["card"])
-        self.input_summary_dot.pack(side=LEFT, padx=(0, 7))
-        self.input_summary_label = ttk.Label(summary_row, textvariable=self.input_summary, style="CardMuted.TLabel", wraplength=1050)
-        self.input_summary_label.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(quick, textvariable=self.data_status, style="Success.TLabel").pack(anchor="w", pady=(8, 0))
-        ttk.Label(quick, textvariable=self.project_scan_summary, style="CardMuted.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(3, 0))
-
-        config_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
+        config_card = ttk.LabelFrame(page, text="区域数据配置", padding=LAYOUT_METRICS["card_padding"])
         config_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
-        ttk.Label(config_card, text="⚙  数据配置", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(config_card, text="按区域查看和补充验证区、多期影像与相邻期变化真值。", style="CardMuted.TLabel").pack(anchor="w", pady=(4, 10))
         region_row = ttk.Frame(config_card)
         region_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
-        ttk.Label(region_row, text="区域", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
+        ttk.Label(region_row, text="区域：", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
         self.project_region_combo = ttk.Combobox(region_row, textvariable=self.data_region, state="readonly", width=35)
         self.project_region_combo.pack(side=LEFT, fill=X, expand=True)
         self.project_region_combo.bind("<<ComboboxSelected>>", self._project_region_changed)
-        ttk.Button(region_row, text="＋ 添加区域", style="Compact.TButton", command=self.add_project_region).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(region_row, text="添加区域", command=self.add_project_region).pack(side=LEFT, padx=(5, 0))
+        ttk.Button(region_row, text="移除区域", command=self.remove_project_region).pack(side=LEFT, padx=(5, 0))
         area_row = ttk.Frame(config_card)
         area_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
-        ttk.Label(area_row, text="验证区", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
-        ttk.Label(area_row, textvariable=self.project_validation_path, style="CardMuted.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(area_row, text="选择…", style="Compact.TButton", command=self.replace_project_validation_area).pack(side=LEFT, padx=(8, 0))
-        ttk.Button(area_row, text="移除区域", style="Compact.TButton", command=self.remove_project_region).pack(side=LEFT, padx=(4, 0))
-        self.project_config_container = ttk.Frame(config_card, style="Soft.TFrame", padding=(14, 10))
-        self.project_config_container.pack(fill=X, pady=(8, 8))
+        ttk.Label(area_row, text="验证区 SHP：", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
+        ttk.Label(area_row, textvariable=self.project_validation_path, anchor="w").pack(side=LEFT, fill=X, expand=True)
+        ttk.Button(area_row, text="选择...", command=self.replace_project_validation_area).pack(side=LEFT, padx=(5, 0))
+        self.project_config_container = ttk.Frame(config_card)
+        self.project_config_container.pack(fill=X, pady=(6, 5))
         config_actions = ttk.Frame(config_card)
         config_actions.pack(fill=X)
-        self.add_project_period_button = ttk.Button(config_actions, text="＋ 添加期次", style="Compact.TButton", command=self.add_project_period)
+        self.add_project_period_button = ttk.Button(config_actions, text="添加期次", command=self.add_project_period)
         self.add_project_period_button.pack(side=LEFT)
         ttk.Button(config_actions, text="检查数据", style="Primary.TButton", command=self.preflight_inputs).pack(side=RIGHT)
+        ttk.Button(config_actions, text="导入配置...", command=self.load_task_config).pack(side=RIGHT, padx=(0, 5))
+        ttk.Button(config_actions, text="导出配置...", command=self.save_task_config).pack(side=RIGHT, padx=(0, 5))
         self._refresh_project_config_panel()
 
         self.manual_toggle = ttk.Button(
-            page, text="›  高级设置  ·  旧版单验证区、参数配置与兼容模式", style="Quiet.TButton", command=self._toggle_manual_inputs,
+            page, text="高级设置...", command=self._toggle_manual_inputs,
         )
-        self.manual_toggle.pack(anchor="w", pady=(12, 3))
-        self.manual_frame = ttk.Frame(page, style="Card.TFrame", padding=(18, 15))
-        ttk.Label(self.manual_frame, text="高级设置", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        self.manual_toggle.pack(anchor="w", pady=(6, 3))
+        self.manual_frame = ttk.LabelFrame(page, text="高级设置", padding=LAYOUT_METRICS["card_padding"])
         ttk.Radiobutton(
             self.manual_frame, text="验证区项目", variable=self.vars["mode"], value="validation",
             command=self._refresh_input_summary,
@@ -117,12 +89,12 @@ class DataPage:
         self.period_container.pack(fill=X)
         period_actions = ttk.Frame(self.manual_frame)
         period_actions.pack(fill=X, pady=(4, 5))
-        ttk.Button(period_actions, text="＋ 添加期次", style="Compact.TButton", command=self._add_period_row).pack(side=LEFT)
+        ttk.Button(period_actions, text="添加期次", command=self._add_period_row).pack(side=LEFT)
         self.truth_container = ttk.Frame(self.manual_frame)
         self._add_period_row("2021")
         self._add_period_row("2022")
         self.grid_toggle = ttk.Button(
-            self.manual_frame, text="▶ 兼容旧版多格网目录", command=self._toggle_grid_options,
+            self.manual_frame, text="兼容旧版多格网目录...", command=self._toggle_grid_options,
         )
         self.grid_toggle.pack(anchor="w", pady=(9, 2))
         self.grid_options = ttk.Frame(self.manual_frame)
@@ -131,10 +103,55 @@ class DataPage:
             command=self._refresh_input_summary,
         ).pack(anchor="w")
         self._field(self.grid_options, "格网数据根目录", "source_root", "dir")
-        config_actions = ttk.Frame(self.manual_frame, style="Card.TFrame")
+        config_actions = ttk.Frame(self.manual_frame)
         config_actions.pack(fill=X, pady=(12, 0))
         ttk.Button(config_actions, text="加载配置…", style="Compact.TButton", command=self.load_task_config).pack(side=LEFT)
         ttk.Button(config_actions, text="导出配置…", style="Compact.TButton", command=self.save_task_config).pack(side=LEFT, padx=8)
+
+        summary = self.step_summaries[0]
+        summary_box = ttk.LabelFrame(summary, text="输入摘要", padding=LAYOUT_METRICS["card_padding"])
+        summary_box.pack(fill=BOTH, expand=True)
+        self.data_summary_sources = StringVar(value="0 个")
+        self.data_summary_areas = StringVar(value="0 个")
+        self.data_summary_periods = StringVar(value="0 个")
+        self.data_summary_truths = StringVar(value="0 组")
+        self.data_summary_candidates = StringVar(value="0 项")
+        self.data_summary_encoding = StringVar(value="自动检测")
+        for row, (label, variable) in enumerate((
+            ("已连接数据源：", self.data_summary_sources),
+            ("验证区：", self.data_summary_areas),
+            ("影像期次：", self.data_summary_periods),
+            ("变化真值：", self.data_summary_truths),
+            ("待确认候选：", self.data_summary_candidates),
+            ("TXT 编码：", self.data_summary_encoding),
+        )):
+            ttk.Label(summary_box, text=label, width=15).grid(row=row, column=0, sticky="nw", pady=2)
+            ttk.Label(summary_box, textvariable=variable).grid(row=row, column=1, sticky="nw", pady=2)
+        summary_box.grid_columnconfigure(1, weight=1)
+        ttk.Separator(summary_box).grid(row=6, column=0, columnspan=2, sticky="ew", pady=8)
+        ttk.Label(summary_box, text="当前输入：", style="CardMuted.TLabel").grid(row=7, column=0, sticky="nw")
+        self.input_summary_label = ttk.Label(summary_box, textvariable=self.input_summary, wraplength=420)
+        self.input_summary_label.grid(row=7, column=1, sticky="nw")
+        ttk.Label(
+            summary_box,
+            text="提示：开始处理前会再次检查影像范围、CRS、波段及数据有效性。",
+            style="CardMuted.TLabel", wraplength=420,
+        ).grid(row=8, column=0, columnspan=2, sticky="nw", pady=(10, 0))
+        self._refresh_data_summary()
+
+    def _refresh_data_summary(self) -> None:
+        if not hasattr(self, "data_summary_sources"):
+            return
+        self.data_summary_sources.set(f"{len(self.project_data_sources)} 个")
+        self.data_summary_areas.set(f"{len(self.project_validation_areas)} 个")
+        self.data_summary_periods.set(
+            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个"
+        )
+        self.data_summary_truths.set(f"{len(self.project_area_truths)} 组")
+        candidate_count = sum(len(rows) for rows in self.project_candidates.values())
+        self.data_summary_candidates.set(f"{candidate_count} 项")
+        encodings = sorted({value for value in self.project_txt_encodings.values() if value})
+        self.data_summary_encoding.set("、".join(encodings) if encodings else "自动检测")
 
     def _selected_project_region(self, scope: str = "data") -> str:
         variable = self.stage_region if scope == "stage" else self.data_region
@@ -147,12 +164,12 @@ class DataPage:
     def _ensure_project_config_tables(self) -> None:
         if hasattr(self, "project_period_tree"):
             return
-        ttk.Label(self.project_config_container, text="多时间影像", style="PathTitle.TLabel").pack(anchor="w", pady=(0, 5))
-        period_frame = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        ttk.Label(self.project_config_container, text="多时相影像").pack(anchor="w", pady=(0, 3))
+        period_frame = ttk.Frame(self.project_config_container)
         period_frame.pack(fill=X)
         self.project_period_tree = ttk.Treeview(
             period_frame, columns=("period", "path", "encoding", "status"),
-            show="headings", height=6, style="Data.Treeview",
+            show="headings", height=4, style="Data.Treeview",
         )
         for column, title, width, stretch in (
             ("period", "期次", 110, False), ("path", "影像路径 TXT", 560, True),
@@ -165,18 +182,18 @@ class DataPage:
         self.project_period_tree.pack(side=LEFT, fill=X, expand=True)
         period_scroll.pack(side=RIGHT, fill="y")
         self.project_period_tree.bind("<Double-1>", lambda _event: self.replace_selected_project_period())
-        period_actions = ttk.Frame(self.project_config_container, style="Soft.TFrame")
-        period_actions.pack(fill=X, pady=(4, 8))
+        period_actions = ttk.Frame(self.project_config_container)
+        period_actions.pack(fill=X, pady=(3, 6))
         ttk.Button(period_actions, text="更换路径", style="Compact.TButton", command=self.replace_selected_project_period).pack(side=LEFT)
         ttk.Button(period_actions, text="移除期次", style="Compact.TButton", command=self.remove_selected_project_period).pack(side=LEFT, padx=(4, 0))
         ttk.Button(period_actions, text="指定 TXT 编码", style="Compact.TButton", command=self.set_selected_txt_encoding).pack(side=LEFT, padx=(4, 0))
 
-        ttk.Label(self.project_config_container, text="变化真值（可选）", style="PathTitle.TLabel").pack(anchor="w", pady=(2, 5))
-        truth_frame = ttk.Frame(self.project_config_container, style="Soft.TFrame")
+        ttk.Label(self.project_config_container, text="变化真值（可选）").pack(anchor="w", pady=(2, 3))
+        truth_frame = ttk.Frame(self.project_config_container)
         truth_frame.pack(fill=X)
         self.project_truth_tree = ttk.Treeview(
             truth_frame, columns=("pair", "path", "status"), show="headings",
-            height=5, style="Data.Treeview",
+            height=3, style="Data.Treeview",
         )
         for column, title, width, stretch in (
             ("pair", "变化对", 150, False), ("path", "真值 SHP", 650, True),
@@ -189,12 +206,12 @@ class DataPage:
         self.project_truth_tree.pack(side=LEFT, fill=X, expand=True)
         truth_scroll.pack(side=RIGHT, fill="y")
         self.project_truth_tree.bind("<Double-1>", lambda _event: self.set_selected_project_truth())
-        truth_actions = ttk.Frame(self.project_config_container, style="Soft.TFrame")
-        truth_actions.pack(fill=X, pady=(4, 8))
+        truth_actions = ttk.Frame(self.project_config_container)
+        truth_actions.pack(fill=X, pady=(3, 6))
         ttk.Button(truth_actions, text="选择真值", style="Compact.TButton", command=self.set_selected_project_truth).pack(side=LEFT)
         ttk.Button(truth_actions, text="移除真值", style="Compact.TButton", command=self.remove_selected_project_truth).pack(side=LEFT, padx=(4, 0))
 
-        ttk.Label(self.project_config_container, text="待确认候选（最多显示 10 项）", style="PathTitle.TLabel").pack(anchor="w", pady=(2, 5))
+        ttk.Label(self.project_config_container, text="待确认候选").pack(anchor="w", pady=(2, 3))
         self.project_candidate_tree = ttk.Treeview(
             self.project_config_container, columns=("kind", "path"), show="headings",
             height=3, style="Data.Treeview",
@@ -283,6 +300,7 @@ class DataPage:
             if hasattr(self, "add_project_period_button"):
                 self.add_project_period_button.state(["disabled"])
             self._refresh_stage_selectors()
+            self._refresh_data_summary()
             return
         if hasattr(self, "add_project_period_button"):
             self.add_project_period_button.state(["!disabled"])
@@ -301,12 +319,13 @@ class DataPage:
             truth = truth_map.get((region, before, after), "")
             iid = f"truth:{before}:{after}"
             self.project_truth_tree.insert(
-                "", END, iid=iid, values=(f"{before} → {after}", truth or "", "已配置" if truth else "未配置"),
+                "", END, iid=iid, values=(f"{before} - {after}", truth or "", "已配置" if truth else "未配置"),
             )
         pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
         for index, (kind, path) in enumerate(pending[:10]):
             self.project_candidate_tree.insert("", END, iid=f"candidate:{index}", values=(kind, path))
         self._refresh_stage_selectors()
+        self._refresh_data_summary()
         self._schedule_content_layout()
 
     def _refresh_stage_selectors(self) -> None:
@@ -971,7 +990,7 @@ class DataPage:
                 continue
             manifest = period_order_manifest(names)
             custom_warning |= bool(manifest["custom_order_warning"])
-            pairs = "、".join(f"{before} → {after}" for before, after in manifest["change_pairs"])
+            pairs = "、".join(f"{before} - {after}" for before, after in manifest["change_pairs"])
             sections.append(
                 f"{area}\n期次顺序：{'、'.join(manifest['period_order'])}\n相邻变化：{pairs}"
             )
@@ -1000,7 +1019,7 @@ class DataPage:
             frame = ttk.Frame(self.truth_container)
             frame.pack(fill=X, pady=2)
             path_var = StringVar(value=preserved.get((before, after), ""))
-            ttk.Label(frame, text=f"{before} → {after}", width=23).pack(side=LEFT)
+            ttk.Label(frame, text=f"{before} - {after}", width=23).pack(side=LEFT)
             truth_entry = ttk.Entry(frame, textvariable=path_var)
             truth_entry.pack(side=LEFT, fill=X, expand=True)
             truth_entry.bind("<FocusOut>", lambda _event: self._refresh_input_summary())
@@ -1013,9 +1032,9 @@ class DataPage:
         self.grid_options_visible = not self.grid_options_visible
         if self.grid_options_visible:
             self.grid_options.pack(fill=X, pady=(2, 4), after=self.grid_toggle)
-            self.grid_toggle.configure(text="▼ 兼容旧版多格网目录")
+            self.grid_toggle.configure(text="收起旧版多格网目录")
         else:
             self.grid_options.pack_forget()
-            self.grid_toggle.configure(text="▶ 兼容旧版多格网目录")
+            self.grid_toggle.configure(text="兼容旧版多格网目录...")
         self._refresh_input_summary()
         self._schedule_content_layout()

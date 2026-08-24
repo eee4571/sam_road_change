@@ -242,10 +242,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.advanced_visible = False
         self.review_advanced_visible = False
         self.evaluation_advanced_visible = False
-        self.log_visible = False
+        self.log_visible = True
         self.current_step = 0
         self.preflight_passed = False
         self.step_pages: list[ttk.Frame] = []
+        self.step_summaries: list[ttk.Frame] = []
         self.step_buttons: list[ttk.Button] = []
         self.active_command = ""
         self.cancel_requested = False
@@ -326,15 +327,15 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.root.configure(background=UI["page"])
         style.configure("TFrame", background=UI["card"])
         style.configure("Page.TFrame", background=UI["page"])
-        style.configure("Header.TFrame", background=UI["header"])
+        style.configure("Header.TFrame", background=UI["card"])
         style.configure("Footer.TFrame", background=UI["card"])
-        style.configure("TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 10))
-        style.configure("Title.TLabel", background=UI["card"], font=("Microsoft YaHei UI", 18, "bold"), foreground=UI["ink"])
+        style.configure("TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9))
+        style.configure("Title.TLabel", background=UI["card"], font=("Microsoft YaHei UI", 10, "bold"), foreground=UI["ink"])
         style.configure("Subtitle.TLabel", background=UI["card"], font=("Microsoft YaHei UI", 9), foreground=UI["muted"])
         style.configure("Brand.TLabel", background=UI["header"], foreground="#79C3AD", font=("Segoe UI", 9, "bold"))
-        style.configure("HeaderTitle.TLabel", background=UI["header"], foreground=UI["header_text"], font=("Microsoft YaHei UI", 16, "bold"))
-        style.configure("HeaderMeta.TLabel", background=UI["header"], foreground=UI["header_muted"], font=("Microsoft YaHei UI", 9))
-        style.configure("HeaderProject.TLabel", background=UI["header"], foreground=UI["header_text"], font=("Microsoft YaHei UI", 9))
+        style.configure("HeaderTitle.TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("HeaderMeta.TLabel", background=UI["card"], foreground=UI["muted"], font=("Microsoft YaHei UI", 9))
+        style.configure("HeaderProject.TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9))
         style.configure("Card.TFrame", background=UI["card"], relief="solid", borderwidth=1, bordercolor=UI["line"])
         style.configure("Soft.TFrame", background=UI["slate_soft"])
         style.configure("BlueSoft.TFrame", background=UI["blue_soft"])
@@ -348,22 +349,22 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.map("TButton", background=[("active", UI["blue_soft"]), ("disabled", "#ECE9E1")], foreground=[("active", UI["blue"]), ("disabled", UI["subtle"])])
         style.configure("Hero.TButton", **CONTROL_METRICS["primary"], foreground="#FFFFFF", background=UI["blue"], borderwidth=1, bordercolor=UI["blue"], focusthickness=0)
         style.map("Hero.TButton", background=[("active", UI["blue_hover"]), ("pressed", UI["header_deep"]), ("disabled", "#B6B8B1")])
-        style.configure("Secondary.TButton", **CONTROL_METRICS["regular"], foreground=UI["blue"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
+        style.configure("Secondary.TButton", **CONTROL_METRICS["regular"], foreground=UI["ink"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
         style.map("Secondary.TButton", background=[("active", UI["blue_soft"]), ("disabled", "#ECE9E1")], foreground=[("disabled", UI["subtle"])])
         style.configure("Compact.TButton", **CONTROL_METRICS["compact"], foreground=UI["ink"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
         style.map("Compact.TButton", background=[("active", UI["blue_soft"]), ("disabled", "#ECE9E1")], foreground=[("active", UI["blue"]), ("disabled", UI["subtle"])])
-        style.configure("Quiet.TButton", **CONTROL_METRICS["compact"], foreground=UI["muted"], background=UI["card"], borderwidth=0, focusthickness=0)
-        style.map("Quiet.TButton", foreground=[("active", UI["blue"])], background=[("active", UI["blue_soft"])])
-        style.configure("Danger.TButton", **CONTROL_METRICS["compact"], foreground="#B42318", background="#FFF1F2", borderwidth=0, focusthickness=0)
-        style.map("Danger.TButton", background=[("active", "#FFE4E6"), ("disabled", "#F8FAFC")], foreground=[("disabled", UI["subtle"])])
+        style.configure("Quiet.TButton", **CONTROL_METRICS["compact"], foreground=UI["ink"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
+        style.map("Quiet.TButton", foreground=[("disabled", UI["subtle"])], background=[("active", UI["blue_soft"])])
+        style.configure("Danger.TButton", **CONTROL_METRICS["compact"], foreground=UI["ink"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
+        style.map("Danger.TButton", background=[("active", UI["blue_soft"]), ("disabled", "#ECE9E1")], foreground=[("disabled", UI["subtle"])])
         style.configure("ResultPrimary.TButton", **CONTROL_METRICS["regular"], foreground="#FFFFFF", background=UI["blue"], borderwidth=1, bordercolor=UI["blue"], focusthickness=0)
         style.map("ResultPrimary.TButton", background=[("active", UI["blue_hover"]), ("pressed", UI["header_deep"]), ("disabled", "#B6B8B1")])
-        style.configure("ResultSecondary.TButton", **CONTROL_METRICS["regular"], foreground=UI["blue"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
+        style.configure("ResultSecondary.TButton", **CONTROL_METRICS["regular"], foreground=UI["ink"], background=UI["card"], borderwidth=1, bordercolor=UI["line_strong"], focusthickness=0)
         style.map("ResultSecondary.TButton", background=[("active", UI["blue_soft"]), ("disabled", "#ECE9E1")], foreground=[("disabled", UI["subtle"])])
-        style.configure("Section.TLabel", font=("Microsoft YaHei UI", 15, "bold"), foreground=UI["ink"], background=UI["page"])
-        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", 12, "bold"), foreground=UI["ink"], background=UI["card"])
+        style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"), foreground=UI["ink"], background=UI["page"])
+        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", 9, "bold"), foreground=UI["ink"], background=UI["card"])
         style.configure("CardTitleSelected.TLabel", font=("Microsoft YaHei UI", 12, "bold"), foreground=UI["blue"], background=UI["blue_soft"])
-        style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 18, "bold"), foreground=UI["ink"], background=UI["card"])
+        style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 9), foreground=UI["ink"], background=UI["card"])
         style.configure("Muted.TLabel", foreground=UI["muted"], background=UI["page"], font=("Microsoft YaHei UI", 9))
         style.configure("CardMuted.TLabel", foreground=UI["muted"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("CardMutedSelected.TLabel", foreground=UI["muted"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 9))
@@ -371,7 +372,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("PathTitle.TLabel", foreground=UI["ink"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("PathText.TLabel", foreground=UI["muted"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 9))
         style.configure("MetricName.TLabel", foreground=UI["muted"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 9))
-        style.configure("MetricValue.TLabel", foreground=UI["ink"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 18, "bold"))
+        style.configure("MetricValue.TLabel", foreground=UI["ink"], background=UI["slate_soft"], font=("Microsoft YaHei UI", 9))
         style.configure("FormLabel.TLabel", foreground=UI["ink"], background=UI["card"], font=("Microsoft YaHei UI", 10))
         style.configure("SelectedMark.TLabel", foreground=UI["blue"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 15, "bold"))
         style.configure("IdleMark.TLabel", foreground=UI["subtle"], background=UI["card"], font=("Microsoft YaHei UI", 15))
@@ -380,18 +381,20 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"), padding=(18, 8))
         style.configure("Hint.TLabel", foreground=UI["muted"], background=UI["card"], wraplength=920)
         style.configure("Success.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("HeaderReady.TLabel", foreground="#8ED3B8", background=UI["header"], font=("Microsoft YaHei UI", 9, "bold"), padding=(8, 4))
-        style.configure("HeaderIdle.TLabel", foreground=UI["header_muted"], background=UI["header"], font=("Microsoft YaHei UI", 9), padding=(8, 4))
+        style.configure("HeaderReady.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("HeaderIdle.TLabel", foreground=UI["muted"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("FooterStatus.TLabel", background=UI["card"], foreground=UI["muted"], font=("Microsoft YaHei UI", 9))
-        style.configure("TEntry", padding=(9, 6), fieldbackground=UI["card"], bordercolor=UI["line_strong"], lightcolor=UI["line_strong"], darkcolor=UI["line_strong"])
-        style.configure("TCombobox", padding=(9, 6), fieldbackground=UI["card"], bordercolor=UI["line_strong"])
+        style.configure("TEntry", padding=(5, 3), fieldbackground=UI["card"], bordercolor=UI["line_strong"], lightcolor=UI["line_strong"], darkcolor=UI["line_strong"])
+        style.configure("TCombobox", padding=(5, 3), fieldbackground=UI["card"], bordercolor=UI["line_strong"])
         style.map("TCombobox", fieldbackground=[("readonly", UI["card"])], background=[("readonly", UI["card"])], foreground=[("readonly", UI["ink"])])
         style.configure("TCheckbutton", background=UI["card"], foreground=UI["ink"])
         style.configure("TRadiobutton", background=UI["card"], foreground=UI["ink"])
-        style.configure("Modern.Horizontal.TProgressbar", background=UI["blue"], troughcolor="#DEDAD0", borderwidth=0, thickness=10)
+        style.configure("Modern.Horizontal.TProgressbar", background=UI["blue"], troughcolor="#DEDAD0", borderwidth=1, thickness=9)
+        style.configure("TLabelframe", background=UI["card"], bordercolor=UI["line_strong"], relief="groove", borderwidth=1)
+        style.configure("TLabelframe.Label", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9, "bold"))
         style.configure(
             "Data.Treeview", background=UI["card"], fieldbackground=UI["card"],
-            foreground=UI["ink"], rowheight=30, borderwidth=0,
+            foreground=UI["ink"], rowheight=23, borderwidth=1,
             font=("Microsoft YaHei UI", 9),
         )
         style.map(
@@ -400,7 +403,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         )
         style.configure(
             "Data.Treeview.Heading", background="#E3DFD5", foreground=UI["ink"],
-            relief="flat", padding=(8, 8), font=("Microsoft YaHei UI", 9, "bold"),
+            relief="raised", padding=(6, 4), font=("Microsoft YaHei UI", 9),
         )
         style.map("Data.Treeview.Heading", background=[("active", UI["blue_soft"])])
 
@@ -419,48 +422,64 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         tools_menu = Menu(menu, tearoff=False)
         tools_menu.add_command(label="运行诊断 / 导出诊断包", command=self.export_diagnostics)
         menu.add_cascade(label="工具", menu=tools_menu)
+        help_menu = Menu(menu, tearoff=False)
+        help_menu.add_command(
+            label="关于",
+            command=lambda: messagebox.showinfo(
+                "关于", "道路实体变化智能检测与人工编辑", parent=self.root,
+            ),
+        )
+        menu.add_cascade(label="帮助", menu=help_menu)
         self.root.configure(menu=menu)
 
-        header = ttk.Frame(self.root, padding=(22, 14, 22, 14), style="Header.TFrame")
+        header = ttk.Frame(self.root, padding=(12, 7), style="Header.TFrame")
         header.pack(fill=X)
-        ttk.Label(header, text="ROAD CHANGE", style="Brand.TLabel").pack(side=LEFT, padx=(0, 22))
-        title_area = ttk.Frame(header, style="Header.TFrame")
-        title_area.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(title_area, text="道路实体变化智能检测与人工编辑", style="HeaderTitle.TLabel").pack(anchor="w")
-        project_area = ttk.Frame(header, style="Header.TFrame")
-        project_area.pack(side=RIGHT)
-        ttk.Label(project_area, textvariable=self.current_project, style="HeaderProject.TLabel").pack(side=LEFT, padx=(0, 20))
-        self.header_state_label = ttk.Label(project_area, textvariable=self.header_state, style="HeaderIdle.TLabel")
-        self.header_state_label.pack(side=LEFT, padx=(0, 20))
-        ttk.Label(project_area, text="道路提取  ·  变化检测  ·  人工编辑  ·  成果交付", style="HeaderMeta.TLabel").pack(side=LEFT)
+        ttk.Label(header, textvariable=self.current_project, style="HeaderProject.TLabel").pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(header, text="状态：", style="HeaderMeta.TLabel").pack(side=LEFT)
+        self.header_state_label = ttk.Label(header, textvariable=self.header_state, style="HeaderIdle.TLabel")
+        self.header_state_label.pack(side=LEFT)
 
         self.stepper_canvas = Canvas(
-            self.root, height=56, background=UI["page"], highlightthickness=0, borderwidth=0,
+            self.root, height=43, background=UI["page"], highlightthickness=0, borderwidth=0,
         )
         self.stepper_canvas.pack(fill=X)
         self.stepper_canvas.bind("<Configure>", lambda _event: self._draw_stepper())
         self.stepper_canvas.bind("<Button-1>", self._on_stepper_click)
 
-        self.content_shell = ttk.Frame(self.root, style="Page.TFrame")
+        self.content_shell = ttk.Frame(self.root, style="Page.TFrame", padding=(10, 0, 10, 0))
         self.content_shell.pack(fill=BOTH, expand=True)
+        self.content_shell.grid_columnconfigure(0, weight=55, uniform="workflow")
+        self.content_shell.grid_columnconfigure(1, weight=45, uniform="workflow")
+        self.content_shell.grid_rowconfigure(0, weight=1)
+        left_shell = ttk.Frame(self.content_shell, style="Page.TFrame")
+        left_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.content_canvas = Canvas(
-            self.content_shell, background=UI["page"], highlightthickness=0, borderwidth=0,
+            left_shell, background=UI["page"], highlightthickness=0, borderwidth=0,
         )
         self.content_scrollbar = ttk.Scrollbar(
-            self.content_shell, orient="vertical", command=self.content_canvas.yview,
+            left_shell, orient="vertical", command=self.content_canvas.yview,
         )
         self.content_scrollbar.pack(side=RIGHT, fill="y")
         self.content_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         self.content_canvas.configure(yscrollcommand=self.content_scrollbar.set)
-        self.page_host = ttk.Frame(self.content_canvas, padding=LAYOUT_METRICS["page_padding"], style="Page.TFrame")
+        self.page_host = ttk.Frame(self.content_canvas, padding=(0, 8, 4, 10), style="Page.TFrame")
         self.page_window = self.content_canvas.create_window((0, 0), window=self.page_host, anchor="nw")
-        self.max_page_width = round(1320 * self.display_scale)
+        self.max_page_width = round(1600 * self.display_scale)
         self.content_canvas.bind("<Configure>", self._resize_content_canvas)
         self.page_host.bind("<Configure>", lambda _event: self._sync_content_scrollregion())
         self.root.bind_all("<MouseWheel>", self._on_content_mousewheel, add="+")
+        self.sidebar = ttk.Frame(self.content_shell, style="Page.TFrame")
+        self.sidebar.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(8, 10))
+        self.sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar.grid_rowconfigure(0, weight=2)
+        self.sidebar.grid_rowconfigure(1, weight=3)
+        self.summary_host = ttk.Frame(self.sidebar, style="Page.TFrame")
+        self.summary_host.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         for _ in WORKFLOW_STEPS:
             page = ttk.Frame(self.page_host, style="Page.TFrame")
             self.step_pages.append(page)
+            summary = ttk.Frame(self.summary_host, style="Page.TFrame")
+            self.step_summaries.append(summary)
 
         self._build_data_page(self.step_pages[0])
         self._build_run_page(self.step_pages[1])
@@ -469,14 +488,13 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self._build_shared_log_panel()
 
         ttk.Separator(self.root).pack(fill=X)
-        footer = ttk.Frame(self.root, padding=(18, 10, 18, 11), style="Footer.TFrame")
+        footer = ttk.Frame(self.root, padding=(10, 6), style="Footer.TFrame")
         footer.pack(fill=X)
-        ttk.Label(footer, text="●", foreground=UI["blue"], background=UI["card"]).pack(side=LEFT, padx=(0, 8))
         ttk.Label(footer, textvariable=self.status, style="FooterStatus.TLabel", wraplength=760).pack(side=LEFT, fill=X, expand=True)
-        self.footer_next = ttk.Button(footer, style="Primary.TButton", command=self._go_next)
+        self.footer_next = ttk.Button(footer, text="下一步", command=self._go_next)
         self.footer_next.pack(side=RIGHT)
-        self.footer_back = ttk.Button(footer, text="上一步", style="Secondary.TButton", command=self._go_back)
-        self.footer_back.pack(side=RIGHT, padx=(0, 10))
+        self.footer_back = ttk.Button(footer, text="上一步", command=self._go_back)
+        self.footer_back.pack(side=RIGHT, padx=(0, 6))
 
         self._show_step(0, force=True)
         self._refresh_input_summary()
@@ -484,22 +502,19 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
 
     def _build_shared_log_panel(self) -> None:
         """Build the window-level log panel shared by every workflow step."""
-        self.shared_log_shell = ttk.Frame(
-            self.root, style="Card.TFrame", padding=(18, 7, 18, 7),
+        self.shared_log_shell = ttk.LabelFrame(
+            self.sidebar, text="全流程日志", padding=LAYOUT_METRICS["card_padding"],
         )
-        self.shared_log_shell.pack(fill=X)
-        log_header = ttk.Frame(self.shared_log_shell, style="Card.TFrame")
+        self.shared_log_shell.grid(row=1, column=0, sticky="nsew")
+        self.shared_log_shell.grid_rowconfigure(1, weight=1)
+        self.shared_log_shell.grid_columnconfigure(0, weight=1)
+        log_header = ttk.Frame(self.shared_log_shell)
         log_header.pack(fill=X)
-        ttk.Label(log_header, text="全流程日志", style="CardTitle.TLabel").pack(side=LEFT)
         self.shared_log_status = StringVar(value="日志尚未开始")
         ttk.Label(
             log_header, textvariable=self.shared_log_status, style="CardMuted.TLabel",
             wraplength=720,
         ).pack(side=LEFT, fill=X, expand=True, padx=(16, 12))
-        self.log_toggle = ttk.Button(
-            log_header, text="展开日志", style="Quiet.TButton", command=self._toggle_log,
-        )
-        self.log_toggle.pack(side=RIGHT)
         ttk.Button(
             log_header, text="复制全部", style="Compact.TButton", command=self.copy_all_logs,
         ).pack(side=RIGHT, padx=(0, 7))
@@ -507,13 +522,14 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             log_header, text="打开日志文件", style="Compact.TButton", command=self.open_active_log,
         ).pack(side=RIGHT, padx=(0, 7))
 
-        self.log_frame = ttk.Frame(self.shared_log_shell, style="Card.TFrame")
-        log_body = ttk.Frame(self.log_frame, style="Card.TFrame")
+        self.log_frame = ttk.Frame(self.shared_log_shell)
+        self.log_frame.pack(fill=BOTH, expand=True, pady=(6, 0))
+        log_body = ttk.Frame(self.log_frame)
         log_body.pack(fill=BOTH, expand=True)
         self.log = Text(
-            log_body, height=9, wrap="none", undo=False, exportselection=True,
-            font=("Consolas", 10), foreground=UI["ink"], background="#FFFFFF",
-            selectbackground=UI["blue"], selectforeground="#FFFFFF", padx=8, pady=7,
+            log_body, height=12, wrap="none", undo=False, exportselection=True,
+            font=("Consolas", 9), foreground=UI["ink"], background="#FFFFFF",
+            selectbackground=UI["blue"], selectforeground="#FFFFFF", padx=5, pady=4,
         )
         log_y = ttk.Scrollbar(log_body, orient="vertical", command=self.log.yview)
         log_x = ttk.Scrollbar(log_body, orient="horizontal", command=self.log.xview)
@@ -573,31 +589,26 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         canvas = self.stepper_canvas
         canvas.delete("all")
         width = max(800, canvas.winfo_width())
-        height = max(48, canvas.winfo_height())
-        margin_x = 18
-        top = 9
-        bottom = height - 2
+        height = max(40, canvas.winfo_height())
+        margin_x = 10
+        top = 4
+        bottom = height - 4
         tab_width = (width - margin_x * 2) / len(WORKFLOW_STEPS)
         centers = [margin_x + tab_width * (index + 0.5) for index in range(len(WORKFLOW_STEPS))]
-        completed_to = getattr(self, "completed_to", 0)
         has_results = self.results_available
         for index, (center, label) in enumerate(zip(centers, WORKFLOW_STEPS)):
             left = margin_x + tab_width * index
             right = left + tab_width
             if index == self.current_step:
-                fill, outline = UI["card"], "#383A36"
-                label_color, weight = UI["blue"], "bold"
-            elif index <= completed_to:
-                fill, outline = UI["green_soft"], UI["line_strong"]
-                label_color, weight = UI["green"], "bold"
+                fill, outline = UI["blue"], UI["blue_hover"]
+                label_color, weight = "#FFFFFF", "bold"
             else:
                 fill, outline = "#E8E4DA", UI["line_strong"]
-                label_color, weight = UI["muted"], "normal"
-            canvas.create_rectangle(left, top, right, bottom, fill=fill, outline=outline, width=2 if index == self.current_step else 1)
-            marker = "✓" if index <= completed_to and index != self.current_step else str(index + 1)
+                label_color, weight = UI["ink"], "normal"
+            canvas.create_rectangle(left, top, right, bottom, fill=fill, outline=outline, width=1)
             canvas.create_text(
-                center, (top + bottom) / 2, text=f"{marker}  {label}", fill=label_color,
-                font=("Microsoft YaHei UI", 10, weight),
+                center, (top + bottom) / 2, text=f"{index + 1}. {label}", fill=label_color,
+                font=("Microsoft YaHei UI", 9, weight),
             )
         self._step_centers = centers
         self._step_tab_width = tab_width
@@ -634,7 +645,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             card["outer"].configure(style="SelectedBorder.TFrame" if selected else "IdleBorder.TFrame")
             card["inner"].configure(style="SelectedCard.TFrame" if selected else "TFrame")
             card["top"].configure(style="SelectedCard.TFrame" if selected else "TFrame")
-            card["mark"].configure(text="●" if selected else "○", style="SelectedMark.TLabel" if selected else "IdleMark.TLabel")
+            card["mark"].configure(text="选中" if selected else "未选", style="SelectedMark.TLabel" if selected else "IdleMark.TLabel")
             card["title"].configure(style="CardTitleSelected.TLabel" if selected else "CardTitle.TLabel")
             card["description"].configure(style="CardMutedSelected.TLabel" if selected else "CardMuted.TLabel")
             if value == "0":
@@ -669,8 +680,12 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             return
         for page in self.step_pages:
             page.pack_forget()
+        for summary in getattr(self, "step_summaries", []):
+            summary.pack_forget()
         self.current_step = index
         self.step_pages[index].pack(fill=BOTH, expand=True)
+        if getattr(self, "step_summaries", None):
+            self.step_summaries[index].pack(fill=BOTH, expand=True)
         if hasattr(self, "content_canvas"):
             self.content_canvas.yview_moveto(0.0)
             self.root.after_idle(self._sync_content_scrollregion)
@@ -682,13 +697,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.completed_to = completed_to
         self.root.after_idle(self._draw_stepper)
         self.footer_back.state(["disabled"] if index == 0 else ["!disabled"])
-        labels = (
-            "下一步：自动处理  →",
-            "下一步：人工编辑（可选）  →",
-            "跳过人工编辑，查看成果  →",
-            "已到最后一步",
-        )
-        self.footer_next.configure(text=labels[index])
+        self.footer_next.configure(text="完成" if index == 3 else "下一步")
         if index == 3:
             self.footer_next.state(["disabled"])
         elif index == 2 and not has_results:
@@ -728,10 +737,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.manual_inputs_visible = not self.manual_inputs_visible
         if self.manual_inputs_visible:
             self.manual_frame.pack(fill=X, pady=(0, 6), after=self.manual_toggle)
-            self.manual_toggle.configure(text="⌄  收起高级设置")
+            self.manual_toggle.configure(text="收起高级设置")
         else:
             self.manual_frame.pack_forget()
-            self.manual_toggle.configure(text="›  高级设置  ·  旧版单验证区、参数配置与兼容模式")
+            self.manual_toggle.configure(text="高级设置...")
         self._schedule_content_layout()
 
     def _show_manual_inputs(self) -> None:
@@ -742,61 +751,57 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
             self.advanced_frame.pack(fill=X, pady=(2, 5), after=self.advanced_toggle)
-            self.advanced_toggle.configure(text="▼ 高级参数")
+            self.advanced_toggle.configure(text="收起高级参数")
         else:
             self.advanced_frame.pack_forget()
-            self.advanced_toggle.configure(text="▶ 高级参数（通常不需要修改）")
+            self.advanced_toggle.configure(text="高级参数...")
         self._schedule_content_layout()
 
     def _toggle_review_advanced(self) -> None:
         self.review_advanced_visible = not self.review_advanced_visible
         if self.review_advanced_visible:
             self.review_advanced_frame.pack(fill=X, pady=(4, 0), after=self.review_advanced_toggle)
-            self.review_advanced_toggle.configure(text="⌄  收起高级操作")
+            self.review_advanced_toggle.configure(text="收起高级操作")
         else:
             self.review_advanced_frame.pack_forget()
-            self.review_advanced_toggle.configure(text="›  高级操作")
+            self.review_advanced_toggle.configure(text="高级操作...")
         self._schedule_content_layout()
 
     def _toggle_evaluation_advanced(self) -> None:
         self.evaluation_advanced_visible = not self.evaluation_advanced_visible
         if self.evaluation_advanced_visible:
             self.evaluation_advanced_frame.pack(fill=X, pady=(2, 10), after=self.evaluation_advanced_toggle)
-            self.evaluation_advanced_toggle.configure(text="⌄  收起评价高级设置")
+            self.evaluation_advanced_toggle.configure(text="收起评价高级设置")
         else:
             self.evaluation_advanced_frame.pack_forget()
-            self.evaluation_advanced_toggle.configure(text="›  评价高级设置")
+            self.evaluation_advanced_toggle.configure(text="评价高级设置...")
         self._schedule_content_layout()
 
     def _toggle_run_settings(self) -> None:
         self.run_settings_visible = not self.run_settings_visible
         if self.run_settings_visible:
             self.run_settings_frame.pack(fill=X, pady=(4, 2), after=self.run_settings_toggle)
-            self.run_settings_toggle.configure(text="⌄  收起输出位置与高级设置")
+            self.run_settings_toggle.configure(text="收起输出位置与高级设置")
         else:
             self.run_settings_frame.pack_forget()
-            self.run_settings_toggle.configure(text="›  输出位置与高级设置")
+            self.run_settings_toggle.configure(text="输出位置与高级设置...")
         self._schedule_content_layout()
 
     def _toggle_log(self) -> None:
-        self.log_visible = not self.log_visible
-        if self.log_visible:
-            self.log_frame.pack(fill=X, pady=(7, 0))
-            self.log_toggle.configure(text="收起日志")
-        else:
-            self.log_frame.pack_forget()
-            self.log_toggle.configure(text="展开日志")
+        """Compatibility hook: the desktop layout keeps the shared log visible."""
+        self.log_visible = True
+        if not self.log_frame.winfo_manager():
+            self.log_frame.pack(fill=BOTH, expand=True, pady=(6, 0))
 
     def _show_log(self) -> None:
-        if not self.log_visible:
-            self._toggle_log()
+        self._toggle_log()
 
     def _refresh_input_summary(self) -> None:
         if not hasattr(self, "input_summary"):
             return
         if hasattr(self, "run_destination_summary"):
             self.run_destination_summary.set(
-                f"成果保存到：{self.vars['output_root'].get().strip() or '尚未选择'}"
+                self.vars["output_root"].get().strip() or "尚未选择"
             )
         mode = self.vars["mode"].get()
         if mode == "grid":
@@ -810,7 +815,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                 self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
             if hasattr(self, "input_summary_label"):
                 self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-                self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+                if hasattr(self, "input_summary_dot"):
+                    self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+            if hasattr(self, "_refresh_data_summary"):
+                self._refresh_data_summary()
             self.root.after_idle(self._draw_stepper)
             return
         area = self.vars["validation_area"].get().strip()
@@ -825,7 +833,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                 self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
             if hasattr(self, "input_summary_label"):
                 self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-                self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+                if hasattr(self, "input_summary_dot"):
+                    self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+            if hasattr(self, "_refresh_data_summary"):
+                self._refresh_data_summary()
             self.root.after_idle(self._draw_stepper)
             return
         area_text = Path(area).name if area else "未选择验证区"
@@ -836,7 +847,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
         if hasattr(self, "input_summary_label"):
             self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-            self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+            if hasattr(self, "input_summary_dot"):
+                self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
+        if hasattr(self, "_refresh_data_summary"):
+            self._refresh_data_summary()
         self.root.after_idle(self._draw_stepper)
 
     def _field(self, parent, label: str, key: str, browse: str | None = None) -> None:
@@ -876,7 +890,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
 
 
 
-    @staticmethod
 
 
 
@@ -1260,7 +1273,9 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                         self.run_button.state(["!disabled"])
                         self.status.set(self._friendly(payload))
                         self.run_status.set(self._friendly(payload))
-                        self.preflight_summary.set("✓ 所有阻断性检查均已通过，可以开始处理。")
+                        self.preflight_summary.set("所有阻断性检查均已通过，可以开始处理。")
+                        for label in getattr(self, "preflight_check_labels", []):
+                            label.configure(text="通过")
                         warnings = payload.get("warnings") or []
                         detail = self._friendly(payload)
                         if warnings:

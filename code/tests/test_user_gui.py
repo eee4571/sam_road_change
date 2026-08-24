@@ -118,21 +118,49 @@ class UserGuiInputCommandTests(unittest.TestCase):
             set(gui.LAYOUT_METRICS),
             {"page_padding", "card_padding", "section_gap", "module_gap", "form_gap", "form_label_width", "content_wrap"},
         )
-        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["page_padding"]), 16)
-        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["card_padding"]), 15)
-        self.assertGreaterEqual(gui.LAYOUT_METRICS["form_gap"], 5)
+        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["page_padding"]), 8)
+        self.assertGreaterEqual(min(gui.LAYOUT_METRICS["card_padding"]), 8)
+        self.assertGreaterEqual(gui.LAYOUT_METRICS["form_gap"], 3)
 
     def test_project_path_row_reserves_flexible_space_for_long_paths(self) -> None:
         source = inspect.getsource(gui.UserApp._build_data_page)
-        self.assertIn("quick_actions.grid_columnconfigure(1, weight=1)", source)
-        self.assertIn('textvariable=self.project_path_display, style="PathText.TLabel", width=1', source)
+        self.assertIn("project_meta.grid_columnconfigure(1, weight=1)", source)
+        self.assertIn('textvariable=self.project_path_display, width=1', source)
         self.assertIn('text="连接数据源"', source)
         self.assertEqual(source.count('text="重新扫描"'), 1)
 
-    def test_result_metrics_keep_four_equal_columns(self) -> None:
+    def test_result_metrics_are_compact_inline_labels(self) -> None:
         source = inspect.getsource(gui.UserApp._build_result_page)
-        self.assertIn('(\"可人工编辑\", self.result_review_count)', source)
-        self.assertIn('box.pack(side=LEFT, fill=X, expand=True, padx=3)', source)
+        self.assertIn('(\"可人工编辑：\", self.result_review_count)', source)
+        self.assertIn('ttk.Label(metrics, textvariable=variable).pack(side=LEFT', source)
+        self.assertNotIn('style="MetricValue.TLabel"', source)
+
+    def test_workflow_pages_use_native_label_frames_without_card_layouts(self) -> None:
+        for builder in (
+            gui.UserApp._build_data_page,
+            gui.UserApp._build_run_page,
+            gui.UserApp._build_review_page,
+            gui.UserApp._build_result_page,
+        ):
+            source = inspect.getsource(builder)
+            self.assertIn("ttk.LabelFrame", source)
+            self.assertNotIn('style="Card.TFrame"', source)
+            self.assertNotIn('style="Soft.TFrame"', source)
+
+    def test_main_window_has_fixed_sidebar_log_and_plain_step_labels(self) -> None:
+        build_source = inspect.getsource(gui.UserApp._build)
+        stepper_source = inspect.getsource(gui.UserApp._draw_stepper)
+        self.assertIn('self.content_shell.grid_columnconfigure(0, weight=55', build_source)
+        self.assertIn('self.content_shell.grid_columnconfigure(1, weight=45', build_source)
+        self.assertIn('self.shared_log_shell.grid(row=1, column=0, sticky="nsew")', inspect.getsource(gui.UserApp._build_shared_log_panel))
+        self.assertNotIn("ROAD CHANGE", build_source)
+        self.assertIn('text=f"{index + 1}. {label}"', stepper_source)
+
+    def test_gui_source_contains_no_decorative_unicode_controls(self) -> None:
+        gui_root = Path(gui.__file__).resolve().parent / "gui"
+        source = "\n".join(path.read_text(encoding="utf-8") for path in gui_root.glob("*.py"))
+        for character in "▣▤⚙＋●○✓›▶▼⌄":
+            self.assertNotIn(character, source)
 
     def test_unicode_paths_and_config_text_round_trip(self) -> None:
         with tempfile.TemporaryDirectory(prefix="SAMRoad_unicode_") as raw:
@@ -267,6 +295,11 @@ class UserGuiInputCommandTests(unittest.TestCase):
         self.assertIn("打开日志文件", source)
         self.assertIn("self._build_shared_log_panel()", build_source)
         self.assertNotIn("self.log = Text(", inspect.getsource(gui.UserApp._build_run_page))
+
+    def test_backend_command_is_an_instance_method(self) -> None:
+        descriptor = inspect.getattr_static(gui.UserApp, "_command")
+        self.assertFalse(isinstance(descriptor, staticmethod))
+        self.assertEqual(list(inspect.signature(descriptor).parameters)[:2], ["self", "args"])
 
     def test_review_page_uses_shared_log_and_keeps_progress_and_stop_controls(self) -> None:
         source = inspect.getsource(gui.UserApp._build_review_page)

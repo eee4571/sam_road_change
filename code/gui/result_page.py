@@ -20,30 +20,22 @@ from .common_widgets import LAYOUT_METRICS, UI
 class ResultPage:
     def _build_result_page(self, page: ttk.Frame) -> None:
         self.result_body = page
-        ttk.Label(page, text="成果与评价", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(page, text="查看、评价并导出本次任务的正式成果。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
-        result_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
+        result_card = ttk.LabelFrame(page, text="处理结果", padding=LAYOUT_METRICS["card_padding"])
         result_card.pack(fill=X)
-        ttk.Label(result_card, text="处理结果", style="CardTitle.TLabel").pack(anchor="w")
         self.result_status = StringVar(value="完成任务或载入已有成果后，可在此查看处理结果。")
-        ttk.Label(result_card, textvariable=self.result_status, style="Hint.TLabel", wraplength=980).pack(fill=X, pady=(4, 0))
-        metrics = ttk.Frame(result_card, style="Card.TFrame")
-        metrics.pack(fill=X, pady=(14, 8))
         self.result_period_count = StringVar(value="0 期")
         self.result_change_count = StringVar(value="0 组")
         self.result_area_count = StringVar(value="0 区")
         self.result_review_count = StringVar(value="0 处")
-        for label, variable in (
-            ("影像期次", self.result_period_count), ("变化检测任务", self.result_change_count),
-            ("验证区", self.result_area_count), ("可人工编辑", self.result_review_count),
-        ):
-            box = ttk.Frame(metrics, style="Soft.TFrame", padding=(16, 12))
-            box.pack(side=LEFT, fill=X, expand=True, padx=3)
-            ttk.Label(box, text=label, style="MetricName.TLabel").pack()
-            ttk.Label(box, textvariable=variable, style="MetricValue.TLabel").pack(pady=(4, 0))
-        browser = ttk.Frame(result_card, style="Soft.TFrame", padding=(10, 8))
-        browser.pack(fill=BOTH, expand=True, pady=(14, 7))
-        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=11, style="Data.Treeview")
+        metrics = ttk.Frame(result_card)
+        metrics.pack(fill=X, pady=(0, 5))
+        for label, variable in (("影像期次：", self.result_period_count), ("变化检测任务：", self.result_change_count), ("验证区：", self.result_area_count), ("可人工编辑：", self.result_review_count)):
+            ttk.Label(metrics, text=label).pack(side=LEFT)
+            ttk.Label(metrics, textvariable=variable).pack(side=LEFT, padx=(0, 10))
+        ttk.Label(result_card, textvariable=self.result_status, wraplength=620).pack(fill=X, pady=(0, 5))
+        browser = ttk.Frame(result_card)
+        browser.pack(fill=BOTH, expand=True, pady=(0, 5))
+        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=10, style="Data.Treeview")
         self.result_tree.heading("#0", text="成果")
         self.result_tree.heading("status", text="状态")
         self.result_tree.column("#0", width=620, minwidth=320, stretch=True)
@@ -55,23 +47,17 @@ class ResultPage:
         self.result_tree.bind("<Double-1>", lambda _event: self.open_selected_result())
         result_actions = ttk.Frame(result_card)
         result_actions.pack(fill=X)
-        ttk.Button(result_actions, text="打开所选成果", style="ResultPrimary.TButton", command=self.open_selected_result).pack(side=LEFT)
-        ttk.Button(result_actions, text="打开所在目录", style="ResultSecondary.TButton", command=self.open_selected_result_folder).pack(side=LEFT, padx=(10, 0))
-        ttk.Button(result_actions, text="查看长时序属性表", style="ResultSecondary.TButton", command=self.open_temporal_attribute_table).pack(side=LEFT, padx=(10, 0))
-        ttk.Label(
-            page,
-            text="成果目录中包含道路中心线、道路面、道路宽度、变化检测结果、长时序道路成果、精度评价结果及任务报告。",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=12)
+        ttk.Button(result_actions, text="打开所选成果", command=self.open_selected_result).pack(side=LEFT)
+        ttk.Button(result_actions, text="打开所在目录", command=self.open_selected_result_folder).pack(side=LEFT, padx=(5, 0))
+        ttk.Button(result_actions, text="查看长时序属性表", command=self.open_temporal_attribute_table).pack(side=LEFT, padx=(5, 0))
 
-        evaluation_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
-        evaluation_card.pack(fill=X, pady=(4, 12))
-        ttk.Label(evaluation_card, text="精度评价", style="CardTitle.TLabel").pack(anchor="w")
+        evaluation_card = ttk.LabelFrame(page, text="精度评价", padding=LAYOUT_METRICS["card_padding"])
+        evaluation_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
         ttk.Label(
             evaluation_card,
             text="根据真值数据中的变化类型，对新增、变化和灭失道路进行精度评价，并汇总各验证区及相邻影像期次的评价结果。中心线位置偏差仅统计新增和灭失道路；宽度变化道路不纳入中心线偏差统计。",
-            style="Hint.TLabel", wraplength=980,
-        ).pack(anchor="w", pady=(4, 12))
+            style="Hint.TLabel", wraplength=620,
+        ).pack(anchor="w", pady=(0, 6))
         pair_row = ttk.Frame(evaluation_card)
         pair_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(pair_row, text="待评价结果", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
@@ -92,7 +78,7 @@ class ResultPage:
         ttk.Label(
             evaluation_card, textvariable=self.evaluation_truth_summary, style="CardMuted.TLabel", wraplength=980,
         ).pack(anchor="w", fill=X, pady=(0, 5))
-        self.evaluation_advanced_toggle = ttk.Button(evaluation_card, text="›  评价高级设置", style="Quiet.TButton", command=self._toggle_evaluation_advanced)
+        self.evaluation_advanced_toggle = ttk.Button(evaluation_card, text="评价高级设置...", command=self._toggle_evaluation_advanced)
         self.evaluation_advanced_toggle.pack(anchor="w", pady=(4, 4))
         options_row = ttk.Frame(evaluation_card)
         self.evaluation_advanced_frame = options_row
@@ -107,7 +93,7 @@ class ResultPage:
         self.evaluation_status = StringVar(value="请先载入或生成包含变化检测的任务结果。")
         ttk.Label(action_row, textvariable=self.evaluation_status, style="Hint.TLabel", wraplength=760).pack(side=LEFT, fill=X, expand=True)
         self.run_evaluation_button = ttk.Button(
-            action_row, text="评价当前结果", style="Primary.TButton", command=self.run_result_evaluation,
+            action_row, text="评价当前结果", command=self.run_result_evaluation,
         )
         self.run_evaluation_button.pack(side=RIGHT)
         self.run_evaluation_button.state(["disabled"])
@@ -116,6 +102,22 @@ class ResultPage:
         )
         self.run_total_evaluation_button.pack(side=RIGHT, padx=(0, 8))
         self.run_total_evaluation_button.state(["disabled"])
+
+        summary = ttk.LabelFrame(self.step_summaries[3], text="成果摘要", padding=LAYOUT_METRICS["card_padding"])
+        summary.pack(fill=BOTH, expand=True)
+        self.result_temporal_summary = StringVar(value="未生成")
+        self.result_evaluable_count = StringVar(value="0 组")
+        for row, (label, variable) in enumerate((
+            ("任务状态：", self.result_status),
+            ("验证区：", self.result_area_count),
+            ("影像期次：", self.result_period_count),
+            ("变化检测：", self.result_change_count),
+            ("长时序成果：", self.result_temporal_summary),
+            ("可评价变化对：", self.result_evaluable_count),
+        )):
+            ttk.Label(summary, text=label, width=15).grid(row=row, column=0, sticky="nw", pady=2)
+            ttk.Label(summary, textvariable=variable, wraplength=390).grid(row=row, column=1, sticky="nw", pady=2)
+        summary.grid_columnconfigure(1, weight=1)
 
     def _latest_manifest(self) -> tuple[dict | None, Path | None]:
         if self.loaded_manifest_path is not None and self.loaded_manifest_path.is_file():
@@ -142,6 +144,8 @@ class ResultPage:
                 self.result_change_count.set("0 组")
                 self.result_area_count.set("0 区")
                 self.result_review_count.set("0 处")
+                self.result_temporal_summary.set("未生成")
+                self.result_evaluable_count.set("0 组")
             if hasattr(self, "review_status"):
                 self.review_status.set("尚未完成自动处理，暂无可复核数据。")
                 self._populate_review_step()
@@ -188,6 +192,7 @@ class ResultPage:
             if str(item.get("manual_item_count", 0) or 0).isdigit()
         )
         self.result_review_count.set(f"{review_count} 处")
+        self.result_temporal_summary.set("已生成" if temporal_results else "未生成")
         self._populate_result_tree(self.project_manager.result_items(manifest, base_dir), base_dir)
         self._refresh_evaluation_results(manifest)
         self._populate_review_step()
@@ -266,9 +271,11 @@ class ResultPage:
             )
         ]
         labels = [
-            f"{entry.get('grid', '项目')} · {entry.get('before_period', '前期')} → {entry.get('after_period', '后期')}"
+            f"{entry.get('grid', '项目')} / {entry.get('before_period', '前期')} - {entry.get('after_period', '后期')}"
             for entry in self.result_change_items
         ]
+        if hasattr(self, "result_evaluable_count"):
+            self.result_evaluable_count.set(f"{len(labels)} 组")
         self.evaluation_pair_combo.configure(values=labels)
         if labels and self.evaluation_pair.get() not in labels:
             self.evaluation_pair.set(labels[0])
@@ -563,19 +570,18 @@ class ResultPage:
         window.title("长时序道路属性表 · road_life.shp")
         configure_window_geometry(window, base_width=1400, base_height=760, min_width=980, min_height=560)
         window.configure(background=UI["page"])
-        header = ttk.Frame(window, padding=(20, 13), style="Header.TFrame")
+        header = ttk.Frame(window, padding=(12, 8))
         header.pack(fill=X)
-        ttk.Label(header, text="ROAD LIFE", style="Brand.TLabel").pack(side=LEFT, padx=(0, 20))
-        title_area = ttk.Frame(header, style="Header.TFrame")
+        title_area = ttk.Frame(header)
         title_area.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(title_area, text="长时序道路属性表", style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(
             title_area, text=f"{item['label']}  ·  road_life.shp",
             style="HeaderMeta.TLabel",
         ).pack(anchor="w", pady=(2, 0))
-        ttk.Label(header, text=f"共 {len(frame)} 条道路", style="HeaderProject.TLabel").pack(side=RIGHT)
+        ttk.Label(header, text=f"共 {len(frame)} 条道路").pack(side=RIGHT)
 
-        filters = ttk.Frame(window, padding=(18, 12), style="Card.TFrame")
+        filters = ttk.Frame(window, padding=(12, 8))
         filters.pack(fill=X, padx=14, pady=(14, 10))
         search_var = StringVar()
         ttk.Label(filters, text="道路筛选", style="CardTitle.TLabel").pack(side=LEFT, padx=(0, 18))

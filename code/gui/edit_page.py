@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
-from .common_widgets import LAYOUT_METRICS, UI
+from .common_widgets import LAYOUT_METRICS
 
 class EditPage:
     def _editor_service(self) -> EditorManager:
@@ -28,64 +28,77 @@ class EditPage:
 
     def _build_review_page(self, page: ttk.Frame) -> None:
         self.review_body = page
-        ttk.Label(page, text="人工编辑（可选）", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(page, text="如需提高成果质量，可修正中心线并重新生成受影响的结果。", style="Muted.TLabel").pack(anchor="w", pady=(4, LAYOUT_METRICS["section_gap"]))
-        review_card = ttk.Frame(page, style="Card.TFrame", padding=LAYOUT_METRICS["card_padding"])
+        review_card = ttk.LabelFrame(page, text="人工编辑", padding=LAYOUT_METRICS["card_padding"])
         review_card.pack(fill=X)
-        ttk.Label(review_card, text="编辑与自动更新", style="CardTitle.TLabel").pack(anchor="w")
         self.review_status = StringVar(value="完成自动处理后，可在此选择需要编辑的期次。")
-        ttk.Label(review_card, textvariable=self.review_status, style="Hint.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(4, 0))
-        selector = ttk.Frame(review_card, style="Soft.TFrame", padding=(14, 11))
-        selector.pack(fill=X, pady=(16, 10))
-        ttk.Label(selector, text="项目 / 格网 / 期次", style="PathTitle.TLabel").pack(side=LEFT)
+        selector = ttk.Frame(review_card)
+        selector.pack(fill=X, pady=(0, 5))
+        ttk.Label(selector, text="区域 / 期次：", width=14).pack(side=LEFT)
         self.review_selection = StringVar()
-        self.review_combo = ttk.Combobox(selector, textvariable=self.review_selection, state="readonly", width=58)
-        self.review_combo.pack(side=LEFT, fill=X, expand=True, padx=(16, 0))
+        self.review_combo = ttk.Combobox(selector, textvariable=self.review_selection, state="readonly")
+        self.review_combo.pack(side=LEFT, fill=X, expand=True)
         self.review_combo.bind("<<ComboboxSelected>>", self._review_selection_changed)
         self.review_detail = StringVar(value="暂无可复核数据。")
-        ttk.Label(review_card, textvariable=self.review_detail, style="Hint.TLabel", wraplength=1040).pack(anchor="w", fill=X, pady=(0, 14))
-        edit_row = ttk.Frame(review_card, style="Soft.TFrame", padding=(14, 9))
-        edit_row.pack(fill=X, pady=(0, 12))
-        ttk.Label(edit_row, text="项目编辑目录", style="PathTitle.TLabel").pack(side=LEFT)
-        ttk.Label(edit_row, textvariable=self.review_edit_directory, style="PathText.TLabel", anchor="w").pack(side=LEFT, fill=X, expand=True, padx=(12, 8))
+        status_row = ttk.Frame(review_card)
+        status_row.pack(fill=X, pady=3)
+        ttk.Label(status_row, text="当前状态：", width=14).pack(side=LEFT)
+        ttk.Label(status_row, textvariable=self.review_status, anchor="w", wraplength=520).pack(side=LEFT, fill=X, expand=True)
+        edit_row = ttk.Frame(review_card)
+        edit_row.pack(fill=X, pady=3)
+        ttk.Label(edit_row, text="项目编辑目录：", width=14).pack(side=LEFT)
+        ttk.Label(edit_row, textvariable=self.review_edit_directory, anchor="w").pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(review_card, textvariable=self.review_detail, wraplength=620).pack(anchor="w", fill=X, pady=(3, 6))
         actions = ttk.Frame(review_card)
         actions.pack(fill=X)
         self.launch_review_button = ttk.Button(actions, text="打开编辑工作台", style="Hero.TButton", command=self.launch_selected_review_editor)
         self.launch_review_button.pack(side=LEFT)
         self.apply_review_button = ttk.Button(actions, text="应用编辑并更新相关结果", style="Primary.TButton", command=self.apply_selected_review)
-        self.apply_review_button.pack(side=LEFT, padx=10)
-        self.review_advanced_toggle = ttk.Button(review_card, text="›  高级操作", style="Quiet.TButton", command=self._toggle_review_advanced)
-        self.review_advanced_toggle.pack(anchor="w", pady=(10, 0))
+        self.apply_review_button.pack(side=LEFT, padx=5)
+        self.review_advanced_toggle = ttk.Button(review_card, text="高级操作...", command=self._toggle_review_advanced)
+        self.review_advanced_toggle.pack(anchor="w", pady=(6, 0))
         self.review_advanced_frame = ttk.Frame(review_card)
-        ttk.Button(self.review_advanced_frame, text="导入外部编辑成果", style="Compact.TButton", command=self.select_review_edit_directory).pack(side=LEFT)
-        ttk.Button(self.review_advanced_frame, text="打开编辑资料目录", style="Compact.TButton", command=self.open_selected_review_folder).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(self.review_advanced_frame, text="导入外部编辑成果", command=self.select_review_edit_directory).pack(side=LEFT)
+        ttk.Button(self.review_advanced_frame, text="打开编辑资料目录", command=self.open_selected_review_folder).pack(side=LEFT, padx=(5, 0))
 
-        self.review_task_frame = ttk.Frame(page, style="Card.TFrame", padding=(18, 15))
-        self.review_task_frame.pack(fill=BOTH, expand=True, pady=(12, 0))
+        self.review_task_frame = ttk.LabelFrame(page, text="编辑后增量重建", padding=LAYOUT_METRICS["card_padding"])
+        self.review_task_frame.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
         review_task_header = ttk.Frame(self.review_task_frame)
         review_task_header.pack(fill=X)
-        ttk.Label(review_task_header, text="编辑后增量重建", style="CardTitle.TLabel").pack(side=LEFT)
+        ttk.Label(review_task_header, text="当前状态：").pack(side=LEFT)
         self.review_cancel_button = ttk.Button(
-            review_task_header, text="停止重建", style="Danger.TButton", command=self.cancel_task,
+            review_task_header, text="停止重建", command=self.cancel_task,
         )
         self.review_cancel_button.pack(side=RIGHT)
         self.review_cancel_button.state(["disabled"])
         ttk.Label(
-            self.review_task_frame, textvariable=self.run_status, style="Hint.TLabel", wraplength=1040,
-        ).pack(anchor="w", fill=X, pady=(7, 8))
+            self.review_task_frame, textvariable=self.run_status, wraplength=620,
+        ).pack(anchor="w", fill=X, pady=(5, 6))
         self.review_progress = ttk.Progressbar(
             self.review_task_frame, mode="determinate", maximum=1, value=0,
             style="Modern.Horizontal.TProgressbar",
         )
         self.review_progress.pack(fill=X)
         ttk.Label(
-            self.review_task_frame, textvariable=self.progress_text, style="CardMuted.TLabel",
-        ).pack(anchor="w", pady=(6, 8))
+            self.review_task_frame, textvariable=self.progress_text,
+        ).pack(anchor="w", pady=(5, 7))
         ttk.Label(
-            self.review_task_frame, text="详细输出统一显示在窗口底部的“全流程日志”。",
+            self.review_task_frame,
+            text="应用编辑后将重新读取编辑成果，执行测宽、道路面更新、受影响变化检测及长时序成果更新。\n详细输出显示在右侧“全流程日志”。",
             style="CardMuted.TLabel",
         ).pack(anchor="w")
-        ttk.Label(page, text="人工编辑不是必需步骤；跳过时将直接采用自动处理结果。", style="Muted.TLabel").pack(anchor="w", pady=(12, 0))
+        ttk.Label(page, text="人工编辑为可选步骤；跳过时将直接采用自动处理结果。", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+
+        summary = ttk.LabelFrame(self.step_summaries[2], text="编辑任务信息", padding=LAYOUT_METRICS["card_padding"])
+        summary.pack(fill=BOTH, expand=True)
+        ttk.Label(summary, text="当前对象：", width=12).grid(row=0, column=0, sticky="nw", pady=2)
+        ttk.Label(summary, textvariable=self.review_selection, wraplength=400).grid(row=0, column=1, sticky="nw", pady=2)
+        ttk.Label(summary, text="对象状态：", width=12).grid(row=1, column=0, sticky="nw", pady=2)
+        ttk.Label(summary, textvariable=self.review_status, wraplength=400).grid(row=1, column=1, sticky="nw", pady=2)
+        ttk.Label(summary, text="编辑目录：", width=12).grid(row=2, column=0, sticky="nw", pady=2)
+        ttk.Label(summary, textvariable=self.review_edit_directory, wraplength=400).grid(row=2, column=1, sticky="nw", pady=2)
+        ttk.Label(summary, text="说明：", width=12).grid(row=3, column=0, sticky="nw", pady=2)
+        ttk.Label(summary, textvariable=self.review_detail, wraplength=400).grid(row=3, column=1, sticky="nw", pady=2)
+        summary.grid_columnconfigure(1, weight=1)
 
     def open_optional_review(self) -> None:
         self._refresh_result_availability()
