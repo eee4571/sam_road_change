@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "project_root": "C:\\Users\\zhoum\\geesing\\sam_road_change",
+  "external_data_sources": [],
+  "external_scan_cache": {},
+  "txt_encodings": {},
+  "validation_areas": [],
+  "area_periods": {},
+  "area_truths": [],
+  "unmapped_candidates": {
+    "shp": [],
+    "txt": []
+  },
+  "output_root": "C:\\Users\\zhoum\\geesing\\sam_road_change\\成果输出",
+  "updated_at": "2026-08-24 15:11:59"
+}

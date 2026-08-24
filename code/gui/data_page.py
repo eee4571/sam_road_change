@@ -16,6 +16,11 @@ from .common_widgets import (
     bind_dynamic_wrap,
 )
 
+
+def _fit_tree_height(tree: ttk.Treeview, item_count: int, minimum: int, maximum: int) -> None:
+    tree.configure(height=max(minimum, min(item_count, maximum)))
+
+
 class DataPage:
     def _build_data_page(self, page: ttk.Frame) -> None:
         self.data_body = page
@@ -57,9 +62,8 @@ class DataPage:
         self.cancel_scan_button.state(["disabled"])
         self.input_summary = StringVar(value="请选择项目目录；如需手工指定数据，可展开高级设置。")
         config_card = ttk.LabelFrame(page, text="区域数据配置", padding=LAYOUT_METRICS["card_padding"])
-        config_card.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
+        config_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
         config_card.grid_columnconfigure(0, weight=1)
-        config_card.grid_rowconfigure(2, weight=1)
         region_row = ttk.Frame(config_card)
         region_row.grid(row=0, column=0, sticky="ew", pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(region_row, text="区域：", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
@@ -76,7 +80,7 @@ class DataPage:
         ttk.Button(area_row, text="选择...", command=self.replace_project_validation_area).pack(side=LEFT, padx=(5, 0))
         self.project_config_container = ttk.Frame(config_card)
         self.project_config_container.grid(
-            row=2, column=0, sticky="nsew",
+            row=2, column=0, sticky="ew",
             pady=(LAYOUT_METRICS["module_gap"], LAYOUT_METRICS["form_gap"]),
         )
         config_actions = ttk.Frame(config_card)
@@ -142,17 +146,13 @@ class DataPage:
             ttk.Label(summary_box, textvariable=variable, style="Metric.TLabel").grid(row=row, column=column + 1, sticky="nw", pady=1)
         summary_box.grid_columnconfigure(1, weight=1)
         summary_box.grid_columnconfigure(3, weight=1)
-        ttk.Label(summary_box, text="当前输入：", style="CardMuted.TLabel").grid(row=3, column=0, columnspan=4, sticky="nw", pady=(3, 0))
-        self.input_summary_label = ttk.Label(summary_box, textvariable=self.input_summary, style="Metric.TLabel")
-        self.input_summary_label.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(1, 0))
-        bind_dynamic_wrap(self.input_summary_label, summary_box, minimum=180, padding=20)
-        ttk.Separator(summary_box).grid(row=5, column=0, columnspan=4, sticky="ew", pady=3)
+        ttk.Separator(summary_box).grid(row=3, column=0, columnspan=4, sticky="ew", pady=3)
         input_hint = ttk.Label(
             summary_box,
             text="提示：开始处理前会再次检查影像范围、CRS、波段及数据有效性。",
             style="CardMuted.TLabel",
         )
-        input_hint.grid(row=6, column=0, columnspan=4, sticky="nw")
+        input_hint.grid(row=4, column=0, columnspan=4, sticky="nw")
         bind_dynamic_wrap(input_hint, summary_box, minimum=220, padding=20)
         self._refresh_data_summary()
 
@@ -182,15 +182,12 @@ class DataPage:
         if hasattr(self, "project_period_tree"):
             return
         self.project_config_container.grid_columnconfigure(0, weight=1)
-        self.project_config_container.grid_rowconfigure(1, weight=5)
-        self.project_config_container.grid_rowconfigure(4, weight=4)
-        self.project_config_container.grid_rowconfigure(7, weight=2)
         ttk.Label(self.project_config_container, text="多时相影像").grid(row=0, column=0, sticky="w", pady=(0, 3))
         period_frame = ttk.Frame(self.project_config_container)
-        period_frame.grid(row=1, column=0, sticky="nsew")
+        period_frame.grid(row=1, column=0, sticky="ew")
         self.project_period_tree = ttk.Treeview(
             period_frame, columns=("period", "path", "encoding", "status"),
-            show="headings", height=6, style="Data.Treeview",
+            show="headings", height=2, style="Data.Treeview",
         )
         for column, title, width, stretch in (
             ("period", "期次", 80, False), ("path", "影像路径 TXT", 520, True),
@@ -204,7 +201,6 @@ class DataPage:
         self.project_period_tree.grid(row=0, column=0, sticky="nsew")
         period_scroll.grid(row=0, column=1, sticky="ns")
         period_xscroll.grid(row=1, column=0, sticky="ew")
-        period_frame.grid_rowconfigure(0, weight=1)
         period_frame.grid_columnconfigure(0, weight=1)
         attach_treeview_tooltip(self.project_period_tree)
         self.project_period_tree.bind("<Double-1>", lambda _event: self.replace_selected_project_period())
@@ -218,10 +214,10 @@ class DataPage:
 
         ttk.Label(self.project_config_container, text="变化真值（可选）").grid(row=3, column=0, sticky="w", pady=(0, 3))
         truth_frame = ttk.Frame(self.project_config_container)
-        truth_frame.grid(row=4, column=0, sticky="nsew")
+        truth_frame.grid(row=4, column=0, sticky="ew")
         self.project_truth_tree = ttk.Treeview(
             truth_frame, columns=("pair", "path", "status"), show="headings",
-            height=5, style="Data.Treeview",
+            height=2, style="Data.Treeview",
         )
         for column, title, width, stretch in (
             ("pair", "变化对", 125, False), ("path", "真值 SHP", 560, True),
@@ -235,7 +231,6 @@ class DataPage:
         self.project_truth_tree.grid(row=0, column=0, sticky="nsew")
         truth_scroll.grid(row=0, column=1, sticky="ns")
         truth_xscroll.grid(row=1, column=0, sticky="ew")
-        truth_frame.grid_rowconfigure(0, weight=1)
         truth_frame.grid_columnconfigure(0, weight=1)
         attach_treeview_tooltip(self.project_truth_tree)
         self.project_truth_tree.bind("<Double-1>", lambda _event: self.set_selected_project_truth())
@@ -246,7 +241,7 @@ class DataPage:
 
         ttk.Label(self.project_config_container, text="待确认候选").grid(row=6, column=0, sticky="w", pady=(0, 3))
         candidate_frame = ttk.Frame(self.project_config_container)
-        candidate_frame.grid(row=7, column=0, sticky="nsew")
+        candidate_frame.grid(row=7, column=0, sticky="ew")
         self.project_candidate_tree = ttk.Treeview(
             candidate_frame, columns=("kind", "path"), show="headings",
             height=2, style="Data.Treeview",
@@ -261,10 +256,10 @@ class DataPage:
         self.project_candidate_tree.grid(row=0, column=0, sticky="nsew")
         candidate_scroll.grid(row=0, column=1, sticky="ns")
         candidate_xscroll.grid(row=1, column=0, sticky="ew")
-        candidate_frame.grid_rowconfigure(0, weight=1)
         candidate_frame.grid_columnconfigure(0, weight=1)
         attach_treeview_tooltip(self.project_candidate_tree)
 
+    @staticmethod
     def _selected_tree_iid(tree) -> str:
         selected = tree.selection()
         return str(selected[0]) if selected else ""
@@ -342,8 +337,12 @@ class DataPage:
         if not region:
             if hasattr(self, "add_project_period_button"):
                 self.add_project_period_button.state(["disabled"])
+            _fit_tree_height(self.project_period_tree, 0, 2, 5)
+            _fit_tree_height(self.project_truth_tree, 0, 2, 4)
+            _fit_tree_height(self.project_candidate_tree, 0, 2, 4)
             self._refresh_stage_selectors()
             self._refresh_data_summary()
+            self._schedule_content_layout()
             return
         if hasattr(self, "add_project_period_button"):
             self.add_project_period_button.state(["!disabled"])
@@ -367,6 +366,9 @@ class DataPage:
         pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
         for index, (kind, path) in enumerate(pending[:10]):
             self.project_candidate_tree.insert("", END, iid=f"candidate:{index}", values=(kind, path))
+        _fit_tree_height(self.project_period_tree, len(rows), 2, 5)
+        _fit_tree_height(self.project_truth_tree, len(pairs), 2, 4)
+        _fit_tree_height(self.project_candidate_tree, min(len(pending), 10), 2, 4)
         self._refresh_stage_selectors()
         self._refresh_data_summary()
         self._schedule_content_layout()

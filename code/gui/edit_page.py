@@ -39,6 +39,8 @@ class EditPage:
         self.review_combo.pack(side=LEFT, fill=X, expand=True)
         self.review_combo.bind("<<ComboboxSelected>>", self._review_selection_changed)
         self.review_detail = StringVar(value="暂无可复核数据。")
+        self.review_object_status = StringVar(value="暂无可复核数据")
+        self.review_affected_pairs = StringVar(value="无相邻变化对")
         status_row = ttk.Frame(review_card)
         status_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
         ttk.Label(status_row, text="当前状态：", width=14).pack(side=LEFT)
@@ -98,15 +100,12 @@ class EditPage:
         selection_label = ttk.Label(summary, textvariable=self.review_selection, style="Metric.TLabel")
         selection_label.grid(row=0, column=1, sticky="nw", pady=2)
         ttk.Label(summary, text="对象状态：", width=12, style="Metric.TLabel").grid(row=1, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
-        status_label = ttk.Label(summary, textvariable=self.review_status, style="Metric.TLabel")
+        status_label = ttk.Label(summary, textvariable=self.review_object_status, style="Metric.TLabel")
         status_label.grid(row=1, column=1, sticky="nw", pady=2)
-        ttk.Label(summary, text="编辑目录：", width=12, style="Metric.TLabel").grid(row=2, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
-        directory_label = ttk.Label(summary, textvariable=self.review_edit_directory, style="Metric.TLabel")
-        directory_label.grid(row=2, column=1, sticky="nw", pady=2)
-        ttk.Label(summary, text="说明：", width=12, style="Metric.TLabel").grid(row=3, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
-        detail_label = ttk.Label(summary, textvariable=self.review_detail, style="Metric.TLabel")
-        detail_label.grid(row=3, column=1, sticky="nw", pady=2)
-        for label in (selection_label, status_label, directory_label, detail_label):
+        ttk.Label(summary, text="受影响变化对：", width=12, style="Metric.TLabel").grid(row=2, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
+        affected_label = ttk.Label(summary, textvariable=self.review_affected_pairs, style="Metric.TLabel")
+        affected_label.grid(row=2, column=1, sticky="nw", pady=2)
+        for label in (selection_label, status_label, affected_label):
             bind_dynamic_wrap(label, summary, minimum=160, padding=130)
         summary.grid_columnconfigure(1, weight=1)
 
@@ -156,6 +155,8 @@ class EditPage:
                 "当前没有可编辑成果。完成至少一个期次的道路处理或打开已有项目后，"
                 "可在此进行人工编辑。"
             )
+            self.review_object_status.set("暂无可复核数据")
+            self.review_affected_pairs.set("无相邻变化对")
             self.review_edit_directory.set("暂无可用编辑目录")
             self.review_status.set("当前没有可编辑成果；人工编辑是可选步骤。")
             self.launch_review_button.state(["disabled"])
@@ -189,6 +190,8 @@ class EditPage:
         item = self._selected_review_item()
         if item is None:
             self.review_detail.set("暂无可复核数据。")
+            self.review_object_status.set("暂无可复核数据")
+            self.review_affected_pairs.set("无相邻变化对")
             return
         saved, _checked = self.task_manager.find_saved_edits(item)
         state = "已人工编辑，待更新" if saved else "可编辑"
@@ -204,6 +207,8 @@ class EditPage:
         periods = [period for period, _source in self.project_area_periods.get(region, [])]
         pairs = self.task_manager.affected_change_pairs(periods, item.get("scope", ""))
         pair_text = "；".join(f"{before} → {after}：需要重新计算" for before, after in pairs) or "无相邻变化对"
+        self.review_object_status.set(state)
+        self.review_affected_pairs.set(pair_text)
         self.review_detail.set(
             f"期次状态：{state}    ·    受影响变化对：{pair_text}"
         )

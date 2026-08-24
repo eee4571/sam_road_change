@@ -13,6 +13,14 @@ import user_workflow_gui as gui
 
 
 class UserGuiInputCommandTests(unittest.TestCase):
+    def test_tree_selection_helper_is_callable_as_bound_method(self) -> None:
+        tree = mock.Mock()
+        tree.selection.return_value = ("2021",)
+
+        app = object.__new__(gui.UserApp)
+
+        self.assertEqual(app._selected_tree_iid(tree), "2021")
+
     def test_harmless_tiff_warning_is_hidden_but_preserved_in_log_file(self) -> None:
         raw = "cv::TIFF_Warning TIFFReadDirectory: Unknown field with tag 33550\n"
         log_file = io.StringIO()
@@ -300,6 +308,39 @@ class UserGuiInputCommandTests(unittest.TestCase):
         descriptor = inspect.getattr_static(gui.UserApp, "_command")
         self.assertFalse(isinstance(descriptor, staticmethod))
         self.assertEqual(list(inspect.signature(descriptor).parameters)[:2], ["self", "args"])
+
+    def test_backend_command_has_safe_log_name_helper(self) -> None:
+        helper = gui.UserApp._command.__globals__.get("_safe_task_name")
+        self.assertTrue(callable(helper))
+        self.assertEqual(helper("rerun-period"), "rerun-period")
+
+    def test_local_rerun_command_creates_log_and_submits(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            app = object.__new__(gui.UserApp)
+            app.process = None
+            app.root = mock.Mock()
+            app.log = mock.Mock()
+            app.shared_log_status = mock.Mock()
+            app.status = mock.Mock()
+            app.run_status = mock.Mock()
+            app.run_button = mock.Mock()
+            app.preflight_button = mock.Mock()
+            app._set_stage_buttons_enabled = mock.Mock()
+            app._set_cancel_enabled = mock.Mock()
+            app.progress = mock.Mock()
+            app.progress_text = mock.Mock()
+            app.project_root_path = None
+            app.project_txt_encodings = {}
+            app.vars = {"output_root": mock.Mock(get=mock.Mock(return_value=raw))}
+            app.task_manager = mock.Mock()
+            app.priority_queue = mock.Mock()
+
+            app._command(["rerun-period"])
+
+            self.assertTrue(app.active_log_path.name.startswith("rerun-period_"))
+            app.task_manager.submit.assert_called_once_with(
+                ["rerun-period"], log_path=app.active_log_path, environment={},
+            )
 
     def test_review_page_uses_shared_log_and_keeps_progress_and_stop_controls(self) -> None:
         source = inspect.getsource(gui.UserApp._build_review_page)

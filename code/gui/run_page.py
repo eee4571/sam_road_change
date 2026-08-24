@@ -110,10 +110,8 @@ class RunPage:
         summary_card.pack(fill=BOTH, expand=True)
         self.run_destination_summary = StringVar(value=self.vars["output_root"].get())
         for row, (label, variable) in enumerate((
-            ("输入数据：", self.input_summary),
-            ("成果位置：", self.run_destination_summary),
             ("当前任务：", self.vars["run_id"]),
-            ("任务状态：", self.run_status),
+            ("成果位置：", self.run_destination_summary),
         )):
             ttk.Label(summary_card, text=label, width=12, style="Metric.TLabel").grid(row=row, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
             value_label = ttk.Label(summary_card, textvariable=variable, style="Metric.TLabel")
@@ -121,7 +119,7 @@ class RunPage:
             bind_dynamic_wrap(value_label, summary_card, minimum=160, padding=130)
         summary_card.grid_columnconfigure(1, weight=1)
         run_settings_shell = ttk.Frame(summary_card)
-        run_settings_shell.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        run_settings_shell.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.run_settings_toggle = ttk.Button(run_settings_shell, text="输出位置与高级设置...", command=self._toggle_run_settings)
         self.run_settings_toggle.pack(anchor="w")
         self.run_settings_frame = ttk.Frame(run_settings_shell)

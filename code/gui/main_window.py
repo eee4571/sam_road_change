@@ -16,7 +16,7 @@ from app.backend_client import BackendClient, BackendEvent
 from app.editor_manager import EditorManager
 from app.project_manager import ProjectManager
 from app.result_publisher import ProjectLayout
-from app.task_manager import TaskManager, structured_task_status
+from app.task_manager import TaskManager, _safe_task_name, structured_task_status
 from gui.common_widgets import (CONTROL_METRICS, LAYOUT_METRICS, PREVIEW_LABELS, UI, WORKFLOW_STEPS, bind_dynamic_wrap, configure_window_geometry, format_percentage, treeview_metrics)
 from gui.data_page import DataPage
 from gui.run_page import RunPage
@@ -484,11 +484,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             pady=(page_padding[1], page_padding[3]),
         )
         self.sidebar.grid_columnconfigure(0, weight=1)
-        self.sidebar.grid_rowconfigure(0, weight=25, uniform="sidebar")
-        self.sidebar.grid_rowconfigure(1, weight=75, uniform="sidebar")
-        self.summary_host = ttk.Frame(self.sidebar, style="Page.TFrame")
-        self.summary_host.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-        self.summary_host.grid_propagate(False)
+        self.sidebar.grid_rowconfigure(0, weight=1)
+        self.sidebar_paned = ttk.Panedwindow(self.sidebar, orient="vertical")
+        self.sidebar_paned.grid(row=0, column=0, sticky="nsew")
+        self.summary_host = ttk.Frame(self.sidebar_paned, style="Page.TFrame")
+        self.sidebar_paned.add(self.summary_host, weight=35)
         for _ in WORKFLOW_STEPS:
             page = ttk.Frame(self.page_host, style="Page.TFrame")
             self.step_pages.append(page)
@@ -515,13 +515,14 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self._show_step(0, force=True)
         self._refresh_input_summary()
         self._refresh_result_availability()
+        self.root.after_idle(self._initialize_sidebar_sash)
 
     def _build_shared_log_panel(self) -> None:
         """Build the window-level log panel shared by every workflow step."""
         self.shared_log_shell = ttk.LabelFrame(
-            self.sidebar, text="全流程日志", padding=LAYOUT_METRICS["card_padding"],
+            self.sidebar_paned, text="全流程日志", padding=LAYOUT_METRICS["card_padding"],
         )
-        self.shared_log_shell.grid(row=1, column=0, sticky="nsew")
+        self.sidebar_paned.add(self.shared_log_shell, weight=65)
         self.shared_log_shell.grid_rowconfigure(1, weight=1)
         self.shared_log_shell.grid_columnconfigure(0, weight=1)
         log_header = ttk.Frame(self.shared_log_shell)
@@ -559,6 +560,26 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.log.bind("<Control-a>", self._select_all_logs)
         self.log.bind("<Control-A>", self._select_all_logs)
         self.log.insert("1.0", "这里统一显示数据检查、自动处理、人工编辑和精度评价日志。\n")
+
+    def _initialize_sidebar_sash(self) -> None:
+        """Set a useful initial split once; later page changes preserve the user's sash."""
+        if getattr(self, "_sidebar_sash_initialized", False):
+            return
+        self.sidebar_paned.update_idletasks()
+        total_height = self.sidebar_paned.winfo_height()
+        if total_height <= 1:
+            self.root.after(50, self._initialize_sidebar_sash)
+            return
+        summary_height = self.summary_host.winfo_reqheight() + LAYOUT_METRICS["module_gap"]
+        lower = round(total_height * 0.30)
+        upper = round(total_height * 0.45)
+        desired = max(lower, min(summary_height, upper))
+        desired = min(desired, max(lower, total_height - 180))
+        try:
+            self.sidebar_paned.sashpos(0, desired)
+        except TclError:
+            return
+        self._sidebar_sash_initialized = True
 
     def _resize_content_canvas(self, event=None) -> None:
         if not hasattr(self, "content_canvas"):
@@ -831,10 +852,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             if hasattr(self, "header_state"):
                 self.header_state.set("项目数据已就绪" if ready else "等待选择数据")
                 self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
-            if hasattr(self, "input_summary_label"):
-                self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-                if hasattr(self, "input_summary_dot"):
-                    self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
             if hasattr(self, "_refresh_data_summary"):
                 self._refresh_data_summary()
             self.root.after_idle(self._draw_stepper)
@@ -849,10 +866,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             if hasattr(self, "header_state"):
                 self.header_state.set("项目数据已就绪" if ready else "等待选择数据")
                 self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
-            if hasattr(self, "input_summary_label"):
-                self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-                if hasattr(self, "input_summary_dot"):
-                    self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
             if hasattr(self, "_refresh_data_summary"):
                 self._refresh_data_summary()
             self.root.after_idle(self._draw_stepper)
@@ -863,10 +876,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         if hasattr(self, "header_state"):
             self.header_state.set("项目数据已就绪" if ready else "等待选择数据")
             self.header_state_label.configure(style="HeaderReady.TLabel" if ready else "HeaderIdle.TLabel")
-        if hasattr(self, "input_summary_label"):
-            self.input_summary_label.configure(style="Success.TLabel" if ready else "CardMuted.TLabel")
-            if hasattr(self, "input_summary_dot"):
-                self.input_summary_dot.configure(foreground=UI["green"] if ready else UI["subtle"])
         if hasattr(self, "_refresh_data_summary"):
             self._refresh_data_summary()
         self.root.after_idle(self._draw_stepper)

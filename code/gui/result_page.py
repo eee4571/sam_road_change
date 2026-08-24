@@ -25,35 +25,29 @@ class ResultPage:
     def _build_result_page(self, page: ttk.Frame) -> None:
         self.result_body = page
         result_card = ttk.LabelFrame(page, text="处理结果", padding=LAYOUT_METRICS["card_padding"])
-        result_card.pack(fill=BOTH, expand=True)
+        result_card.pack(fill=X)
         self.result_status = StringVar(value="打开项目或完成任务后，可在此查看处理结果。")
         self.result_period_count = StringVar(value="0 期")
         self.result_change_count = StringVar(value="0 组")
         self.result_area_count = StringVar(value="0 区")
         self.result_review_count = StringVar(value="0 处")
-        metrics = ttk.Frame(result_card)
-        metrics.pack(fill=X, pady=(0, 5))
-        for label, variable in (("影像期次：", self.result_period_count), ("变化检测任务：", self.result_change_count), ("验证区：", self.result_area_count), ("可人工编辑：", self.result_review_count)):
-            ttk.Label(metrics, text=label).pack(side=LEFT)
-            ttk.Label(metrics, textvariable=variable).pack(side=LEFT, padx=(0, 10))
         result_status_label = ttk.Label(result_card, textvariable=self.result_status)
         result_status_label.pack(fill=X, pady=(0, 5))
         bind_dynamic_wrap(result_status_label, result_card, minimum=260, padding=20)
         browser = ttk.Frame(result_card)
-        browser.pack(fill=BOTH, expand=True, pady=(0, 5))
-        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=12, style="Data.Treeview")
+        browser.pack(fill=X, pady=(0, 5))
+        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=6, style="Data.Treeview")
         self.result_tree.heading("#0", text="成果")
         self.result_tree.heading("status", text="状态")
-        self.result_tree.column("#0", width=620, minwidth=320, stretch=True)
-        self.result_tree.column("status", width=140, minwidth=100, stretch=False)
+        self.result_tree.column("#0", width=620, minwidth=240, stretch=True)
+        self.result_tree.column("status", width=90, minwidth=80, stretch=False)
         tree_scroll = ttk.Scrollbar(browser, orient="vertical", command=self.result_tree.yview)
-        tree_xscroll = ttk.Scrollbar(browser, orient="horizontal", command=self.result_tree.xview)
-        self.result_tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=tree_xscroll.set)
+        self.result_tree.configure(yscrollcommand=tree_scroll.set)
         self.result_tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
-        tree_xscroll.grid(row=1, column=0, sticky="ew")
-        browser.grid_rowconfigure(0, weight=1)
         browser.grid_columnconfigure(0, weight=1)
+        self.result_tree.tag_configure("area", font=("Microsoft YaHei UI", 9, "bold"))
+        self.result_tree.tag_configure("category", foreground=UI["green"], font=("Microsoft YaHei UI", 9, "bold"))
         self.result_tree_tooltip = Tooltip(self.result_tree, self._result_tree_tooltip_text)
         self.result_tree.bind("<Double-1>", lambda _event: self.open_selected_result())
         result_actions = ttk.Frame(result_card)
@@ -126,11 +120,11 @@ class ResultPage:
         self.result_temporal_summary = StringVar(value="未生成")
         self.result_evaluable_count = StringVar(value="0 组")
         for row, (label, variable) in enumerate((
-            ("任务状态：", self.result_status),
             ("验证区：", self.result_area_count),
             ("影像期次：", self.result_period_count),
             ("变化检测：", self.result_change_count),
             ("长时序成果：", self.result_temporal_summary),
+            ("可人工编辑：", self.result_review_count),
             ("可评价变化对：", self.result_evaluable_count),
         )):
             ttk.Label(summary, text=label, width=15, style="Metric.TLabel").grid(row=row, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
@@ -242,9 +236,13 @@ class ResultPage:
                 if parent and parent not in inserted:
                     next_pending.append(item)
                     continue
+                is_area = not bool(parent)
+                is_category = bool(parent) and not item.get("path")
+                tag = "area" if is_area else "category" if is_category else ""
+                status = "" if is_category else item.get("status", "")
                 node = self.result_tree.insert(
-                    parent, END, iid=item["id"], text=item["label"], values=(item.get("status", ""),),
-                    open=not bool(parent),
+                    parent, END, iid=item["id"], text=item["label"], values=(status,),
+                    open=is_area, tags=(tag,) if tag else (),
                 )
                 inserted.add(node)
                 path_text = item.get("path", "")
@@ -253,6 +251,11 @@ class ResultPage:
             if len(next_pending) == len(pending):
                 break
             pending = next_pending
+        visible_rows = sum(
+            1 + len(self.result_tree.get_children(root))
+            for root in self.result_tree.get_children("")
+        )
+        self.result_tree.configure(height=max(6, min(visible_rows, 10)))
 
     def _result_tree_tooltip_text(self, _event=None) -> str:
         if not hasattr(self, "result_tree"):
