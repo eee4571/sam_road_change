@@ -55,21 +55,20 @@ class RunPage:
         stage_card = ttk.LabelFrame(page, text="局部重跑", padding=LAYOUT_METRICS["card_padding"])
         stage_card.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
         selectors = ttk.Frame(stage_card)
-        selectors.pack(fill=X, pady=(0, 5))
-        ttk.Label(selectors, text="区域：").grid(row=0, column=0, sticky="w")
+        selectors.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
+        ttk.Label(selectors, text="区域：", width=LAYOUT_METRICS["form_label_width"]).grid(row=0, column=0, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.stage_region, state="readonly", width=14)
-        self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(3, 7))
+        self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"]), pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
-        ttk.Label(selectors, text="期次：").grid(row=0, column=2, sticky="w")
+        ttk.Label(selectors, text="期次：", width=6).grid(row=0, column=2, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=12)
-        self.stage_period_combo.grid(row=0, column=3, sticky="ew", padx=(3, 7))
+        self.stage_period_combo.grid(row=0, column=3, sticky="ew", pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_period_combo.bind("<<ComboboxSelected>>", self._stage_period_changed)
-        ttk.Label(selectors, text="相邻变化对：").grid(row=0, column=4, sticky="w")
+        ttk.Label(selectors, text="相邻变化对：", width=LAYOUT_METRICS["form_label_width"]).grid(row=1, column=0, sticky="w")
         self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=16)
-        self.stage_pair_combo.grid(row=0, column=5, sticky="ew", padx=(3, 0))
-        selectors.grid_columnconfigure(1, weight=3)
-        selectors.grid_columnconfigure(3, weight=2)
-        selectors.grid_columnconfigure(5, weight=3)
+        self.stage_pair_combo.grid(row=1, column=1, columnspan=3, sticky="ew")
+        selectors.grid_columnconfigure(1, weight=1)
+        selectors.grid_columnconfigure(3, weight=1)
         self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
         affected_row = ttk.Frame(stage_card)
         affected_row.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
@@ -84,6 +83,7 @@ class RunPage:
         change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=LAYOUT_METRICS["card_padding"])
         change_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
         self.stage_buttons = []
+        action_columns = {road_actions: 0, change_actions: 0}
         for parent, text, command in (
             (road_actions, "重跑该期", lambda: self.rerun_selected_period(False)),
             (road_actions, "重跑并更新相关结果", lambda: self.rerun_selected_period(True)),
@@ -91,7 +91,13 @@ class RunPage:
             (change_actions, "重跑并更新长时序成果", lambda: self.rerun_selected_change(True)),
         ):
             button = ttk.Button(parent, text=text, command=command)
-            button.pack(side=LEFT, padx=(0, 4))
+            column = action_columns[parent]
+            button.grid(
+                row=0, column=column, sticky="ew",
+                padx=(0, LAYOUT_METRICS["module_gap"] if column == 0 else 0),
+            )
+            parent.grid_columnconfigure(column, weight=1, uniform="stage_actions")
+            action_columns[parent] += 1
             self.stage_buttons.append(button)
         advanced_stage = ttk.Frame(stage_card)
         advanced_stage.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))

@@ -22,7 +22,7 @@ class DataPage:
         project_card = ttk.LabelFrame(page, text="项目与数据管理", padding=LAYOUT_METRICS["card_padding"])
         project_card.pack(fill=X)
         project_actions = ttk.Frame(project_card)
-        project_actions.pack(fill=X, pady=(0, 6))
+        project_actions.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
         ttk.Button(project_actions, text="新建项目", command=self.create_project_folder).pack(side=LEFT)
         ttk.Button(project_actions, text="打开项目", command=self.import_project_folder).pack(side=LEFT, padx=(5, 0))
         ttk.Button(project_actions, text="打开项目文件夹", command=self.open_project_folder).pack(side=LEFT, padx=(5, 0))
@@ -30,19 +30,19 @@ class DataPage:
         project_meta.pack(fill=X)
         self.project_name_display = StringVar(value="尚未打开项目")
         self.project_path_display = StringVar(value="尚未选择项目目录")
-        ttk.Label(project_meta, text="项目路径：", width=12).grid(row=0, column=0, sticky="w")
+        ttk.Label(project_meta, text="项目路径：", width=LAYOUT_METRICS["form_label_width"]).grid(row=0, column=0, sticky="w")
         self.project_path_field = PathDisplay(project_meta, textvariable=self.project_path_display, width=1)
         self.project_path_field.grid(row=0, column=1, sticky="ew")
-        ttk.Label(project_meta, text="外部数据源：", width=12).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(project_meta, text="外部数据源：", width=LAYOUT_METRICS["form_label_width"]).grid(row=1, column=0, sticky="w", pady=(LAYOUT_METRICS["form_gap"], 0))
         self.data_source_field = PathDisplay(project_meta, textvariable=self.data_source_display, width=1)
-        self.data_source_field.grid(row=1, column=1, sticky="ew", pady=(4, 0))
-        ttk.Label(project_meta, text="扫描状态：", width=12).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.data_source_field.grid(row=1, column=1, sticky="ew", pady=(LAYOUT_METRICS["form_gap"], 0))
+        ttk.Label(project_meta, text="扫描状态：", width=LAYOUT_METRICS["form_label_width"]).grid(row=2, column=0, sticky="w", pady=(LAYOUT_METRICS["form_gap"], 0))
         self.project_scan_label = ttk.Label(project_meta, textvariable=self.project_scan_summary, width=1)
-        self.project_scan_label.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        self.project_scan_label.grid(row=2, column=1, sticky="ew", pady=(LAYOUT_METRICS["form_gap"], 0))
         bind_dynamic_wrap(self.project_scan_label, project_meta, minimum=220, padding=120)
         project_meta.grid_columnconfigure(1, weight=1)
         quick_actions = ttk.Frame(project_card)
-        quick_actions.pack(fill=X, pady=(6, 0))
+        quick_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
         ttk.Button(quick_actions, text="连接数据源", command=self.connect_data_source).pack(side=LEFT)
         self.scan_data_button = ttk.Button(
             quick_actions, text="重新扫描",
@@ -129,7 +129,7 @@ class DataPage:
         self.data_summary_truths = StringVar(value="0 组")
         self.data_summary_candidates = StringVar(value="0 项")
         self.data_summary_encoding = StringVar(value="自动检测")
-        for row, (label, variable) in enumerate((
+        for index, (label, variable) in enumerate((
             ("已连接数据源：", self.data_summary_sources),
             ("验证区：", self.data_summary_areas),
             ("影像期次：", self.data_summary_periods),
@@ -137,20 +137,22 @@ class DataPage:
             ("待确认候选：", self.data_summary_candidates),
             ("TXT 编码：", self.data_summary_encoding),
         )):
-            ttk.Label(summary_box, text=label, width=15, style="Metric.TLabel").grid(row=row, column=0, sticky="nw", pady=1)
-            ttk.Label(summary_box, textvariable=variable, style="Metric.TLabel").grid(row=row, column=1, sticky="nw", pady=1)
+            row, column = index % 3, (index // 3) * 2
+            ttk.Label(summary_box, text=label, width=11, style="Metric.TLabel").grid(row=row, column=column, sticky="nw", pady=1)
+            ttk.Label(summary_box, textvariable=variable, style="Metric.TLabel").grid(row=row, column=column + 1, sticky="nw", pady=1)
         summary_box.grid_columnconfigure(1, weight=1)
-        ttk.Label(summary_box, text="当前输入：", style="CardMuted.TLabel").grid(row=6, column=0, columnspan=2, sticky="nw", pady=(3, 0))
+        summary_box.grid_columnconfigure(3, weight=1)
+        ttk.Label(summary_box, text="当前输入：", style="CardMuted.TLabel").grid(row=3, column=0, columnspan=4, sticky="nw", pady=(3, 0))
         self.input_summary_label = ttk.Label(summary_box, textvariable=self.input_summary, style="Metric.TLabel")
-        self.input_summary_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(1, 0))
+        self.input_summary_label.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(1, 0))
         bind_dynamic_wrap(self.input_summary_label, summary_box, minimum=180, padding=20)
-        ttk.Separator(summary_box).grid(row=8, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Separator(summary_box).grid(row=5, column=0, columnspan=4, sticky="ew", pady=3)
         input_hint = ttk.Label(
             summary_box,
             text="提示：开始处理前会再次检查影像范围、CRS、波段及数据有效性。",
             style="CardMuted.TLabel",
         )
-        input_hint.grid(row=9, column=0, columnspan=2, sticky="nw")
+        input_hint.grid(row=6, column=0, columnspan=4, sticky="nw")
         bind_dynamic_wrap(input_hint, summary_box, minimum=220, padding=20)
         self._refresh_data_summary()
 
@@ -188,11 +190,11 @@ class DataPage:
         period_frame.grid(row=1, column=0, sticky="nsew")
         self.project_period_tree = ttk.Treeview(
             period_frame, columns=("period", "path", "encoding", "status"),
-            show="headings", height=5, style="Data.Treeview",
+            show="headings", height=6, style="Data.Treeview",
         )
         for column, title, width, stretch in (
-            ("period", "期次", 100, False), ("path", "影像路径 TXT", 520, True),
-            ("encoding", "编码", 100, False), ("status", "状态", 100, False),
+            ("period", "期次", 80, False), ("path", "影像路径 TXT", 520, True),
+            ("encoding", "编码", 75, False), ("status", "状态", 85, False),
         ):
             self.project_period_tree.heading(column, text=title, anchor="w")
             self.project_period_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")
@@ -219,11 +221,11 @@ class DataPage:
         truth_frame.grid(row=4, column=0, sticky="nsew")
         self.project_truth_tree = ttk.Treeview(
             truth_frame, columns=("pair", "path", "status"), show="headings",
-            height=4, style="Data.Treeview",
+            height=5, style="Data.Treeview",
         )
         for column, title, width, stretch in (
-            ("pair", "变化对", 150, False), ("path", "真值 SHP", 560, True),
-            ("status", "状态", 115, False),
+            ("pair", "变化对", 125, False), ("path", "真值 SHP", 560, True),
+            ("status", "状态", 85, False),
         ):
             self.project_truth_tree.heading(column, text=title, anchor="w")
             self.project_truth_tree.column(column, width=width, minwidth=70, stretch=stretch, anchor="w")

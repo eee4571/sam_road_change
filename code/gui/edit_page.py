@@ -65,7 +65,7 @@ class EditPage:
         ttk.Button(self.review_advanced_frame, text="打开编辑资料目录", command=self.open_selected_review_folder).pack(side=LEFT, padx=(5, 0))
 
         self.review_task_frame = ttk.LabelFrame(page, text="编辑后增量重建", padding=LAYOUT_METRICS["card_padding"])
-        self.review_task_frame.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
+        self.review_task_frame.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
         review_task_header = ttk.Frame(self.review_task_frame)
         review_task_header.pack(fill=X)
         ttk.Label(review_task_header, text="当前状态：").pack(side=LEFT)
