@@ -11,11 +11,11 @@ Work incrementally from the repository's current state. Keep the task boundary n
 
 Before reading implementation files:
 
-1. Read the root `AGENTS.md` completely.
-2. Read `docs/CODEMAP.md` completely.
+1. Use the applicable `AGENTS.md` instructions already loaded by Codex. Do not reread the root file by default; read it only when instruction scope is unclear, the file has changed, or the applicable instructions are unavailable.
+2. Treat `docs/CODEMAP.md` as a navigation index. Search it for task-specific headings or keywords and read only the matching sections; do not load the whole file unless the task genuinely spans it.
 3. Run `git status`, `git diff --stat`, and inspect the current diff relevant to the requested files.
 
-If a required instruction file is absent, report that fact briefly and use the closest clearly equivalent repository document when one exists. Do not compensate by recursively scanning the repository.
+When work enters a nested scope, load its applicable nested `AGENTS.md` only if those instructions are not already available. If a needed instruction or index file is absent, use the closest clearly equivalent repository document without recursively scanning the repository.
 
 Treat all pre-existing tracked and untracked changes as user work. Do not overwrite, revert, reformat, or fold them into the task unless the request explicitly requires it.
 
@@ -31,7 +31,7 @@ Expand this set only when a concrete unresolved dependency or behavior requires 
 
 For GUI-only layout, wording, styling, or widget changes, default to the relevant files under `code/gui/`. Do not read `code/user_pipeline.py` or `code/engine/` unless the requested behavior demonstrably crosses into pipeline or algorithm execution.
 
-Before changing anything under `code/gui/`, read and follow `code/gui/AGENTS.md`. If it is absent, follow the root `AGENTS.md` and note the missing local instruction file.
+Before changing anything under `code/gui/`, follow the applicable `code/gui/AGENTS.md` instructions, loading that file only when they are not already available. If it is absent, follow the applicable root instructions.
 
 ## Preserve project boundaries
 
