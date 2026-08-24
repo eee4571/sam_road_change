@@ -154,6 +154,52 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
             self.assertEqual(calls[0], "道路面提取")
             self.assertNotIn("道路提取", calls)
 
+    def test_running_centerline_stage_enables_per_image_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            workspace, args = self._checkpoint_workspace(root)
+            state = user_pipeline._period_state_template("area_03", "2021")
+            state.update({"status": "running", "current_stage": "centerline"})
+            state["stages"].update({"prepare": "completed", "centerline": "running"})
+            user_pipeline.write_json(workspace / "period_state.json", state)
+            pipeline_state = root / "job_state.json"
+            user_pipeline.write_json(pipeline_state, {"run_id": "run_a", "status": "running"})
+            args.resume = True
+            args.pipeline_state = str(pipeline_state)
+            commands = []
+
+            def fake_run(command, _cwd, _env, label, _context=None):
+                commands.append((label, command))
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
+                user_pipeline.extract(args)
+
+            centerline_command = next(command for label, command in commands if label == "道路提取")
+            self.assertIn("--resume-existing-images", centerline_command)
+            state_index = centerline_command.index("--pipeline-state")
+            self.assertEqual(centerline_command[state_index + 1], str(pipeline_state))
+
+    def test_new_centerline_stage_does_not_enable_per_image_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace, args = self._checkpoint_workspace(Path(raw))
+            commands = []
+
+            def fake_run(command, _cwd, _env, label, _context=None):
+                commands.append((label, command))
+                return self._complete_fake_stage(workspace, label)
+
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
+                user_pipeline.extract(args)
+
+            centerline_command = next(command for label, command in commands if label == "道路提取")
+            self.assertNotIn("--resume-existing-images", centerline_command)
+            self.assertNotIn("--pipeline-state", centerline_command)
+
     def test_completed_stage_with_missing_output_is_not_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             workspace, args = self._checkpoint_workspace(Path(raw))

@@ -2270,6 +2270,10 @@ def extract(args: argparse.Namespace) -> dict:
             "--visualization", str(products / "road_overview.png"),
         ], ROOT),
     }
+    if resume:
+        stage_commands["centerline"][0].append("--resume-existing-images")
+        if pipeline_state_path is not None:
+            stage_commands["centerline"][0].extend(("--pipeline-state", str(pipeline_state_path.resolve())))
     try:
         for stage_index, (stage_key, stage_label) in enumerate(PERIOD_STAGE_DEFINITIONS, start=1):
             event_context = {

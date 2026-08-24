@@ -30,6 +30,12 @@ from argparse import ArgumentParser
 from pathlib import Path
 from package_paths import INFER_RUNS_ROOT, PROJECT_ROOT, resolve_path
 from input_catalog import read_path_list
+from image_resume import (
+    ImageResumeManager,
+    build_batch_identity,
+    ensure_unique_output_stems,
+    marker_summaries,
+)
 
 try:
     import rasterio
@@ -79,6 +85,14 @@ parser.add_argument(
     type=float,
     default=25.0,
     help="Fail fast above this single-image size to avoid exhausting RAM/VRAM. Set 0 to disable.",
+)
+parser.add_argument(
+    "--resume-existing-images", action="store_true",
+    help="Validate and skip complete input images in an interrupted batch.",
+)
+parser.add_argument(
+    "--pipeline-state", default="",
+    help="Optional pipeline job_state.json used only for safe legacy-output adoption.",
 )
 args = parser.parse_args()
 
@@ -192,20 +206,58 @@ def resolve_relative_context_for_postprocess(
     )
 
 
-def run_inference_on_images(net, config, input_img_paths, output_dir, input_label):
+def run_inference_on_images(
+    net, config, input_img_paths, output_dir, input_label, *,
+    resume_existing_images=False, resume_identity=None,
+    legacy_metadata=None, pipeline_state=None,
+):
     total_inference_seconds = 0.0
     recovery_summaries = []
     profile_decisions = []
+    ensure_unique_output_stems(input_img_paths)
+    resume_manager = (
+        ImageResumeManager(
+            output_dir, resume_identity, enabled=resume_existing_images,
+            legacy_metadata=legacy_metadata, pipeline_state=pipeline_state,
+        )
+        if isinstance(resume_identity, dict) else None
+    )
+    resume_counts = {
+        "validated_marker_skip_count": 0,
+        "legacy_adopted_count": 0,
+        "inferred_count": 0,
+    }
     print(f'Found {len(input_img_paths)} image(s) under {input_label}.')
     print(f'Inference patch size: {config.PATCH_SIZE}x{config.PATCH_SIZE}')
     print(f'Inference device: {resolved_device_name}')
+    print(
+        f'Image resume: {"enabled" if resume_existing_images else "disabled"}; '
+        f'total image count: {len(input_img_paths)}.'
+    )
 
     for img_path in input_img_paths:
         # Threshold selection is per complete image.  Never mutate the shared
         # batch config, otherwise one weak image would leak into the next tile.
         image_config = copy.deepcopy(config)
-        img_path = Path(img_path)
+        img_path = Path(img_path).expanduser().resolve()
         img_id = img_path.stem
+        if resume_manager is not None:
+            decision = resume_manager.inspect(img_path)
+            if decision["action"] == "skip":
+                recovery_summary, profile_decision = marker_summaries(decision["marker"])
+                recovery_summaries.append(recovery_summary)
+                profile_decisions.append(profile_decision)
+                total_inference_seconds += float(recovery_summary.get("total_image_seconds", 0.0) or 0.0)
+                if decision["origin"] == "legacy_adopted":
+                    resume_counts["legacy_adopted_count"] += 1
+                    print(f'[image-resume] Adopted complete legacy outputs for {img_path}.')
+                else:
+                    resume_counts["validated_marker_skip_count"] += 1
+                    print(f'[image-resume] Validated and skipped {img_path}.')
+                continue
+            print(f'[image-resume] Reprocessing {img_path}: {decision.get("reason", "not complete")}')
+            resume_manager.prepare_for_processing(img_path)
+        resume_counts["inferred_count"] += 1
         print(f'Processing {img_path}')
         img = read_rgb_img(img_path)
         original_height, original_width = img.shape[:2]
@@ -590,11 +642,21 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
                     'selected': int(float(score) > float(image_config.TOPO_THRESHOLD)),
                 })
 
+        if resume_manager is not None:
+            resume_manager.complete(img_path, recovery_summary, profile_decision)
+
         print(f'Done for {img_id}.')
 
+    known_timing_count = sum(
+        "total_image_seconds" in row for row in recovery_summaries
+    )
     time_txt = (
         f'Inference completed for {len(input_img_paths)} image(s) from {input_label} '
-        f'in {total_inference_seconds} seconds.'
+        f'with {total_inference_seconds} recorded seconds '
+        f'(timing available for {known_timing_count}/{len(input_img_paths)} images; '
+        f'validated marker skips: {resume_counts["validated_marker_skip_count"]}, '
+        f'legacy adopted: {resume_counts["legacy_adopted_count"]}, '
+        f'inferred: {resume_counts["inferred_count"]}).'
     )
     print(time_txt)
     with open(os.path.join(output_dir, 'inference_time.txt'), 'w', encoding='utf-8') as f:
@@ -691,6 +753,14 @@ def run_inference_on_images(net, config, input_img_paths, output_dir, input_labe
             })
         },
         'tiles': recovery_summaries,
+        'image_resume': {
+            'enabled': bool(resume_existing_images),
+            **resume_counts,
+        },
+        'summary_field_coverage': {
+            name: int(sum(name in row for row in recovery_summaries))
+            for name in (*total_fields, *timing_fields)
+        },
     }
     with open(os.path.join(output_dir, 'weak_recovery_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(recovery_report, file, ensure_ascii=False, indent=2)
@@ -1106,7 +1176,8 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     )
 
 if __name__ == "__main__":
-    config = load_config(args.config)
+    config_path = resolve_repo_path(args.config).resolve()
+    config = load_config(config_path)
     config.INFER_RESCALE_TO_MODEL_GSD = args.rescale_to_model_gsd == "on"
     if args.junction_node_mode:
         config.JUNCTION_NODE_MODE = args.junction_node_mode
@@ -1120,7 +1191,7 @@ if __name__ == "__main__":
     net = SAMRoadplus(config)
 
     # load checkpoint
-    checkpoint_path = resolve_repo_path(args.checkpoint)
+    checkpoint_path = resolve_repo_path(args.checkpoint).resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     print(f'##### Loading Trained CKPT {checkpoint_path} #####')
     net.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -1149,54 +1220,64 @@ if __name__ == "__main__":
         and not regularized_skeleton_active
         and config.get('RELATIVE_CONTINUOUS_TRACING_EXPERIMENTAL', False)
     )
-    with open(os.path.join(base_output_dir, 'inference_metadata.json'), 'w', encoding='utf-8') as file:
-        json.dump(
-            {
-                'checkpoint': str(checkpoint_path),
-                'config': str(resolve_repo_path(args.config)),
-                'device': resolved_device_name,
-                'topology_threshold': float(config.TOPO_THRESHOLD),
-                'topology_candidate_threshold': float(config.get('TOPO_CANDIDATE_THRESHOLD', 0.20)),
-                'requested_road_threshold_profile': requested_profile,
-                'diagnostic_reference_profile': str(
-                    config.get('SCENE_DIAGNOSTIC_REFERENCE_PROFILE', 'default')
-                ),
-                'profile_selection_mode': (
-                    'automatic' if requested_profile == 'auto' else 'manual'
-                ),
-                'weak_recovery_enabled': bool(config.get('WEAK_RECOVERY_ENABLED', True)),
-                'weak_bootstrap_enabled': bool(config.get('WEAK_BOOTSTRAP_ENABLED', True)),
-                'weak_bootstrap_only_if_low_confidence': bool(
-                    config.get('WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE', True)
-                ),
-                'relative_roadness_enabled': bool(
-                    config.get('RELATIVE_ROADNESS_ENABLED', False)
-                ),
-                'relative_injected_into_toponet': bool(
-                    config.get('RELATIVE_ROADNESS_ENABLED', False)
-                    and config.get('RELATIVE_INJECT_INTO_TOPONET', False)
-                ),
-                'relative_centerline_method': (
-                    'regularized_skeleton' if regularized_skeleton_active
-                    else 'continuous_trace' if continuous_tracing_active
-                    else 'ribbon'
-                ),
-                'regularized_skeleton_active': regularized_skeleton_active,
-                'continuous_tracing_active': continuous_tracing_active,
-                'junction_collapse_active': bool(
-                    regularized_skeleton_active
-                    and config.get('RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL', False)
-                ),
-                'endpoint_segment_recovery_active': bool(
-                    config.get('WEAK_SEGMENT_RECOVERY_ENABLED', False)
-                ),
-                'branch_aware_road_nms': True,
-            },
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
+    identity_parameters = {
+        'device': resolved_device_name,
+        'rescale_to_model_gsd': args.rescale_to_model_gsd,
+        'input_gsd': args.input_gsd,
+        'model_gsd': args.model_gsd,
+        'max_image_megapixels': args.max_image_megapixels,
+        'junction_node_mode': str(config.get('JUNCTION_NODE_MODE', '')),
+        'topology_threshold': float(config.TOPO_THRESHOLD),
+        'topology_candidate_threshold': float(config.get('TOPO_CANDIDATE_THRESHOLD', 0.20)),
+        'requested_road_threshold_profile': requested_profile,
+        'diagnostic_reference_profile': str(config.get('SCENE_DIAGNOSTIC_REFERENCE_PROFILE', 'default')),
+        'weak_recovery_enabled': bool(config.get('WEAK_RECOVERY_ENABLED', True)),
+        'weak_bootstrap_enabled': bool(config.get('WEAK_BOOTSTRAP_ENABLED', True)),
+        'weak_bootstrap_only_if_low_confidence': bool(config.get('WEAK_BOOTSTRAP_ONLY_IF_LOW_CONFIDENCE', True)),
+        'relative_roadness_enabled': bool(config.get('RELATIVE_ROADNESS_ENABLED', False)),
+        'relative_injected_into_toponet': bool(
+            config.get('RELATIVE_ROADNESS_ENABLED', False)
+            and config.get('RELATIVE_INJECT_INTO_TOPONET', False)
+        ),
+    }
+    resume_identity = build_batch_identity(checkpoint_path, config_path, identity_parameters)
+    metadata_path = Path(base_output_dir) / 'inference_metadata.json'
+    legacy_metadata = None
+    if args.resume_existing_images and metadata_path.is_file():
+        try:
+            value = json.loads(metadata_path.read_text(encoding='utf-8'))
+            legacy_metadata = value if isinstance(value, dict) else None
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            legacy_metadata = None
+    metadata = {
+        'checkpoint': str(checkpoint_path),
+        'config': str(config_path),
+        'device': resolved_device_name,
+        'topology_threshold': identity_parameters['topology_threshold'],
+        'topology_candidate_threshold': identity_parameters['topology_candidate_threshold'],
+        'requested_road_threshold_profile': requested_profile,
+        'diagnostic_reference_profile': identity_parameters['diagnostic_reference_profile'],
+        'profile_selection_mode': 'automatic' if requested_profile == 'auto' else 'manual',
+        'weak_recovery_enabled': identity_parameters['weak_recovery_enabled'],
+        'weak_bootstrap_enabled': identity_parameters['weak_bootstrap_enabled'],
+        'weak_bootstrap_only_if_low_confidence': identity_parameters['weak_bootstrap_only_if_low_confidence'],
+        'relative_roadness_enabled': identity_parameters['relative_roadness_enabled'],
+        'relative_injected_into_toponet': identity_parameters['relative_injected_into_toponet'],
+        'relative_centerline_method': (
+            'regularized_skeleton' if regularized_skeleton_active
+            else 'continuous_trace' if continuous_tracing_active
+            else 'ribbon'
+        ),
+        'regularized_skeleton_active': regularized_skeleton_active,
+        'continuous_tracing_active': continuous_tracing_active,
+        'junction_collapse_active': bool(
+            regularized_skeleton_active
+            and config.get('RELATIVE_JUNCTION_COLLAPSE_EXPERIMENTAL', False)
+        ),
+        'endpoint_segment_recovery_active': bool(config.get('WEAK_SEGMENT_RECOVERY_ENABLED', False)),
+        'branch_aware_road_nms': True,
+        'resume_identity': resume_identity,
+    }
     for source_name, source_path, input_img_paths in inference_sources:
         if not input_img_paths:
             raise RuntimeError(f"No images found in inference source: {source_path}")
@@ -1206,4 +1287,21 @@ if __name__ == "__main__":
         else:
             output_dir = base_output_dir
 
-        run_inference_on_images(net, config, input_img_paths, output_dir, str(source_path))
+        run_inference_on_images(
+            net, config, input_img_paths, output_dir, str(source_path),
+            resume_existing_images=args.resume_existing_images,
+            resume_identity=resume_identity,
+            legacy_metadata=legacy_metadata,
+            pipeline_state=(args.pipeline_state or None),
+        )
+
+    metadata_temporary = metadata_path.with_name(
+        f'.{metadata_path.name}.{os.getpid()}.tmp'
+    )
+    try:
+        metadata_temporary.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8',
+        )
+        os.replace(metadata_temporary, metadata_path)
+    finally:
+        metadata_temporary.unlink(missing_ok=True)
