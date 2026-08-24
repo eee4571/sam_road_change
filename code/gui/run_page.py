@@ -22,9 +22,9 @@ class RunPage:
         checklist.pack(fill=X, pady=(0, 6))
         self.preflight_check_labels = []
         for row_index, label in enumerate(("项目结构与验证区", "影像期次与覆盖范围", "模型、参数与运行环境", "输出位置与磁盘空间")):
-            ttk.Label(checklist, text=label).grid(row=row_index, column=0, sticky="w", pady=1)
+            ttk.Label(checklist, text=label).grid(row=row_index, column=0, sticky="w", pady=2)
             state_label = ttk.Label(checklist, text="开始前检查", style="CardMuted.TLabel")
-            state_label.grid(row=row_index, column=1, sticky="e", pady=1)
+            state_label.grid(row=row_index, column=1, sticky="e", pady=2)
             self.preflight_check_labels.append(state_label)
         checklist.grid_columnconfigure(0, weight=1)
         actions = ttk.Frame(run_card)
@@ -53,7 +53,7 @@ class RunPage:
         ttk.Label(progress_card, textvariable=self.progress_text).pack(anchor="w", pady=(5, 0))
 
         stage_card = ttk.LabelFrame(page, text="局部重跑", padding=LAYOUT_METRICS["card_padding"])
-        stage_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
+        stage_card.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
         selectors = ttk.Frame(stage_card)
         selectors.pack(fill=X, pady=(0, 5))
         ttk.Label(selectors, text="区域：").grid(row=0, column=0, sticky="w")
@@ -67,18 +67,22 @@ class RunPage:
         ttk.Label(selectors, text="相邻变化对：").grid(row=0, column=4, sticky="w")
         self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=16)
         self.stage_pair_combo.grid(row=0, column=5, sticky="ew", padx=(3, 0))
-        for column in (1, 3, 5):
-            selectors.grid_columnconfigure(column, weight=1)
+        selectors.grid_columnconfigure(1, weight=3)
+        selectors.grid_columnconfigure(3, weight=2)
+        selectors.grid_columnconfigure(5, weight=3)
         self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
-        affected_label = ttk.Label(stage_card, textvariable=self.affected_pairs_summary)
-        affected_label.pack(anchor="w", fill=X, pady=(0, 5))
-        bind_dynamic_wrap(affected_label, stage_card, minimum=220, padding=20)
+        affected_row = ttk.Frame(stage_card)
+        affected_row.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
+        ttk.Label(affected_row, text="受影响变化对：").pack(side=LEFT)
+        affected_label = ttk.Label(affected_row, textvariable=self.affected_pairs_summary)
+        affected_label.pack(side=LEFT, fill=X, expand=True)
+        bind_dynamic_wrap(affected_label, affected_row, minimum=180, padding=130)
         stage_actions = ttk.Frame(stage_card)
         stage_actions.pack(fill=X)
-        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=(7, 5))
-        road_actions.pack(side=LEFT, fill=X, expand=True, padx=(0, 3))
-        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=(7, 5))
-        change_actions.pack(side=LEFT, fill=X, expand=True, padx=(3, 0))
+        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=LAYOUT_METRICS["card_padding"])
+        road_actions.pack(fill=X)
+        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=LAYOUT_METRICS["card_padding"])
+        change_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
         self.stage_buttons = []
         for parent, text, command in (
             (road_actions, "重跑该期", lambda: self.rerun_selected_period(False)),
@@ -90,7 +94,7 @@ class RunPage:
             button.pack(side=LEFT, padx=(0, 4))
             self.stage_buttons.append(button)
         advanced_stage = ttk.Frame(stage_card)
-        advanced_stage.pack(fill=X, pady=(5, 0))
+        advanced_stage.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
         ttk.Label(advanced_stage, text="高级操作：").pack(side=LEFT)
         batch_button = ttk.Button(advanced_stage, text="批量重跑全部道路提取", command=self.run_extract_all)
         batch_button.pack(side=LEFT)
@@ -105,9 +109,9 @@ class RunPage:
             ("当前任务：", self.vars["run_id"]),
             ("任务状态：", self.run_status),
         )):
-            ttk.Label(summary_card, text=label, width=12).grid(row=row, column=0, sticky="nw", pady=2)
-            value_label = ttk.Label(summary_card, textvariable=variable)
-            value_label.grid(row=row, column=1, sticky="nw", pady=2)
+            ttk.Label(summary_card, text=label, width=12, style="Metric.TLabel").grid(row=row, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
+            value_label = ttk.Label(summary_card, textvariable=variable, style="Metric.TLabel")
+            value_label.grid(row=row, column=1, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
             bind_dynamic_wrap(value_label, summary_card, minimum=160, padding=130)
         summary_card.grid_columnconfigure(1, weight=1)
         run_settings_shell = ttk.Frame(summary_card)

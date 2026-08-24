@@ -329,7 +329,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("Page.TFrame", background=UI["page"])
         style.configure("Header.TFrame", background=UI["card"])
         style.configure("Footer.TFrame", background=UI["card"])
-        style.configure("TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9))
+        style.configure("TLabel", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 10))
         style.configure("Title.TLabel", background=UI["card"], font=("Microsoft YaHei UI", 10, "bold"), foreground=UI["ink"])
         style.configure("Subtitle.TLabel", background=UI["card"], font=("Microsoft YaHei UI", 9), foreground=UI["muted"])
         style.configure("Brand.TLabel", background=UI["header"], foreground="#79C3AD", font=("Segoe UI", 9, "bold"))
@@ -379,19 +379,19 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         style.configure("SuccessNote.TLabel", foreground=UI["green"], background=UI["blue_soft"], font=("Microsoft YaHei UI", 9))
         style.configure("WarningNote.TLabel", foreground=UI["amber"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"), padding=(18, 8))
-        style.configure("Hint.TLabel", foreground=UI["muted"], background=UI["card"])
+        style.configure("Hint.TLabel", foreground=UI["muted"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("Success.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("HeaderReady.TLabel", foreground=UI["green"], background=UI["card"], font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("HeaderIdle.TLabel", foreground=UI["muted"], background=UI["card"], font=("Microsoft YaHei UI", 9))
         style.configure("FooterStatus.TLabel", background=UI["card"], foreground=UI["muted"], font=("Microsoft YaHei UI", 9))
-        style.configure("TEntry", padding=(5, 3), fieldbackground=UI["card"], bordercolor=UI["line_strong"], lightcolor=UI["line_strong"], darkcolor=UI["line_strong"])
-        style.configure("TCombobox", padding=(5, 3), fieldbackground=UI["card"], bordercolor=UI["line_strong"])
+        style.configure("TEntry", padding=(6, 4), fieldbackground=UI["card"], bordercolor=UI["line_strong"], lightcolor=UI["line_strong"], darkcolor=UI["line_strong"])
+        style.configure("TCombobox", padding=(6, 4), fieldbackground=UI["card"], bordercolor=UI["line_strong"])
         style.map("TCombobox", fieldbackground=[("readonly", UI["card"])], background=[("readonly", UI["card"])], foreground=[("readonly", UI["ink"])])
         style.configure("TCheckbutton", background=UI["card"], foreground=UI["ink"])
         style.configure("TRadiobutton", background=UI["card"], foreground=UI["ink"])
         style.configure("Modern.Horizontal.TProgressbar", background=UI["blue"], troughcolor="#DEDAD0", borderwidth=1, thickness=9)
         style.configure("TLabelframe", background=UI["card"], bordercolor=UI["line_strong"], relief="groove", borderwidth=1)
-        style.configure("TLabelframe.Label", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("TLabelframe.Label", background=UI["card"], foreground=UI["ink"], font=("Microsoft YaHei UI", 10, "bold"))
         tree_metrics = treeview_metrics(self.root, ("Microsoft YaHei UI", 9))
         style.configure(
             "Data.Treeview", background=UI["card"], fieldbackground=UI["card"],
@@ -432,7 +432,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         menu.add_cascade(label="帮助", menu=help_menu)
         self.root.configure(menu=menu)
 
-        header = ttk.Frame(self.root, padding=(12, 7), style="Header.TFrame")
+        header = ttk.Frame(self.root, padding=(12, 6), style="Header.TFrame")
         header.pack(fill=X)
         ttk.Label(header, textvariable=self.current_project, style="HeaderProject.TLabel").pack(side=LEFT, fill=X, expand=True)
         ttk.Label(header, text="状态：", style="HeaderMeta.TLabel").pack(side=LEFT)
@@ -440,19 +440,24 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.header_state_label.pack(side=LEFT)
 
         self.stepper_canvas = Canvas(
-            self.root, height=43, background=UI["page"], highlightthickness=0, borderwidth=0,
+            self.root, height=round(34 * self.display_scale), background=UI["page"], highlightthickness=0, borderwidth=0,
         )
         self.stepper_canvas.pack(fill=X)
         self.stepper_canvas.bind("<Configure>", lambda _event: self._draw_stepper())
         self.stepper_canvas.bind("<Button-1>", self._on_stepper_click)
 
-        self.content_shell = ttk.Frame(self.root, style="Page.TFrame", padding=(10, 0, 10, 0))
+        page_padding = LAYOUT_METRICS["page_padding"]
+        self.content_shell = ttk.Frame(
+            self.root, style="Page.TFrame",
+            padding=(page_padding[0], 0, page_padding[2], 0),
+        )
         self.content_shell.pack(fill=BOTH, expand=True)
+        self.content_shell.grid_propagate(False)
         self.content_shell.grid_columnconfigure(0, weight=55, uniform="workflow")
         self.content_shell.grid_columnconfigure(1, weight=45, uniform="workflow")
         self.content_shell.grid_rowconfigure(0, weight=1)
         left_shell = ttk.Frame(self.content_shell, style="Page.TFrame")
-        left_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        left_shell.grid(row=0, column=0, sticky="nsew", padx=(0, LAYOUT_METRICS["module_gap"] // 2))
         self.content_canvas = Canvas(
             left_shell, background=UI["page"], highlightthickness=0, borderwidth=0,
         )
@@ -462,19 +467,28 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.content_scrollbar.pack(side=RIGHT, fill="y")
         self.content_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         self.content_canvas.configure(yscrollcommand=self.content_scrollbar.set)
-        self.page_host = ttk.Frame(self.content_canvas, padding=(0, 8, 4, 10), style="Page.TFrame")
+        self.page_host = ttk.Frame(
+            self.content_canvas,
+            padding=(0, page_padding[1], LAYOUT_METRICS["module_gap"] // 2, page_padding[3]),
+            style="Page.TFrame",
+        )
         self.page_window = self.content_canvas.create_window((0, 0), window=self.page_host, anchor="nw")
         self.max_page_width = round(1600 * self.display_scale)
         self.content_canvas.bind("<Configure>", self._resize_content_canvas)
         self.page_host.bind("<Configure>", lambda _event: self._sync_content_scrollregion())
         self.root.bind_all("<MouseWheel>", self._on_content_mousewheel, add="+")
         self.sidebar = ttk.Frame(self.content_shell, style="Page.TFrame")
-        self.sidebar.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(8, 10))
+        self.sidebar.grid(
+            row=0, column=1, sticky="nsew",
+            padx=(LAYOUT_METRICS["module_gap"] // 2, 0),
+            pady=(page_padding[1], page_padding[3]),
+        )
         self.sidebar.grid_columnconfigure(0, weight=1)
-        self.sidebar.grid_rowconfigure(0, weight=2)
-        self.sidebar.grid_rowconfigure(1, weight=3)
+        self.sidebar.grid_rowconfigure(0, weight=32, uniform="sidebar")
+        self.sidebar.grid_rowconfigure(1, weight=68, uniform="sidebar")
         self.summary_host = ttk.Frame(self.sidebar, style="Page.TFrame")
         self.summary_host.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        self.summary_host.grid_propagate(False)
         for _ in WORKFLOW_STEPS:
             page = ttk.Frame(self.page_host, style="Page.TFrame")
             self.step_pages.append(page)
@@ -488,7 +502,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self._build_shared_log_panel()
 
         ttk.Separator(self.root).pack(fill=X)
-        footer = ttk.Frame(self.root, padding=(10, 6), style="Footer.TFrame")
+        footer = ttk.Frame(self.root, padding=(12, 2), style="Footer.TFrame")
         footer.pack(fill=X)
         footer_status = ttk.Label(footer, textvariable=self.status, style="FooterStatus.TLabel")
         footer_status.pack(side=LEFT, fill=X, expand=True)
@@ -516,17 +530,17 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         log_status = ttk.Label(
             log_header, textvariable=self.shared_log_status, style="CardMuted.TLabel",
         )
-        log_status.pack(side=LEFT, fill=X, expand=True, padx=(16, 12))
+        log_status.pack(side=LEFT, fill=X, expand=True, padx=(LAYOUT_METRICS["module_gap"], 10))
         bind_dynamic_wrap(log_status, log_header, minimum=180, padding=220)
         ttk.Button(
             log_header, text="复制全部", style="Compact.TButton", command=self.copy_all_logs,
-        ).pack(side=RIGHT, padx=(0, 7))
+        ).pack(side=RIGHT, padx=(0, 5))
         ttk.Button(
             log_header, text="打开日志文件", style="Compact.TButton", command=self.open_active_log,
-        ).pack(side=RIGHT, padx=(0, 7))
+        ).pack(side=RIGHT, padx=(0, 5))
 
         self.log_frame = ttk.Frame(self.shared_log_shell)
-        self.log_frame.pack(fill=BOTH, expand=True, pady=(6, 0))
+        self.log_frame.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["module_gap"], 0))
         log_body = ttk.Frame(self.log_frame)
         log_body.pack(fill=BOTH, expand=True)
         self.log = Text(
@@ -592,10 +606,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         canvas = self.stepper_canvas
         canvas.delete("all")
         width = max(800, canvas.winfo_width())
-        height = max(40, canvas.winfo_height())
-        margin_x = 10
-        top = 4
-        bottom = height - 4
+        height = max(round(30 * self.display_scale), canvas.winfo_height())
+        margin_x = round(10 * self.display_scale)
+        edge = max(3, round(3 * self.display_scale))
+        top = edge
+        bottom = height - edge
         tab_width = (width - margin_x * 2) / len(WORKFLOW_STEPS)
         centers = [margin_x + tab_width * (index + 0.5) for index in range(len(WORKFLOW_STEPS))]
         has_results = self.results_available
@@ -794,7 +809,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         """Compatibility hook: the desktop layout keeps the shared log visible."""
         self.log_visible = True
         if not self.log_frame.winfo_manager():
-            self.log_frame.pack(fill=BOTH, expand=True, pady=(6, 0))
+            self.log_frame.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["module_gap"], 0))
 
     def _show_log(self) -> None:
         self._toggle_log()

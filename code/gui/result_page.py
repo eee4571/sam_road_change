@@ -25,7 +25,7 @@ class ResultPage:
     def _build_result_page(self, page: ttk.Frame) -> None:
         self.result_body = page
         result_card = ttk.LabelFrame(page, text="处理结果", padding=LAYOUT_METRICS["card_padding"])
-        result_card.pack(fill=X)
+        result_card.pack(fill=BOTH, expand=True)
         self.result_status = StringVar(value="打开项目或完成任务后，可在此查看处理结果。")
         self.result_period_count = StringVar(value="0 期")
         self.result_change_count = StringVar(value="0 组")
@@ -41,7 +41,7 @@ class ResultPage:
         bind_dynamic_wrap(result_status_label, result_card, minimum=260, padding=20)
         browser = ttk.Frame(result_card)
         browser.pack(fill=BOTH, expand=True, pady=(0, 5))
-        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=10, style="Data.Treeview")
+        self.result_tree = ttk.Treeview(browser, columns=("status",), show="tree headings", height=12, style="Data.Treeview")
         self.result_tree.heading("#0", text="成果")
         self.result_tree.heading("status", text="状态")
         self.result_tree.column("#0", width=620, minwidth=320, stretch=True)
@@ -133,9 +133,9 @@ class ResultPage:
             ("长时序成果：", self.result_temporal_summary),
             ("可评价变化对：", self.result_evaluable_count),
         )):
-            ttk.Label(summary, text=label, width=15).grid(row=row, column=0, sticky="nw", pady=2)
-            summary_value = ttk.Label(summary, textvariable=variable)
-            summary_value.grid(row=row, column=1, sticky="nw", pady=2)
+            ttk.Label(summary, text=label, width=15, style="Metric.TLabel").grid(row=row, column=0, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
+            summary_value = ttk.Label(summary, textvariable=variable, style="Metric.TLabel")
+            summary_value.grid(row=row, column=1, sticky="nw", pady=LAYOUT_METRICS["form_gap"] // 2)
             bind_dynamic_wrap(summary_value, summary, minimum=160, padding=150)
         summary.grid_columnconfigure(1, weight=1)
 
