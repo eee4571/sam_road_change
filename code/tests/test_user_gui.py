@@ -75,6 +75,68 @@ class UserGuiInputCommandTests(unittest.TestCase):
             button.state.assert_called_once_with(["disabled"])
         app.evaluation_status.set.assert_called_with("当前任务没有可评价的变化检测成果。")
 
+    def test_truth_shapefile_fields_and_type_codes_can_be_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            truth = Path(raw) / "truth.shp"
+            truth.touch()
+            fields = (("BHBM", b"N", 5), ("NOTE", b"C", 20))
+            header_length = 32 + 32 * len(fields) + 1
+            record_length = 1 + sum(length for _name, _kind, length in fields)
+            header = bytearray(32)
+            header[0] = 3
+            header[4:8] = (3).to_bytes(4, "little")
+            header[8:10] = header_length.to_bytes(2, "little")
+            header[10:12] = record_length.to_bytes(2, "little")
+            descriptors = bytearray()
+            for name, kind, length in fields:
+                row = bytearray(32)
+                row[:len(name)] = name.encode("ascii")
+                row[11:12] = kind
+                row[16] = length
+                descriptors.extend(row)
+            records = bytearray()
+            for code, note in ((2, "新增"), (3, "变化"), (4, "灭失")):
+                records.extend(b" " + f"{code:>5}".encode("ascii") + note.encode("utf-8").ljust(20))
+            truth.with_suffix(".dbf").write_bytes(header + descriptors + b"\r" + records + b"\x1a")
+            truth.with_suffix(".cpg").write_text("UTF-8", encoding="ascii")
+
+            summary = gui.shapefile_field_summary(truth)
+
+        self.assertEqual(summary["fields"], ["BHBM", "NOTE"])
+        self.assertEqual(summary["values"]["BHBM"], ["2", "3", "4"])
+
+    def test_evaluation_field_status_confirms_bhbm_mapping_and_missing_field(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.evaluation_truth = mock.Mock(get=mock.Mock(return_value="truth.shp"))
+        app.evaluation_type_field = mock.Mock(get=mock.Mock(return_value="BHBM"))
+        app.evaluation_type_field_combo = mock.Mock()
+        app.evaluation_type_field_status = mock.Mock()
+        app.evaluation_added_value = mock.Mock(get=mock.Mock(return_value="2"))
+        app.evaluation_width_changed_value = mock.Mock(get=mock.Mock(return_value="3"))
+        app.evaluation_removed_value = mock.Mock(get=mock.Mock(return_value="4"))
+        app.evaluation_value_combos = {
+            "added": mock.Mock(), "width_changed": mock.Mock(), "removed": mock.Mock(),
+        }
+        app.project_manager = mock.Mock()
+        app.project_manager.truth_field_summary.return_value = {
+            "fields": ["BHBM", "name"],
+            "values": {"BHBM": ["2", "3", "4"], "name": ["sample"]},
+        }
+
+        app._refresh_evaluation_truth_fields()
+
+        app.evaluation_type_field_combo.configure.assert_called_with(values=["BHBM", "name"])
+        message = app.evaluation_type_field_status.set.call_args.args[0]
+        self.assertIn("已确认字段“BHBM”", message)
+        self.assertIn("2=新增，3=宽度变化，4=灭失", message)
+        self.assertEqual(app._evaluation_truth_value_map(), {
+            "added": "2", "width_changed": "3", "removed": "4",
+        })
+
+        app.evaluation_type_field.get.return_value = "change_type"
+        app._evaluation_type_field_changed()
+        self.assertIn("当前真值不含字段“change_type”", app.evaluation_type_field_status.set.call_args.args[0])
+
     def test_harmless_tiff_warning_is_hidden_but_preserved_in_log_file(self) -> None:
         raw = "cv::TIFF_Warning TIFFReadDirectory: Unknown field with tag 33550\n"
         log_file = io.StringIO()
@@ -337,10 +399,16 @@ class UserGuiInputCommandTests(unittest.TestCase):
                 {"grid": "validation", "before_period": "2021", "after_period": "2022"},
                 root / "pipeline_result.json", str(truth), truth_type_field="change_typ",
                 validation_area=str(root / "area.shp"), evaluation_tolerance="5.0",
+                truth_value_map={
+                    "added": "A", "width_changed": "W", "removed": "R",
+                },
             )
             self.assertEqual(command[0], "evaluate-existing")
             self.assertIn("--pipeline-manifest", command)
             self.assertIn("--truth-type-field", command)
+            self.assertEqual(command[command.index("--truth-added-value") + 1], "A")
+            self.assertEqual(command[command.index("--truth-width-changed-value") + 1], "W")
+            self.assertEqual(command[command.index("--truth-removed-value") + 1], "R")
 
     def test_entering_run_step_does_not_auto_start_preflight(self) -> None:
         source = inspect.getsource(gui.UserApp._show_step)

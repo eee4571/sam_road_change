@@ -465,7 +465,7 @@ def manifest_contains_period_result(manifest_path: Path | str | None, result_pat
 def build_evaluate_existing_command(
     item: dict[str, str], pipeline_manifest: Path | str, truth: str,
     *, truth_type_field: str = "", validation_area: str = "",
-    evaluation_tolerance: str = "5.0",
+    evaluation_tolerance: str = "5.0", truth_value_map: dict[str, str] | None = None,
 ) -> list[str]:
     """Build a result-stage evaluation command for one existing change pair."""
     truth_path = Path(str(truth).strip()).expanduser()
@@ -486,12 +486,20 @@ def build_evaluate_existing_command(
         args.extend(("--validation-area", str(validation_area).strip()))
     if str(truth_type_field).strip():
         args.extend(("--truth-type-field", str(truth_type_field).strip()))
+    for key, option in (
+        ("added", "--truth-added-value"),
+        ("width_changed", "--truth-width-changed-value"),
+        ("removed", "--truth-removed-value"),
+    ):
+        value = str((truth_value_map or {}).get(key) or "").strip()
+        if value:
+            args.extend((option, value))
     return args
 
 def build_evaluate_all_command(
     manifest: dict, pipeline_manifest: Path | str,
     truths: list[tuple[str, str, str, str]], *, truth_type_field: str = "BHBM",
-    evaluation_tolerance: str = "5.0",
+    evaluation_tolerance: str = "5.0", truth_value_map: dict[str, str] | None = None,
 ) -> list[str]:
     """Build one result-stage command covering every area and adjacent pair."""
     truth_map = {
@@ -504,6 +512,14 @@ def build_evaluate_all_command(
         "--truth-type-field", str(truth_type_field or "BHBM"),
         "--evaluation-tolerance", str(evaluation_tolerance),
     ]
+    for key, option in (
+        ("added", "--truth-added-value"),
+        ("width_changed", "--truth-width-changed-value"),
+        ("removed", "--truth-removed-value"),
+    ):
+        value = str((truth_value_map or {}).get(key) or "").strip()
+        if value:
+            args.extend((option, value))
     missing = []
     for entry in changes:
         key = (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))

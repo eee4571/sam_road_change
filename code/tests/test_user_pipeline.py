@@ -31,6 +31,19 @@ class GridDiscoveryTests(unittest.TestCase):
             self.assertEqual(list(found), ["grid_01"])
             self.assertEqual(list(found["grid_01"]), ["2021", "2022", "2023"])
 
+    def test_truth_value_mapping_standardizes_user_selected_values_in_memory(self) -> None:
+        import pandas as pd
+
+        truth = pd.DataFrame({"CUSTOM": ["new-road", "changed", "gone", "ignore"]})
+        mapped, field = user_pipeline.apply_truth_value_mapping(truth, "custom", {
+            "added": "new-road", "width_changed": "changed", "removed": "gone",
+        })
+
+        self.assertEqual(field, "__samroad_truth_type")
+        self.assertEqual(list(mapped[field].iloc[:3]), ["added", "width_changed", "removed"])
+        self.assertTrue(pd.isna(mapped[field].iloc[3]))
+        self.assertNotIn(field, truth.columns)
+
     def test_rejects_grid_with_only_one_period(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             grid = Path(raw) / "grid_01"

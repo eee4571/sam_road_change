@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from input_catalog import (
@@ -2591,6 +2592,43 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
     return payload
 
 
+def _truth_value_key(value) -> str:
+    text = str(value).strip()
+    try:
+        return "number:" + str(Decimal(text).normalize())
+    except (InvalidOperation, ValueError):
+        return "text:" + text.casefold()
+
+
+def apply_truth_value_mapping(truth, type_field: str, value_map: dict[str, str]):
+    """Return an in-memory standardized truth field without editing the SHP."""
+    configured = {key: str(value or "").strip() for key, value in value_map.items()}
+    if any(not configured.get(key) for key in ("added", "width_changed", "removed")):
+        raise ValueError("真值类型映射必须同时提供新增、宽度变化和灭失三个字段值。")
+    if not type_field:
+        raise ValueError("配置真值类型映射时必须指定变化类型字段。")
+    field = next(
+        (str(column) for column in truth.columns if str(column).casefold() == type_field.casefold()),
+        "",
+    )
+    if not field:
+        raise ValueError(f"真值中不存在变化类型字段：{type_field}")
+    normalized_map = {
+        _truth_value_key(raw_value): change_type
+        for change_type, raw_value in configured.items()
+    }
+    if len(normalized_map) != 3:
+        raise ValueError("新增、宽度变化和灭失必须对应三个不同的真值字段值。")
+    target_field = "__samroad_truth_type"
+    mapped = truth.copy()
+    mapped[target_field] = mapped[field].map(
+        lambda value: normalized_map.get(_truth_value_key(value)),
+    )
+    if not mapped[target_field].notna().any():
+        raise ValueError("当前真值中没有记录匹配所配置的变化类型字段值。")
+    return mapped, target_field
+
+
 def evaluate_existing_changes(args: argparse.Namespace) -> dict:
     """Evaluate one saved change result without rerunning extraction or detection."""
     started = time.monotonic()
@@ -2623,6 +2661,18 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
 
     emit("stage", stage="精度评价", status="running", completed=0, total=1)
     truth = gpd.read_file(truth_path)
+    original_truth_type_field = str(args.truth_type_field or "").strip()
+    truth_value_map = {
+        "added": str(getattr(args, "truth_added_value", "") or "").strip(),
+        "width_changed": str(getattr(args, "truth_width_changed_value", "") or "").strip(),
+        "removed": str(getattr(args, "truth_removed_value", "") or "").strip(),
+    }
+    configured_values = [value for value in truth_value_map.values() if value]
+    evaluation_truth_type_field = original_truth_type_field
+    if configured_values:
+        truth, evaluation_truth_type_field = apply_truth_value_mapping(
+            truth, original_truth_type_field, truth_value_map,
+        )
     if gpkg.is_file():
         predicted = gpd.read_file(gpkg, layer="road_changes")
     else:
@@ -2643,7 +2693,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         predicted,
         truth,
         validation,
-        str(args.truth_type_field or "").strip(),
+        evaluation_truth_type_field,
         float(args.evaluation_tolerance),
         class_mode="three",
     )
@@ -2656,15 +2706,22 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
     summary_path = Path(str(entry.get("summary") or output / "change_summary.json")).expanduser().resolve()
     summary = read_json(summary_path) if summary_path.is_file() else {}
     summary["evaluation"] = {"metadata": metadata, "metrics": rows}
+    if configured_values:
+        summary["evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
+        summary["evaluation"]["metadata"]["truth_value_map"] = truth_value_map
     write_json(summary_path, summary)
 
     entry["truth"] = str(truth_path)
-    entry["truth_type_field"] = str(args.truth_type_field or "").strip()
+    entry["truth_type_field"] = original_truth_type_field
+    if configured_values:
+        entry["truth_value_map"] = truth_value_map
     entry["validation_area"] = validation_value
     entry["evaluation_metrics"] = str(metrics_path)
     entry["evaluated_at"] = now_text()
     manifest["evaluation_enabled"] = True
-    manifest["truth_type_field"] = str(args.truth_type_field or "").strip()
+    manifest["truth_type_field"] = original_truth_type_field
+    if configured_values:
+        manifest["truth_value_map"] = truth_value_map
     manifest["updated_at"] = now_text()
 
     job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
@@ -2728,6 +2785,9 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
             before_period=key[1], after_period=key[2], truth=truths[key],
             validation_area=str(entry.get("validation_area") or ""),
             truth_type_field=str(args.truth_type_field or entry.get("truth_type_field") or ""),
+            truth_added_value=str(getattr(args, "truth_added_value", "") or ""),
+            truth_width_changed_value=str(getattr(args, "truth_width_changed_value", "") or ""),
+            truth_removed_value=str(getattr(args, "truth_removed_value", "") or ""),
             evaluation_tolerance=float(args.evaluation_tolerance),
         ))
         completed += 1
@@ -4365,11 +4425,17 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--truth", required=True)
     a.add_argument("--validation-area", default="")
     a.add_argument("--truth-type-field", default="")
+    a.add_argument("--truth-added-value", default="")
+    a.add_argument("--truth-width-changed-value", default="")
+    a.add_argument("--truth-removed-value", default="")
     a.add_argument("--evaluation-tolerance", type=float, default=5.0)
     a = sub.add_parser("evaluate-all-existing", help="评价已有任务的全部验证区和相邻期变化，并汇总总精度")
     a.add_argument("--pipeline-manifest", required=True)
     a.add_argument("--truth", action="append", nargs=4, metavar=("AREA", "BEFORE", "AFTER", "SHP"), default=[])
     a.add_argument("--truth-type-field", default="BHBM")
+    a.add_argument("--truth-added-value", default="")
+    a.add_argument("--truth-width-changed-value", default="")
+    a.add_argument("--truth-removed-value", default="")
     a.add_argument("--evaluation-tolerance", type=float, default=5.0)
     a = sub.add_parser("all", help="验证模式默认按显式期次运行；格网模式保留旧布局扫描")
     a.add_argument("--mode", choices=["validation", "grid"], default="validation")

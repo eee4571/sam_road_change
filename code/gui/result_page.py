@@ -94,12 +94,54 @@ class ResultPage:
         self.evaluation_advanced_toggle.pack(anchor="w", pady=(4, 4))
         options_row = ttk.Frame(evaluation_card)
         self.evaluation_advanced_frame = options_row
-        ttk.Label(options_row, text="变化类型字段", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
+        field_row = ttk.Frame(options_row)
+        field_row.pack(fill=X)
+        ttk.Label(field_row, text="变化类型字段", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_type_field = StringVar(value="BHBM")
-        ttk.Entry(options_row, textvariable=self.evaluation_type_field, width=18).pack(side=LEFT)
-        ttk.Label(options_row, text="中心线匹配容差（米）").pack(side=LEFT, padx=(20, 8))
+        self.evaluation_type_field_combo = ttk.Combobox(
+            field_row, textvariable=self.evaluation_type_field, width=18, state="normal",
+        )
+        self.evaluation_type_field_combo.pack(side=LEFT)
+        self.evaluation_type_field_combo.bind(
+            "<<ComboboxSelected>>", self._evaluation_type_field_changed,
+        )
+        self.evaluation_type_field_combo.bind(
+            "<FocusOut>", self._evaluation_type_field_changed,
+        )
+        ttk.Button(
+            field_row, text="检查当前真值字段", style="Compact.TButton",
+            command=lambda: self._refresh_evaluation_truth_fields(show_error=True),
+        ).pack(side=LEFT, padx=(6, 0))
+        tolerance_row = ttk.Frame(options_row)
+        tolerance_row.pack(fill=X, pady=(4, 0))
+        ttk.Label(tolerance_row, text="中心线匹配容差（米）", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_tolerance = StringVar(value="5.0")
-        ttk.Entry(options_row, textvariable=self.evaluation_tolerance, width=9).pack(side=LEFT)
+        ttk.Entry(tolerance_row, textvariable=self.evaluation_tolerance, width=9).pack(side=LEFT)
+        self.evaluation_type_field_status = StringVar(
+            value="选择变化对并补充真值后，可检查 SHP 中实际存在的字段和样例值。",
+        )
+        self._evaluation_truth_field_summary: dict[str, object] = {}
+        type_field_status_label = ttk.Label(
+            options_row, textvariable=self.evaluation_type_field_status, style="CardMuted.TLabel",
+        )
+        type_field_status_label.pack(anchor="w", fill=X, pady=(4, 0))
+        bind_dynamic_wrap(type_field_status_label, options_row, minimum=260, padding=20)
+        value_row = ttk.Frame(options_row)
+        value_row.pack(fill=X, pady=(5, 0))
+        ttk.Label(value_row, text="字段值对应关系", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
+        self.evaluation_added_value = StringVar(value="2")
+        self.evaluation_width_changed_value = StringVar(value="3")
+        self.evaluation_removed_value = StringVar(value="4")
+        self.evaluation_value_combos = {}
+        for key, label, variable in (
+            ("added", "新增", self.evaluation_added_value),
+            ("width_changed", "宽度变化", self.evaluation_width_changed_value),
+            ("removed", "灭失", self.evaluation_removed_value),
+        ):
+            ttk.Label(value_row, text=f"{label}=").pack(side=LEFT, padx=((8 if key != "added" else 0), 3))
+            combo = ttk.Combobox(value_row, textvariable=variable, width=9, state="normal")
+            combo.pack(side=LEFT)
+            self.evaluation_value_combos[key] = combo
         action_row = ttk.Frame(evaluation_card)
         action_row.pack(fill=X)
         self.evaluation_status = StringVar(value="请先载入或生成包含变化检测的任务结果。")
@@ -396,6 +438,97 @@ class ResultPage:
         else:
             self.evaluation_truth.set("缺少真值")
             self.evaluation_truth_summary.set("缺少真值；点击“补充真值”后会自动保存到项目配置。")
+        self._refresh_evaluation_truth_fields()
+
+    def _refresh_evaluation_truth_fields(self, *, show_error: bool = False) -> None:
+        if not hasattr(self, "evaluation_type_field_combo"):
+            return
+        truth = str(self.evaluation_truth.get() or "").strip()
+        if not truth or truth == "缺少真值":
+            self._evaluation_truth_field_summary = {}
+            self.evaluation_type_field_combo.configure(values=())
+            self.evaluation_type_field_status.set(
+                "选择变化对并补充真值后，可检查 SHP 中实际存在的字段和样例值。",
+            )
+            return
+        try:
+            summary = self.project_manager.truth_field_summary(truth)
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._evaluation_truth_field_summary = {}
+            self.evaluation_type_field_combo.configure(values=())
+            self.evaluation_type_field_status.set(f"无法读取当前真值字段：{exc}")
+            if show_error:
+                messagebox.showerror("无法检查真值字段", str(exc), parent=self.root)
+            return
+        self._evaluation_truth_field_summary = summary
+        fields = [str(name) for name in summary.get("fields", [])]
+        self.evaluation_type_field_combo.configure(values=fields)
+        selected = self.evaluation_type_field.get().strip()
+        canonical = next(
+            (name for name in fields if name.casefold() == selected.casefold()), None,
+        )
+        if canonical is not None and canonical != selected:
+            self.evaluation_type_field.set(canonical)
+        self._evaluation_type_field_changed()
+
+    def _evaluation_type_field_changed(self, _event=None) -> None:
+        if not hasattr(self, "evaluation_type_field_status"):
+            return
+        field = self.evaluation_type_field.get().strip()
+        summary = getattr(self, "_evaluation_truth_field_summary", {})
+        fields = [str(name) for name in summary.get("fields", [])]
+        matched = next((name for name in fields if name.casefold() == field.casefold()), None)
+        if not fields:
+            return
+        if matched is None:
+            self.evaluation_type_field_status.set(
+                f"当前真值不含字段“{field or '（空）'}”；请选择实际字段：{'、'.join(fields)}。",
+            )
+            return
+        values_by_field = summary.get("values") if isinstance(summary.get("values"), dict) else {}
+        values = [str(value) for value in values_by_field.get(matched, [])]
+        samples = "、".join(values) if values else "未读取到非空值"
+        for combo in getattr(self, "evaluation_value_combos", {}).values():
+            combo.configure(values=values)
+        if matched.casefold() == "bhbm":
+            detail = f"编码规则：2=新增，3=宽度变化，4=灭失；当前样例值：{samples}"
+            defaults = ("2", "3", "4")
+            for variable, default in zip((
+                self.evaluation_added_value,
+                self.evaluation_width_changed_value,
+                self.evaluation_removed_value,
+            ), defaults):
+                if default in values or not values:
+                    variable.set(default)
+        else:
+            detail = f"样例值：{samples}"
+        self.evaluation_type_field_status.set(f"已确认字段“{matched}”；{detail}。")
+
+    def _evaluation_truth_value_map(self) -> dict[str, str]:
+        mapping = {
+            "added": self.evaluation_added_value.get().strip(),
+            "width_changed": self.evaluation_width_changed_value.get().strip(),
+            "removed": self.evaluation_removed_value.get().strip(),
+        }
+        if any(not value for value in mapping.values()):
+            raise ValueError("请分别选择新增、宽度变化和灭失对应的真值字段值。")
+        if len({value.casefold() for value in mapping.values()}) != 3:
+            raise ValueError("新增、宽度变化和灭失必须对应三个不同的真值字段值。")
+        values_by_field = (
+            getattr(self, "_evaluation_truth_field_summary", {}).get("values") or {}
+        )
+        selected_field = self.evaluation_type_field.get().strip()
+        matched_field = next(
+            (name for name in values_by_field if str(name).casefold() == selected_field.casefold()),
+            selected_field,
+        )
+        available = {
+            str(value).casefold() for value in values_by_field.get(matched_field, [])
+        }
+        missing = [value for value in mapping.values() if available and value.casefold() not in available]
+        if missing:
+            raise ValueError("所选字段中没有以下映射值：" + "、".join(missing))
+        return mapping
 
     def supplement_evaluation_truth(self) -> None:
         if not self.result_change_items or not hasattr(self, "evaluation_pair_combo"):
@@ -458,11 +591,17 @@ class ResultPage:
             messagebox.showinfo("未选择变化对", "请先选择一组待评价的变化检测成果。", parent=self.root)
             return
         try:
+            value_map = self._evaluation_truth_value_map()
+        except ValueError as exc:
+            messagebox.showinfo("真值类型映射不完整", str(exc), parent=self.root)
+            return
+        try:
             args = self.task_manager.build_evaluate_existing(
                 item, latest, self.evaluation_truth.get(),
                 truth_type_field=self.evaluation_type_field.get(),
                 validation_area=str(item.get("validation_area") or manifest.get("validation_area") or ""),
                 evaluation_tolerance=self.evaluation_tolerance.get(),
+                truth_value_map=value_map,
             )
         except ValueError as exc:
             messagebox.showerror("无法运行精度评价", str(exc), parent=self.root)
@@ -479,10 +618,12 @@ class ResultPage:
             messagebox.showinfo("暂无可评价成果", "当前任务没有可评价的变化检测成果。", parent=self.root)
             return
         try:
+            value_map = self._evaluation_truth_value_map()
             args = self.task_manager.build_evaluate_all(
                 manifest, latest, self.project_area_truths,
                 truth_type_field=self.evaluation_type_field.get(),
                 evaluation_tolerance=self.evaluation_tolerance.get(),
+                truth_value_map=value_map,
             )
         except ValueError as exc:
             messagebox.showerror("无法运行总精度评价", str(exc), parent=self.root)

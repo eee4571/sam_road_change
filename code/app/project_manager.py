@@ -51,6 +51,91 @@ PREVIEW_LABELS = {
     "review_change": "待复核变化",
 }
 
+
+def shapefile_field_summary(
+    path: Path | str, *, record_limit: int = 200, value_limit: int = 8,
+) -> dict[str, object]:
+    """Read a small DBF schema/value sample without loading feature geometry."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.suffix.casefold() != USER_VECTOR_SUFFIX:
+        raise ValueError(f"找不到真值 SHP 文件：{source}")
+    dbf = source.with_suffix(".dbf")
+    if not dbf.is_file():
+        raise ValueError(f"真值 SHP 缺少属性表 DBF：{dbf}")
+    cpg = source.with_suffix(".cpg")
+    encodings: list[str] = []
+    if cpg.is_file():
+        try:
+            declared = cpg.read_text(encoding="ascii", errors="ignore").strip().strip('"')
+            declared = {"65001": "utf-8", "936": "cp936", "54936": "gb18030"}.get(
+                declared, declared,
+            )
+            if declared:
+                encodings.append(declared)
+        except OSError:
+            pass
+    encodings.extend(("utf-8", "gb18030", "cp936", "latin1"))
+    encodings = list(dict.fromkeys(encodings))
+
+    def decode(raw: bytes) -> str:
+        content = raw.rstrip(b" \x00")
+        if not content:
+            return ""
+        for encoding in encodings:
+            try:
+                return content.decode(encoding).strip()
+            except (LookupError, UnicodeError):
+                continue
+        return content.decode("latin1", errors="replace").strip()
+
+    try:
+        with dbf.open("rb") as stream:
+            header = stream.read(32)
+            if len(header) != 32:
+                raise ValueError("DBF 文件头不完整")
+            record_count = int.from_bytes(header[4:8], "little")
+            header_length = int.from_bytes(header[8:10], "little")
+            record_length = int.from_bytes(header[10:12], "little")
+            if header_length < 33 or record_length < 1:
+                raise ValueError("DBF 文件头尺寸无效")
+            descriptor_data = stream.read(header_length - 32)
+            descriptors: list[tuple[str, int]] = []
+            for offset in range(0, len(descriptor_data), 32):
+                row = descriptor_data[offset:offset + 32]
+                if not row or row[0] == 0x0D:
+                    break
+                if len(row) < 32:
+                    raise ValueError("DBF 字段描述不完整")
+                name = decode(row[:11])
+                length = int(row[16])
+                if name and length > 0:
+                    descriptors.append((name, length))
+            if not descriptors:
+                raise ValueError("DBF 中没有可用字段")
+            fields = [name for name, _length in descriptors]
+            values: dict[str, list[str]] = {name: [] for name in fields}
+            sampled = 0
+            stream.seek(header_length)
+            for _index in range(min(record_count, max(0, int(record_limit)))):
+                record = stream.read(record_length)
+                if len(record) != record_length:
+                    raise ValueError("DBF 属性记录被截断")
+                if record[:1] == b"*":
+                    continue
+                sampled += 1
+                position = 1
+                for name, length in descriptors:
+                    text = decode(record[position:position + length])
+                    position += length
+                    if text and text not in values[name] and len(values[name]) < value_limit:
+                        values[name].append(text)
+            return {
+                "path": str(source), "fields": fields, "values": values,
+                "encoding": encodings[0], "sampled_records": sampled,
+            }
+    except OSError as exc:
+        raise ValueError(f"无法读取真值 DBF：{dbf}：{exc}") from exc
+
 def _manifest_path(value: object, base_dir: Path | None = None) -> Path | None:
     """Return a manifest path, accepting the frozen string or a small path mapping."""
     if isinstance(value, dict):
@@ -1142,6 +1227,10 @@ class ProjectManager:
     @staticmethod
     def source_signature(source: Path | str) -> dict[str, int]:
         return external_source_signature(source)
+
+    @staticmethod
+    def truth_field_summary(path: Path | str) -> dict[str, object]:
+        return shapefile_field_summary(path)
 
     @staticmethod
     def cache_scan(scan: dict) -> dict:
