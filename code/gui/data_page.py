@@ -49,6 +49,7 @@ class DataPage:
         quick_actions = ttk.Frame(project_card)
         quick_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
         ttk.Button(quick_actions, text="连接数据源", command=self.connect_data_source).pack(side=LEFT)
+        ttk.Button(quick_actions, text="重新定位", command=self.relocate_data_source).pack(side=LEFT, padx=(5, 0))
         self.scan_data_button = ttk.Button(
             quick_actions, text="重新扫描",
             command=self.scan_data_sources,
@@ -406,6 +407,7 @@ class DataPage:
             "external_data_sources": list(dict.fromkeys(self.project_data_sources)),
             "external_scan_cache": self.project_scan_cache,
             "txt_encodings": self.project_txt_encodings,
+            "path_relocations": self.project_path_relocations,
             "validation_areas": [list(row) for row in self.project_validation_areas],
             "area_periods": {
                 area: [list(row) for row in rows]
@@ -476,6 +478,11 @@ class DataPage:
             for source, encoding in (payload.get("txt_encodings") or {}).items()
             if str(source).strip() and str(encoding).strip()
         }
+        self.project_path_relocations = {
+            str(old): str(new)
+            for old, new in (payload.get("path_relocations") or {}).items()
+            if str(old).strip() and str(new).strip()
+        }
         self.project_validation_areas = [
             (str(name), str(path)) for name, path in payload.get("validation_areas", [])
         ]
@@ -508,6 +515,13 @@ class DataPage:
             )
             self.data_status.set("已恢复扫描缓存")
 
+        issues = self.project_manager.path_issues(payload)
+        if issues:
+            self.data_status.set("存在失效路径")
+            self.project_scan_summary.set(
+                f"检测到 {len(issues)} 个失效输入路径；请点击“重新定位”选择新的数据目录。"
+            )
+
     def connect_data_source(self) -> None:
         if not self.project_root_path:
             messagebox.showinfo("请先打开项目", "请先新建或打开项目文件夹，再连接外部原始数据源。", parent=self.root)
@@ -526,6 +540,51 @@ class DataPage:
             self.scan_data_sources(sources=[resolved], force=True)
         else:
             self.status.set("该数据源已有完整扫描缓存；点击“重新扫描”可显式刷新。")
+
+    def relocate_data_source(self) -> None:
+        if not self.project_root_path:
+            messagebox.showinfo("请先打开项目", "请先打开包含失效路径的项目。", parent=self.root)
+            return
+        payload = self._project_payload()
+        issues = self.project_manager.path_issues(payload)
+        missing_sources = [
+            str(source) for source in self.project_data_sources
+            if str(source).strip() and not Path(source).expanduser().is_dir()
+        ]
+        if not issues and not missing_sources:
+            messagebox.showinfo("路径有效", "当前配置的外部数据路径均有效。", parent=self.root)
+            return
+        suggested = missing_sources[0] if missing_sources else str(Path(issues[0]["path"]).parent)
+        old_value = simpledialog.askstring(
+            "原数据根目录",
+            "请输入需要替换的原数据根目录。目录下的验证区、期次 TXT、真值和缓存路径会一起更新：",
+            initialvalue=suggested,
+            parent=self.root,
+        )
+        if old_value is None or not old_value.strip():
+            return
+        new_value = filedialog.askdirectory(parent=self.root, title="选择重新定位后的数据根目录")
+        if not new_value:
+            return
+        try:
+            updated = self.project_manager.relocate_paths(payload, old_value, new_value)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("重新定位失败", str(exc), parent=self.root)
+            return
+        self._apply_project_config(updated)
+        self._refresh_project_config_panel()
+        self._refresh_input_summary()
+        if not self._save_project_config():
+            return
+        remaining = self.project_manager.path_issues(self._project_payload())
+        self.data_status.set("重新定位完成" if not remaining else "仍有失效路径")
+        self.project_scan_summary.set(
+            "数据路径重新定位完成。" if not remaining
+            else f"本次映射已保存，仍有 {len(remaining)} 个失效路径；可再次点击“重新定位”。"
+        )
+        resolved_new = str(Path(new_value).expanduser().resolve())
+        if resolved_new in self.project_data_sources:
+            self.scan_data_sources(sources=[resolved_new], force=True)
 
     def scan_data_sources(self, *, sources: list[str] | None = None, force: bool = True) -> None:
         if not self.project_data_sources:
@@ -801,6 +860,7 @@ class DataPage:
         self.project_data_sources = []
         self.project_scan_cache = {}
         self.project_txt_encodings = {}
+        self.project_path_relocations = {}
         self.project_candidates = {"shp": [], "txt": []}
         self.vars["output_root"].set(str((root / RESULT_DIRECTORY_NAME).resolve()))
         self.data_source_display.set("尚未连接外部数据源")
@@ -858,6 +918,7 @@ class DataPage:
             self.project_data_sources = []
             self.project_scan_cache = {}
             self.project_txt_encodings = {}
+            self.project_path_relocations = {}
             self.project_validation_areas = []
             self.project_area_truths = []
             self.project_area_periods = {}

@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from input_catalog import period_sort_key
+from input_catalog import period_sort_key, read_path_list
 from app.result_publisher import (
     LEGACY_RESULT_DIRECTORY_NAME, RESULT_DIRECTORY_NAME,
     ProjectLayout, atomic_write_json as write_result_json,
@@ -213,6 +213,205 @@ def atomic_write_json(path: Path | str, value: dict) -> Path:
 def project_config_path(project_root: Path | str) -> Path:
     return Path(project_root).expanduser().resolve() / PROJECT_CONFIG_NAME
 
+def _path_within(path: Path, root: Path) -> Path | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return None
+
+def _resolve_project_config_path(
+    value: object, project_root: Path, recorded_project_root: Path | None,
+) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        return str((project_root / path).resolve())
+    resolved = path.resolve()
+    if recorded_project_root is not None:
+        relative = _path_within(resolved, recorded_project_root)
+        if relative is not None:
+            return str((project_root / relative).resolve())
+    return str(resolved)
+
+def _store_project_config_path(value: object, project_root: Path) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    resolved = path.resolve()
+    relative = _path_within(resolved, project_root)
+    return str(relative) if relative is not None else str(resolved)
+
+def _map_discovered_paths(discovered: object, mapper) -> object:
+    if not isinstance(discovered, dict):
+        return discovered
+    value = dict(discovered)
+    value["validation_areas"] = [
+        [str(name), mapper(path)] for name, path in value.get("validation_areas", [])
+    ]
+    value["area_periods"] = {
+        str(area): [[str(period), mapper(source)] for period, source in rows]
+        for area, rows in (value.get("area_periods") or {}).items()
+    }
+    raw_truths = value.get("area_truths") or []
+    if isinstance(raw_truths, dict):
+        value["area_truths"] = {key: mapper(path) for key, path in raw_truths.items()}
+    else:
+        value["area_truths"] = [
+            [str(area), str(before), str(after), mapper(path)]
+            for area, before, after, path in raw_truths
+        ]
+    return value
+
+def _map_project_config_paths(payload: dict, mapper) -> dict:
+    value = dict(payload)
+    if "external_data_sources" in value:
+        value["external_data_sources"] = [
+            mapper(path) for path in value.get("external_data_sources", []) if str(path).strip()
+        ]
+    if "validation_areas" in value:
+        value["validation_areas"] = [
+            [str(name), mapper(path)] for name, path in value.get("validation_areas", [])
+        ]
+    if "area_periods" in value:
+        value["area_periods"] = {
+            str(area): [[str(period), mapper(source)] for period, source in rows]
+            for area, rows in (value.get("area_periods") or {}).items()
+        }
+    if "area_truths" in value:
+        value["area_truths"] = [
+            [str(area), str(before), str(after), mapper(path)]
+            for area, before, after, path in value.get("area_truths", [])
+        ]
+    if "unmapped_candidates" in value:
+        value["unmapped_candidates"] = {
+            kind: [mapper(path) for path in (value.get("unmapped_candidates") or {}).get(kind, [])]
+            for kind in ("shp", "txt")
+        }
+    if "txt_encodings" in value:
+        value["txt_encodings"] = {
+            mapper(path): str(encoding)
+            for path, encoding in (value.get("txt_encodings") or {}).items()
+        }
+    if "external_scan_cache" in value:
+        mapped_cache = {}
+        for source, raw_record in (value.get("external_scan_cache") or {}).items():
+            record = dict(raw_record) if isinstance(raw_record, dict) else {}
+            mapped_source = mapper(source)
+            record["root"] = mapper(record.get("root") or source)
+            record["candidates"] = {
+                kind: [mapper(path) for path in (record.get("candidates") or {}).get(kind, [])]
+                for kind in ("shp", "txt")
+            }
+            record["discovered"] = _map_discovered_paths(record.get("discovered"), mapper)
+            mapped_cache[mapped_source] = record
+        value["external_scan_cache"] = mapped_cache
+    if value.get("output_root"):
+        value["output_root"] = mapper(value["output_root"])
+    active_task = dict(value.get("active_task") or {})
+    if active_task.get("state"):
+        active_task["state"] = mapper(active_task["state"])
+    if active_task:
+        value["active_task"] = active_task
+    return value
+
+def resolve_project_config(project_root: Path | str, payload: dict) -> dict:
+    """Resolve portable paths and rebase legacy project-owned paths after a move."""
+    root = Path(project_root).expanduser().resolve()
+    recorded_text = str(payload.get("project_root") or "").strip()
+    recorded = Path(recorded_text).expanduser() if recorded_text else None
+    if recorded is not None and not recorded.is_absolute():
+        recorded = root / recorded
+    recorded = recorded.resolve() if recorded is not None else None
+    value = _map_project_config_paths(
+        payload, lambda path: _resolve_project_config_path(path, root, recorded),
+    )
+    value["project_root"] = str(root)
+    if "path_relocations" in payload:
+        value["path_relocations"] = {
+            str(Path(old).expanduser().resolve()): str(Path(new).expanduser().resolve())
+            for old, new in (payload.get("path_relocations") or {}).items()
+            if str(old).strip() and str(new).strip()
+        }
+    return value
+
+def portable_project_config(project_root: Path | str, payload: dict) -> dict:
+    """Serialize project-owned paths relatively while retaining external paths."""
+    root = Path(project_root).expanduser().resolve()
+    value = _map_project_config_paths(
+        payload, lambda path: _store_project_config_path(path, root),
+    )
+    value["project_root"] = "."
+    if "path_relocations" in payload:
+        value["path_relocations"] = {
+            str(Path(old).expanduser().resolve()): str(Path(new).expanduser().resolve())
+            for old, new in (payload.get("path_relocations") or {}).items()
+            if str(old).strip() and str(new).strip()
+        }
+    return value
+
+def _replace_path_root(value: object, old_root: Path, new_root: Path) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        return text
+    relative = _path_within(path.resolve(), old_root)
+    return str((new_root / relative).resolve()) if relative is not None else str(path.resolve())
+
+def relocate_project_config_paths(
+    payload: dict, old_root: Path | str, new_root: Path | str,
+) -> dict:
+    """Apply an explicit external-data root mapping throughout one project config."""
+    old = Path(old_root).expanduser().resolve()
+    new = Path(new_root).expanduser().resolve()
+    value = _map_project_config_paths(payload, lambda path: _replace_path_root(path, old, new))
+    relocations = dict(payload.get("path_relocations") or {})
+    relocations[str(old)] = str(new)
+    value["path_relocations"] = relocations
+    return value
+
+def project_path_issues(payload: dict) -> list[dict[str, str]]:
+    """Return missing configured inputs without touching outputs or cached products."""
+    issues: list[dict[str, str]] = []
+
+    def check(kind: str, label: str, raw_path: object, directory: bool = False) -> None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return
+        path = Path(text).expanduser()
+        available = path.is_dir() if directory else path.is_file()
+        if not available:
+            issues.append({"kind": kind, "label": label, "path": str(path)})
+
+    for source in payload.get("external_data_sources", []):
+        check("source", "外部数据源", source, directory=True)
+    for area, path in payload.get("validation_areas", []):
+        check("validation", f"{area} 验证区", path)
+    for area, rows in (payload.get("area_periods") or {}).items():
+        for period, source in rows:
+            check("period", f"{area} / {period} 期影像 TXT", source)
+            source_path = Path(str(source or "")).expanduser()
+            if source_path.is_file():
+                try:
+                    read_path_list(
+                        source_path,
+                        path_relocations=payload.get("path_relocations") or None,
+                    )
+                except (FileNotFoundError, UnicodeError, ValueError) as exc:
+                    issues.append({
+                        "kind": "image", "label": f"{area} / {period} 期影像路径",
+                        "path": str(source_path), "detail": str(exc),
+                    })
+    for area, before, after, path in payload.get("area_truths", []):
+        check("truth", f"{area} / {before} → {after} 真值", path)
+    return issues
+
 def read_project_config(project_root: Path | str) -> dict:
     """Read the new project config while accepting an absent legacy config."""
     path = project_config_path(project_root)
@@ -221,7 +420,7 @@ def read_project_config(project_root: Path | str) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"项目配置根节点必须是 JSON 对象：{path}")
-    return value
+    return resolve_project_config(project_root, value)
 
 
 def discover_legacy_result_manifest(output_root: Path | str) -> tuple[dict | None, Path | None]:
@@ -314,10 +513,14 @@ def preferred_project_result_root(
     """Keep an explicitly configured old project on its old root; default new projects to 成果输出."""
     project = Path(project_root).expanduser().resolve()
     if configured_output:
-        configured = Path(configured_output).expanduser().resolve()
-        if configured.is_dir() or configured.name in {
-            RESULT_DIRECTORY_NAME, LEGACY_RESULT_DIRECTORY_NAME,
-        }:
+        configured = Path(configured_output).expanduser()
+        if not configured.is_absolute():
+            configured = project / configured
+        configured = configured.resolve()
+        if configured.is_dir() or (
+            configured.parent.is_dir()
+            and configured.name in {RESULT_DIRECTORY_NAME, LEGACY_RESULT_DIRECTORY_NAME}
+        ):
             return configured
     current = project / RESULT_DIRECTORY_NAME
     legacy = project / LEGACY_RESULT_DIRECTORY_NAME
@@ -330,6 +533,32 @@ def _read_json_object(path: Path) -> dict | None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _rebase_project_tree(value, recorded_root: object, project_root: Path):
+    """Rebase absolute project-owned paths in legacy manifests and result indexes."""
+    recorded_text = str(recorded_root or "").strip()
+    if not recorded_text:
+        return value
+    old_root = Path(recorded_text).expanduser()
+    if not old_root.is_absolute():
+        return value
+    old_root = old_root.resolve()
+
+    def visit(item):
+        if isinstance(item, dict):
+            return {key: visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        if not isinstance(item, str) or not item.strip():
+            return item
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            return item
+        relative = _path_within(path.resolve(), old_root)
+        return str((project_root / relative).resolve()) if relative is not None else item
+
+    return visit(value)
 
 
 def discover_project_result_context(
@@ -350,6 +579,8 @@ def discover_project_result_context(
         None,
     )
     index = read_result_index(index_path) if index_path is not None else None
+    if isinstance(index, dict):
+        index = _rebase_project_tree(index, index.get("project_root"), project)
 
     manifest = None
     manifest_path = None
@@ -370,6 +601,7 @@ def discover_project_result_context(
                 manifest, manifest_path = value, path
                 break
     manifest = dict(manifest or {})
+    manifest = _rebase_project_tree(manifest, manifest.get("project_root"), project)
 
     period_map: dict[tuple[str, str], dict] = {}
     for entry in manifest.get("period_results", []) or []:
@@ -389,7 +621,8 @@ def discover_project_result_context(
             "result": str(path.resolve()), "status": "completed",
         }
         existing = period_map.get(key)
-        if existing is None or not _manifest_path(existing.get("result")):
+        existing_result = _manifest_path(existing.get("result")) if existing is not None else None
+        if existing is None or existing_result is None or not existing_result.is_file():
             period_map[key] = recovered
         else:
             for name, value in recovered.items():
@@ -902,10 +1135,20 @@ class ProjectManager:
         return discover_validation_project(project_root)
 
     def save_config(self, project_root: Path | str, payload: dict) -> Path:
-        path = atomic_write_json(project_config_path(project_root), payload)
+        path = atomic_write_json(
+            project_config_path(project_root), portable_project_config(project_root, payload),
+        )
         self.project_root = Path(project_root).expanduser().resolve()
-        self.config = dict(payload)
+        self.config = resolve_project_config(project_root, payload)
         return path
+
+    @staticmethod
+    def relocate_paths(payload: dict, old_root: Path | str, new_root: Path | str) -> dict:
+        return relocate_project_config_paths(payload, old_root, new_root)
+
+    @staticmethod
+    def path_issues(payload: dict) -> list[dict[str, str]]:
+        return project_path_issues(payload)
 
     def scan_source(self, source: Path | str, **kwargs) -> dict:
         return scan_external_data_source(source, **kwargs)

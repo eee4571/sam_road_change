@@ -1,7 +1,7 @@
 {
-  "input_image": "C:\\Users\\zhoum\\geesing\\sam_road_change\\dev_tools\\weak_road_recovery_test\\1.tif",
-  "config": "C:\\Users\\zhoum\\geesing\\sam_road_change\\config\\samroad_inference.yaml",
-  "checkpoint": "C:\\Users\\zhoum\\geesing\\sam_road_change\\models\\samroad\\samroad.ckpt",
+  "input_image": "dev_tools\\weak_road_recovery_test\\1.tif",
+  "config": "..\\runtime\\config\\samroad_inference.yaml",
+  "checkpoint": "..\\runtime\\models\\samroad\\samroad.ckpt",
   "device": "cuda",
   "batch_size": 16,
   "ROAD_THRESHOLD_PROFILE": "default",

@@ -10,7 +10,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 @dataclass(frozen=True)
@@ -67,12 +67,55 @@ def _candidate_path_lines(text: str, limit: int = 50) -> list[tuple[int, str]]:
                 break
     return rows
 
+def _configured_path_relocations(
+    explicit: Mapping[str, str] | None = None,
+) -> list[tuple[Path, Path]]:
+    if explicit is None:
+        try:
+            raw = json.loads(os.environ.get("SAMROAD_PATH_RELOCATIONS", "{}"))
+        except json.JSONDecodeError:
+            return []
+    else:
+        raw = explicit
+    if not isinstance(raw, dict):
+        return []
+    mappings = []
+    for old, new in raw.items():
+        if not str(old).strip() or not str(new).strip():
+            continue
+        mappings.append((Path(str(old)).expanduser().resolve(), Path(str(new)).expanduser().resolve()))
+    return sorted(mappings, key=lambda item: len(item[0].parts), reverse=True)
 
-def _path_hit_count(lines: list[tuple[int, str]], roots: list[Path]) -> int:
+def _relocated_path(
+    path: Path, relocations: Mapping[str, str] | None = None,
+) -> Path | None:
+    if not path.is_absolute():
+        return None
+    for old_root, new_root in _configured_path_relocations(relocations):
+        try:
+            relative = path.resolve().relative_to(old_root)
+        except ValueError:
+            continue
+        return (new_root / relative).resolve()
+    return None
+
+def _path_choices(
+    candidate: Path, roots: list[Path], relocations: Mapping[str, str] | None = None,
+) -> list[Path]:
+    if not candidate.is_absolute():
+        return [root / candidate for root in roots]
+    relocated = _relocated_path(candidate, relocations)
+    return [candidate, relocated] if relocated is not None else [candidate]
+
+
+def _path_hit_count(
+    lines: list[tuple[int, str]], roots: list[Path],
+    relocations: Mapping[str, str] | None = None,
+) -> int:
     hits = 0
     for _line_number, value in lines:
         candidate = Path(value).expanduser()
-        choices = [candidate] if candidate.is_absolute() else [root / candidate for root in roots]
+        choices = _path_choices(candidate, roots, relocations)
         if any(choice.is_file() for choice in choices):
             hits += 1
     return hits
@@ -81,6 +124,7 @@ def _path_hit_count(lines: list[tuple[int, str]], roots: list[Path]) -> int:
 def decode_text_auto(
     path: Path | str, *, search_roots: Iterable[Path | str] = (),
     encoding_override: str | None = None,
+    path_relocations: Mapping[str, str] | None = None,
 ) -> tuple[str, str]:
     """Score every strict decode using real path hits and text quality."""
     source = Path(path).expanduser().resolve()
@@ -109,7 +153,7 @@ def decode_text_auto(
             failures.append(f"{encoding}: decoded text contains NUL characters")
             continue
         lines = _candidate_path_lines(text)
-        hits = _path_hit_count(lines, roots)
+        hits = _path_hit_count(lines, roots, path_relocations)
         bad_controls = sum(
             1 for character in text
             if unicodedata.category(character).startswith("C") and character not in "\r\n\t"
@@ -143,6 +187,7 @@ def read_path_list(
     search_roots: Iterable[Path | str] = (),
     require_files: bool = True,
     encoding_override: str | None = None,
+    path_relocations: Mapping[str, str] | None = None,
 ) -> PathList:
     """Read a TXT path list and retain actionable line-level diagnostics."""
     source = Path(path).expanduser().resolve()
@@ -160,6 +205,7 @@ def read_path_list(
     attempted_encodings = tuple(_candidate_encodings(source.read_bytes()))
     text, encoding = decode_text_auto(
         source, search_roots=roots[1:], encoding_override=encoding_override,
+        path_relocations=path_relocations,
     )
     entries: list[ListedPath] = []
     missing: list[str] = []
@@ -168,7 +214,7 @@ def read_path_list(
         if not value:
             continue
         candidate = Path(value).expanduser()
-        candidates = [candidate] if candidate.is_absolute() else [root / candidate for root in roots]
+        candidates = _path_choices(candidate, roots, path_relocations)
         resolved = next((item.resolve() for item in candidates if item.is_file()), candidates[0].resolve())
         if require_files and not resolved.is_file():
             missing.append(f"第 {line_number} 行：{value} → {resolved}")

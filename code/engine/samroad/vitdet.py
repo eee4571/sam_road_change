@@ -1,5 +1,9 @@
 import sys
-sys.path.insert(0, './detectron2')
+from pathlib import Path
+
+DETECTRON2_ROOT = Path(__file__).resolve().parent / "detectron2"
+if str(DETECTRON2_ROOT) not in sys.path:
+    sys.path.insert(0, str(DETECTRON2_ROOT))
 
 from functools import partial
 

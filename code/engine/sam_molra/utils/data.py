@@ -192,5 +192,4 @@ clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize = (8, 8))
 
 
 if __name__ == '__main__':
-    image = cv2.imread('G:/dataset_sum/9_SpaceNet2Build/AOI4/image/RGB-PanSharpen_AOI_4_Shanghai_img273.png')
-    Ada_Hist(image)
+    raise SystemExit("Pass image paths through the dataset API; no machine-local demo path is bundled.")

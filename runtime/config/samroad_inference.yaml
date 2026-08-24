@@ -2,7 +2,7 @@
 DATASET: 'cityscale'
 NO_SAM: false
 SAM_VERSION: vit_b
-SAM_CKPT_PATH: '../../models/samroad/sam_vit_b_01ec64.pth'
+SAM_CKPT_PATH: '../models/samroad/sam_vit_b_01ec64.pth'
 
 # ===== Training size / speed / memory =====
 PATCH_SIZE: 512

@@ -200,13 +200,15 @@ def apply_accepted_candidates(
             document.add_polyline(points)
 
 
-def current_edited_graph(summary: dict, edited_graph: Path) -> bool:
+def current_edited_graph(
+    summary: dict, edited_graph: Path, summary_dir: Path | None = None,
+) -> bool:
     """Return true only when the edit was saved after the current prepared graph."""
     if not edited_graph.is_file():
         return False
     prepared_graph = Path(summary.get("prepared_graph", summary.get("graph", "")))
     if not prepared_graph.is_absolute():
-        prepared_graph = Path.cwd() / prepared_graph
+        prepared_graph = (summary_dir or edited_graph.parent) / prepared_graph
     if not prepared_graph.is_file():
         return True
     return edited_graph.stat().st_mtime_ns >= prepared_graph.stat().st_mtime_ns
@@ -2104,11 +2106,14 @@ def load_documents(
         if progress:
             progress(f"正在读取切片 {stem}…")
         summary = load_review_summary(summary_path)
-        image = imread_unicode(Path(summary["image"]), cv2.IMREAD_COLOR)
+        image_path = Path(summary["image"])
+        if not image_path.is_absolute():
+            image_path = summary_path.parent / image_path
+        image = imread_unicode(image_path, cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"Cannot read image for {stem}: {summary.get('image')}")
         edited_graph = edited_dir / f"{stem}_edited_graph.p"
-        if current_edited_graph(summary, edited_graph):
+        if current_edited_graph(summary, edited_graph, summary_path.parent):
             nodes, edges = load_graph(edited_graph)
             mask = imread_unicode(review_dir / f"{stem}_molra_clean_mask.png", cv2.IMREAD_GRAYSCALE)
             rows = read_csv(review_dir / f"{stem}_candidate_centerlines.csv")

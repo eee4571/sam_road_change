@@ -76,7 +76,105 @@ class ProjectManagerArchitectureTests(unittest.TestCase):
             }
             path = manager.save_config(root, payload)
             self.assertEqual(path.name, "project_config.json")
-            self.assertEqual(manager.read_config(root), payload)
+            restored = manager.read_config(root)
+            self.assertEqual(restored["version"], payload["version"])
+            self.assertEqual(Path(restored["project_root"]), root.resolve())
+            self.assertEqual(Path(restored["external_data_sources"][0]), Path("D:/data"))
+            self.assertEqual(Path(restored["validation_areas"][0][1]), Path("D:/area1.shp"))
+
+    def test_project_owned_paths_are_stored_relative_and_rebased_after_move(self) -> None:
+        manager = ProjectManager()
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw)
+            old_root = workspace / "old" / "project"
+            moved_root = workspace / "moved" / "project"
+            moved_root.mkdir(parents=True)
+            internal_area = moved_root / "data" / "area.shp"
+            internal_area.parent.mkdir()
+            internal_area.touch()
+            payload = {
+                "version": 3,
+                "project_root": str(old_root),
+                "output_root": str(old_root / "成果输出"),
+                "external_data_sources": [],
+                "validation_areas": [["area", str(old_root / "data" / "area.shp")]],
+            }
+            (moved_root / "project_config.json").write_text(
+                json.dumps(payload), encoding="utf-8",
+            )
+
+            restored = manager.read_config(moved_root)
+
+            self.assertEqual(restored["project_root"], str(moved_root.resolve()))
+            self.assertEqual(restored["output_root"], str((moved_root / "成果输出").resolve()))
+            self.assertEqual(restored["validation_areas"][0][1], str(internal_area.resolve()))
+            manager.save_config(moved_root, restored)
+            stored = json.loads((moved_root / "project_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["project_root"], ".")
+            self.assertEqual(stored["output_root"], "成果输出")
+            self.assertEqual(stored["validation_areas"][0][1], str(Path("data") / "area.shp"))
+
+    def test_external_root_relocation_updates_all_configured_inputs(self) -> None:
+        manager = ProjectManager()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            old = root / "old-data"
+            new = root / "new-data"
+            image_dir = new / "area"
+            image_dir.mkdir(parents=True)
+            area = image_dir / "boundary.shp"
+            listing = image_dir / "2022.txt"
+            truth = image_dir / "2021_to_2022.shp"
+            image = new / "tiles" / "image.tif"
+            image.parent.mkdir()
+            for path in (area, truth, image):
+                path.touch()
+            listing.write_text(str(old / "tiles" / image.name), encoding="utf-8")
+            payload = {
+                "external_data_sources": [str(old)],
+                "validation_areas": [["area", str(old / "area" / area.name)]],
+                "area_periods": {"area": [["2022", str(old / "area" / listing.name)]]},
+                "area_truths": [["area", "2021", "2022", str(old / "area" / truth.name)]],
+                "external_scan_cache": {
+                    str(old): {"root": str(old), "candidates": {"shp": [str(old / "area" / area.name)], "txt": []}},
+                },
+            }
+
+            relocated = manager.relocate_paths(payload, old, new)
+
+            self.assertEqual(manager.path_issues(relocated), [])
+            self.assertEqual(relocated["external_data_sources"], [str(new.resolve())])
+            self.assertEqual(relocated["path_relocations"][str(old.resolve())], str(new.resolve()))
+            self.assertIn(str(new.resolve()), relocated["external_scan_cache"])
+
+    def test_legacy_manifest_paths_are_rebased_to_the_moved_project(self) -> None:
+        manager = ProjectManager()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            old_project = root / "old-project"
+            moved_project = root / "moved-project"
+            output = moved_project / "成果输出"
+            result = moved_project / "_work" / "tasks" / "runs" / "run1" / "result.json"
+            result.parent.mkdir(parents=True)
+            output.mkdir(parents=True)
+            result.write_text("{}", encoding="utf-8")
+            latest = moved_project / "_work" / "tasks" / "latest_pipeline.json"
+            latest.parent.mkdir(parents=True, exist_ok=True)
+            latest.write_text(json.dumps({
+                "project_root": str(old_project),
+                "output_root": str(old_project / "成果输出"),
+                "period_results": [{
+                    "grid": "area", "period": "2022", "status": "completed",
+                    "result": str(old_project / result.relative_to(moved_project)),
+                }],
+                "change_results": [],
+            }), encoding="utf-8")
+
+            manifest, manifest_path = manager.result_context(moved_project, output)
+
+            self.assertEqual(manifest_path, latest)
+            self.assertEqual(manifest["project_root"], str(moved_project.resolve()))
+            self.assertEqual(Path(manifest["period_results"][0]["result"]), result.resolve())
 
     def test_manifest_result_models_are_built_outside_tk(self) -> None:
         manager = ProjectManager()

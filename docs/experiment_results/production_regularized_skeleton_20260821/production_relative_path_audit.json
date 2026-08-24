@@ -1,5 +1,5 @@
 {
-  "config": "C:\\Users\\zhoum\\geesing\\sam_road_change\\config\\samroad_inference.yaml",
+  "config": "runtime/config/samroad_inference.yaml",
   "requested_threshold_profile": "auto",
   "effective_threshold_profile": "weak_sensor",
   "relative_roadness_enabled": true,
@@ -23,5 +23,5 @@
     "cycle_cleanup_seconds": 3.00002284348011e-07,
     "total_seconds": 0.012740200036205351
   },
-  "result_image": "C:\\Users\\zhoum\\geesing\\sam_road_change\\docs\\experiment_results\\production_regularized_skeleton_20260821\\production_relative_path_result.png"
+  "result_image": "docs/experiment_results/production_regularized_skeleton_20260821/production_relative_path_result.png"
 }

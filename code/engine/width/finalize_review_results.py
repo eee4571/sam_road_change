@@ -373,13 +373,13 @@ def finalization_candidate_points(
     )
 
 
-def load_image(summary: dict, fallback: Path) -> np.ndarray | None:
+def load_image(summary: dict, fallback: Path, base_dir: Path) -> np.ndarray | None:
     candidates = []
     image_value = summary.get("image", "")
     if image_value:
         image_path = Path(image_value)
         if not image_path.is_absolute():
-            image_path = Path.cwd() / image_path
+            image_path = base_dir / image_path
         candidates.append(image_path)
     candidates.append(fallback)
     for path in candidates:
@@ -740,7 +740,7 @@ def finalize_one(
     reconstructed_mask_path = edited_dir / f"{stem}_reconstructed_road_surface.png" if edited_dir else None
     prepared_graph_path = Path(summary.get("prepared_graph", summary.get("graph", "")))
     if not prepared_graph_path.is_absolute():
-        prepared_graph_path = Path.cwd() / prepared_graph_path
+        prepared_graph_path = summary_path.parent / prepared_graph_path
     geometry_edited = bool(
         edited_graph_path
         and edited_graph_path.is_file()
@@ -756,7 +756,7 @@ def finalize_one(
         )
     graph_path = edited_graph_path if geometry_edited else Path(summary.get("graph", ""))
     if not graph_path.is_absolute():
-        graph_path = Path.cwd() / graph_path
+        graph_path = summary_path.parent / graph_path
     nodes_np, edges_np = load_graph(graph_path)
     original_nodes = [(int(round(r)), int(round(c))) for r, c in nodes_np.tolist()]
     final_nodes = list(original_nodes)
@@ -1264,7 +1264,7 @@ def finalize_one(
     save_graph(final_dir / f"{stem}_optimized_graph.p", final_nodes, final_edges)
 
     review_demo = exact_file(output_dir, stem, "review_demo.png")
-    image = load_image(summary, review_demo)
+    image = load_image(summary, review_demo, summary_path.parent)
     if image is not None:
         draw_viz(
             image=image,

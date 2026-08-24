@@ -14,5 +14,5 @@
   "context_embed_seconds": 7.660000119358301e-05,
   "same_shape_arrays_reused": true,
   "final_skeleton_pixels": 55784,
-  "result_image": "C:\\Users\\zhoum\\geesing\\sam_road_change\\docs\\experiment_results\\relative_context_embed_fix_20260821\\relative_context_embed_4096_result.png"
+  "result_image": "docs/experiment_results/relative_context_embed_fix_20260821/relative_context_embed_4096_result.png"
 }

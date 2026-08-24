@@ -30,6 +30,10 @@ DEFAULT_CONFIG = RUNTIME_ROOT / "config" / "samroad_inference.yaml"
 DEFAULT_CHECKPOINT = RUNTIME_ROOT / "models" / "samroad" / "samroad.ckpt"
 DEFAULT_OUTPUTS = Path(__file__).resolve().parent / "outputs"
 
+def _resolve_cached_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
+
 WEAK_CANDIDATE_FIELDS = (
     "candidate_type", "start", "end", "distance", "direction_cosine",
     "path_length", "path_ratio", "mean_probability", "q25_probability",
@@ -1455,7 +1459,10 @@ def main(argv: list[str] | None = None) -> int:
         if not cached_path.is_file():
             raise FileNotFoundError(f"Missing recovery cache metadata: {cached_path}")
         cached = json.loads(cached_path.read_text(encoding="utf-8"))
-        image_path = Path(arguments.image or cached["input_image"]).expanduser().resolve()
+        image_path = (
+            Path(arguments.image).expanduser().resolve()
+            if arguments.image else _resolve_cached_path(cached["input_image"])
+        )
     else:
         if not arguments.image:
             raise ValueError("Full mode requires --image")
@@ -1468,10 +1475,14 @@ def main(argv: list[str] | None = None) -> int:
         raise FileNotFoundError(f"Input image does not exist: {image_path}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    config_path = Path(arguments.config or cached.get("config") or DEFAULT_CONFIG).expanduser().resolve()
-    checkpoint_path = Path(
-        arguments.checkpoint or cached.get("checkpoint") or DEFAULT_CHECKPOINT
-    ).expanduser().resolve()
+    config_path = (
+        Path(arguments.config).expanduser().resolve()
+        if arguments.config else _resolve_cached_path(cached.get("config") or DEFAULT_CONFIG)
+    )
+    checkpoint_path = (
+        Path(arguments.checkpoint).expanduser().resolve()
+        if arguments.checkpoint else _resolve_cached_path(cached.get("checkpoint") or DEFAULT_CHECKPOINT)
+    )
     config = single_image_inference.load_config(config_path)
     if arguments.recovery_only and arguments.batch_size is None and cached.get("batch_size"):
         config.INFER_BATCH_SIZE = int(cached["batch_size"])

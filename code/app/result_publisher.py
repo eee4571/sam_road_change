@@ -453,7 +453,15 @@ def result_index_from_manifest(
     manifest: dict, base_dir: Path | None = None,
 ) -> dict:
     """Build a read-only business index for a legacy manifest without migration."""
-    project_value = manifest.get("project_root") or (base_dir.parent if base_dir else Path.cwd())
+    project_value = manifest.get("project_root")
+    if not project_value:
+        output_hint = manifest.get("output_root")
+        if output_hint:
+            project_value = Path(output_hint).expanduser().parent
+        elif base_dir is not None:
+            project_value = base_dir.parent
+        else:
+            project_value = Path(__file__).resolve().parents[2]
     output_value = manifest.get("output_root") or (Path(project_value) / RESULT_DIRECTORY_NAME)
     layout = ProjectLayout.from_project(project_value, output_value)
     index = empty_result_index(layout)

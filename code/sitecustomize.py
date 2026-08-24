@@ -9,8 +9,8 @@ from pathlib import Path
 
 def _configure_gis_data() -> None:
     """Use the GIS databases actually bundled in this portable runtime."""
-    root = Path(__file__).resolve().parent
-    site_packages = root / "env" / "samroad_env" / "Lib" / "site-packages"
+    runtime_root = Path(__file__).resolve().parent.parent / "runtime"
+    site_packages = runtime_root / "env" / "samroad_env" / "Lib" / "site-packages"
     # Rasterio/GDAL in this bundle expects the newer database layout shipped
     # with rasterio. Pyproj can consume it too; the reverse combination fails.
     proj_data = site_packages / "rasterio" / "proj_data"

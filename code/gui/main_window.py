@@ -224,6 +224,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.project_data_sources: list[str] = []
         self.project_scan_cache: dict[str, dict] = {}
         self.project_txt_encodings: dict[str, str] = {}
+        self.project_path_relocations: dict[str, str] = {}
         self.project_candidates: dict[str, list[str]] = {"shp": [], "txt": []}
         self.project_config: dict = {}
         self.project_root_path = ""
@@ -1057,6 +1058,11 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         if self.project_txt_encodings:
             environment["SAMROAD_TXT_ENCODINGS"] = json.dumps(
                 self.project_txt_encodings, ensure_ascii=False,
+            )
+        path_relocations = getattr(self, "project_path_relocations", {})
+        if path_relocations:
+            environment["SAMROAD_PATH_RELOCATIONS"] = json.dumps(
+                path_relocations, ensure_ascii=False,
             )
         try:
             self.task_manager.submit(

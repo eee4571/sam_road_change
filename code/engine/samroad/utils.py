@@ -4,13 +4,16 @@ from datetime import datetime
 import os
 from pathlib import Path
 
-from package_paths import PROJECT_ROOT, resolve_path
+from package_paths import PROJECT_ROOT, SAM_CKPT_PATH, resolve_path
 
 def load_config(path):
     config_path = resolve_path(path)
     with open(config_path, encoding='utf-8-sig') as file:
         config_dict = yaml.safe_load(file)
     config = Dict(config_dict)
+    configured_sam = Path(str(config.get('SAM_CKPT_PATH') or ''))
+    if not configured_sam.is_absolute() and SAM_CKPT_PATH.is_file():
+        config.SAM_CKPT_PATH = str(SAM_CKPT_PATH.resolve())
     if not config.get('CONFIG_PATH'):
         config.CONFIG_PATH = str(config_path)
     if not config.get('PROJECT_ROOT'):

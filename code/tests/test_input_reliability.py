@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -89,6 +90,23 @@ class PathListEncodingTests(unittest.TestCase):
                 [entry.path for entry in parsed.entries],
                 [first_image.resolve(), second_image.resolve()],
             )
+
+    def test_missing_absolute_paths_use_explicit_root_relocation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            old = root / "old-source"
+            new = root / "new-source"
+            image = new / "tiles" / "image.tif"
+            image.parent.mkdir(parents=True)
+            image.touch()
+            listing = root / "absolute.txt"
+            listing.write_text(str(old / "tiles" / "image.tif"), encoding="utf-8")
+            environment = json.dumps({str(old): str(new)}, ensure_ascii=False)
+
+            with mock.patch.dict("os.environ", {"SAMROAD_PATH_RELOCATIONS": environment}):
+                parsed = read_path_list(listing)
+
+            self.assertEqual(parsed.entries[0].path, image.resolve())
 
 
 class PeriodOrderingTests(unittest.TestCase):

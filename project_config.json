@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "project_root": "C:\\Users\\zhoum\\geesing\\sam_road_change",
+  "project_root": ".",
   "external_data_sources": [],
   "external_scan_cache": {},
   "txt_encodings": {},
@@ -11,6 +11,6 @@
     "shp": [],
     "txt": []
   },
-  "output_root": "C:\\Users\\zhoum\\geesing\\sam_road_change\\成果输出",
+  "output_root": "成果输出",
   "updated_at": "2026-08-24 15:11:59"
 }

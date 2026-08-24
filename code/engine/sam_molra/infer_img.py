@@ -1,4 +1,5 @@
 import argparse
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -19,8 +20,11 @@ from networks.sam_multi_lora import (
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_SAM_PRETRAINED_PATH = ROOT_DIR / "trained_weight" / "sam_vit_b_01ec64.pth"
-DEFAULT_WEIGHT_PATH = ROOT_DIR / "weight" / "b_adapter_sam_multi_lora" / "b_adapter_sam_multi_lora_120.th"
+RUNTIME_MODELS_ROOT = Path(
+    os.environ.get("SAMROAD_MODELS_ROOT", ROOT_DIR.parents[2] / "runtime" / "models")
+).expanduser()
+DEFAULT_SAM_PRETRAINED_PATH = RUNTIME_MODELS_ROOT / "sam_molra" / "sam_vit_b_01ec64.pth"
+DEFAULT_WEIGHT_PATH = RUNTIME_MODELS_ROOT / "sam_molra" / "adapter.th"
 DEFAULT_INPUT_ROOT = ROOT_DIR / "data" / "infer_input"
 DEFAULT_INPUT_DIR = DEFAULT_INPUT_ROOT / "img"
 DEFAULT_INPUT_TXT_DIR = DEFAULT_INPUT_ROOT / "txts"
@@ -140,7 +144,6 @@ def resolve_listed_path(raw_path, txt_path):
     candidates = [
         txt_path.parent / path,
         ROOT_DIR / path,
-        Path.cwd() / path,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -149,7 +152,7 @@ def resolve_listed_path(raw_path, txt_path):
 
 
 def read_txt_images(txt_path):
-    listing = read_path_list(txt_path, search_roots=(ROOT_DIR, Path.cwd()))
+    listing = read_path_list(txt_path, search_roots=(ROOT_DIR,))
     return [entry.path for entry in listing.entries]
 
 

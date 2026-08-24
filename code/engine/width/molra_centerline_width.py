@@ -4,6 +4,7 @@ import argparse
 import csv
 import heapq
 import json
+import os
 import pickle
 import sys
 import time
@@ -20,8 +21,11 @@ from topology_optimizer import candidate_path_for_graph, optimize_divided_road_j
 TOOL_DIR = Path(__file__).resolve().parent
 PACKAGE_ROOT = TOOL_DIR.parent
 SAM_MOLRA_ROOT = PACKAGE_ROOT / "sam_molra"
-DEFAULT_MOLRA_SAM = PACKAGE_ROOT / "weights" / "sam_ckpts" / "sam_vit_b_01ec64.pth"
-DEFAULT_MOLRA_WEIGHT = SAM_MOLRA_ROOT / "weight" / "b_adapter_sam_multi_lora" / "b_adapter_sam_multi_lora_120.th"
+RUNTIME_MODELS_ROOT = Path(
+    os.environ.get("SAMROAD_MODELS_ROOT", TOOL_DIR.parents[2] / "runtime" / "models")
+).expanduser()
+DEFAULT_MOLRA_SAM = RUNTIME_MODELS_ROOT / "sam_molra" / "sam_vit_b_01ec64.pth"
+DEFAULT_MOLRA_WEIGHT = RUNTIME_MODELS_ROOT / "sam_molra" / "adapter.th"
 IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 MASK_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 

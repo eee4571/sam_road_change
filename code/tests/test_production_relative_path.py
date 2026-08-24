@@ -67,6 +67,11 @@ class ProductionRelativePathTests(unittest.TestCase):
         self.assertEqual(config["MAX_NEIGHBOR_QUERIES"], 16)
         self.assertEqual(config["TOPO_SAMPLE_NUM"], 512)
 
+        loaded = load_config(CONFIG_PATH)
+        expected_model = ROOT.parent / "runtime" / "models" / "samroad" / "sam_vit_b_01ec64.pth"
+        self.assertEqual(Path(loaded.SAM_CKPT_PATH).resolve(), expected_model.resolve())
+        self.assertTrue(expected_model.is_file())
+
     def test_production_config_runs_regularized_skeleton_centerline(self):
         config = load_config(CONFIG_PATH)
         probability = np.full((96, 160), 0.01, dtype=np.float32)

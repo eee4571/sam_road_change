@@ -122,7 +122,7 @@ def load_image_paths_from_txt(txt_path):
     txt_path = Path(txt_path)
     if not txt_path.exists():
         raise FileNotFoundError(f"Input txt does not exist: {txt_path}")
-    listing = read_path_list(txt_path, search_roots=(PROJECT_ROOT, Path.cwd()))
+    listing = read_path_list(txt_path, search_roots=(PROJECT_ROOT,))
     return [entry.path for entry in listing.entries]
 
 
