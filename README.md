@@ -61,7 +61,7 @@ runtime\env\samroad_env\python.exe code\user_pipeline.py all `
   --period south 2020 D:\project\south\02_影像\2020.txt `
   --period south 2023 D:\project\south\02_影像\2023.txt `
   --truth south 2020 2023 D:\project\south\03_变化真值\2020_to_2023.shp `
-  --output-root project\04_成果输出 `
+  --output-root project\成果输出 `
   --checkpoint runtime\models\samroad\samroad.ckpt `
   --config runtime\config\samroad_inference.yaml
 ```
@@ -130,26 +130,30 @@ area_01/2022/*.tif
 ## 输出结构
 
 项目将“当前正式成果”和“可续跑任务工作区”分开保存。业务人员只需浏览
-`04_成果输出`；任务名称和 `run_id` 仅用于 `_work/tasks` 中的历史与恢复状态。
+`成果输出`；任务名称和 `run_id` 仅用于 `_work/tasks` 中的历史与恢复状态。
 完整运行、单期重跑、变化对重跑和人工编辑更新都会覆盖同一个业务键对应的
 当前正式成果，不再新增一层用户可见的任务目录：
 
 ```text
 project/
 ├─ project_config.json
-├─ 04_成果输出/
+├─ 成果输出/
 │  ├─ <区域>/
 │  │  ├─ 01_单期道路/<期次>/
 │  │  │  ├─ road_centerlines.shp
 │  │  │  ├─ road_surfaces.shp
 │  │  │  ├─ road_width_segments.shp
-│  │  │  └─ road_corridors.shp
+│  │  │  ├─ road_corridors.shp
+│  │  │  ├─ road_extraction.png       整区域最终道路提取图
+│  │  │  └─ road_width.png            整区域最终道路宽度图
 │  │  ├─ 02_变化检测/<前期>_to_<后期>/
 │  │  │  ├─ road_changes.shp
 │  │  │  ├─ added_roads.shp
 │  │  │  ├─ removed_roads.shp
 │  │  │  ├─ widened_road_parts.shp
-│  │  │  └─ narrowed_road_parts.shp
+│  │  │  ├─ narrowed_road_parts.shp
+│  │  │  ├─ road_change.png           正式变化检测图
+│  │  │  └─ review_change.png         仅存在待复核变化时发布
 │  │  ├─ 03_长时序/（road_life、road_obs、road_event 等）
 │  │  └─ 04_精度评价/（evaluation_summary.csv/json）
 │  ├─ task_report.csv
@@ -162,17 +166,17 @@ project/
 └─ _logs/
 ```
 
-算法原始输出、`pipeline_result.json`、规范化影像、推理、路面、测宽、固化和人工编辑缓存均保存在 `_work`。每个成功阶段由统一发布器将 Shapefile 及其 `.shp/.shx/.dbf/.prj/.cpg` 等同名附件发布到 `04_成果输出`，并原子更新 `result_index.json`。GUI 成果树只读取该业务索引，不展示 workspace、run_id、inference、surface、width_review、finalized 或任务 JSON。
+算法原始输出、`pipeline_result.json`、规范化影像、推理、路面、测宽、固化和人工编辑缓存均保存在 `_work`。每个成功阶段由统一发布器将 Shapefile 及其 `.shp/.shx/.dbf/.prj/.cpg` 等同名附件和四类整区域正式 PNG 发布到 `成果输出`，并原子更新 `result_index.json`。tile 级推理图、mask 和调试 PNG 继续留在 `_work`。GUI 成果树只读取该业务索引，不展示 workspace、run_id、inference、surface、width_review、finalized 或任务 JSON。
 
-旧项目无需迁移：仍可载入旧 `04_成果输出/<run_id>/grids/...`、`period_extractions` 和 `period_changes` 下的 manifest，GUI 会在内存中转换为业务成果树；只有之后新运行或重跑成功的结果才发布到新结构。
+旧项目无需迁移：仍可读取旧 `04_成果输出/result_index.json`、`04_成果输出/<run_id>/grids/...`、`period_extractions` 和 `period_changes` 下的 manifest。新建项目统一使用 `成果输出`；明确配置为旧目录的项目保持原路径，以免破坏续跑。
 
 ## 可选人工编辑与成果评价
 
 一键流程先自动完成“道路中心线 + SAM-MLoRA 道路面 + 概率引导融合 + 最终统一测宽 + 初次变化检测”。自动处理结束后，界面进入“人工编辑（可选）”：用户可以修正中心线并通过“应用编辑并更新相关结果”串行更新测宽、道路面、相邻变化对、评价、长时序成果和任务索引，也可以明确跳过，直接采用自动处理结果。
 
-无需先运行新任务：使用菜单“项目 → 载入已有任务结果”，可选择新项目的 `result_index.json`，也可选择旧任务的 `latest_pipeline.json` 或 `pipeline_result.json`。旧 manifest 仍支持人工编辑与增量更新；只有受编辑期次的后处理会执行，不会重新运行 SAMRoad 或 SAM-MLoRA。
+无需手动选择任务 JSON。点击“打开项目”后，程序会同时读取 `project_config.json`、`成果输出/result_index.json` 和 `_work` 中已有任务 manifest，自动恢复成果树、精度评价和人工编辑状态。结果页的“刷新成果”只重新扫描当前项目，不弹文件选择框。旧 manifest 仍支持人工编辑与增量更新；只有受编辑期次的后处理会执行，不会重新运行 SAMRoad 或 SAM-MLoRA。
 
-结果页不再读取、缩放或展示 PNG 预览，以免大图阻塞界面；直接提供正式成果目录、长时序 SHP、属性表、任务报告和精度汇总入口。后端仍保留诊断图片供排障使用，不影响正式矢量成果 `road_centerlines.shp`、`road_surfaces.shp`、`roads.gpkg` 和 `road_changes.gpkg`。
+结果页不在界面内解码和缩放大图，以免阻塞窗口；成果树会列出四类正式 PNG，双击后交给系统图片查看器。其余诊断图片只保留在 `_work` 供排障使用。
 
 人工编辑不是默认流程的闸门。自动处理完成后，在第三步选择项目/格网和期次并打开内置编辑工作台。编辑器把该期 `products/road_centerlines.shp` 作为一个全局最终网络打开，不再逐切片切换和重复修同一道路。背景是全部编辑影像构成的限尺寸全局概览，道路面、补画/擦除和手工测宽仍可使用。保存时只持久化权威的 `global_edited_centerlines.gpkg`、全局人工修改和受影响切片清单；点击“应用编辑”后才把权威网络投影到受影响窗口，并只为这些窗口重建路面和测宽，其他窗口复用已有成果。最终导出直接使用该全局 GPKG 作为中心线 canonical network，并自动重跑包含该期次的相邻变化对、评价和长时序道路表，不重新运行 SAMRoad 或 SAM-MLoRA。
 

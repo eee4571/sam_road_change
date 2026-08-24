@@ -215,7 +215,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.results_available = False
         self.review_items: list[dict[str, str]] = []
         self.temporal_items: list[dict[str, str]] = []
-        self.loaded_manifest_path: Path | None = None
         self.period_rows: list[dict[str, object]] = []
         self.truth_rows: list[dict[str, object]] = []
         self.result_change_items: list[dict] = []
@@ -276,7 +275,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                 "resume": "0",
                 "continue_on_error": "1",
                 "source_root": str(DEFAULT_TEST_DATA),
-                "output_root": str(PROJECT_ROOT / "04_成果输出"),
+                "output_root": str(PROJECT_ROOT / "成果输出"),
                 "run_id": "",
                 "checkpoint": str(DEFAULT_CKPT),
                 "config": str(DEFAULT_CONFIG),
@@ -417,7 +416,6 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         project_menu = Menu(menu, tearoff=False)
         project_menu.add_command(label="新建项目", command=self.create_project_folder)
         project_menu.add_command(label="打开项目", command=self.import_project_folder)
-        project_menu.add_command(label="载入已有任务结果", command=self.load_existing_results)
         project_menu.add_separator()
         project_menu.add_command(label="打开项目文件夹", command=self.open_project_folder)
         menu.add_cascade(label="项目", menu=project_menu)
@@ -681,7 +679,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             return
         has_results = self.results_available
         if index == 3 and not has_results and not force:
-            self.status.set("请先完成自动处理或载入已有成果，再进入成果与评价步骤。")
+            self.status.set("请先完成自动处理或打开包含已有成果的项目，再进入成果与评价步骤。")
             return
         for page in self.step_pages:
             page.pack_forget()

@@ -28,7 +28,10 @@ from input_catalog import (
     period_sort_key,
     read_path_list,
 )
-from app.result_publisher import ProjectLayout, ResultPublisher
+from app.result_publisher import (
+    LEGACY_RESULT_DIRECTORY_NAME, RESULT_DIRECTORY_NAME,
+    ProjectLayout, ResultPublisher, shapefile_has_records,
+)
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -130,15 +133,11 @@ def discover_preview_paths(run_root: Path) -> dict[str, str | None]:
         ),
         "fusion": _first_existing_path(
             root,
-            (
-                "products/road_overview.png",
-                "finalized/*_fusion_comparison.png",
-                "width_review/*_review_demo.png",
-            ),
+            ("products/road_overview.png",),
         ),
         "width": _first_existing_path(
             root,
-            ("finalized/*_optimized_viz.png", "products/road_overview.png"),
+            ("products/road_width_overview.png",),
         ),
     }
     return {key: str(path) if path is not None else None for key, path in paths.items()}
@@ -154,10 +153,13 @@ def discover_change_previews(output: Path) -> dict[str, str | None]:
     root = Path(output).expanduser()
     paths = {
         "change": root / "change_preview.png",
-        "review_change": root / "review_preview.png",
+        "review_change": (
+            root / "review_preview.png"
+            if shapefile_has_records(root / "review_changes.shp") else None
+        ),
     }
     return {
-        key: str(path.resolve()) if path.is_file() else None
+        key: str(path.resolve()) if path is not None and path.is_file() else None
         for key, path in paths.items()
     }
 
@@ -249,7 +251,12 @@ def _ensure_extract_manifest_fields(result: dict | None) -> dict:
     discovered = discover_preview_paths(run_root) if run_root is not None else {key: None for key in PREVIEW_KEYS}
     existing_previews = payload.get("previews") if isinstance(payload.get("previews"), dict) else {}
     payload["previews"] = {
-        key: existing_previews.get(key, discovered[key]) for key in PREVIEW_KEYS
+        key: (
+            discovered[key] or existing_previews.get(key)
+            if key in {"fusion", "width"}
+            else existing_previews.get(key, discovered[key])
+        )
+        for key in PREVIEW_KEYS
     }
     if isinstance(payload.get("review"), dict):
         review = dict(payload["review"])
@@ -702,7 +709,13 @@ def discover_validation_project(project_dir: str | Path) -> dict:
             "periods": [{"period": row[1], "source": row[2]} for row in area_periods],
             "truths": [{"before": row[1], "after": row[2], "source": row[3]} for row in area_truths],
         })
-    output_dir = named_directory(root, "04_", ("outputs", "output", "成果输出")) or root / "04_成果输出"
+    output_dir = (
+        root / RESULT_DIRECTORY_NAME
+        if (root / RESULT_DIRECTORY_NAME).is_dir()
+        else root / LEGACY_RESULT_DIRECTORY_NAME
+        if (root / LEGACY_RESULT_DIRECTORY_NAME).is_dir()
+        else root / RESULT_DIRECTORY_NAME
+    )
     return {
         "project_root": str(root), "project_name": root.name, "output_root": str(output_dir),
         "validation_areas": validation_areas, "periods": periods, "truths": truths, "areas": area_summaries,

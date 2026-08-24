@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Iterable
 
 
-RESULT_DIRECTORY_NAME = "04_成果输出"
+RESULT_DIRECTORY_NAME = "成果输出"
+LEGACY_RESULT_DIRECTORY_NAME = "04_成果输出"
 WORK_DIRECTORY_NAME = "_work"
 LOG_DIRECTORY_NAME = "_logs"
 RESULT_INDEX_NAME = "result_index.json"
@@ -66,7 +67,7 @@ class ProjectLayout:
     @classmethod
     def from_output(cls, output_root: Path | str) -> "ProjectLayout":
         results = _resolved(output_root)
-        # The GUI always supplies 04_成果输出.  For custom CLI output names the
+        # The GUI normally supplies 成果输出.  For custom CLI output names the
         # containing directory is still the project root and receives _work/_logs.
         return cls(results.parent, results)
 
@@ -95,6 +96,12 @@ class ProjectLayout:
         return self.results_root / RESULT_INDEX_NAME
 
     @property
+    def legacy_results_root(self) -> Path:
+        if self.results_root.name == RESULT_DIRECTORY_NAME:
+            return self.project_root / LEGACY_RESULT_DIRECTORY_NAME
+        return self.results_root
+
+    @property
     def latest_pipeline_path(self) -> Path:
         return self.tasks_root / "latest_pipeline.json"
 
@@ -102,11 +109,11 @@ class ProjectLayout:
         return self.tasks_root / "runs" / safe_name(run_id)
 
     def legacy_full_run_root(self, run_id: object) -> Path:
-        return self.results_root / safe_name(run_id)
+        return self.legacy_results_root / safe_name(run_id)
 
     @property
     def legacy_latest_pipeline_path(self) -> Path:
-        return self.results_root / "latest_pipeline.json"
+        return self.legacy_results_root / "latest_pipeline.json"
 
     def period_task_root(self, area: object, period: object, run_id: object) -> Path:
         return (
@@ -116,7 +123,7 @@ class ProjectLayout:
 
     def legacy_period_task_root(self, area: object, period: object, run_id: object) -> Path:
         return (
-            self.results_root / "period_extractions" / safe_name(area) /
+            self.legacy_results_root / "period_extractions" / safe_name(area) /
             safe_name(period) / safe_name(run_id)
         )
 
@@ -142,9 +149,12 @@ class ProjectLayout:
 def _manifest_path(value: object, base_dir: Path | None = None) -> Path | None:
     if isinstance(value, dict):
         value = value.get("path") or value.get("file")
-    if not isinstance(value, str) or not value.strip():
+    if isinstance(value, os.PathLike):
+        path = Path(value).expanduser()
+    elif isinstance(value, str) and value.strip():
+        path = Path(value).expanduser()
+    else:
         return None
-    path = Path(value).expanduser()
     if base_dir is not None and not path.is_absolute():
         path = base_dir / path
     return path.resolve()
@@ -179,6 +189,20 @@ def copy_dataset(source: Path | str, destination: Path | str) -> Path:
         suffix = member.name[len(origin.stem):]
         shutil.copy2(member, target.with_name(target.stem + suffix))
     return target
+
+
+def shapefile_has_records(path: Path | str | None) -> bool:
+    """Read the DBF header count without loading a geospatial dataframe."""
+    source = _manifest_path(path)
+    if source is None or source.suffix.casefold() != ".shp":
+        return False
+    dbf = source.with_suffix(".dbf")
+    try:
+        with dbf.open("rb") as stream:
+            header = stream.read(8)
+    except OSError:
+        return False
+    return len(header) == 8 and int.from_bytes(header[4:8], "little") > 0
 
 
 def empty_result_index(layout: ProjectLayout) -> dict:
@@ -256,6 +280,34 @@ class ResultPublisher:
             ("width_segments", "road_width_segments.shp"),
             ("corridors", "road_corridors.shp"),
         ), base_dir=base_dir)
+        previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
+        extraction_preview = result.get("road_extraction")
+        if not extraction_preview:
+            candidate = _manifest_path(previews.get("fusion"), base_dir)
+            if candidate is not None and candidate.name.casefold() in {
+                "road_overview.png", "road_extraction.png",
+            }:
+                extraction_preview = str(candidate)
+        width_preview = result.get("road_width")
+        if not width_preview:
+            candidate = _manifest_path(previews.get("width"), base_dir)
+            if candidate is not None and candidate.name.casefold() in {
+                "road_width_overview.png", "road_width.png",
+            }:
+                width_preview = str(candidate)
+        published.update(self._copy_fields(
+            {"road_extraction": extraction_preview, "road_width": width_preview},
+            target,
+            (("road_extraction", "road_extraction.png"), ("road_width", "road_width.png")),
+            base_dir=base_dir,
+        ))
+        if isinstance(result.get("previews"), dict):
+            for key, filename in (
+                ("road_extraction", "road_extraction.png"),
+                ("road_width", "road_width.png"),
+            ):
+                if key not in published:
+                    (target / filename).unlink(missing_ok=True)
         if published:
             self._area(area)["periods"][str(period)] = {
                 **published, "status": "已生成",
@@ -280,6 +332,21 @@ class ResultPublisher:
             ("widened", "widened_road_parts.shp"),
             ("narrowed", "narrowed_road_parts.shp"),
         ), base_dir=base_dir)
+        previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
+        review_preview = result.get("review_change")
+        if not review_preview and shapefile_has_records(layers.get("review")):
+            review_preview = previews.get("review_change")
+        published.update(self._copy_fields(
+            {
+                "road_change": result.get("road_change") or previews.get("change"),
+                "review_change": review_preview,
+            },
+            target,
+            (("road_change", "road_change.png"), ("review_change", "review_change.png")),
+            base_dir=base_dir,
+        ))
+        if "review_change" not in published:
+            (target / "review_change.png").unlink(missing_ok=True)
         if published:
             self._area(area)["changes"][f"{before}_to_{after}"] = {
                 **published, "before_period": str(before), "after_period": str(after),
@@ -401,10 +468,23 @@ def result_index_from_manifest(
         area, period = str(entry.get("grid") or "validation"), str(entry.get("period") or "未命名期次")
         area_node = index["areas"].setdefault(area, {"periods": {}, "changes": {}, "temporal": {}, "evaluation": {}})
         published = entry.get("published") if isinstance(entry.get("published"), dict) else {}
+        previews = entry.get("previews") if isinstance(entry.get("previews"), dict) else {}
         area_node["periods"][period] = {
-            key: path_text(published.get(key) or entry.get(key))
-            for key in ("centerlines", "surfaces", "width_segments", "corridors")
+            key: path_text(
+                published.get(key)
+                or entry.get(key)
+                or (previews.get("fusion") if key == "road_extraction" else None)
+                or (previews.get("width") if key == "road_width" else None)
+            )
+            for key in (
+                "centerlines", "surfaces", "width_segments", "corridors",
+                "road_extraction", "road_width",
+            )
             if published.get(key) or entry.get(key)
+            or (previews and (
+                (key == "road_extraction" and previews.get("fusion"))
+                or (key == "road_width" and previews.get("width"))
+            ))
         }
     for entry in manifest.get("change_results", []) or []:
         if not isinstance(entry, dict):
@@ -414,14 +494,26 @@ def result_index_from_manifest(
         area_node = index["areas"].setdefault(area, {"periods": {}, "changes": {}, "temporal": {}, "evaluation": {}})
         published = entry.get("published") if isinstance(entry.get("published"), dict) else {}
         layers = entry.get("layers") if isinstance(entry.get("layers"), dict) else {}
+        previews = entry.get("previews") if isinstance(entry.get("previews"), dict) else {}
         changes_value = published.get("changes") or layers.get("changes") or entry.get("gpkg") or entry.get("summary")
         area_node["changes"][f"{before}_to_{after}"] = {
             "before_period": before, "after_period": after,
             **({"changes": path_text(changes_value)} if changes_value else {}),
             **{
-                key: path_text(published.get(key) or layers.get(key))
-                for key in ("added", "removed", "widened", "narrowed")
+                key: path_text(
+                    published.get(key) or layers.get(key)
+                    or (previews.get("change") if key == "road_change" else None)
+                    or (previews.get("review_change") if key == "review_change" else None)
+                )
+                for key in (
+                    "added", "removed", "widened", "narrowed",
+                    "road_change", "review_change",
+                )
                 if published.get(key) or layers.get(key)
+                or (previews and (
+                    (key == "road_change" and previews.get("change"))
+                    or (key == "review_change" and previews.get("review_change"))
+                ))
             },
         }
     for entry in manifest.get("temporal_results", []) or []:

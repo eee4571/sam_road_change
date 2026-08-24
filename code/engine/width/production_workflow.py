@@ -1301,6 +1301,66 @@ def _write_final_visualization(
     }
 
 
+def _write_final_width_visualization(
+    width_segments: gpd.GeoDataFrame,
+    road_corridors: gpd.GeoDataFrame,
+    output: Path,
+) -> dict:
+    """Write one whole-area width map; tile/debug previews remain internal."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(14, 10), constrained_layout=True)
+    if road_corridors is not None and not road_corridors.empty:
+        road_corridors.plot(
+            ax=ax, facecolor="#d9e2ec", edgecolor="#829ab1",
+            linewidth=0.25, alpha=0.32,
+        )
+    valid_count = 0
+    unresolved_count = 0
+    if width_segments is not None and not width_segments.empty:
+        frame = width_segments.copy()
+        width_values = (
+            frame["width_m"] if "width_m" in frame.columns
+            else pd.Series(0.0, index=frame.index)
+        )
+        frame["_display_width_m"] = pd.to_numeric(
+            width_values, errors="coerce",
+        ).fillna(0.0)
+        valid = frame[frame["_display_width_m"] > 0]
+        unresolved = frame[frame["_display_width_m"] <= 0]
+        valid_count = len(valid)
+        unresolved_count = len(unresolved)
+        if not valid.empty:
+            valid.plot(
+                ax=ax, column="_display_width_m", cmap="viridis",
+                linewidth=2.0, legend=True,
+                legend_kwds={"label": "Road width (m)", "shrink": 0.72},
+            )
+        if not unresolved.empty:
+            unresolved.plot(ax=ax, color="#d64545", linewidth=1.1, linestyle="--")
+    ax.set_title("Final Road Width", fontsize=16, fontweight="bold", pad=14)
+    ax.text(
+        0.5, 1.005,
+        f"Measured segments: {valid_count:,}   Width unresolved: {unresolved_count:,}",
+        transform=ax.transAxes, ha="center", va="bottom", fontsize=10, color="#52606d",
+    )
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_axis_off()
+    fig.savefig(output, dpi=180, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "path": str(output),
+        "display_mode": "whole_area_width_segments",
+        "width_colored_feature_count": int(valid_count),
+        "unresolved_feature_count": int(unresolved_count),
+    }
+
+
 def export_final_products(
     final_dir: Path,
     image_dir: Path,
@@ -1633,9 +1693,13 @@ def export_final_products(
         else surface_shp.parent if surface_shp is not None
         else output.parent
     )
-    visualization = visualization or report_dir / "road_width_overview.png"
+    visualization = visualization or report_dir / "road_overview.png"
     visualization_started = time.perf_counter()
     visualization_report = _write_final_visualization(layers, crs, visualization, background_images)
+    width_visualization = visualization.with_name("road_width_overview.png")
+    width_visualization_report = _write_final_width_visualization(
+        standardized_width_segments, standardized_corridors, width_visualization,
+    )
     visualization_seconds = time.perf_counter() - visualization_started
     report = {
         "geopackage": str(output) if output is not None else "",
@@ -1644,6 +1708,7 @@ def export_final_products(
         "width_segments_shp": str(width_segment_shp),
         "corridors_shp": str(corridor_shp),
         "visualization": visualization_report,
+        "width_visualization": width_visualization_report,
         "profiling": {
             "centerline_fusion_seconds": float(centerline_fusion_seconds),
             "surface_fusion_seconds": float(surface_fusion_seconds),

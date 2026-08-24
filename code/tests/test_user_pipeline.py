@@ -962,7 +962,7 @@ class ManifestMetadataTests(unittest.TestCase):
             fallback_surface = run_root / "width_review" / "tile_molra_clean_mask.png"
             fusion = run_root / "width_review" / "tile_review_demo.png"
             final_fusion = run_root / "products" / "road_overview.png"
-            width = run_root / "finalized" / "tile_optimized_viz.png"
+            width = run_root / "products" / "road_width_overview.png"
             for path in (preferred_centerline, fallback_centerline, preferred_surface, fallback_surface, fusion, final_fusion, width):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
@@ -978,7 +978,7 @@ class ManifestMetadataTests(unittest.TestCase):
             width.unlink()
             fallback_previews = user_pipeline.discover_preview_paths(run_root)
             self.assertEqual(fallback_previews["surface"], str(fallback_surface.resolve()))
-            self.assertEqual(fallback_previews["width"], str(final_fusion.resolve()))
+            self.assertIsNone(fallback_previews["width"])
 
             missing = user_pipeline.discover_preview_paths(run_root / "missing")
             self.assertIsNone(missing["centerline"])
@@ -1021,6 +1021,10 @@ class ManifestMetadataTests(unittest.TestCase):
             review = output / "review_preview.png"
             formal.touch()
             review.touch()
+            (output / "review_changes.shp").touch()
+            dbf_header = bytearray(8)
+            dbf_header[4:8] = (1).to_bytes(4, "little")
+            (output / "review_changes.dbf").write_bytes(dbf_header)
 
             payload = user_pipeline._ensure_change_manifest_fields(
                 {"output": str(output), "previews": {"legacy": "kept"}}, output,

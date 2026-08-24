@@ -153,7 +153,7 @@ class EditPage:
             self.review_selection.set("")
             self.review_combo.configure(state="disabled")
             self.review_detail.set(
-                "当前没有可编辑成果。完成至少一个期次的道路处理或载入已有成果后，"
+                "当前没有可编辑成果。完成至少一个期次的道路处理或打开已有项目后，"
                 "可在此进行人工编辑。"
             )
             self.review_edit_directory.set("暂无可用编辑目录")

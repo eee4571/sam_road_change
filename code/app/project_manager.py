@@ -13,7 +13,9 @@ from pathlib import Path
 
 from input_catalog import period_sort_key
 from app.result_publisher import (
-    ProjectLayout, read_result_index, result_index_from_manifest,
+    LEGACY_RESULT_DIRECTORY_NAME, RESULT_DIRECTORY_NAME,
+    ProjectLayout, atomic_write_json as write_result_json,
+    read_result_index, result_index_from_manifest,
 )
 USER_VECTOR_SUFFIX = ".shp"
 
@@ -29,7 +31,8 @@ SCAN_PROGRESS_TIME_INTERVAL = 0.3
 
 SCAN_EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".git", ".github", "env", ".venv", "venv", "__pycache__",
-    "04_成果输出", "_work", "_logs", ".editor_cache", "models", ".runtime",
+    RESULT_DIRECTORY_NAME, LEGACY_RESULT_DIRECTORY_NAME,
+    "_work", "_logs", ".editor_cache", "models", ".runtime",
     "runtime", "node_modules", "tmp", "temp", ".cache",
     "cache", "caches", "_cache", "_tmp", "temporary",
 })
@@ -285,6 +288,261 @@ def discover_legacy_result_manifest(output_root: Path | str) -> tuple[dict | Non
         "temporal_results": [],
     }, output / "legacy_results.virtual.json")
 
+
+def project_result_roots(
+    project_root: Path | str, preferred_output: Path | str | None = None,
+) -> list[Path]:
+    """Return configured, current and legacy result roots in read priority order."""
+    project = Path(project_root).expanduser().resolve()
+    candidates = []
+    if preferred_output:
+        candidates.append(Path(preferred_output).expanduser().resolve())
+    candidates.extend((project / RESULT_DIRECTORY_NAME, project / LEGACY_RESULT_DIRECTORY_NAME))
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate))
+        if key not in seen:
+            seen.add(key)
+            roots.append(candidate)
+    return roots
+
+
+def preferred_project_result_root(
+    project_root: Path | str, configured_output: Path | str | None = None,
+) -> Path:
+    """Keep an explicitly configured old project on its old root; default new projects to 成果输出."""
+    project = Path(project_root).expanduser().resolve()
+    if configured_output:
+        configured = Path(configured_output).expanduser().resolve()
+        if configured.is_dir() or configured.name in {
+            RESULT_DIRECTORY_NAME, LEGACY_RESULT_DIRECTORY_NAME,
+        }:
+            return configured
+    current = project / RESULT_DIRECTORY_NAME
+    legacy = project / LEGACY_RESULT_DIRECTORY_NAME
+    return current if current.is_dir() or not legacy.is_dir() else legacy
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def discover_project_result_context(
+    project_root: Path | str, output_root: Path | str,
+    *, persist: bool = False,
+) -> tuple[dict | None, Path | None]:
+    """Merge the formal index and recoverable internal manifests for GUI use.
+
+    The formal index owns the result tree. Internal latest-result files add the
+    review/edit and rerun metadata that is intentionally absent from that index.
+    """
+    project = Path(project_root).expanduser().resolve()
+    output = Path(output_root).expanduser().resolve()
+    layout = ProjectLayout.from_project(project, output)
+    roots = project_result_roots(project, output)
+    index_path = next(
+        (root / "result_index.json" for root in roots if (root / "result_index.json").is_file()),
+        None,
+    )
+    index = read_result_index(index_path) if index_path is not None else None
+
+    manifest = None
+    manifest_path = None
+    candidates = [layout.latest_pipeline_path]
+    candidates.extend(sorted(
+        layout.tasks_root.glob("runs/*/pipeline_result.json"),
+        key=lambda path: path.stat().st_mtime_ns, reverse=True,
+    ))
+    for candidate in candidates:
+        value = _read_json_object(candidate) if candidate.is_file() else None
+        if value is not None:
+            manifest, manifest_path = value, candidate
+            break
+    if manifest is None:
+        for root in roots:
+            value, path = discover_legacy_result_manifest(root)
+            if value is not None:
+                manifest, manifest_path = value, path
+                break
+    manifest = dict(manifest or {})
+
+    period_map: dict[tuple[str, str], dict] = {}
+    for entry in manifest.get("period_results", []) or []:
+        if isinstance(entry, dict):
+            key = (str(entry.get("grid") or "validation"), str(entry.get("period") or ""))
+            period_map[key] = dict(entry)
+
+    for path in layout.tasks_root.glob("runs/*/grids/*/periods/*/latest_result.json"):
+        result = _read_json_object(path)
+        if result is None:
+            continue
+        period = path.parent.name
+        area = path.parents[2].name
+        key = (area, period)
+        recovered = {
+            **result, "grid": area, "period": period,
+            "result": str(path.resolve()), "status": "completed",
+        }
+        existing = period_map.get(key)
+        if existing is None or not _manifest_path(existing.get("result")):
+            period_map[key] = recovered
+        else:
+            for name, value in recovered.items():
+                existing.setdefault(name, value)
+
+    for path in layout.tasks_root.glob("period_extractions/*/*/*/period_task.json"):
+        state = _read_json_object(path)
+        if state is None or state.get("status") != "completed":
+            continue
+        result = state.get("result_manifest") if isinstance(state.get("result_manifest"), dict) else {}
+        spec = state.get("input_spec") if isinstance(state.get("input_spec"), dict) else {}
+        area = str(spec.get("area_id") or path.parents[2].name)
+        period = str(spec.get("period") or path.parents[1].name)
+        period_map.setdefault((area, period), {
+            **result, "grid": area, "period": period,
+            "result": str(state.get("result") or ""), "status": "completed",
+        })
+
+    change_map: dict[tuple[str, str, str], dict] = {}
+    for entry in manifest.get("change_results", []) or []:
+        if isinstance(entry, dict):
+            key = (
+                str(entry.get("grid") or "validation"),
+                str(entry.get("before_period") or ""),
+                str(entry.get("after_period") or ""),
+            )
+            change_map[key] = dict(entry)
+    for directory in layout.tasks_root.glob("runs/*/grids/*/changes/*"):
+        if not directory.is_dir() or "_to_" not in directory.name:
+            continue
+        before, after = directory.name.split("_to_", 1)
+        area = directory.parents[1].name
+        layers = {}
+        for key, name in (
+            ("changes", "road_changes.shp"), ("added", "added_roads.shp"),
+            ("removed", "removed_roads.shp"), ("widened", "widened_road_parts.shp"),
+            ("narrowed", "narrowed_road_parts.shp"), ("review", "review_changes.shp"),
+        ):
+            path = directory / name
+            if path.is_file():
+                layers[key] = str(path.resolve())
+        if not layers:
+            continue
+        previews = {}
+        for key, name in (("change", "change_preview.png"), ("review_change", "review_preview.png")):
+            path = directory / name
+            if path.is_file():
+                previews[key] = str(path.resolve())
+        recovered = {
+            "grid": area, "before_period": before, "after_period": after,
+            "output": str(directory.resolve()), "layers": layers,
+            "previews": previews, "status": "completed",
+        }
+        gpkg, summary = directory / "road_changes.gpkg", directory / "change_summary.json"
+        if gpkg.is_file():
+            recovered["gpkg"] = str(gpkg.resolve())
+        if summary.is_file():
+            recovered["summary"] = str(summary.resolve())
+        change_map.setdefault((area, before, after), recovered)
+
+    temporal_map: dict[str, dict] = {
+        str(entry.get("grid") or "validation"): dict(entry)
+        for entry in (manifest.get("temporal_results", []) or []) if isinstance(entry, dict)
+    }
+    for directory in layout.tasks_root.glob("runs/*/grids/*/05_长时序成果"):
+        if not directory.is_dir():
+            continue
+        area = directory.parent.name
+        recovered = {"grid": area, "period_count": sum(key[0] == area for key in period_map)}
+        for key, name in (
+            ("life_shp", "road_life.shp"), ("observations_shp", "road_obs.shp"),
+            ("events_shp", "road_event.shp"), ("event_parts_shp", "event_parts.shp"),
+            ("lineage_shp", "road_lineage.shp"), ("review_shp", "road_review.shp"),
+        ):
+            path = directory / name
+            if path.is_file():
+                recovered[key] = str(path.resolve())
+        if recovered.get("life_shp"):
+            temporal_map.setdefault(area, recovered)
+
+    if index is not None:
+        for area, area_value in (index.get("areas") or {}).items():
+            if not isinstance(area_value, dict):
+                continue
+            for period, products in (area_value.get("periods") or {}).items():
+                if not isinstance(products, dict):
+                    continue
+                entry = period_map.setdefault((str(area), str(period)), {
+                    "grid": str(area), "period": str(period), "status": "completed",
+                })
+                entry["published"] = {
+                    key: value for key, value in products.items()
+                    if key in {
+                        "centerlines", "surfaces", "width_segments", "corridors",
+                        "road_extraction", "road_width",
+                    }
+                }
+                for key in ("centerlines", "surfaces", "width_segments", "corridors"):
+                    if products.get(key):
+                        entry.setdefault(key, products[key])
+            for pair, products in (area_value.get("changes") or {}).items():
+                if not isinstance(products, dict):
+                    continue
+                before = str(products.get("before_period") or pair.split("_to_", 1)[0])
+                after = str(products.get("after_period") or (pair.split("_to_", 1)[1] if "_to_" in pair else ""))
+                entry = change_map.setdefault((str(area), before, after), {
+                    "grid": str(area), "before_period": before, "after_period": after,
+                    "status": "completed",
+                })
+                entry["published"] = {
+                    key: value for key, value in products.items()
+                    if key in {
+                        "changes", "added", "removed", "widened", "narrowed",
+                        "road_change", "review_change",
+                    }
+                }
+                layers = entry.setdefault("layers", {})
+                for key in ("changes", "added", "removed", "widened", "narrowed"):
+                    if products.get(key):
+                        layers.setdefault(key, products[key])
+            temporal = area_value.get("temporal")
+            if isinstance(temporal, dict) and temporal:
+                entry = temporal_map.setdefault(str(area), {"grid": str(area)})
+                entry.setdefault("published", {}).update({
+                    key: value for key, value in temporal.items() if isinstance(value, str)
+                })
+                for key, value in temporal.items():
+                    if key.endswith("_shp") and value:
+                        entry.setdefault(key, value)
+        manifest["result_index"] = str(index_path)
+
+    manifest["period_results"] = list(period_map.values())
+    manifest["change_results"] = list(change_map.values())
+    manifest["temporal_results"] = list(temporal_map.values())
+    manifest["project_root"] = str(project)
+    manifest["output_root"] = str(index_path.parent if index_path is not None else output)
+    if index and not manifest.get("evaluation_summary"):
+        evaluations = [
+            value.get("evaluation") for value in (index.get("areas") or {}).values()
+            if isinstance(value, dict) and isinstance(value.get("evaluation"), dict)
+        ]
+        if evaluations:
+            manifest["evaluation_summary"] = dict(evaluations[0])
+    if index and not manifest.get("status"):
+        manifest["status"] = "completed"
+    if not manifest.get("period_results") and not manifest.get("change_results") and not index:
+        return None, manifest_path
+    if persist:
+        available = layout.tasks_root / "available_results.json"
+        write_result_json(available, manifest)
+        manifest_path = available
+    return manifest, (manifest_path or index_path)
+
 def external_source_signature(source_dir: Path | str) -> dict[str, int]:
     """Return a cheap source fingerprint; explicit rescans remain authoritative."""
     root = Path(source_dir).expanduser().resolve()
@@ -454,10 +712,12 @@ def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> l
     product_labels = {
         "centerlines": "中心线", "surfaces": "道路面",
         "width_segments": "道路宽度", "corridors": "道路走廊",
+        "road_extraction": "道路提取图", "road_width": "道路宽度图",
     }
     change_labels = {
         "changes": "全部变化", "added": "新增道路", "removed": "灭失道路",
         "widened": "拓宽道路部分", "narrowed": "变窄道路部分",
+        "road_change": "变化结果图", "review_change": "待复核变化图",
     }
     temporal_labels = {
         "life_shp": "道路生命史", "observations_shp": "道路观测",
@@ -550,7 +810,13 @@ def discover_validation_project(project_dir: Path | str) -> dict:
                     truths[(match.group(1), match.group(2))] = str(path)
         return sorted(periods, key=lambda item: natural_key(item[0])), truths
 
-    output_dir = named_directory(root, "04_", ("outputs", "output", "成果输出")) or root / "04_成果输出"
+    output_dir = (
+        root / RESULT_DIRECTORY_NAME
+        if (root / RESULT_DIRECTORY_NAME).is_dir()
+        else root / LEGACY_RESULT_DIRECTORY_NAME
+        if (root / LEGACY_RESULT_DIRECTORY_NAME).is_dir()
+        else root / RESULT_DIRECTORY_NAME
+    )
     flat_area_dir = named_directory(root, "01_", ("validation", "validation_area", "验证区"))
     flat_imagery_dir = named_directory(root, "02_", ("images", "imagery", "影像"))
     areas: list[tuple[str, str]] = []
@@ -673,11 +939,15 @@ class ProjectManager:
         )
         if layout.latest_pipeline_path.is_file():
             return layout.latest_pipeline_path
-        legacy_latest = Path(output_root).expanduser().resolve() / "latest_pipeline.json"
-        if legacy_latest.is_file():
-            return legacy_latest
-        _manifest, legacy_path = discover_legacy_result_manifest(output_root)
-        return legacy_path or legacy_latest
+        roots = project_result_roots(layout.project_root, output_root)
+        for root in roots:
+            legacy_latest = root / "latest_pipeline.json"
+            if legacy_latest.is_file():
+                return legacy_latest
+            _manifest, legacy_path = discover_legacy_result_manifest(root)
+            if legacy_path is not None:
+                return legacy_path
+        return layout.latest_pipeline_path
 
     @staticmethod
     def legacy_results(output_root: Path | str) -> tuple[dict | None, Path | None]:
@@ -686,6 +956,18 @@ class ProjectManager:
     @staticmethod
     def result_index(output_root: Path | str) -> dict | None:
         return read_result_index(Path(output_root).expanduser().resolve() / "result_index.json")
+
+    @staticmethod
+    def result_context(
+        project_root: Path | str, output_root: Path | str, *, persist: bool = False,
+    ) -> tuple[dict | None, Path | None]:
+        return discover_project_result_context(project_root, output_root, persist=persist)
+
+    @staticmethod
+    def preferred_output_root(
+        project_root: Path | str, configured_output: Path | str | None = None,
+    ) -> Path:
+        return preferred_project_result_root(project_root, configured_output)
 
     @staticmethod
     def review_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:

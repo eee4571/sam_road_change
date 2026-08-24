@@ -7,6 +7,7 @@ from tkinter import END, filedialog, messagebox, simpledialog
 
 from input_catalog import period_order_manifest, period_sort_key
 from app.project_manager import natural_key
+from app.result_publisher import RESULT_DIRECTORY_NAME
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
@@ -473,9 +474,11 @@ class DataPage:
             "shp": [str(value) for value in candidates.get("shp", [])],
             "txt": [str(value) for value in candidates.get("txt", [])],
         }
-        output_root = str(payload.get("output_root") or "").strip()
-        if output_root:
-            self.vars["output_root"].set(output_root)
+        output_root = self.project_manager.preferred_output_root(
+            self.project_root_path or payload.get("project_root") or ".",
+            str(payload.get("output_root") or "").strip() or None,
+        )
+        self.vars["output_root"].set(str(output_root))
         active = payload.get("active_task") or {}
         if isinstance(active, dict) and str(active.get("run_id") or "").strip():
             self.vars["run_id"].set(str(active["run_id"]))
@@ -763,7 +766,7 @@ class DataPage:
             return
         try:
             for child in (
-                "04_成果输出", "_work/tasks", "_work/cache",
+                RESULT_DIRECTORY_NAME, "_work/tasks", "_work/cache",
                 "_work/editor_cache", "_logs",
             ):
                 (root / child).mkdir(parents=True, exist_ok=True)
@@ -781,7 +784,7 @@ class DataPage:
         self.project_scan_cache = {}
         self.project_txt_encodings = {}
         self.project_candidates = {"shp": [], "txt": []}
-        self.vars["output_root"].set(str((root / "04_成果输出").resolve()))
+        self.vars["output_root"].set(str((root / RESULT_DIRECTORY_NAME).resolve()))
         self.data_source_display.set("尚未连接外部数据源")
         self.data_status.set("未连接数据源")
         self.project_scan_summary.set("项目已创建；请连接外部原始数据源。")
@@ -841,7 +844,7 @@ class DataPage:
             self.project_area_truths = []
             self.project_area_periods = {}
             self.project_candidates = {"shp": [], "txt": []}
-            output = root / "04_成果输出"
+            output = root / RESULT_DIRECTORY_NAME
             self.vars["output_root"].set(str(output))
             self.data_source_display.set("尚未连接外部数据源")
         flat_periods = next(iter(self.project_area_periods.values()), [])
@@ -880,6 +883,7 @@ class DataPage:
         else:
             self.status.set(self.project_scan_summary.get())
         self._save_project_config()
+        self.refresh_project_results(automatic=True)
 
     def save_task_config(self) -> None:
         path = filedialog.asksaveasfilename(

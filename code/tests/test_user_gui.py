@@ -393,7 +393,7 @@ class UserGuiInputCommandTests(unittest.TestCase):
             project = gui.discover_validation_project(root)
             self.assertEqual([period for period, _source in project["periods"]], ["2021", "2022"])
             self.assertEqual(project["truths"][("2021", "2022")], str(truth_dir / "2021_to_2022.shp"))
-            self.assertEqual(Path(project["output_root"]), root / "04_成果输出")
+            self.assertEqual(Path(project["output_root"]), root / "成果输出")
 
     def test_nested_area_folders_keep_independent_periods_and_truths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -464,6 +464,16 @@ class UserGuiInputCommandTests(unittest.TestCase):
         self.assertNotIn("open_preview_window", source)
         self.assertNotIn("_refresh_result_thumbnails", source)
         self.assertNotIn("PILImage.open", source)
+
+    def test_project_open_auto_loads_results_without_manual_manifest_picker(self) -> None:
+        code_root = Path(__file__).resolve().parents[1]
+        main_source = (code_root / "gui" / "main_window.py").read_text(encoding="utf-8")
+        data_source = (code_root / "gui" / "data_page.py").read_text(encoding="utf-8")
+        result_source = (code_root / "gui" / "result_page.py").read_text(encoding="utf-8")
+        self.assertNotIn("载入已有任务结果", main_source)
+        self.assertNotIn("选择已有任务结果索引", result_source)
+        self.assertIn("text=\"刷新成果\"", result_source)
+        self.assertIn("self.refresh_project_results(automatic=True)", data_source)
 
     def test_validation_command_rejects_non_shp_or_non_txt_user_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

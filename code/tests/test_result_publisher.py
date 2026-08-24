@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from app.project_manager import collect_result_tree_items, discover_legacy_result_manifest
+from app.project_manager import discover_project_result_context
 from app.result_publisher import (
     ProjectLayout, ResultPublisher, result_index_from_manifest,
 )
@@ -22,8 +23,10 @@ class ProjectLayoutTests(unittest.TestCase):
     def test_task_history_is_outside_user_result_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"
-            output = project / "04_成果输出"
-            layout = ProjectLayout.from_project(project, output)
+            output = project / "成果输出"
+            layout = ProjectLayout.from_project(project)
+            self.assertEqual(layout.results_root, output)
+            self.assertEqual(layout.legacy_results_root, project / "04_成果输出")
             self.assertEqual(
                 layout.full_run_root("run_1"), project / "_work" / "tasks" / "runs" / "run_1",
             )
@@ -36,7 +39,7 @@ class ResultPublisherTests(unittest.TestCase):
     def test_period_publish_copies_all_shapefile_components_and_rerun_overwrites_current(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"
-            output = project / "04_成果输出"
+            output = project / "成果输出"
             first = make_shapefile(project / "_work" / "first", "center", "first")
             surface = make_shapefile(project / "_work" / "first", "surface", "surface")
             publisher = ResultPublisher(output, project_root=project)
@@ -61,7 +64,7 @@ class ResultPublisherTests(unittest.TestCase):
     def test_change_rerun_overwrites_same_business_pair(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"
-            output = project / "04_成果输出"
+            output = project / "成果输出"
             first = make_shapefile(project / "_work" / "first", "changes", "old")
             second = make_shapefile(project / "_work" / "second", "changes", "new")
             publisher = ResultPublisher(output, project_root=project)
@@ -73,6 +76,78 @@ class ResultPublisherTests(unittest.TestCase):
             )
             self.assertEqual(one["changes"], two["changes"])
             self.assertEqual(Path(two["changes"]).read_text(encoding="utf-8"), "new.shp")
+
+    def test_only_whole_area_png_files_are_published(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            work = project / "_work"
+            work.mkdir(parents=True)
+            extraction = work / "road_overview.png"
+            width = work / "road_width_overview.png"
+            tile = work / "tile_optimized_viz.png"
+            change = work / "change_preview.png"
+            review = work / "review_preview.png"
+            for path in (extraction, width, tile, change, review):
+                path.write_bytes(path.name.encode("ascii"))
+            publisher = ResultPublisher(output, project_root=project)
+            period = publisher.publish_period("区域A", "2021", {
+                "previews": {"fusion": str(extraction), "width": str(width)},
+            })
+            self.assertEqual(Path(period["road_extraction"]).name, "road_extraction.png")
+            self.assertEqual(Path(period["road_width"]).name, "road_width.png")
+            rejected = publisher.publish_period("区域A", "2022", {
+                "previews": {"width": str(tile)},
+            })
+            self.assertNotIn("road_width", rejected)
+            published_change = publisher.publish_change("区域A", "2021", "2022", {
+                "review_change": str(review),
+                "previews": {"change": str(change), "review_change": str(review)},
+            })
+            self.assertEqual(Path(published_change["road_change"]).name, "road_change.png")
+            self.assertEqual(Path(published_change["review_change"]).name, "review_change.png")
+            publisher.publish_change("区域A", "2021", "2022", {
+                "previews": {"change": str(change)},
+            })
+            self.assertFalse((output / "区域A" / "02_变化检测" / "2021_to_2022" / "review_change.png").exists())
+
+    def test_open_project_merges_formal_index_and_internal_review_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            run = project / "_work" / "tasks" / "runs" / "run_1"
+            period = run / "grids" / "区域A" / "periods" / "2021"
+            products = period / "runs" / "roads" / "products"
+            center = make_shapefile(products, "road_centerlines", "center")
+            review = period / "runs" / "roads" / "width_review"
+            review.mkdir(parents=True)
+            result_path = period / "latest_result.json"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(json.dumps({
+                "centerlines": str(center),
+                "review": {"available": True, "directory": str(review)},
+            }, ensure_ascii=False), encoding="utf-8")
+            publisher = ResultPublisher(output, project_root=project)
+            publisher.publish_period("区域A", "2021", {"centerlines": str(center)})
+            manifest, path = discover_project_result_context(project, output, persist=True)
+            self.assertEqual(path, project / "_work" / "tasks" / "available_results.json")
+            self.assertEqual(len(manifest["period_results"]), 1)
+            self.assertEqual(manifest["period_results"][0]["result"], str(result_path.resolve()))
+            self.assertTrue(manifest["period_results"][0]["review"]["available"])
+            labels = {item["label"] for item in collect_result_tree_items(manifest, path.parent)}
+            self.assertTrue({"区域A", "单期道路", "2021", "中心线"}.issubset(labels))
+
+    def test_old_result_index_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "04_成果输出"
+            center = make_shapefile(output / "区域A" / "01_单期道路" / "2021", "road_centerlines", "old")
+            ResultPublisher(output, project_root=project).publish_period(
+                "区域A", "2021", {"centerlines": str(center)},
+            )
+            manifest, _path = discover_project_result_context(project, output)
+            self.assertEqual(manifest["output_root"], str(output.resolve()))
+            self.assertEqual(len(manifest["period_results"]), 1)
 
     def test_legacy_manifest_builds_read_only_business_tree_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

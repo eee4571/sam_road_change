@@ -26,7 +26,7 @@ class ResultPage:
         self.result_body = page
         result_card = ttk.LabelFrame(page, text="处理结果", padding=LAYOUT_METRICS["card_padding"])
         result_card.pack(fill=X)
-        self.result_status = StringVar(value="完成任务或载入已有成果后，可在此查看处理结果。")
+        self.result_status = StringVar(value="打开项目或完成任务后，可在此查看处理结果。")
         self.result_period_count = StringVar(value="0 期")
         self.result_change_count = StringVar(value="0 组")
         self.result_area_count = StringVar(value="0 区")
@@ -61,6 +61,7 @@ class ResultPage:
         ttk.Button(result_actions, text="打开所选成果", command=self.open_selected_result).pack(side=LEFT)
         ttk.Button(result_actions, text="打开所在目录", command=self.open_selected_result_folder).pack(side=LEFT, padx=(5, 0))
         ttk.Button(result_actions, text="查看长时序属性表", command=self.open_temporal_attribute_table).pack(side=LEFT, padx=(5, 0))
+        ttk.Button(result_actions, text="刷新成果", command=self.refresh_project_results).pack(side=LEFT, padx=(5, 0))
 
         evaluation_card = ttk.LabelFrame(page, text="精度评价", padding=LAYOUT_METRICS["card_padding"])
         evaluation_card.pack(fill=X, pady=(LAYOUT_METRICS["section_gap"], 0))
@@ -139,41 +140,11 @@ class ResultPage:
         summary.grid_columnconfigure(1, weight=1)
 
     def _latest_manifest(self) -> tuple[dict | None, Path | None]:
-        if self.loaded_manifest_path is not None and self.loaded_manifest_path.is_file():
-            latest = self.loaded_manifest_path
-        else:
-            latest = self.project_manager.latest_manifest_path(
-                self.vars["output_root"].get().strip(), self.project_root_path,
-            )
-        if not latest.is_file():
-            result_index = Path(self.vars["output_root"].get().strip()) / "result_index.json"
-            if result_index.is_file():
-                return ({
-                    "result_index": str(result_index),
-                    "output_root": str(result_index.parent),
-                    "project_root": self.project_root_path,
-                    "period_results": [], "change_results": [], "temporal_results": [],
-                    "status": "completed",
-                }, result_index)
-            legacy, legacy_path = self.project_manager.legacy_results(
-                self.vars["output_root"].get().strip(),
-            )
-            if legacy is not None and legacy_path is not None:
-                return legacy, legacy_path
-            return None, latest
-        try:
-            value = json.loads(latest.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None, latest
-        if isinstance(value, dict) and isinstance(value.get("areas"), dict):
-            value = {
-                "result_index": str(latest),
-                "output_root": str(latest.parent),
-                "project_root": str(value.get("project_root") or self.project_root_path),
-                "period_results": [], "change_results": [], "temporal_results": [],
-                "status": "completed",
-            }
-        return (value, latest) if isinstance(value, dict) else (None, latest)
+        if not self.project_root_path:
+            return None, None
+        return self.project_manager.result_context(
+            self.project_root_path, self.vars["output_root"].get().strip(), persist=True,
+        )
 
     def _refresh_result_availability(self) -> None:
         manifest, latest = self._latest_manifest()
@@ -181,7 +152,7 @@ class ResultPage:
             self.results_available = False
             self.review_items = []
             self.temporal_items = []
-            self.result_status.set("尚无可显示的任务成果；完成任务或载入已有成果后即可查看。")
+            self.result_status.set("尚无可显示的任务成果；完成任务或打开已有项目后即可查看。")
             if hasattr(self, "result_period_count"):
                 self.result_period_count.set("0 期")
                 self.result_change_count.set("0 组")
@@ -329,6 +300,11 @@ class ResultPage:
             if isinstance(entry, dict) and (
                 (entry.get("gpkg") and Path(str(entry["gpkg"])).is_file())
                 or (entry.get("summary") and Path(str(entry["summary"])).is_file())
+                or (
+                    isinstance(entry.get("layers"), dict)
+                    and entry["layers"].get("changes")
+                    and Path(str(entry["layers"]["changes"])).is_file()
+                )
             )
         ]
         labels = [
@@ -495,35 +471,15 @@ class ResultPage:
         output_root = Path(str(manifest.get("output_root") or self.vars["output_root"].get())).expanduser()
         self._open(output_root)
 
-    def load_existing_results(self) -> None:
-        """Attach the GUI to an existing saved run without executing inference."""
-        selected = filedialog.askopenfilename(
-            parent=self.root, title="选择已有任务结果索引",
-            filetypes=(("SAMRoad 任务索引", "*.json"),),
-        )
-        if not selected:
-            return
-        path = Path(selected).expanduser().resolve()
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            messagebox.showerror("无法读取已有结果", str(exc), parent=self.root)
-            return
-        is_pipeline = isinstance(manifest, dict) and isinstance(manifest.get("period_results"), list)
-        is_result_index = isinstance(manifest, dict) and isinstance(manifest.get("areas"), dict)
-        if not is_pipeline and not is_result_index:
-            messagebox.showerror("不是任务结果索引", "请选择 result_index.json、latest_pipeline.json 或 pipeline_result.json。", parent=self.root)
-            return
-        self.loaded_manifest_path = path
-        output = str(manifest.get("output_root") or (path.parent if is_result_index else "")).strip()
-        if not output:
-            output = str(path.parent if path.name == "latest_pipeline.json" else Path(manifest.get("job_root", path.parent)).parent)
-        self.vars["output_root"].set(output)
-        self.current_project.set(f"已有结果：{manifest.get('run_id', path.parent.name)}")
-        self.preflight_passed = True
+    def refresh_project_results(self, *, automatic: bool = False) -> None:
+        """Reload the current project's index and manifests without a file picker."""
+        self._result_tree_fingerprint = None
         self._refresh_result_availability()
-        self._show_step(3, force=True)
-        self.status.set("已载入已有成果；可直接查看成果或进入人工编辑，不会运行推理。")
+        if not automatic:
+            self.status.set(
+                "成果已刷新；已重新读取当前项目的正式索引、任务状态和人工编辑资料。"
+                if self.results_available else "成果已刷新；当前项目尚无正式成果。"
+            )
 
     def open_task_report(self) -> None:
         manifest, latest = self._latest_manifest()
