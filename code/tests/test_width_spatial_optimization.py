@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -17,6 +20,7 @@ from graph_spatial_context import (  # noqa: E402
     find_vertical_divided_anchor_pair,
     points_within_radius_of_references,
 )
+import finalize_review_results  # noqa: E402
 from parallel_utils import resolve_worker_count, spawn_map  # noqa: E402
 
 
@@ -75,6 +79,44 @@ def naive_vertical_pair(
 
 
 class WidthSpatialOptimizationTests(unittest.TestCase):
+    def test_finalize_memory_failure_detection_is_specific(self) -> None:
+        self.assertTrue(finalize_review_results._is_memory_allocation_failure({
+            "error": "Unable to allocate 16.0 MiB for an array",
+        }))
+        self.assertTrue(finalize_review_results._is_memory_allocation_failure({
+            "error": "", "error_type": "MemoryError",
+        }))
+        self.assertFalse(finalize_review_results._is_memory_allocation_failure({
+            "error": "invalid optimized graph",
+            "error_type": "ValueError",
+        }))
+
+    def test_finalize_memory_failures_are_retried_serially_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            failures = [
+                {"summary": str(root / "v0001_summary.json"), "error": "Unable to allocate 16 MiB"},
+                {"summary": str(root / "v0002_summary.json"), "error": "out of memory"},
+            ]
+            calls: list[str] = []
+
+            def fake_finalize(_args, _output, _final, summary_path, _decisions, _decisions_path):
+                calls.append(summary_path.name)
+                if summary_path.stem.startswith("v0002"):
+                    raise MemoryError("serial allocation still failed")
+                return {"tile": summary_path.stem, "profiling": {"total_seconds": 1.0}}
+
+            with mock.patch.object(finalize_review_results, "finalize_one", side_effect=fake_finalize):
+                recovered, remaining = finalize_review_results._retry_memory_failures_serially(
+                    argparse.Namespace(), root, root / "final", {}, root / "decisions.csv", failures,
+                )
+
+            self.assertEqual(calls, ["v0001_summary.json", "v0002_summary.json"])
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(len(remaining), 1)
+            self.assertTrue(remaining[0]["serial_memory_retry"])
+            self.assertEqual(remaining[0]["parallel_error"], "out of memory")
+
     def test_worker_count_is_conservative_and_explicitly_controllable(self) -> None:
         self.assertEqual(resolve_worker_count(0, 6, automatic_limit=2), 2)
         self.assertEqual(resolve_worker_count(1, 6), 1)

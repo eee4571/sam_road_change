@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import pickle
 import time
@@ -1446,8 +1447,64 @@ def _finalize_one_worker(payload: tuple[dict, str, str, str, dict, str]) -> dict
     except Exception as exc:
         return {
             "ok": False,
-            "failure": {"summary": str(summary_path), "error": str(exc)},
+            "failure": {
+                "summary": str(summary_path),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
         }
+
+
+def _is_memory_allocation_failure(failure: dict) -> bool:
+    """Return whether a parallel failure is safe to retry serially."""
+    error_type = str(failure.get("error_type", "")).strip().casefold()
+    if error_type in {"memoryerror", "_arraymemoryerror", "arraymemoryerror"}:
+        return True
+    message = str(failure.get("error", "")).strip().casefold()
+    return any(marker in message for marker in (
+        "unable to allocate",
+        "cannot allocate memory",
+        "out of memory",
+        "not enough memory",
+        "memoryerror",
+        "std::bad_alloc",
+    ))
+
+
+def _retry_memory_failures_serially(
+    args: argparse.Namespace,
+    output_dir: Path,
+    final_dir: Path,
+    decisions: dict[tuple[str, str, str], dict],
+    decisions_path: Path,
+    memory_failures: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Retry memory-related failures after the parallel worker pool has exited."""
+    recovered: list[dict] = []
+    remaining: list[dict] = []
+    for index, failure in enumerate(memory_failures, start=1):
+        summary_path = Path(str(failure.get("summary", "")))
+        print(
+            f"[memory-retry {index}/{len(memory_failures)}] "
+            f"Retrying {summary_path.name} serially after parallel memory failure."
+        )
+        gc.collect()
+        try:
+            recovered.append(
+                finalize_one(args, output_dir, final_dir, summary_path, decisions, decisions_path)
+            )
+            print(f"[memory-retry] Serial retry succeeded: {summary_path}")
+        except Exception as exc:
+            retry_failure = {
+                "summary": str(summary_path),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "parallel_error": str(failure.get("error", "")),
+                "serial_memory_retry": True,
+            }
+            remaining.append(retry_failure)
+            print(f"Failed after serial memory retry: {summary_path} -> {exc}")
+    return recovered, remaining
 
 
 def main() -> int:
@@ -1526,6 +1583,9 @@ def main() -> int:
     success_count = 0
     failures = []
     optimized_summaries = []
+    parallel_failure_count = 0
+    serial_memory_retry_count = 0
+    serial_memory_retry_success_count = 0
     worker_count = resolve_worker_count(args.workers, len(summary_paths))
     print(f"Finalize slice workers: {worker_count or 1}; slice count: {len(summary_paths)}")
     if worker_count <= 1:
@@ -1537,7 +1597,11 @@ def main() -> int:
                 )
                 success_count += 1
             except Exception as exc:
-                failures.append({"summary": str(summary_path), "error": str(exc)})
+                failures.append({
+                    "summary": str(summary_path),
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                })
                 print(f"Failed: {summary_path} -> {exc}")
     else:
         payloads = [
@@ -1548,13 +1612,37 @@ def main() -> int:
             for summary_path in summary_paths
         ]
         results = spawn_map(_finalize_one_worker, payloads, worker_count)
+        parallel_failures = []
         for result in results:
             if result["ok"]:
                 success_count += 1
                 optimized_summaries.append(result["summary"])
             else:
-                failures.append(result["failure"])
-                print(f"Failed: {result['failure']['summary']} -> {result['failure']['error']}")
+                parallel_failures.append(result["failure"])
+        parallel_failure_count = len(parallel_failures)
+        memory_failures = [
+            failure for failure in parallel_failures
+            if _is_memory_allocation_failure(failure)
+        ]
+        failures.extend(
+            failure for failure in parallel_failures
+            if not _is_memory_allocation_failure(failure)
+        )
+        for failure in failures:
+            print(f"Failed: {failure['summary']} -> {failure['error']}")
+        if memory_failures:
+            serial_memory_retry_count = len(memory_failures)
+            print(
+                f"Parallel finalization exhausted memory for {len(memory_failures)} slice(s); "
+                "the worker pool has exited, retrying those slices serially."
+            )
+            recovered, retry_failures = _retry_memory_failures_serially(
+                args, output_dir, final_dir, decisions, decisions_path, memory_failures,
+            )
+            optimized_summaries.extend(recovered)
+            success_count += len(recovered)
+            serial_memory_retry_success_count = len(recovered)
+            failures.extend(retry_failures)
     batch_summary = {
         "source_output_dir": str(output_dir),
         "final_dir": str(final_dir),
@@ -1562,6 +1650,12 @@ def main() -> int:
         "success_count": success_count,
         "failure_count": len(failures),
         "workers": int(worker_count),
+        "parallel_failure_count": int(parallel_failure_count),
+        "serial_memory_retry_count": int(serial_memory_retry_count),
+        "serial_memory_retry_success_count": int(serial_memory_retry_success_count),
+        "serial_memory_retry_failure_count": int(
+            serial_memory_retry_count - serial_memory_retry_success_count
+        ),
         "failures": failures,
         "slices": [summary_path.name.removesuffix("_summary.json") for summary_path in summary_paths],
         "partial_rebuild": bool(requested_stems),
