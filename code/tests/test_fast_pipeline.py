@@ -29,8 +29,8 @@ from engine.fast_pipeline import (
     export_fast_products,
     measure_fast_edge_widths,
     measure_fast_widths,
-    _save_graph,
 )
+from engine.samroad.image_resume import required_image_outputs
 
 
 class FastCommandTests(unittest.TestCase):
@@ -56,6 +56,11 @@ class FastCommandTests(unittest.TestCase):
             self.assertNotIn("--execution-profile", full)
             self.assertEqual(fast[fast.index("--execution-profile") + 1], "fast")
 
+    def test_fast_resume_requires_probability_but_no_graph(self) -> None:
+        outputs = required_image_outputs(Path("output"), "tile", "fast")
+        self.assertEqual([item["role"] for item in outputs], ["road_probability"])
+        self.assertTrue(str(outputs[0]["path"]).endswith("tile_road.png"))
+
     def test_legacy_full_resume_treats_missing_profile_as_full(self) -> None:
         prior = {
             "pipeline_version": "v", "mode": "validation", "device": "cpu",
@@ -74,27 +79,37 @@ class FastCommandTests(unittest.TestCase):
 
 
 class FastRelativeTests(unittest.TestCase):
-    def test_normal_high_confidence_road_uses_absolute_mask(self) -> None:
+    def test_high_probability_road_is_retained(self) -> None:
         probability = np.full((80, 80), 0.03, dtype=np.float32)
         probability[:, 36:44] = 0.85
         mask, metadata = build_fast_surface_mask(probability)
-        self.assertFalse(metadata["fast_relative_triggered"])
+        self.assertEqual(metadata["raw_high_probability_pixel_count"], 80 * 8)
         self.assertGreater(float(mask[:, 38].mean()), 0.9)
 
-    def test_weak_but_separable_road_triggers_relative_recovery(self) -> None:
+    def test_weak_road_is_recovered_from_local_relative_contrast(self) -> None:
         probability = np.full((100, 100), 0.04, dtype=np.float32)
         probability[:, 47:53] = 0.24
         mask, metadata = build_fast_surface_mask(probability)
-        self.assertTrue(metadata["fast_relative_triggered"])
+        self.assertEqual(metadata["raw_high_probability_pixel_count"], 0)
+        self.assertGreater(metadata["relative_added_pixel_count"], 0)
         self.assertGreater(float(mask[:, 50].mean()), 0.75)
         self.assertLess(float(mask.mean()), 0.2)
+
+    def test_weak_road_is_recovered_beside_a_strong_road(self) -> None:
+        probability = np.full((120, 120), 0.04, dtype=np.float32)
+        probability[:, 20:27] = 0.82
+        probability[:, 86:92] = 0.26
+        mask, metadata = build_fast_surface_mask(probability)
+        self.assertGreater(float(mask[:, 23].mean()), 0.9)
+        self.assertGreater(float(mask[:, 89].mean()), 0.75)
+        self.assertGreater(metadata["relative_added_pixel_count"], 0)
 
     def test_background_noise_does_not_become_foreground(self) -> None:
         rng = np.random.default_rng(7)
         probability = np.clip(rng.normal(0.04, 0.006, (100, 100)), 0, 1).astype(np.float32)
         mask, metadata = build_fast_surface_mask(probability)
-        self.assertFalse(metadata["fast_relative_triggered"])
         self.assertEqual(int(mask.sum()), 0)
+        self.assertEqual(metadata["relative_added_pixel_count"], 0)
 
 
 class FastWidthTests(unittest.TestCase):
@@ -113,7 +128,6 @@ class FastWidthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             images = root / "images"; images.mkdir()
-            graphs = root / "graphs"; graphs.mkdir()
             probabilities = root / "probabilities"; probabilities.mkdir()
             surfaces = root / "surfaces"
             widths = root / "widths"
@@ -127,10 +141,8 @@ class FastWidthTests(unittest.TestCase):
             probability = np.zeros((80, 80), dtype=np.uint8)
             probability[:, 30:40] = 220
             cv2.imwrite(str(probabilities / "tile_road.png"), probability)
-            cv2.imwrite(str(probabilities / "tile_centerline_probability.png"), probability)
-            _save_graph(graphs / "tile.p", self.nodes, self.edges)
             build_fast_surfaces(images, probabilities, surfaces)
-            measure_fast_widths(images, graphs, surfaces, probabilities, widths)
+            summary = measure_fast_widths(images, surfaces, probabilities, widths)
             exported = export_fast_products(widths, products, image_dir=images)
             for key in ("centerlines", "surfaces", "width_segments", "corridors", "gpkg"):
                 self.assertTrue(Path(exported[key]).is_file(), key)
@@ -138,6 +150,9 @@ class FastWidthTests(unittest.TestCase):
             self.assertTrue((products / "road_width_overview.png").is_file())
             self.assertEqual(Path(exported["previews"]["fusion"]), products / "road_overview.png")
             self.assertEqual(Path(exported["previews"]["width"]), products / "road_width_overview.png")
+            self.assertFalse((root / "graphs").exists())
+            self.assertGreater(summary["images"][0]["final_centerline_length"], 0)
+            self.assertGreater(summary["images"][0]["measured_edge_count"], 0)
 
     def test_distance_transform_is_used_when_normal_probe_fails(self) -> None:
         rows = measure_fast_edge_widths(

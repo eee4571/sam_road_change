@@ -133,6 +133,18 @@ class UserGuiInputCommandTests(unittest.TestCase):
             "added": "2", "width_changed": "3", "removed": "4",
         })
 
+        app._evaluation_truth_field_summary = {
+            "fields": ["BHBM"], "values": {"BHBM": ["3"]},
+        }
+        app._evaluation_type_field_changed()
+        self.assertIn(
+            "未出现的类别值：2、4（按当前真值无对应类别处理）",
+            app.evaluation_type_field_status.set.call_args.args[0],
+        )
+        self.assertEqual(app._evaluation_truth_value_map(), {
+            "added": "2", "width_changed": "3", "removed": "4",
+        })
+
         app.evaluation_type_field.get.return_value = "change_type"
         app._evaluation_type_field_changed()
         self.assertIn("当前真值不含字段“change_type”", app.evaluation_type_field_status.set.call_args.args[0])

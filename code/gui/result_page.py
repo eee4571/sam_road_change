@@ -491,7 +491,6 @@ class ResultPage:
         for combo in getattr(self, "evaluation_value_combos", {}).values():
             combo.configure(values=values)
         if matched.casefold() == "bhbm":
-            detail = f"编码规则：2=新增，3=宽度变化，4=灭失；当前样例值：{samples}"
             defaults = ("2", "3", "4")
             for variable, default in zip((
                 self.evaluation_added_value,
@@ -500,6 +499,15 @@ class ResultPage:
             ), defaults):
                 if default in values or not values:
                     variable.set(default)
+            absent = [value for value in defaults if values and value not in values]
+            absent_note = (
+                f"；未出现的类别值：{'、'.join(absent)}（按当前真值无对应类别处理）"
+                if absent else ""
+            )
+            detail = (
+                f"编码规则：2=新增，3=宽度变化，4=灭失；当前样例值：{samples}"
+                f"{absent_note}"
+            )
         else:
             detail = f"样例值：{samples}"
         self.evaluation_type_field_status.set(f"已确认字段“{matched}”；{detail}。")
@@ -514,20 +522,6 @@ class ResultPage:
             raise ValueError("请分别选择新增、宽度变化和灭失对应的真值字段值。")
         if len({value.casefold() for value in mapping.values()}) != 3:
             raise ValueError("新增、宽度变化和灭失必须对应三个不同的真值字段值。")
-        values_by_field = (
-            getattr(self, "_evaluation_truth_field_summary", {}).get("values") or {}
-        )
-        selected_field = self.evaluation_type_field.get().strip()
-        matched_field = next(
-            (name for name in values_by_field if str(name).casefold() == selected_field.casefold()),
-            selected_field,
-        )
-        available = {
-            str(value).casefold() for value in values_by_field.get(matched_field, [])
-        }
-        missing = [value for value in mapping.values() if available and value.casefold() not in available]
-        if missing:
-            raise ValueError("所选字段中没有以下映射值：" + "、".join(missing))
         return mapping
 
     def supplement_evaluation_truth(self) -> None:

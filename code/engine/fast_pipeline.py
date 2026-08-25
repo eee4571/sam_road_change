@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import sys
 from pathlib import Path
 
@@ -45,141 +44,61 @@ def build_fast_surface_mask(
     absolute_threshold: float = 0.45,
     min_area: int = 24,
 ) -> tuple[np.ndarray, dict]:
-    """Build a small-morphology road mask and automatically recover separable weak scenes."""
+    """Build the single Fast road mask from absolute and local-relative evidence."""
     values = _probability01(probability)
-    percentiles = np.percentile(values, (50, 80, 90, 95, 99)) if values.size else np.zeros(5)
-    p50, p80, p90, p95, p99 = (float(value) for value in percentiles)
-    high_fraction = float(np.mean(values >= absolute_threshold)) if values.size else 0.0
-    separable = (p99 - p80) >= 0.035 and (p99 - p50) >= 0.07
-    triggered = bool(p95 < absolute_threshold and high_fraction < 0.01 and separable)
-
+    high = values >= float(absolute_threshold)
+    background_small = cv2.GaussianBlur(values, (0, 0), sigmaX=3.0, sigmaY=3.0)
+    background_large = cv2.GaussianBlur(values, (0, 0), sigmaX=9.0, sigmaY=9.0)
+    relative_contrast = np.maximum(values - background_small, values - background_large)
+    relative = (values >= 0.10) & (relative_contrast >= 0.055)
+    relative = _remove_small_components(relative, min_area)
+    relative_added = relative & ~high
     kernel = np.ones((3, 3), dtype=np.uint8)
-    if not triggered:
-        binary = (values >= absolute_threshold).astype(np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        binary = _remove_small_components(binary, min_area)
-        return binary, {
-            "fast_relative_triggered": False,
-            "p50": p50, "p80": p80, "p90": p90, "p95": p95, "p99": p99,
-            "fixed_high_foreground_ratio": high_fraction,
-            "foreground_ratio": float(binary.mean()) if binary.size else 0.0,
-        }
-
-    local_mean = cv2.GaussianBlur(values, (0, 0), sigmaX=5.0, sigmaY=5.0)
-    local_square_mean = cv2.GaussianBlur(values * values, (0, 0), sigmaX=5.0, sigmaY=5.0)
-    local_std = np.sqrt(np.maximum(local_square_mean - local_mean * local_mean, 0.0))
-    contrast = values - local_mean
-    z_score = contrast / (local_std + 1e-4)
-    positive = contrast[contrast > 0]
-    contrast_floor = max(0.008, float(np.percentile(positive, 65)) if positive.size else 1.0)
-    strong_threshold = max(p90, p50 + 0.55 * max(p99 - p50, 0.0))
-    weak_threshold = max(p80, p50 + 0.18 * max(p99 - p50, 0.0))
-    strong = (values >= strong_threshold) & (contrast >= contrast_floor)
-    weak = (
-        (values >= weak_threshold)
-        & (contrast >= contrast_floor * 0.65)
-        & (z_score >= 0.65)
-    )
-    candidate = cv2.morphologyEx((strong | weak).astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidate, connectivity=8)
-    kept = np.zeros_like(candidate)
-    for label in range(1, count):
-        component = labels == label
-        if int(stats[label, cv2.CC_STAT_AREA]) >= min_area and bool(np.any(strong & component)):
-            kept[component] = 1
-    kept = _remove_small_components(kept, min_area)
-    return kept, {
-        "fast_relative_triggered": True,
-        "p50": p50, "p80": p80, "p90": p90, "p95": p95, "p99": p99,
-        "fixed_high_foreground_ratio": high_fraction,
-        "strong_threshold": float(strong_threshold),
-        "weak_threshold": float(weak_threshold),
-        "contrast_threshold": float(contrast_floor),
-        "foreground_ratio": float(kept.mean()) if kept.size else 0.0,
+    final_mask = cv2.morphologyEx((high | relative).astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    final_mask = _remove_small_components(final_mask, min_area)
+    return final_mask, {
+        "raw_high_probability_pixel_count": int(np.count_nonzero(high)),
+        "relative_added_pixel_count": int(np.count_nonzero(relative_added)),
+        "final_mask_pixel_count": int(np.count_nonzero(final_mask)),
     }
 
 
-def _read_graph(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    with path.open("rb") as stream:
-        graph = pickle.load(stream)
-    node_to_index: dict[tuple[int, int], int] = {}
-    edges: set[tuple[int, int]] = set()
-    for raw_node, raw_neighbors in graph.items():
-        node = tuple(int(round(value)) for value in raw_node)
-        node_to_index.setdefault(node, len(node_to_index))
-        for raw_neighbor in raw_neighbors:
-            neighbor = tuple(int(round(value)) for value in raw_neighbor)
-            node_to_index.setdefault(neighbor, len(node_to_index))
-            src, dst = node_to_index[node], node_to_index[neighbor]
-            if src != dst:
-                edges.add(tuple(sorted((src, dst))))
-    nodes = np.zeros((len(node_to_index), 2), dtype=np.float32)
-    for node, index in node_to_index.items():
-        nodes[index] = node
-    return nodes, np.asarray(sorted(edges), dtype=np.int32).reshape(-1, 2)
-
-
-def _save_graph(path: Path, nodes: np.ndarray, edges: np.ndarray) -> None:
-    graph: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for src_index, dst_index in edges.tolist():
-        src = tuple(int(round(value)) for value in nodes[int(src_index)])
-        dst = tuple(int(round(value)) for value in nodes[int(dst_index)])
-        if src == dst:
-            continue
-        graph.setdefault(src, [])
-        graph.setdefault(dst, [])
-        if dst not in graph[src]:
-            graph[src].append(dst)
-        if src not in graph[dst]:
-            graph[dst].append(src)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as stream:
-        pickle.dump(graph, stream)
-
-
-def filter_fast_native_graph(
-    nodes: np.ndarray,
-    edges: np.ndarray,
-    *,
-    min_component_length_px: float = 12.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Remove only very short isolated native TopoNet components."""
-    nodes = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
-    edges = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
-    if edges.size == 0:
-        return nodes[:0], edges
-    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(len(nodes))]
-    for edge_id, (src, dst) in enumerate(edges.tolist()):
-        adjacency[src].append((dst, edge_id))
-        adjacency[dst].append((src, edge_id))
-    visited: set[int] = set()
-    kept_edge_ids: list[int] = []
-    for seed in range(len(nodes)):
-        if seed in visited or not adjacency[seed]:
-            continue
-        stack = [seed]
-        visited.add(seed)
-        component_edges: set[int] = set()
-        while stack:
-            node = stack.pop()
-            for neighbor, edge_id in adjacency[node]:
-                component_edges.add(edge_id)
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    stack.append(neighbor)
-        length = sum(
-            float(np.linalg.norm(nodes[edges[edge_id, 1]] - nodes[edges[edge_id, 0]]))
-            for edge_id in component_edges
-        )
-        if length >= min_component_length_px:
-            kept_edge_ids.extend(component_edges)
-    if not kept_edge_ids:
-        return nodes[:0], np.empty((0, 2), dtype=np.int32)
-    kept_edges = edges[sorted(set(kept_edge_ids))]
-    used = sorted(set(kept_edges.ravel().tolist()))
-    remap = {old: new for new, old in enumerate(used)}
-    compact = np.asarray([(remap[int(src)], remap[int(dst)]) for src, dst in kept_edges], dtype=np.int32)
-    return nodes[used], compact
+def _prune_short_skeleton_spurs(skeleton: np.ndarray, max_length_px: int = 6) -> np.ndarray:
+    """Delete short endpoint-to-junction branches from a one-pixel skeleton."""
+    working = np.asarray(skeleton, dtype=bool).copy()
+    for _pass in range(max(1, int(max_length_px))):
+        points = {tuple(int(value) for value in point) for point in np.argwhere(working)}
+        adjacency = {
+            point: [
+                (point[0] + drow, point[1] + dcol)
+                for drow in (-1, 0, 1) for dcol in (-1, 0, 1)
+                if (drow or dcol) and (point[0] + drow, point[1] + dcol) in points
+            ]
+            for point in points
+        }
+        removed: set[tuple[int, int]] = set()
+        for endpoint in sorted(point for point, neighbors in adjacency.items() if len(neighbors) == 1):
+            if endpoint in removed:
+                continue
+            path = [endpoint]
+            previous = None
+            current = endpoint
+            while len(path) <= int(max_length_px) + 1:
+                candidates = [point for point in adjacency.get(current, []) if point != previous]
+                if not candidates:
+                    break
+                following = candidates[0]
+                path.append(following)
+                previous, current = current, following
+                if len(adjacency.get(current, [])) != 2:
+                    break
+            if len(adjacency.get(current, [])) >= 3 and len(path) - 1 <= int(max_length_px):
+                removed.update(path[:-1])
+        if not removed:
+            break
+        rows, cols = zip(*removed)
+        working[np.asarray(rows), np.asarray(cols)] = False
+    return working.astype(np.uint8)
 
 
 def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -195,6 +114,7 @@ def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             skeleton |= working & (1 - opened)
             working = cv2.erode(working, element)
         skeleton = skeleton > 0
+    skeleton = _prune_short_skeleton_spurs(skeleton, max_length_px=6) > 0
     points = [tuple(int(value) for value in point) for point in np.argwhere(skeleton).tolist()]
     if not points:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.int32)
@@ -253,48 +173,7 @@ def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     nodes_array = np.zeros((len(node_index), 2), dtype=np.float32)
     for point, index in node_index.items():
         nodes_array[index] = point
-    nodes, compact = filter_fast_native_graph(
-        nodes_array, np.asarray(sorted(graph_edges), dtype=np.int32).reshape(-1, 2),
-        min_component_length_px=20.0,
-    )
-    return nodes, compact
-
-
-def recover_fast_graphs(image_dir: Path, graph_dir: Path, probability_dir: Path, output_dir: Path) -> dict:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for image_path in _raster_paths(image_dir):
-        graph_path = graph_dir / f"{image_path.stem}.p"
-        probability_path = probability_dir / f"{image_path.stem}_road.png"
-        if not graph_path.is_file() or not probability_path.is_file():
-            raise FileNotFoundError(f"Fast recovery input missing for {image_path.stem}")
-        probability = cv2.imread(str(probability_path), cv2.IMREAD_GRAYSCALE)
-        if probability is None:
-            raise ValueError(f"Cannot read SAMRoad probability: {probability_path}")
-        surface, diagnostics = build_fast_surface_mask(probability)
-        nodes, edges = _read_graph(graph_path)
-        nodes, edges = filter_fast_native_graph(nodes, edges)
-        native_length = sum(
-            float(np.linalg.norm(nodes[dst] - nodes[src])) for src, dst in edges.tolist()
-        )
-        source = "samroad_native_toponet"
-        if diagnostics["fast_relative_triggered"] and native_length < 40.0:
-            nodes, edges = _skeleton_graph(surface)
-            source = "samroad_probability_fast_relative"
-        _save_graph(graph_path, nodes, edges)
-        row = {
-            "image": str(image_path), "graph": str(graph_path),
-            "edge_count": int(edges.shape[0]), "centerline_source": source,
-            "native_centerline_length_px": float(native_length),
-            **diagnostics,
-        }
-        rows.append(row)
-        (output_dir / f"{image_path.stem}_fast_recovery.json").write_text(
-            json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-    summary = {"execution_profile": "fast", "images": rows}
-    (output_dir / "fast_recovery_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return summary
+    return nodes_array, np.asarray(sorted(graph_edges), dtype=np.int32).reshape(-1, 2)
 
 
 def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path) -> dict:
@@ -311,10 +190,16 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
             raise OSError(f"Cannot write Fast surface mask: {target}")
         row = {"image": str(image_path), "mask": str(target), **diagnostics}
         rows.append(row)
+        print(
+            f"[Fast Mask] {image_path.stem}: "
+            f"high={diagnostics['raw_high_probability_pixel_count']}, "
+            f"relative_added={diagnostics['relative_added_pixel_count']}, "
+            f"final={diagnostics['final_mask_pixel_count']}"
+        )
         (output_dir / f"{image_path.stem}_fast_surface.json").write_text(
             json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8",
         )
-    summary = {"execution_profile": "fast", "surface_source": "probability_fast", "images": rows}
+    summary = {"execution_profile": "fast", "surface_source": "final_fast_mask", "images": rows}
     (output_dir / "batch_surface_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
@@ -389,7 +274,6 @@ def measure_fast_edge_widths(
 
 def measure_fast_widths(
     image_dir: Path,
-    graph_dir: Path,
     surface_dir: Path,
     probability_dir: Path,
     output_dir: Path,
@@ -405,15 +289,13 @@ def measure_fast_widths(
     target_crs = None
     image_rows = []
     for image_path in _raster_paths(image_dir):
-        graph_path = graph_dir / f"{image_path.stem}.p"
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
-        probability_path = probability_dir / f"{image_path.stem}_centerline_probability.png"
-        nodes, edges = _read_graph(graph_path)
+        probability_path = probability_dir / f"{image_path.stem}_road.png"
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Cannot read Fast surface mask: {mask_path}")
         binary = (mask > 0).astype(np.uint8)
-        distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        nodes, edges = _skeleton_graph(binary)
         with rasterio.open(image_path) as dataset:
             if dataset.crs is None:
                 raise ValueError(f"Fast products require raster CRS: {image_path}")
@@ -437,7 +319,7 @@ def measure_fast_widths(
                     "width_m": float(width), "width_src": width_source,
                     "exec_prof": "fast", "geometry": line,
                 }
-                layer_records["centerlines"].append({**common, "source": "samroad_fast"})
+                layer_records["centerlines"].append({**common, "source": "final_mask_skeleton"})
                 layer_records["width_segments"].append(common)
                 layer_records["corridors"].append({**common, "geometry": line.buffer(width / 2.0)})
             valid = dataset.dataset_mask() > 0
@@ -447,18 +329,38 @@ def measure_fast_widths(
                 geometry = make_valid(shape(mapping))
                 if not geometry.is_empty and geometry.area > 0:
                     layer_records["surfaces"].append({
-                        "tile": image_path.stem, "source": "probability_fast",
+                        "tile": image_path.stem, "source": "final_fast_mask",
                         "exec_prof": "fast", "geometry": geometry,
                     })
         if probability_path.is_file():
-            target_probability = output_dir / probability_path.name
+            target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
             target_probability.write_bytes(probability_path.read_bytes())
+        centerline_length_px = float(sum(
+            np.linalg.norm(nodes[int(dst)] - nodes[int(src)])
+            for src, dst in edges.tolist()
+        ))
+        surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
+        surface_diagnostics = {}
+        if surface_diagnostics_path.is_file():
+            try:
+                surface_diagnostics = json.loads(surface_diagnostics_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                surface_diagnostics = {}
         tile_summary = {
-            "stem": image_path.stem, "image": str(image_path), "graph": str(graph_path),
+            "stem": image_path.stem, "image": str(image_path),
             "surface_mask": str(mask_path), "edge_count": int(edges.shape[0]),
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,
+            "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
+            "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
+            "final_mask_pixel_count": int(surface_diagnostics.get("final_mask_pixel_count", np.count_nonzero(binary))),
+            "final_centerline_length": centerline_length_px * float(pixel_size),
+            "final_centerline_length_px": centerline_length_px,
         }
+        print(
+            f"[Fast Centerline] {image_path.stem}: "
+            f"length={tile_summary['final_centerline_length']:.3f}"
+        )
         image_rows.append(tile_summary)
         (output_dir / f"{image_path.stem}_summary.json").write_text(json.dumps(tile_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -654,12 +556,10 @@ def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--image-dir", required=True)
     common.add_argument("--probability-dir", required=True)
-    command = sub.add_parser("recover", parents=[common])
-    command.add_argument("--graph-dir", required=True); command.add_argument("--output-dir", required=True)
     command = sub.add_parser("surface", parents=[common])
     command.add_argument("--output-dir", required=True)
     command = sub.add_parser("width", parents=[common])
-    command.add_argument("--graph-dir", required=True); command.add_argument("--surface-dir", required=True)
+    command.add_argument("--surface-dir", required=True)
     command.add_argument("--output-dir", required=True); command.add_argument("--pixel-size", type=float, default=0.0)
     command = sub.add_parser("export")
     command.add_argument("--width-dir", required=True); command.add_argument("--output-dir", required=True)
@@ -670,13 +570,11 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    if args.command == "recover":
-        recover_fast_graphs(Path(args.image_dir), Path(args.graph_dir), Path(args.probability_dir), Path(args.output_dir))
-    elif args.command == "surface":
+    if args.command == "surface":
         build_fast_surfaces(Path(args.image_dir), Path(args.probability_dir), Path(args.output_dir))
     elif args.command == "width":
         measure_fast_widths(
-            Path(args.image_dir), Path(args.graph_dir), Path(args.surface_dir), Path(args.probability_dir),
+            Path(args.image_dir), Path(args.surface_dir), Path(args.probability_dir),
             Path(args.output_dir), requested_pixel_size=float(args.pixel_size),
         )
     else:

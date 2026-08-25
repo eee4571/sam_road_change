@@ -67,9 +67,8 @@ PERIOD_STAGE_DEFINITIONS = (
     ("export", "道路产品导出"),
 )
 FAST_PERIOD_STAGE_DEFINITIONS = (
-    ("centerline", "道路模型推理"),
-    ("recover", "快速道路恢复"),
-    ("surface", "快速道路面"),
+    ("centerline", "道路概率推理"),
+    ("surface", "Final Fast Mask"),
     ("width", "快速道路宽度"),
     ("export", "道路产品导出"),
 )
@@ -2003,32 +2002,52 @@ def _prepared_workspace_complete(workspace: Path) -> bool:
 def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
     stems = context["image_stems"]
     if stage_key == "centerline":
+        if context.get("execution_profile") == "fast":
+            return _named_outputs_complete(
+                context["infer_dir"] / "mask", [f"{stem}_road.png" for stem in stems],
+            )
         return _named_outputs_complete(context["infer_dir"], [f"{stem}.p" for stem in stems])
     if stage_key == "surface":
         root = context["surface_mask_dir"]
         if not root.is_dir() or not stems:
             return False
         names = {path.name for path in root.rglob("*") if path.is_file()}
-        return all(
+        masks_complete = all(
             f"{stem}_mask.png" in names or f"{stem}_mask.tif" in names
             for stem in stems
         )
-    if stage_key == "recover":
-        return (
-            (context["recovery_dir"] / "fast_recovery_summary.json").is_file()
-            and _named_outputs_complete(
-                context["recovery_dir"], [f"{stem}_fast_recovery.json" for stem in stems],
+        if not masks_complete or context.get("execution_profile") != "fast":
+            return masks_complete
+        try:
+            return all(
+                {
+                    "raw_high_probability_pixel_count",
+                    "relative_added_pixel_count",
+                    "final_mask_pixel_count",
+                }.issubset(read_json(root / f"{stem}_fast_surface.json"))
+                for stem in stems
             )
-        )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+            return False
     if stage_key == "width":
         ready = (
             (context["width_dir"] / "batch_width_summary.json").is_file()
             and _named_outputs_complete(context["width_dir"], [f"{stem}_summary.json" for stem in stems])
         )
-        return ready and (
-            context.get("execution_profile") != "fast"
-            or (context["width_dir"] / "fast_products.gpkg").is_file()
-        )
+        if not ready or context.get("execution_profile") != "fast":
+            return ready
+        try:
+            return (
+                (context["width_dir"] / "fast_products.gpkg").is_file()
+                and all(
+                    "final_centerline_length" in read_json(
+                        context["width_dir"] / f"{stem}_summary.json"
+                    )
+                    for stem in stems
+                )
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+            return False
     if stage_key == "finalize":
         return (
             (context["final_dir"] / "batch_optimized_summary.json").is_file()
@@ -2296,11 +2315,9 @@ def extract(args: argparse.Namespace) -> dict:
     pipeline_state_path = Path(pipeline_state_value).expanduser() if pipeline_state_value else None
     image_stems = [path.stem for path in listed_rasters(images)]
     inference_batch_dir = infer_dir / image_txt.stem
-    recovery_dir = run_root / "fast_recovery"
     stage_context = {
         "image_stems": image_stems,
         "infer_dir": inference_batch_dir,
-        "recovery_dir": recovery_dir,
         "surface_mask_dir": surface_root / "masks" / image_txt.stem,
         "width_dir": width_dir,
         "final_dir": final_dir,
@@ -2348,7 +2365,6 @@ def extract(args: argparse.Namespace) -> dict:
     if execution_profile == "fast":
         fast_script = ROOT / "engine" / "fast_pipeline.py"
         probability_dir = inference_batch_dir / "mask"
-        graph_dir = inference_batch_dir / "graph"
         surface_mask_dir = surface_root / "masks" / image_txt.stem
         validation_value = str(getattr(args, "validation_area", "") or "").strip()
         stage_commands = {
@@ -2359,18 +2375,13 @@ def extract(args: argparse.Namespace) -> dict:
                 "--junction_node_mode", str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                 "--execution-profile", "fast",
             ], SAMROAD),
-            "recover": ([
-                str(PYTHON), str(fast_script), "recover", "--image-dir", str(images),
-                "--graph-dir", str(graph_dir), "--probability-dir", str(probability_dir),
-                "--output-dir", str(recovery_dir),
-            ], ROOT),
             "surface": ([
                 str(PYTHON), str(fast_script), "surface", "--image-dir", str(images),
                 "--probability-dir", str(probability_dir), "--output-dir", str(surface_mask_dir),
             ], ROOT),
             "width": ([
                 str(PYTHON), str(fast_script), "width", "--image-dir", str(images),
-                "--graph-dir", str(graph_dir), "--surface-dir", str(surface_mask_dir),
+                "--surface-dir", str(surface_mask_dir),
                 "--probability-dir", str(probability_dir), "--output-dir", str(width_dir),
                 "--pixel-size", str(args.pixel_size),
             ], ROOT),

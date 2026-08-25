@@ -124,8 +124,14 @@ def ensure_unique_output_stems(image_paths) -> None:
         )
 
 
-def required_image_outputs(output_dir: Path | str, stem: str) -> list[dict]:
+def required_image_outputs(
+    output_dir: Path | str, stem: str, execution_profile: str = "full",
+) -> list[dict]:
     root = _resolved(output_dir)
+    if str(execution_profile).casefold() == "fast":
+        return [
+            {"role": "road_probability", "path": root / "mask" / f"{stem}_road.png", "kind": "png"},
+        ]
     return [
         {"role": "graph", "path": root / "graph" / f"{stem}.p", "kind": "pickle_graph"},
         {
@@ -153,9 +159,16 @@ def required_image_outputs(output_dir: Path | str, stem: str) -> list[dict]:
     ]
 
 
-def all_image_outputs(output_dir: Path | str, stem: str) -> list[Path]:
+def all_image_outputs(
+    output_dir: Path | str, stem: str, execution_profile: str = "full",
+) -> list[Path]:
     root = _resolved(output_dir)
-    paths = [Path(item["path"]) for item in required_image_outputs(root, stem)]
+    paths = [
+        Path(item["path"])
+        for item in required_image_outputs(root, stem, execution_profile)
+    ]
+    if str(execution_profile).casefold() == "fast":
+        return paths
     paths.extend(
         root / directory / f"{stem}{suffix}"
         for directory, suffix in (
@@ -362,6 +375,9 @@ class ImageResumeManager:
     ) -> None:
         self.output_dir = _resolved(output_dir)
         self.batch_identity = batch_identity
+        self.execution_profile = str(
+            batch_identity.get("parameters", {}).get("execution_profile", "full")
+        ).casefold()
         self.enabled = bool(enabled)
         self.legacy_metadata = legacy_metadata
         self.pipeline_identities = load_pipeline_identities(pipeline_state)
@@ -402,7 +418,7 @@ class ImageResumeManager:
 
     def _output_records(self, stem: str) -> tuple[list[dict] | None, str]:
         records = []
-        for spec in required_image_outputs(self.output_dir, stem):
+        for spec in required_image_outputs(self.output_dir, stem, self.execution_profile):
             valid, reason = validate_output(spec["path"], spec["kind"], headers=spec.get("headers", ()))
             if not valid:
                 return None, f"{spec['role']}: {reason}"
@@ -439,7 +455,12 @@ class ImageResumeManager:
             return False, "config identity changed"
         if marker.get("parameters") != self.batch_identity.get("parameters"):
             return False, "inference parameters changed"
-        expected = {item["role"]: item for item in required_image_outputs(self.output_dir, image_path.stem)}
+        expected = {
+            item["role"]: item
+            for item in required_image_outputs(
+                self.output_dir, image_path.stem, self.execution_profile,
+            )
+        }
         recorded = {
             str(item.get("role")): item
             for item in marker.get("outputs", []) if isinstance(item, dict)
@@ -507,6 +528,8 @@ class ImageResumeManager:
         return updated
 
     def _adopt_legacy(self, image: Path) -> dict:
+        if self.execution_profile == "fast":
+            return {"action": "process", "reason": "legacy Fast outputs predate probability-only markers"}
         compatible, reason = _legacy_batch_compatible(
             self.legacy_metadata, self.batch_identity, self.pipeline_identities,
         )
@@ -550,7 +573,10 @@ class ImageResumeManager:
         if backup_dir.is_dir():
             self._restore_backup(backup_dir)
         manifest_path = backup_dir / "backup_manifest.json"
-        candidates = [*self._marker_candidates(image), *all_image_outputs(self.output_dir, image.stem)]
+        candidates = [
+            *self._marker_candidates(image),
+            *all_image_outputs(self.output_dir, image.stem, self.execution_profile),
+        ]
         existing = [path for path in candidates if path.is_file()]
         backup_dir.mkdir(parents=True, exist_ok=True)
         manifest = {

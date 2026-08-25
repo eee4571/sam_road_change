@@ -44,6 +44,16 @@ class GridDiscoveryTests(unittest.TestCase):
         self.assertTrue(pd.isna(mapped[field].iloc[3]))
         self.assertNotIn(field, truth.columns)
 
+    def test_truth_value_mapping_allows_truth_with_only_one_present_class(self) -> None:
+        import pandas as pd
+
+        truth = pd.DataFrame({"BHBM": [3, 3]})
+        mapped, field = user_pipeline.apply_truth_value_mapping(truth, "BHBM", {
+            "added": "2", "width_changed": "3", "removed": "4",
+        })
+
+        self.assertEqual(list(mapped[field]), ["width_changed", "width_changed"])
+
     def test_rejects_grid_with_only_one_period(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             grid = Path(raw) / "grid_01"
