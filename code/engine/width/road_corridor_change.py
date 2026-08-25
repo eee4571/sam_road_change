@@ -307,6 +307,18 @@ def detect_corridor_changes(
         minimum_samples=int(getattr(config, "paired_width_min_samples", 5)),
         minimum_direction_ratio=float(config.width_same_direction_ratio),
         maximum_diff_mad=float(getattr(config, "paired_width_max_mad", 1.0)),
+        uncertainty_scale=float(getattr(config, "paired_width_uncertainty_scale", 2.5)),
+        maximum_gap_samples=int(getattr(config, "paired_width_max_gap_samples", 1)),
+        maximum_gap_length=float(getattr(config, "paired_width_max_gap_length", 4.0)),
+        surface_probability_max_relative_difference=float(getattr(
+            config, "paired_width_surface_probability_max_relative_difference", 0.30,
+        )),
+        probability_minimum_contrast=float(getattr(
+            config, "paired_width_probability_minimum_contrast", 0.08,
+        )),
+        probability_minimum_confidence=float(getattr(
+            config, "paired_width_probability_minimum_confidence", 0.55,
+        )),
     )
     canonical_rows = []
     match_rows = []
@@ -320,7 +332,9 @@ def detect_corridor_changes(
     rejected_low_valid: set[tuple[str, str]] = set()
     rejected_samples: set[tuple[str, str]] = set()
     rejected_mad: set[tuple[str, str]] = set()
+    rejected_uncertainty: set[tuple[str, str]] = set()
     review_missing_surface: set[tuple[str, str]] = set()
+    review_surface_probability_disagreement: set[tuple[str, str]] = set()
     for pair_index, pair in enumerate(reliable_pairs):
         before_row, after_row = pair["before"], pair["after"]
         legacy_before_width = float(before_row.get("width_m", 0.0) or 0.0)
@@ -342,6 +356,9 @@ def detect_corridor_changes(
             before_surface,
             after_surface,
             paired_config,
+            before_probability=before_probability,
+            after_probability=after_probability,
+            geometry_crs=crs,
         )
         paired_profiles[canonical_id] = profile
         profile_stats = robust_change_statistics(profile.valid_samples)
@@ -373,7 +390,7 @@ def detect_corridor_changes(
             and str(after_row.get("width_quality", "C")) != "C"
         )
         runs = candidate_change_runs(profile, paired_config)
-        if before_surface is None or after_surface is None:
+        if (before_surface is None or after_surface is None) and not profile.valid_samples:
             legacy_delta = legacy_after_width - legacy_before_width
             legacy_relative = abs(legacy_delta) / max(legacy_before_width, legacy_after_width, 0.1)
             legacy_threshold = (
@@ -412,12 +429,15 @@ def detect_corridor_changes(
             rejected_quality.add(rejection_key)
             profile_decisions[canonical_id] = "no_change:paired_width_quality_rejected"
             continue
-        if profile.valid_ratio < paired_config.minimum_valid_ratio:
-            rejected_low_valid.add(rejection_key)
-            profile_decisions[canonical_id] = "no_change:paired_width_valid_ratio_too_low"
-            continue
         if not runs:
-            profile_decisions[canonical_id] = "no_change"
+            if any(sample.surface_probability_disagreement for sample in profile.samples):
+                review_surface_probability_disagreement.add(rejection_key)
+                profile_decisions[canonical_id] = "review:surface_probability_disagreement"
+            elif profile.valid_ratio < paired_config.minimum_valid_ratio:
+                rejected_low_valid.add(rejection_key)
+                profile_decisions[canonical_id] = "no_change:paired_width_valid_ratio_too_low"
+            else:
+                profile_decisions[canonical_id] = "no_change"
             continue
         profile_decisions[canonical_id] = "candidate"
         for run in runs:
@@ -429,7 +449,7 @@ def detect_corridor_changes(
                 "after_w": run.after_width,
                 "width_diff": run.width_diff,
                 "samples": run.samples,
-                "valid_ratio": profile.valid_ratio,
+                "valid_ratio": run.valid_ratio,
                 "fallback_review": False,
                 "rejection_key": rejection_key,
                 "qa_state": qa_state,
@@ -448,7 +468,10 @@ def detect_corridor_changes(
         axis_length = float(component_axis.length)
         fallback_review = any(bool(row.get("fallback_review")) for row in selected)
         samples = tuple(sample for row in selected for sample in row.get("samples", tuple()))
-        valid_ratio = min(float(row.get("valid_ratio", 0.0)) for row in selected)
+        valid_ratio = (
+            sum(sample.valid for sample in samples) / len(samples)
+            if samples else 0.0
+        )
         if fallback_review:
             before_width = float(np.median([row["before_w"] for row in selected]))
             after_width = float(np.median([row["after_w"] for row in selected]))
@@ -481,6 +504,8 @@ def detect_corridor_changes(
                 rejected_low_valid.update(row["rejection_key"] for row in selected)
             elif reject_reason == "paired_width_mad_too_large":
                 rejected_mad.update(row["rejection_key"] for row in selected)
+            elif reject_reason == "paired_width_uncertainty_too_large":
+                rejected_uncertainty.update(row["rejection_key"] for row in selected)
             for row in selected:
                 profile_decisions[row["canonical_id"]] = f"no_change:{reject_reason}"
         qa_value = "review" if fallback_review or any(row["qa_state"] == "review" for row in selected) else "auto"
@@ -793,6 +818,12 @@ def detect_corridor_changes(
         "paired_width_sample_spacing_m": paired_config.sample_spacing,
         "paired_width_min_samples": paired_config.minimum_samples,
         "paired_width_max_mad_m": paired_config.maximum_diff_mad,
+        "paired_width_uncertainty_scale": paired_config.uncertainty_scale,
+        "paired_width_max_gap_samples": paired_config.maximum_gap_samples,
+        "paired_width_max_gap_length_m": paired_config.maximum_gap_length,
+        "paired_width_surface_probability_max_relative_difference": (
+            paired_config.surface_probability_max_relative_difference
+        ),
         "paired_width_sample_count": len(paired_samples),
         "paired_width_valid_sample_count": int(paired_samples["valid"].sum()) if not paired_samples.empty else 0,
         "width_rejected_match_count": max(0, len(matches) - len(reliable_pairs)),
@@ -803,7 +834,11 @@ def detect_corridor_changes(
         "width_rejected_low_valid_ratio_count": len(rejected_low_valid),
         "width_rejected_min_samples_count": len(rejected_samples),
         "width_rejected_mad_count": len(rejected_mad),
+        "width_rejected_uncertainty_count": len(rejected_uncertainty),
         "width_review_missing_surface_count": len(review_missing_surface),
+        "width_review_surface_probability_disagreement_count": len(
+            review_surface_probability_disagreement
+        ),
         "presence_confirmed_count": presence_confirmed,
         "presence_review_count": presence_review,
         "presence_suppressed_low_confidence_count": 0,

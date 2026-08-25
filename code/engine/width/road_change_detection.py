@@ -76,6 +76,12 @@ class DetectionConfig:
     paired_width_normal_half_length: float = 60.0
     paired_width_min_samples: int = 5
     paired_width_max_mad: float = 1.0
+    paired_width_uncertainty_scale: float = 2.5
+    paired_width_max_gap_samples: int = 1
+    paired_width_max_gap_length: float = 4.0
+    paired_width_surface_probability_max_relative_difference: float = 0.30
+    paired_width_probability_minimum_contrast: float = 0.08
+    paired_width_probability_minimum_confidence: float = 0.55
     allow_legacy_absence_without_valid_mask: bool = False
 
 
@@ -1821,6 +1827,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paired-width-sample-spacing", type=float, default=2.0)
     parser.add_argument("--paired-width-min-samples", type=int, default=5)
     parser.add_argument("--paired-width-max-mad", type=float, default=1.0)
+    parser.add_argument("--paired-width-uncertainty-scale", type=float, default=2.5)
+    parser.add_argument("--paired-width-max-gap-samples", type=int, default=1)
+    parser.add_argument("--paired-width-max-gap-length", type=float, default=4.0)
+    parser.add_argument(
+        "--paired-width-surface-probability-max-relative-difference", type=float, default=0.30,
+    )
+    parser.add_argument("--paired-width-probability-minimum-contrast", type=float, default=0.08)
+    parser.add_argument("--paired-width-probability-minimum-confidence", type=float, default=0.55)
     parser.add_argument("--truth", default="", help="Optional vector truth of road changes.")
     parser.add_argument("--validation-area", default="", help="Optional polygon boundary for evaluation.")
     parser.add_argument("--truth-type-field", default="")
@@ -1835,6 +1849,9 @@ def main(argv: list[str] | None = None) -> int:
         or args.width_change_absolute < 0 or args.width_min_overlap_length < 0
         or args.width_min_polygon_area < 0 or args.paired_width_sample_spacing <= 0
         or args.paired_width_min_samples <= 0 or args.paired_width_max_mad < 0
+        or args.paired_width_uncertainty_scale < 0 or args.paired_width_max_gap_samples < 0
+        or args.paired_width_max_gap_length < 0
+        or args.paired_width_probability_minimum_contrast < 0
     ):
         raise ValueError("Detection thresholds cannot be negative.")
     if (
@@ -1844,6 +1861,8 @@ def main(argv: list[str] | None = None) -> int:
         or not 0 < args.width_line_match_ratio <= 1
         or not 0 <= args.width_min_valid_ratio <= 1
         or not 0 <= args.width_same_direction_ratio <= 1
+        or not 0 <= args.paired_width_surface_probability_max_relative_difference <= 1
+        or not 0 <= args.paired_width_probability_minimum_confidence <= 1
     ):
         raise ValueError("Width change ratio must be 0..1 and line match ratios must be >0..1.")
     if args.evaluation_tolerance <= 0:
@@ -1883,6 +1902,18 @@ def main(argv: list[str] | None = None) -> int:
             paired_width_sample_spacing=args.paired_width_sample_spacing,
             paired_width_min_samples=args.paired_width_min_samples,
             paired_width_max_mad=args.paired_width_max_mad,
+            paired_width_uncertainty_scale=args.paired_width_uncertainty_scale,
+            paired_width_max_gap_samples=args.paired_width_max_gap_samples,
+            paired_width_max_gap_length=args.paired_width_max_gap_length,
+            paired_width_surface_probability_max_relative_difference=(
+                args.paired_width_surface_probability_max_relative_difference
+            ),
+            paired_width_probability_minimum_contrast=(
+                args.paired_width_probability_minimum_contrast
+            ),
+            paired_width_probability_minimum_confidence=(
+                args.paired_width_probability_minimum_confidence
+            ),
         ),
         args.before_period,
         args.after_period,

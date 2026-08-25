@@ -11,6 +11,7 @@ from pyproj import CRS, Transformer
 from rasterio.features import rasterize
 from rasterio.windows import Window, from_bounds
 from shapely import make_valid
+from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as transform_geometry
 
@@ -84,6 +85,85 @@ class RoadProbabilityRaster:
             return geometry
         transformer = Transformer.from_crs(source, self.crs, always_xy=True)
         return transform_geometry(transformer.transform, geometry)
+
+    def sample_cross_section(
+        self,
+        center: Point,
+        normal: tuple[float, float],
+        geometry_crs,
+        *,
+        search_radius: float,
+    ) -> dict[str, np.ndarray | float]:
+        """Sample one world-coordinate normal without interpreting road width.
+
+        Distances are expressed in the input geometry CRS (the metric analysis
+        CRS used by change detection). Samples outside the raster or masked by
+        NoData are returned with ``valid_mask=False`` and ``probability=NaN``.
+        """
+        radius = float(search_radius)
+        nx, ny = float(normal[0]), float(normal[1])
+        norm = float(np.hypot(nx, ny))
+        if radius <= 0 or norm <= 1e-12:
+            raise ValueError("Cross-section search radius and normal must be positive.")
+        nx, ny = nx / norm, ny / norm
+        source_crs = CRS.from_user_input(geometry_crs or self.crs)
+        transformer = (
+            None if source_crs == self.crs
+            else Transformer.from_crs(source_crs, self.crs, always_xy=True)
+        )
+
+        def raster_xy(distance: float) -> tuple[float, float]:
+            x = center.x + nx * distance
+            y = center.y + ny * distance
+            return transformer.transform(x, y) if transformer is not None else (x, y)
+
+        inverse = ~self.transform
+        center_xy = raster_xy(0.0)
+        left_xy = raster_xy(-radius)
+        right_xy = raster_xy(radius)
+        center_col, center_row = inverse * center_xy
+        left_col, left_row = inverse * left_xy
+        right_col, right_row = inverse * right_xy
+        pixel_span = float(
+            np.hypot(left_col - center_col, left_row - center_row)
+            + np.hypot(right_col - center_col, right_row - center_row)
+        )
+        interval_count = max(2, min(4096, int(np.ceil(pixel_span * 2.0))))
+        distances = np.linspace(-radius, radius, interval_count + 1, dtype=np.float64)
+        source_x = center.x + nx * distances
+        source_y = center.y + ny * distances
+        if transformer is not None:
+            raster_x, raster_y = transformer.transform(source_x, source_y)
+        else:
+            raster_x, raster_y = source_x, source_y
+        columns_float, rows_float = inverse * (raster_x, raster_y)
+        columns = np.floor(np.asarray(columns_float)).astype(np.int64)
+        rows = np.floor(np.asarray(rows_float)).astype(np.int64)
+        inside = (
+            (rows >= 0) & (rows < self.values.shape[0])
+            & (columns >= 0) & (columns < self.values.shape[1])
+        )
+        valid = np.zeros(distances.shape, dtype=bool)
+        probability = np.full(distances.shape, np.nan, dtype=np.float32)
+        if bool(inside.any()):
+            inside_indices = np.flatnonzero(inside)
+            inside_rows = rows[inside_indices]
+            inside_columns = columns[inside_indices]
+            usable = (
+                self.valid_mask[inside_rows, inside_columns]
+                & np.isfinite(self.values[inside_rows, inside_columns])
+            )
+            usable_indices = inside_indices[usable]
+            valid[usable_indices] = True
+            probability[usable_indices] = self.values[
+                rows[usable_indices], columns[usable_indices]
+            ]
+        return {
+            "distance": distances,
+            "probability": probability,
+            "valid_mask": valid,
+            "sample_step": float(distances[1] - distances[0]),
+        }
 
     def sample_axis(
         self,
