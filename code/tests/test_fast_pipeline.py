@@ -103,7 +103,7 @@ class FastRelativeTests(unittest.TestCase):
         graph_probability, diagnostics = build_fast_enhanced_road_probability(
             probability, high_threshold=0.36,
         )
-        self.assertAlmostEqual(float(graph_probability[:, 50].mean()), 0.37, places=6)
+        self.assertAlmostEqual(float(graph_probability[:, 50].mean()), 0.50, places=6)
         self.assertGreater(diagnostics["relative_candidate_pixel_count"], 0)
 
     def test_extremely_low_noise_is_not_boosted(self) -> None:

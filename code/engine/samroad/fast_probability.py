@@ -6,11 +6,10 @@ import cv2
 import numpy as np
 
 
-FAST_RELATIVE_SIGMA = 15.0
-FAST_RELATIVE_EPS = 0.005
-FAST_RELATIVE_MIN_CONTRAST = 0.01
-FAST_RELATIVE_MIN_RATIO = 1.5
-FAST_RELATIVE_THRESHOLD_MARGIN = 0.01
+FAST_RELATIVE_SIGMA = 25.0
+FAST_RELATIVE_EPS = 0.003
+FAST_RELATIVE_MIN_CONTRAST = 0.004
+FAST_RELATIVE_MIN_RATIO = 0.8
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -32,13 +31,13 @@ def build_fast_enhanced_road_probability(
         if probability.size else (0.0, 0.0)
     )
     adaptive_floor = float(np.clip(
-        p50 + 0.05 * (p99 - p50),
-        0.003,
-        0.015,
+        p50 + 0.03 * (p99 - p50),
+        0.001,
+        0.010,
     ))
     graph_candidate_level = float(min(
         1.0,
-        float(high_threshold) + FAST_RELATIVE_THRESHOLD_MARGIN,
+        max(float(high_threshold) + 0.05, 0.50),
     ))
     local_background = cv2.GaussianBlur(
         probability,
@@ -53,6 +52,11 @@ def build_fast_enhanced_road_probability(
         & (contrast >= FAST_RELATIVE_MIN_CONTRAST)
         & (relative_ratio >= FAST_RELATIVE_MIN_RATIO)
     )
+    relative_candidate = cv2.morphologyEx(
+        relative_candidate.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+    ) > 0
     graph_probability = probability.copy()
     graph_probability[relative_candidate] = np.maximum(
         graph_probability[relative_candidate],
