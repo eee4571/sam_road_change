@@ -38,6 +38,35 @@ def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return kept
 
 
+def _fast_relative_score(values: np.ndarray) -> np.ndarray:
+    """Return the strongest positive local z-score across two background scales."""
+    scores = []
+    for sigma in (3.0, 15.0):
+        local_mean = cv2.GaussianBlur(values, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        local_square_mean = cv2.GaussianBlur(
+            values * values, (0, 0), sigmaX=sigma, sigmaY=sigma,
+        )
+        local_std = np.sqrt(np.maximum(local_square_mean - local_mean * local_mean, 0.0))
+        scores.append(np.maximum(values - local_mean, 0.0) / (local_std + 1e-6))
+    return np.maximum(scores[0], scores[1])
+
+
+def _relative_hysteresis_mask(relative_score: np.ndarray, min_area: int) -> np.ndarray:
+    """Keep medium Relative evidence only inside components containing Strong evidence."""
+    strong = np.asarray(relative_score) >= 1.30
+    weak = (np.asarray(relative_score) >= 0.90).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(weak, connectivity=8)
+    kept = np.zeros_like(weak)
+    for label in range(1, count):
+        component = labels == label
+        if (
+            int(stats[label, cv2.CC_STAT_AREA]) >= int(min_area)
+            and bool(np.any(strong & component))
+        ):
+            kept[component] = 1
+    return kept
+
+
 def build_fast_surface_mask(
     probability: np.ndarray,
     *,
@@ -47,11 +76,8 @@ def build_fast_surface_mask(
     """Build the single Fast road mask from absolute and local-relative evidence."""
     values = _probability01(probability)
     high = values >= float(absolute_threshold)
-    background_small = cv2.GaussianBlur(values, (0, 0), sigmaX=3.0, sigmaY=3.0)
-    background_large = cv2.GaussianBlur(values, (0, 0), sigmaX=9.0, sigmaY=9.0)
-    relative_contrast = np.maximum(values - background_small, values - background_large)
-    relative = (values >= 0.10) & (relative_contrast >= 0.055)
-    relative = _remove_small_components(relative, min_area)
+    relative_score = _fast_relative_score(values)
+    relative = _relative_hysteresis_mask(relative_score, min_area)
     relative_added = relative & ~high
     kernel = np.ones((3, 3), dtype=np.uint8)
     final_mask = cv2.morphologyEx((high | relative).astype(np.uint8), cv2.MORPH_CLOSE, kernel)

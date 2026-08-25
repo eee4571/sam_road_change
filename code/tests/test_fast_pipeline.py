@@ -29,6 +29,7 @@ from engine.fast_pipeline import (
     export_fast_products,
     measure_fast_edge_widths,
     measure_fast_widths,
+    _relative_hysteresis_mask,
 )
 from engine.samroad.image_resume import required_image_outputs
 
@@ -94,6 +95,23 @@ class FastRelativeTests(unittest.TestCase):
         self.assertGreater(metadata["relative_added_pixel_count"], 0)
         self.assertGreater(float(mask[:, 50].mean()), 0.75)
         self.assertLess(float(mask.mean()), 0.2)
+
+    def test_very_low_probability_road_needs_no_absolute_floor(self) -> None:
+        probability = np.full((100, 100), 0.0003, dtype=np.float32)
+        probability[:, 47:53] = 0.0025
+        mask, metadata = build_fast_surface_mask(probability)
+        self.assertEqual(metadata["raw_high_probability_pixel_count"], 0)
+        self.assertGreater(metadata["relative_added_pixel_count"], 0)
+        self.assertGreater(float(mask[:, 50].mean()), 0.75)
+
+    def test_relative_weak_component_must_connect_to_strong(self) -> None:
+        score = np.zeros((60, 80), dtype=np.float32)
+        score[20, 10:60] = 1.0
+        score[20, 10] = 1.5
+        score[40, 10:60] = 1.0
+        mask = _relative_hysteresis_mask(score, min_area=24)
+        self.assertEqual(int(mask[20, 10:60].sum()), 50)
+        self.assertEqual(int(mask[40, 10:60].sum()), 0)
 
     def test_weak_road_is_recovered_beside_a_strong_road(self) -> None:
         probability = np.full((120, 120), 0.04, dtype=np.float32)
