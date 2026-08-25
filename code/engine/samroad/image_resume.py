@@ -14,6 +14,7 @@ import pickle
 import struct
 import time
 import zlib
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,6 +132,11 @@ def required_image_outputs(
     if str(execution_profile).casefold() == "fast":
         return [
             {"role": "road_probability", "path": root / "mask" / f"{stem}_road.png", "kind": "png"},
+            {
+                "role": "fast_topology",
+                "path": root / "graph" / f"{stem}_fast_topology.npz",
+                "kind": "npz",
+            },
         ]
     return [
         {"role": "graph", "path": root / "graph" / f"{stem}.p", "kind": "pickle_graph"},
@@ -260,6 +266,20 @@ def _validate_csv(path: Path, headers) -> tuple[bool, str]:
     return (False, "CSV header is missing: " + ", ".join(missing)) if missing else (True, "")
 
 
+def _validate_npz(path: Path) -> tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            missing = {"nodes.npy", "edges.npy", "scores.npy"} - names
+            if missing:
+                return False, "NPZ arrays missing: " + ", ".join(sorted(missing))
+            if archive.testzip() is not None:
+                return False, "NPZ archive CRC check failed"
+    except (OSError, zipfile.BadZipFile) as exc:
+        return False, f"cannot read NPZ: {exc}"
+    return True, ""
+
+
 def validate_output(path: Path | str, kind: str, *, headers=()) -> tuple[bool, str]:
     source = _resolved(path)
     try:
@@ -275,6 +295,8 @@ def validate_output(path: Path | str, kind: str, *, headers=()) -> tuple[bool, s
         return _validate_csv(source, headers)
     if kind == "pickle_graph":
         return _validate_pickle_graph(source)
+    if kind == "npz":
+        return _validate_npz(source)
     return False, f"unsupported output kind: {kind}"
 
 

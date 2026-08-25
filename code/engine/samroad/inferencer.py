@@ -97,7 +97,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--execution-profile", choices=["full", "fast"], default="full",
-    help="Fast writes road probability only and skips graph extraction, TopoNet, and weak postprocess.",
+    help="Fast writes road probability plus native TopoNet and skips weak postprocess.",
 )
 args = parser.parse_args()
 
@@ -339,12 +339,17 @@ def run_inference_on_images(
                 time.perf_counter() - image_start_seconds
             )
             total_inference_seconds += performance_summary["total_image_seconds"]
+            profile_decision.update({
+                "graph_extraction_skipped": False,
+                "toponet_skipped": False,
+                "weak_postprocess_skipped": True,
+            })
             profile_decision = {"image": str(img_path), "tile": img_id, **profile_decision}
             recovery_summary = {
                 "tile": img_id,
                 **profile_decision,
                 "execution_profile": "fast",
-                "centerline_method": "final_fast_mask_skeleton",
+                "centerline_method": "fast_toponet_relative_hybrid",
                 **performance_summary,
             }
             profile_decisions.append(profile_decision)
@@ -354,9 +359,20 @@ def run_inference_on_images(
             probability_path = os.path.join(mask_save_dir, f"{img_id}_road.png")
             if not cv2.imwrite(probability_path, road_mask):
                 raise OSError(f"Cannot write Fast road probability: {probability_path}")
+            graph_save_dir = os.path.join(output_dir, "graph")
+            os.makedirs(graph_save_dir, exist_ok=True)
+            np.savez_compressed(
+                os.path.join(graph_save_dir, f"{img_id}_fast_topology.npz"),
+                nodes=np.asarray(pred_nodes, dtype=np.float32),
+                edges=np.asarray(pred_edges, dtype=np.int32).reshape(-1, 2),
+                scores=np.asarray(edge_confidences, dtype=np.float32),
+            )
             if resume_manager is not None:
                 resume_manager.complete(img_path, recovery_summary, profile_decision)
-            print(f"Done probability-only Fast inference for {img_id}.")
+            print(
+                f"Done Fast probability + native TopoNet for {img_id}: "
+                f"nodes={pred_nodes.shape[0]}, edges={pred_edges.shape[0]}."
+            )
             continue
 
         postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
@@ -970,18 +986,14 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
             batch_img_patches = batch_img_patches.to(args.device, non_blocking=False)
             # [B, H, W, 2]
             mask_scores, patch_img_features = net.infer_masks_and_img_features(batch_img_patches)
-            if args.execution_profile != "fast":
-                img_features.append(patch_img_features)
-            
-            if args.execution_profile != "fast":
-                mask_scores11 = mask_scores.permute(0, 3, 1, 2)#(0,3,1,2)
-                img_mask.append(mask_scores11)
+            img_features.append(patch_img_features)
+            mask_scores11 = mask_scores.permute(0, 3, 1, 2)#(0,3,1,2)
+            img_mask.append(mask_scores11)
         # Aggregate masks
         for patch_index, patch_info in enumerate(batch_patch_info):
             _, (x0, y0), (x1, y1) = patch_info
             keypoint_patch, road_patch = mask_scores[patch_index, :, :, 0], mask_scores[patch_index, :, :, 1]
-            if args.execution_profile != "fast":
-                fused_keypoint_mask[y0:y1, x0:x1] += keypoint_patch
+            fused_keypoint_mask[y0:y1, x0:x1] += keypoint_patch
             fused_road_mask[y0:y1, x0:x1] += road_patch
             pixel_counter[y0:y1, x0:x1] += torch.ones(road_patch.shape[0:2], dtype=torch.float32, device=args.device)
 
@@ -1003,40 +1015,6 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     mask_inference_seconds = float(time.perf_counter() - mask_start_seconds)
 
     print(fused_road_mask.shape)
-    if args.execution_profile == "fast":
-        empty_nodes = np.empty((0, 2), dtype=np.float32)
-        empty_edges = np.empty((0, 2), dtype=np.int32)
-        empty_scores = np.empty((0,), dtype=np.float32)
-        profile_decision = {
-            "requested_profile": "fast_probability_only",
-            "effective_profile": "fast_probability_only",
-            "scene_confidence_state": "not_evaluated",
-            "diagnostic_reference_profile": "not_evaluated",
-            "graph_extraction_skipped": True,
-            "toponet_skipped": True,
-            "weak_postprocess_skipped": True,
-        }
-        performance_summary = {
-            "mask_inference_seconds": mask_inference_seconds,
-            "native_graph_and_toponet_seconds": 0.0,
-            "relative_roadness_seconds": 0.0,
-            "weak_postprocess_seconds": 0.0,
-            "total_image_seconds": 0.0,
-            "relative_injected_into_toponet": False,
-            "relative_compute_call_count": 0,
-            "native_graph_point_count": 0,
-            "relative_graph_point_count": 0,
-            "toponet_graph_point_count": 0,
-            "toponet_candidate_edge_count": 0,
-            "toponet_pred_edge_count": 0,
-            "relative_final_centerline_length": 0.0,
-        }
-        return (
-            empty_nodes, empty_edges, empty_scores, empty_edges, empty_scores,
-            fused_keypoint_mask, fused_road_mask, profile_decision, None,
-            performance_summary,
-        )
-
     diagnostic_probability = fused_road_mask
     if diagnostic_shape is not None:
         diagnostic_height, diagnostic_width = diagnostic_shape

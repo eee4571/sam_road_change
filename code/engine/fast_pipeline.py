@@ -476,11 +476,39 @@ def _fill_small_holes(mask: np.ndarray, max_area: int = 64) -> np.ndarray:
     return (binary | fill[labels]).astype(np.uint8)
 
 
+def _rasterize_fast_topology(
+    shape_: tuple[int, int], nodes: np.ndarray | None, edges: np.ndarray | None,
+) -> tuple[np.ndarray, int]:
+    raster = np.zeros(shape_, dtype=np.uint8)
+    if nodes is None or edges is None:
+        return raster, 0
+    points = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
+    links = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    unique_links = {
+        tuple(sorted((int(src), int(dst))))
+        for src, dst in links.tolist()
+        if 0 <= int(src) < len(points) and 0 <= int(dst) < len(points) and int(src) != int(dst)
+    }
+    for src, dst in sorted(unique_links):
+        first = np.rint(points[src]).astype(np.int32)
+        second = np.rint(points[dst]).astype(np.int32)
+        cv2.line(
+            raster,
+            (int(first[1]), int(first[0])),
+            (int(second[1]), int(second[0])),
+            1,
+            1,
+        )
+    return raster, len(unique_links)
+
+
 def _build_fast_road_geometry(
     probability: np.ndarray,
     *,
     absolute_threshold: float = 0.45,
     min_area: int = 24,
+    topology_nodes: np.ndarray | None = None,
+    topology_edges: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[FastRoadPath], dict]:
     started = time.perf_counter()
     values = _probability01(probability)
@@ -502,14 +530,29 @@ def _build_fast_road_geometry(
     surface_regularization_elapsed = time.perf_counter() - regularize_started
 
     path_started = time.perf_counter()
-    raw_skeleton = _skeletonize_mask(final_mask)
+    relative_skeleton = _skeletonize_mask(final_mask)
+    topology_skeleton, topology_edge_count = _rasterize_fast_topology(
+        final_mask.shape, topology_nodes, topology_edges,
+    )
+    topology_paths = _trace_skeleton_paths(topology_skeleton)
+    if topology_skeleton.any():
+        topology_corridor = cv2.dilate(
+            topology_skeleton,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        ) > 0
+        raw_skeleton = (relative_skeleton > 0) & ~topology_corridor
+        raw_skeleton = (raw_skeleton | (topology_skeleton > 0)).astype(np.uint8)
+    else:
+        raw_skeleton = relative_skeleton
     skeleton_component_count = cv2.connectedComponents(raw_skeleton, connectivity=8)[0] - 1
     evidence_score = np.maximum(relative_score, high.astype(np.float32) * 1.30)
+    evidence_score = np.maximum(evidence_score, topology_skeleton.astype(np.float32) * 1.30)
     paths = _trace_skeleton_paths(raw_skeleton, evidence_score)
     path_count = len(paths)
     bridge_support = (
         (final_mask > 0)
         | (relative_score >= FAST_SCALE_SUPPORT_THRESHOLD)
+        | (cv2.dilate(topology_skeleton, np.ones((3, 3), dtype=np.uint8)) > 0)
     ).astype(np.uint8)
     bridged_skeleton, gap_bridge_count = _bridge_small_supported_gaps(
         raw_skeleton, paths, bridge_support,
@@ -533,6 +576,9 @@ def _build_fast_road_geometry(
         "raw_high_probability_pixel_count": int(np.count_nonzero(high)),
         "relative_added_pixel_count": int(np.count_nonzero(relative_added)),
         "relative_support_component_count": int(support_component_count),
+        "toponet_node_count": int(0 if topology_nodes is None else np.asarray(topology_nodes).reshape(-1, 2).shape[0]),
+        "toponet_edge_count": int(topology_edge_count),
+        "toponet_backbone_path_count": int(len(topology_paths)),
         "skeleton_component_count": int(skeleton_component_count),
         "path_count": int(path_count),
         "bridged_path_count": int(bridged_path_count),
@@ -588,7 +634,16 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
         probability = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
         if probability is None:
             raise FileNotFoundError(f"Cannot read SAMRoad probability: {source}")
-        mask, centerline, _paths, diagnostics = _build_fast_road_geometry(probability)
+        topology_path = probability_dir.parent / "graph" / f"{image_path.stem}_fast_topology.npz"
+        topology_nodes = None
+        topology_edges = None
+        if topology_path.is_file():
+            with np.load(topology_path, allow_pickle=False) as topology:
+                topology_nodes = np.asarray(topology["nodes"], dtype=np.float32)
+                topology_edges = np.asarray(topology["edges"], dtype=np.int32)
+        mask, centerline, _paths, diagnostics = _build_fast_road_geometry(
+            probability, topology_nodes=topology_nodes, topology_edges=topology_edges,
+        )
         target = output_dir / f"{image_path.stem}_mask.png"
         if not cv2.imwrite(str(target), mask * 255):
             raise OSError(f"Cannot write Fast surface mask: {target}")
@@ -597,7 +652,9 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
             raise OSError(f"Cannot write Fast centerline mask: {centerline_target}")
         row = {
             "image": str(image_path), "mask": str(target),
-            "centerline_mask": str(centerline_target), **diagnostics,
+            "centerline_mask": str(centerline_target),
+            "topology": str(topology_path) if topology_path.is_file() else None,
+            **diagnostics,
         }
         rows.append(row)
         print(
@@ -605,6 +662,8 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
             f"high={diagnostics['raw_high_probability_pixel_count']}, "
             f"relative_added={diagnostics['relative_added_pixel_count']}, "
             f"support_components={diagnostics['relative_support_component_count']}, "
+            f"toponet={diagnostics['toponet_edge_count']} edges/"
+            f"{diagnostics['toponet_backbone_path_count']} paths, "
             f"paths={diagnostics['path_count']}->{diagnostics['final_centerline_path_count']}, "
             f"cleanup={diagnostics['path_cleanup_removed_count']}"
             f"(isolated={diagnostics['path_cleanup_isolated_count']}, "

@@ -64,10 +64,14 @@ class FastCommandTests(unittest.TestCase):
             self.assertNotIn("--execution-profile", full)
             self.assertEqual(fast[fast.index("--execution-profile") + 1], "fast")
 
-    def test_fast_resume_requires_probability_but_no_graph(self) -> None:
+    def test_fast_resume_requires_probability_and_native_topology(self) -> None:
         outputs = required_image_outputs(Path("output"), "tile", "fast")
-        self.assertEqual([item["role"] for item in outputs], ["road_probability"])
+        self.assertEqual(
+            [item["role"] for item in outputs],
+            ["road_probability", "fast_topology"],
+        )
         self.assertTrue(str(outputs[0]["path"]).endswith("tile_road.png"))
+        self.assertTrue(str(outputs[1]["path"]).endswith("tile_fast_topology.npz"))
 
     def test_legacy_full_resume_treats_missing_profile_as_full(self) -> None:
         prior = {
