@@ -398,13 +398,12 @@ def run_inference_on_images(
                 resume_manager.complete(img_path, recovery_summary, profile_decision)
             print(
                 f"Done Fast probability + native TopoNet for {img_id}: "
-                f"graph points={performance_summary['raw_graph_point_count']}"
-                f"->{performance_summary['fast_graph_point_count']}, "
-                f"edges={pred_edges.shape[0]}, "
-                f"threshold pixels="
-                f"{performance_summary['raw_pixels_above_graph_threshold']}"
-                f"->{performance_summary['enhanced_pixels_above_graph_threshold']}, "
-                f"boosted pixels={performance_summary['relative_boost_pixel_count']}."
+                f"fast_graph_point_count="
+                f"{performance_summary['fast_graph_point_count']}, "
+                f"toponet_candidate_edge_count="
+                f"{performance_summary['toponet_candidate_edge_count']}, "
+                f"toponet_final_edge_count="
+                f"{performance_summary['toponet_final_edge_count']}."
             )
             continue
 
@@ -982,6 +981,37 @@ def get_batch_img_patches(img, batch_patch_info):
     batch = torch.stack(patches, 0).contiguous()
     return batch
 
+
+def prepare_toponet_batch_mask(
+    batch_mask,
+    batch_patch_info,
+    enhanced_road_probability,
+    *,
+    execution_profile,
+):
+    """Replace only the Fast TopoNet road channel with aligned enhanced patches."""
+    if str(execution_profile).casefold() != "fast":
+        return batch_mask
+    if enhanced_road_probability is None:
+        raise ValueError("Fast TopoNet requires enhanced road probability")
+    probability = np.asarray(enhanced_road_probability, dtype=np.float32)
+    road_patches = []
+    for _, (x0, y0), (x1, y1) in batch_patch_info:
+        road_patches.append(probability[y0:y1, x0:x1])
+    enhanced_batch = torch.as_tensor(
+        np.stack(road_patches, axis=0),
+        dtype=batch_mask.dtype,
+        device=batch_mask.device,
+    )
+    if enhanced_batch.shape != batch_mask[:, 1, :, :].shape:
+        raise ValueError(
+            "Fast enhanced TopoNet patch shape mismatch: "
+            f"{tuple(enhanced_batch.shape)} != {tuple(batch_mask[:, 1, :, :].shape)}"
+        )
+    updated_mask = batch_mask.clone()
+    updated_mask[:, 1, :, :] = enhanced_batch
+    return updated_mask
+
 def infer_one_img(net, img, config, *, diagnostic_shape=None):
     # TODO(congrui): centralize these configs
     image_height, image_width = img.shape[:2]
@@ -1092,6 +1122,7 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     )
     graph_points = native_graph_points
     fast_enhancement_context = None
+    enhanced_probability = None
     if args.execution_profile == "fast":
         fast_graph_high_threshold, _fast_low_threshold, _fast_profile = (
             graph_extraction.resolve_road_thresholds(config)
@@ -1224,7 +1255,12 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         # infer toponet
         # [B, D, h, w]
         batch_features = img_features[batch_index]
-        batch_mask = img_mask[batch_index]
+        batch_mask = prepare_toponet_batch_mask(
+            img_mask[batch_index],
+            batch_patch_info,
+            enhanced_probability,
+            execution_profile=args.execution_profile,
+        )
         # [B, N_sample, N_pair, 2]
         batch_points = torch.tensor(collated['points'], device=args.device)
         batch_pairs = torch.tensor(collated['pairs'], device=args.device)

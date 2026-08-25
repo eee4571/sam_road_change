@@ -223,6 +223,31 @@ class RelativeTopoNetDecouplingTests(unittest.TestCase):
         self.assertGreater(result[9]["relative_boost_pixel_count"], 0)
         self.assertEqual(result[9]["relative_compute_call_count"], 0)
 
+    def test_fast_toponet_replaces_only_enhanced_road_channel(self):
+        batch_mask = torch.zeros((2, 2, 4, 4), dtype=torch.float32)
+        batch_mask[:, 0, :, :] = 0.70
+        batch_mask[:, 1, :, :] = 0.05
+        enhanced = np.zeros((4, 8), dtype=np.float32)
+        enhanced[:, :4] = 0.30
+        enhanced[:, 4:] = 0.40
+        patch_info = [
+            (0, (0, 0), (4, 4)),
+            (1, (4, 0), (8, 4)),
+        ]
+
+        fast_mask = inferencer.prepare_toponet_batch_mask(
+            batch_mask, patch_info, enhanced, execution_profile="fast",
+        )
+        full_mask = inferencer.prepare_toponet_batch_mask(
+            batch_mask, patch_info, enhanced, execution_profile="full",
+        )
+
+        self.assertTrue(torch.equal(fast_mask[:, 0], batch_mask[:, 0]))
+        self.assertTrue(torch.allclose(fast_mask[0, 1], torch.full((4, 4), 0.30)))
+        self.assertTrue(torch.allclose(fast_mask[1, 1], torch.full((4, 4), 0.40)))
+        self.assertIs(full_mask, batch_mask)
+        self.assertTrue(torch.equal(full_mask[:, 1], batch_mask[:, 1]))
+
 
 if __name__ == "__main__":
     unittest.main()
