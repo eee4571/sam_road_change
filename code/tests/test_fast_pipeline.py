@@ -451,8 +451,16 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 position_tolerance=2.0, width_change_absolute=2.0,
                 width_change_ratio=0.2,
             )
-            for change_type in ("added", "removed", "widened", "narrowed"):
-                self.assertGreater(len(gpd.read_file(result["layers"][change_type])), 0)
+            presence_count = sum(
+                len(gpd.read_file(result["layers"][change_type]))
+                for change_type in ("added", "removed")
+            )
+            width_count = sum(
+                len(gpd.read_file(result["layers"][change_type]))
+                for change_type in ("widened", "narrowed")
+            )
+            self.assertGreater(presence_count, 0)
+            self.assertGreater(width_count, 0)
             changes = gpd.read_file(result["road_changes"])
             shifted_road_area = box(-5, 55, 105, 65)
             self.assertFalse(changes.geometry.intersects(shifted_road_area).any())
@@ -468,8 +476,12 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 "merge_seconds", "write_seconds", "total_seconds",
             ):
                 self.assertGreaterEqual(float(summary[timing_key]), 0.0)
-            self.assertEqual(summary["presence_guard_mode"], "normal")
-            self.assertEqual(summary["width_guard_mode"], "normal")
+            self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
+            self.assertEqual(summary["width_guard_mode"], "ranked_limited")
+            self.assertGreater(summary["raw_presence_candidate_count"], 0)
+            self.assertGreater(summary["retained_presence_candidate_count"], 0)
+            self.assertGreater(summary["raw_width_candidate_count"], 0)
+            self.assertGreater(summary["retained_width_candidate_count"], 0)
             stable = detect_fast_changes(
                 after_result, after_result, root / "stable_changes",
                 before_period="2021", after_period="2022",
@@ -477,18 +489,20 @@ class FastAutomaticChangeTests(unittest.TestCase):
             )
             self.assertTrue(gpd.read_file(stable["road_changes"]).empty)
 
-    def test_presence_guard_suppresses_global_instability(self) -> None:
+    def test_presence_guard_keeps_best_candidate_instead_of_clearing_all(self) -> None:
         added, removed, summary = _apply_fast_presence_guard(
-            [{"_line_key": "added:0", "_line_len": 400.0}],
-            [{"_line_key": "removed:0", "_line_len": 400.0}],
+            [{"_line_key": "added:0", "_line_len": 400.0, "_line_score": 300.0}],
+            [{"_line_key": "removed:0", "_line_len": 400.0, "_line_score": 200.0}],
             before_total_length=500.0, after_total_length=500.0,
         )
-        self.assertEqual(added, [])
+        self.assertEqual(len(added), 1)
         self.assertEqual(removed, [])
-        self.assertEqual(summary["presence_guard_mode"], "suppressed_unreliable")
-        self.assertFalse(summary["presence_result_reliable"])
+        self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
+        self.assertTrue(summary["presence_result_reliable"])
+        self.assertEqual(summary["raw_presence_candidate_count"], 2)
+        self.assertEqual(summary["retained_presence_candidate_count"], 1)
 
-    def test_presence_guard_keeps_only_long_paths_in_conservative_mode(self) -> None:
+    def test_presence_guard_ranks_and_limits_candidates(self) -> None:
         added, removed, summary = _apply_fast_presence_guard(
             [
                 {"_line_key": "added:0", "_line_len": 160.0},
@@ -498,7 +512,7 @@ class FastAutomaticChangeTests(unittest.TestCase):
         )
         self.assertEqual(len(added), 1)
         self.assertEqual(removed, [])
-        self.assertEqual(summary["presence_guard_mode"], "conservative")
+        self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
 
     def test_width_match_rejects_crossing_and_large_length_mismatch(self) -> None:
         before = gpd.GeoDataFrame(
@@ -544,14 +558,19 @@ class FastAutomaticChangeTests(unittest.TestCase):
         self.assertEqual(fallback_records, [])
         self.assertEqual(fallback_matched, 0.0)
 
-    def test_width_change_guard_suppresses_unstable_network(self) -> None:
+    def test_width_change_guard_keeps_best_candidate_instead_of_clearing_all(self) -> None:
         records, summary = _apply_fast_width_guard(
-            [{"_match_key": "0:0", "_match_len": 200.0, "geometry": box(0, 0, 1, 1)}],
+            [{
+                "_match_key": "0:0", "_match_len": 200.0,
+                "_width_score": 2.0, "geometry": box(0, 0, 1, 1),
+            }],
             matched_total_length=1000.0,
         )
-        self.assertEqual(records, [])
-        self.assertEqual(summary["width_guard_mode"], "suppressed_unreliable")
-        self.assertFalse(summary["width_result_reliable"])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(summary["width_guard_mode"], "ranked_limited")
+        self.assertTrue(summary["width_result_reliable"])
+        self.assertEqual(summary["raw_width_candidate_count"], 1)
+        self.assertEqual(summary["retained_width_candidate_count"], 1)
 
 
 if __name__ == "__main__":

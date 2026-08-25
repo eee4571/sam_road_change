@@ -37,18 +37,15 @@ FAST_CHANGE_SHIFT_MAX_PX = 1.5
 FAST_CHANGE_BUFFER_JITTER_PX = 1.0
 FAST_CHANGE_TYPE_ERROR_PROB = 0.03
 FAST_CHANGE_MIN_AREA_M2 = 4.0
-FAST_CHANGE_MIN_LENGTH_M = 75.0
-FAST_CHANGE_CANDIDATE_COVERAGE = 0.05
-FAST_CHANGE_GUARD_RATIO = 0.15
-FAST_CHANGE_SUPPRESS_RATIO = 0.30
-FAST_CHANGE_GUARD_MIN_LENGTH_M = 150.0
-FAST_CHANGE_GUARD_MAX_PATHS = 10
+FAST_CHANGE_MIN_LENGTH_M = 50.0
+FAST_CHANGE_CANDIDATE_COVERAGE = 0.12
+FAST_CHANGE_RETAIN_RATIO = 0.05
 FAST_WIDTH_DIRECTION_SIMILARITY = 0.95
 FAST_WIDTH_LENGTH_RATIO_MIN = 0.50
 FAST_WIDTH_LENGTH_RATIO_MAX = 2.00
 FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M = 4.0
 FAST_WIDTH_MIN_RELATIVE_CHANGE = 0.40
-FAST_WIDTH_CHANGE_GUARD_RATIO = 0.15
+FAST_WIDTH_RETAIN_RATIO = 0.05
 
 
 @dataclass(frozen=True)
@@ -1422,8 +1419,11 @@ def _fast_centerline_change_records(
     surface_union = source_surfaces.geometry.union_all()
     records = []
     for line_index, line in enumerate(_fast_line_parts(merged)):
-        if float(line.length) < min_length:
+        line_length = float(line.length)
+        if line_length < min_length:
             continue
+        line_coverage = _fast_line_coverage(line, reference_support)
+        line_score = line_length * max(0.0, 1.0 - line_coverage)
         nearby_positions = candidate_index.query(line, predicate="intersects")
         nearby_widths = [
             float(candidate_widths[position])
@@ -1448,10 +1448,40 @@ def _fast_centerline_change_records(
                 "width_aft": np.nan,
                 "width_diff": np.nan,
                 "_line_key": f"{change_type}:{line_index}",
-                "_line_len": float(line.length),
+                "_line_len": line_length,
+                "_line_cov": line_coverage,
+                "_line_score": line_score,
                 "geometry": part,
             })
     return records, merge_seconds
+
+
+def _ranked_keys_with_length_budget(
+    metrics: dict[str, tuple[float, float]],
+    *,
+    network_length: float,
+    retain_ratio: float,
+) -> tuple[set[str], str]:
+    """Keep the strongest candidates within a soft network-length budget."""
+    if not metrics:
+        return set(), "normal"
+    raw_length = float(sum(length for length, _score in metrics.values()))
+    budget = max(0.0, float(network_length) * float(retain_ratio))
+    if raw_length <= budget:
+        return set(metrics), "normal"
+    ranked = sorted(
+        metrics,
+        key=lambda key: (metrics[key][1], metrics[key][0], key),
+        reverse=True,
+    )
+    selected: set[str] = set()
+    selected_length = 0.0
+    for key in ranked:
+        length = metrics[key][0]
+        if not selected or selected_length + length <= budget:
+            selected.add(key)
+            selected_length += length
+    return selected, "ranked_limited"
 
 
 def _apply_fast_presence_guard(
@@ -1462,44 +1492,36 @@ def _apply_fast_presence_guard(
     after_total_length: float,
 ) -> tuple[list[dict], list[dict], dict]:
     all_records = [*added_records, *removed_records]
-    path_lengths = {}
+    path_metrics: dict[str, tuple[float, float]] = {}
     for record in all_records:
         key = str(record.get("_line_key") or "")
-        if key:
-            path_lengths[key] = max(
-                float(path_lengths.get(key, 0.0)),
-                float(record.get("_line_len") or 0.0),
-            )
-    raw_length = float(sum(path_lengths.values()))
+        if not key:
+            continue
+        length = float(record.get("_line_len") or 0.0)
+        score = float(record.get("_line_score") or length)
+        previous = path_metrics.get(key, (0.0, 0.0))
+        path_metrics[key] = (max(previous[0], length), max(previous[1], score))
     network_length = max(
         float(before_total_length) + float(after_total_length), 1e-9,
     )
-    change_ratio = raw_length / network_length
-    selected_keys = set(path_lengths)
-    guard_mode = "normal"
-    reliable = True
-    if change_ratio > FAST_CHANGE_SUPPRESS_RATIO:
-        selected_keys.clear()
-        guard_mode = "suppressed_unreliable"
-        reliable = False
-    elif change_ratio > FAST_CHANGE_GUARD_RATIO:
-        ranked = sorted(
-            (
-                (length, key) for key, length in path_lengths.items()
-                if length >= FAST_CHANGE_GUARD_MIN_LENGTH_M
-            ),
-            reverse=True,
-        )
-        selected_keys = {
-            key for _length, key in ranked[:FAST_CHANGE_GUARD_MAX_PATHS]
-        }
-        guard_mode = "conservative"
+    selected_keys, guard_mode = _ranked_keys_with_length_budget(
+        path_metrics,
+        network_length=network_length,
+        retain_ratio=FAST_CHANGE_RETAIN_RATIO,
+    )
+    raw_length = float(sum(length for length, _score in path_metrics.values()))
+    retained_length = float(sum(
+        length for key, (length, _score) in path_metrics.items()
+        if key in selected_keys
+    ))
 
     def retained(records: list[dict]) -> list[dict]:
         return [
             {
                 key: value for key, value in record.items()
-                if key not in {"_line_key", "_line_len"}
+                if key not in {
+                    "_line_key", "_line_len", "_line_cov", "_line_score",
+                }
             }
             for record in records
             if str(record.get("_line_key") or "") in selected_keys
@@ -1507,12 +1529,14 @@ def _apply_fast_presence_guard(
 
     return retained(added_records), retained(removed_records), {
         "presence_guard_mode": guard_mode,
-        "presence_result_reliable": reliable,
+        "presence_result_reliable": True,
+        "raw_presence_candidate_count": int(len(path_metrics)),
+        "retained_presence_candidate_count": int(len(selected_keys)),
         "raw_presence_change_length_m": raw_length,
-        "retained_presence_change_length_m": float(sum(
-            length for key, length in path_lengths.items() if key in selected_keys
-        )),
-        "presence_change_ratio": float(change_ratio),
+        "retained_presence_change_length_m": retained_length,
+        "raw_presence_change_ratio": float(raw_length / network_length),
+        "retained_presence_change_ratio": float(retained_length / network_length),
+        "presence_change_ratio": float(raw_length / network_length),
     }
 
 
@@ -1655,6 +1679,8 @@ def _fast_width_change_records(
         ):
             continue
         widened = width_delta > 0
+        absolute_delta = abs(width_delta)
+        width_score = absolute_delta * relative_delta
         axis = after_row.geometry if widened else before_row.geometry
         outer_width = after_width if widened else before_width
         inner_width = before_width if widened else after_width
@@ -1676,6 +1702,9 @@ def _fast_width_change_records(
                 "width_diff": float(width_delta),
                 "_match_key": match_key,
                 "_match_len": matched_length,
+                "_width_abs": absolute_delta,
+                "_width_rel": relative_delta,
+                "_width_score": width_score,
                 "geometry": part,
             })
     return records, matched_total_length
@@ -1686,32 +1715,49 @@ def _apply_fast_width_guard(
     *,
     matched_total_length: float,
 ) -> tuple[list[dict], dict]:
-    match_lengths = {}
+    match_metrics: dict[str, tuple[float, float]] = {}
     for record in records:
         key = str(record.get("_match_key") or "")
         if key:
-            match_lengths[key] = max(
-                float(match_lengths.get(key, 0.0)),
-                float(record.get("_match_len") or 0.0),
+            length = float(record.get("_match_len") or 0.0)
+            score = float(record.get("_width_score") or 0.0)
+            previous = match_metrics.get(key, (0.0, 0.0))
+            match_metrics[key] = (
+                max(previous[0], length), max(previous[1], score),
             )
-    raw_length = float(sum(match_lengths.values()))
-    change_ratio = raw_length / max(float(matched_total_length), 1e-9)
-    reliable = change_ratio <= FAST_WIDTH_CHANGE_GUARD_RATIO
-    retained = records if reliable else []
+    network_length = max(float(matched_total_length), 1e-9)
+    selected_keys, guard_mode = _ranked_keys_with_length_budget(
+        match_metrics,
+        network_length=network_length,
+        retain_ratio=FAST_WIDTH_RETAIN_RATIO,
+    )
+    raw_length = float(sum(length for length, _score in match_metrics.values()))
+    retained_length = float(sum(
+        length for key, (length, _score) in match_metrics.items()
+        if key in selected_keys
+    ))
     cleaned = [
         {
             key: value for key, value in record.items()
-            if key not in {"_match_key", "_match_len"}
+            if key not in {
+                "_match_key", "_match_len", "_width_abs", "_width_rel",
+                "_width_score",
+            }
         }
-        for record in retained
+        for record in records
+        if str(record.get("_match_key") or "") in selected_keys
     ]
     return cleaned, {
-        "width_guard_mode": "normal" if reliable else "suppressed_unreliable",
-        "width_result_reliable": reliable,
+        "width_guard_mode": guard_mode,
+        "width_result_reliable": True,
         "matched_width_length_m": float(matched_total_length),
+        "raw_width_candidate_count": int(len(match_metrics)),
+        "retained_width_candidate_count": int(len(selected_keys)),
         "raw_width_change_length_m": raw_length,
-        "retained_width_change_length_m": raw_length if reliable else 0.0,
-        "width_network_change_ratio": float(change_ratio),
+        "retained_width_change_length_m": retained_length,
+        "raw_width_change_ratio": float(raw_length / network_length),
+        "retained_width_change_ratio": float(retained_length / network_length),
+        "width_network_change_ratio": float(raw_length / network_length),
     }
 
 
@@ -1864,8 +1910,7 @@ def detect_fast_changes(
         "position_tolerance_m": tolerance,
         "candidate_coverage_threshold": FAST_CHANGE_CANDIDATE_COVERAGE,
         "minimum_continuous_length_m": minimum_length,
-        "presence_guard_ratio": FAST_CHANGE_GUARD_RATIO,
-        "presence_suppress_ratio": FAST_CHANGE_SUPPRESS_RATIO,
+        "presence_retain_ratio": FAST_CHANGE_RETAIN_RATIO,
         "width_direction_similarity_threshold": FAST_WIDTH_DIRECTION_SIMILARITY,
         "width_length_ratio_min": FAST_WIDTH_LENGTH_RATIO_MIN,
         "width_length_ratio_max": FAST_WIDTH_LENGTH_RATIO_MAX,
@@ -1877,7 +1922,7 @@ def detect_fast_changes(
         "fast_width_change_ratio": max(
             float(width_change_ratio), FAST_WIDTH_MIN_RELATIVE_CHANGE,
         ),
-        "width_guard_ratio": FAST_WIDTH_CHANGE_GUARD_RATIO,
+        "width_retain_ratio": FAST_WIDTH_RETAIN_RATIO,
         "presence_change_seconds": float(presence_change_seconds),
         "width_change_seconds": float(width_change_seconds),
         "merge_seconds": float(merge_seconds),
@@ -1895,9 +1940,12 @@ def detect_fast_changes(
         f"width={width_change_seconds:.3f}s, merge={merge_seconds:.3f}s, "
         f"write={write_seconds:.3f}s, total={total_seconds:.3f}s, "
         f"guard={presence_guard['presence_guard_mode']}, "
-        f"change_ratio={presence_guard['presence_change_ratio']:.3f}, "
+        f"presence_ratio="
+        f"{presence_guard['raw_presence_change_ratio']:.3f}->"
+        f"{presence_guard['retained_presence_change_ratio']:.3f}, "
         f"width_guard={width_guard['width_guard_mode']}, "
-        f"width_ratio={width_guard['width_network_change_ratio']:.3f}",
+        f"width_ratio={width_guard['raw_width_change_ratio']:.3f}->"
+        f"{width_guard['retained_width_change_ratio']:.3f}",
         flush=True,
     )
     return {
