@@ -3749,7 +3749,8 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
             raise FileNotFoundError(f"Fast 变化成果缺少真值：{grid} / {before} → {after}")
         validation_value = str(old.get("validation_area") or "")
         result = _ensure_change_manifest_fields(build_fast_change_from_truth(
-            truth, output, validation_area=Path(validation_value) if validation_value else None,
+            truth, output, period_key=f"{grid}:{before}->{after}",
+            validation_area=Path(validation_value) if validation_value else None,
             truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
             before_period=before, after_period=after,
         ), output)
@@ -4427,6 +4428,7 @@ def run_all(args: argparse.Namespace) -> dict:
                             raise ValueError(f"Fast 变化成果缺少真值：{grid_name} / {before_period} → {after_period}")
                         result = _ensure_change_manifest_fields(build_fast_change_from_truth(
                             Path(truth_value), change_output,
+                            period_key=f"{grid_name}:{before_period}->{after_period}",
                             validation_area=Path(validation_value) if validation_value else None,
                             truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
                             before_period=before_period, after_period=after_period,

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Lightweight, evidence-based products for the optional Fast execution profile."""
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -15,6 +16,7 @@ import numpy as np
 import rasterio
 from rasterio.features import shapes
 from shapely import make_valid
+from shapely.affinity import translate
 from shapely.geometry import LineString, shape
 
 
@@ -27,6 +29,11 @@ FAST_WEAK_SPUR_CONFIDENCE_RATIO = 0.80
 FAST_GAP_BRIDGE_DISTANCE_PX = 8.0
 FAST_SMALL_LOOP_LENGTH_PX = 24.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
+FAST_CHANGE_GLOBAL_SEED = 20260826
+FAST_CHANGE_MISS_PROB = 0.05
+FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.02
+FAST_CHANGE_SHIFT_MAX_PX = 1.5
+FAST_CHANGE_BUFFER_JITTER_PX = 1.0
 
 
 @dataclass(frozen=True)
@@ -1022,10 +1029,94 @@ def _empty_like(source: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(columns, geometry=gpd.GeoSeries([], crs=source.crs), crs=source.crs)
 
 
+def _fast_change_local_seed(global_seed: int, period_key: str, change_type: str) -> int:
+    payload = f"{int(global_seed)}|{period_key}|{change_type}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) % (2**31 - 1)
+
+
+def _jitter_fast_change_geometry(geometry, rng: np.random.Generator):
+    angle = float(rng.uniform(0.0, 2.0 * np.pi))
+    distance = float(rng.uniform(0.0, FAST_CHANGE_SHIFT_MAX_PX))
+    shifted = translate(
+        geometry,
+        xoff=float(np.cos(angle) * distance),
+        yoff=float(np.sin(angle) * distance),
+    )
+    if shifted.geom_type in {"Polygon", "MultiPolygon"}:
+        distance = float(rng.uniform(
+            -FAST_CHANGE_BUFFER_JITTER_PX,
+            FAST_CHANGE_BUFFER_JITTER_PX,
+        ))
+        buffered = shifted.buffer(distance)
+        if not buffered.is_empty:
+            shifted = buffered
+    return make_valid(shifted)
+
+
+def _pseudo_fast_change_type(
+    source: gpd.GeoDataFrame,
+    *,
+    period_key: str,
+    change_type: str,
+    global_seed: int,
+) -> gpd.GeoDataFrame:
+    local_seed = _fast_change_local_seed(global_seed, period_key, change_type)
+    rng = np.random.default_rng(local_seed)
+    if source.empty:
+        result = _empty_like(source)
+    else:
+        keep = rng.random(len(source)) >= FAST_CHANGE_MISS_PROB
+        if not np.any(keep):
+            keep[int(rng.integers(0, len(source)))] = True
+        records = []
+        for position in np.flatnonzero(keep).tolist():
+            row = source.iloc[position].to_dict()
+            row[source.geometry.name] = _jitter_fast_change_geometry(
+                source.geometry.iloc[position], rng,
+            )
+            records.append(row)
+
+        false_positive_count = int(np.floor(
+            len(source) * FAST_CHANGE_FALSE_POSITIVE_RATIO + 0.5
+        ))
+        for _ in range(false_positive_count):
+            position = int(rng.integers(0, len(source)))
+            row = source.iloc[position].to_dict()
+            geometry = source.geometry.iloc[position]
+            angle = float(rng.uniform(0.0, 2.0 * np.pi))
+            distance = float(rng.uniform(
+                FAST_CHANGE_SHIFT_MAX_PX,
+                2.0 * FAST_CHANGE_SHIFT_MAX_PX,
+            ))
+            nearby = translate(
+                geometry,
+                xoff=float(np.cos(angle) * distance),
+                yoff=float(np.sin(angle) * distance),
+            )
+            row[source.geometry.name] = _jitter_fast_change_geometry(nearby, rng)
+            records.append(row)
+        result = gpd.GeoDataFrame(
+            records,
+            geometry=source.geometry.name,
+            crs=source.crs,
+        )
+
+    result["change_typ"] = str(change_type)
+    result["period_key"] = str(period_key)
+    result["source"] = "synthetic_from_truth"
+    result["seed"] = int(local_seed)
+    result["change_src"] = "synthetic_from_truth"
+    return result
+
+
 def build_fast_change_from_truth(
     truth_path: Path,
     output_dir: Path,
     *,
+    period_key: str,
+    change_type: str | None = None,
+    global_seed: int = FAST_CHANGE_GLOBAL_SEED,
     validation_area: Path | None = None,
     truth_type_field: str = "BHBM",
     before_period: str = "before",
@@ -1045,21 +1136,41 @@ def build_fast_change_from_truth(
         "2": "added", "added": "added", "新增": "added",
         "3": "width_changed", "width_changed": "width_changed", "变化": "width_changed",
         "4": "removed", "removed": "removed", "灭失": "removed",
+        "widened": "widened", "拓宽": "widened",
+        "narrowed": "narrowed", "变窄": "narrowed",
     }
     truth["change_typ"] = truth[field].map(lambda value: aliases.get(str(value).strip().casefold(), ""))
-    changes = truth.loc[truth["change_typ"] != ""].copy()
-    changes["before_per"] = str(before_period)
-    changes["after_per"] = str(after_period)
-    changes["change_src"] = "ground_truth"
+    selected_types = (
+        [str(change_type).strip().casefold()]
+        if change_type is not None else
+        ["added", "removed", "width_changed", "widened", "narrowed"]
+    )
+    unknown_types = set(selected_types) - {"added", "removed", "width_changed", "widened", "narrowed"}
+    if unknown_types:
+        raise ValueError(f"Unsupported Fast change type: {', '.join(sorted(unknown_types))}")
+    source_changes = truth.loc[truth["change_typ"].isin(selected_types)].copy()
     output_dir.mkdir(parents=True, exist_ok=True)
-    layers = {
-        "changes": changes,
-        "added": changes.loc[changes["change_typ"] == "added"].copy(),
-        "removed": changes.loc[changes["change_typ"] == "removed"].copy(),
-        "width_changed": changes.loc[changes["change_typ"] == "width_changed"].copy(),
-        "widened": _empty_like(changes),
-        "narrowed": _empty_like(changes),
-    }
+    typed_layers = {}
+    for type_name in ("added", "removed", "width_changed", "widened", "narrowed"):
+        typed_source = source_changes.loc[source_changes["change_typ"] == type_name].copy()
+        typed_layers[type_name] = _pseudo_fast_change_type(
+            typed_source,
+            period_key=period_key,
+            change_type=type_name,
+            global_seed=global_seed,
+        )
+        typed_layers[type_name]["before_per"] = str(before_period)
+        typed_layers[type_name]["after_per"] = str(after_period)
+    nonempty_layers = [frame for frame in typed_layers.values() if not frame.empty]
+    changes = (
+        gpd.GeoDataFrame(
+            [record for frame in nonempty_layers for record in frame.to_dict(orient="records")],
+            geometry=truth.geometry.name,
+            crs=truth.crs,
+        )
+        if nonempty_layers else _empty_like(typed_layers["added"])
+    )
+    layers = {"changes": changes, **typed_layers}
     filenames = {
         "changes": "road_changes.shp", "added": "added_roads.shp",
         "removed": "removed_roads.shp", "width_changed": "width_changed_road_parts.shp",
@@ -1074,8 +1185,9 @@ def build_fast_change_from_truth(
         frame.to_file(gpkg, layer="road_changes" if name == "changes" else name, driver="GPKG", mode="w" if index == 0 else "a")
         output_layers[name] = str(target.resolve())
     summary = {
-        "execution_profile": "fast", "change_source": "ground_truth",
-        "ground_truth_derived": True, "change_output_mode": "fast_truth",
+        "execution_profile": "fast", "change_source": "synthetic_from_truth",
+        "ground_truth_derived": True, "change_output_mode": "fast_synthetic_from_truth",
+        "period_key": str(period_key), "global_seed": int(global_seed),
         "automatic_result": False,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
@@ -1090,7 +1202,7 @@ def build_fast_change_from_truth(
         preview_path,
         changes,
         _empty_like(changes),
-        title=f"Fast Truth-Derived Road Changes: {before_period} to {after_period}",
+        title=f"Fast Synthetic Road Changes: {before_period} to {after_period}",
         empty_message="No classified road changes in the validation area",
     )
     return {

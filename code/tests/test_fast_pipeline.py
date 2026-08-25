@@ -296,7 +296,9 @@ class FastTruthChangeTests(unittest.TestCase):
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
-            result = build_fast_change_from_truth(truth_path, root / "result")
+            result = build_fast_change_from_truth(
+                truth_path, root / "result", period_key="area:2021->2022",
+            )
             self.assertEqual(len(gpd.read_file(result["layers"]["added"])), 1)
             self.assertEqual(len(gpd.read_file(result["layers"]["width_changed"])), 1)
             self.assertEqual(len(gpd.read_file(result["layers"]["removed"])), 1)
@@ -313,7 +315,9 @@ class FastTruthChangeTests(unittest.TestCase):
                 geometry=[box(0, 0, 2, 2), box(3, 0, 5, 2), box(6, 0, 8, 2)],
                 crs="EPSG:3857",
             ).to_file(truth_path)
-            change = build_fast_change_from_truth(truth_path, root / "change")
+            change = build_fast_change_from_truth(
+                truth_path, root / "change", period_key="area:2021->2022",
+            )
             job_root = root / "job"; job_root.mkdir()
             manifest_path = job_root / "pipeline_result.json"
             manifest = {
@@ -333,6 +337,32 @@ class FastTruthChangeTests(unittest.TestCase):
             ))
             self.assertTrue(Path(evaluated["metrics"]).is_file())
             self.assertIn("evaluation", json.loads(Path(change["summary"]).read_text(encoding="utf-8")))
+
+    def test_pseudo_change_is_reproducible_for_same_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            truth_path = root / "truth.shp"
+            truth = gpd.GeoDataFrame(
+                {"BHBM": [2] * 40},
+                geometry=[box(index * 5, 0, index * 5 + 2, 2) for index in range(40)],
+                crs="EPSG:3857",
+            )
+            truth.to_file(truth_path)
+            first = build_fast_change_from_truth(
+                truth_path, root / "first", period_key="area:2021->2022",
+                change_type="added", global_seed=20260826,
+            )
+            second = build_fast_change_from_truth(
+                truth_path, root / "second", period_key="area:2021->2022",
+                change_type="added", global_seed=20260826,
+            )
+            first_frame = gpd.read_file(first["layers"]["added"])
+            second_frame = gpd.read_file(second["layers"]["added"])
+            self.assertEqual(len(first_frame), len(second_frame))
+            self.assertEqual(
+                first_frame.geometry.to_wkb().tolist(),
+                second_frame.geometry.to_wkb().tolist(),
+            )
 
 
 if __name__ == "__main__":
