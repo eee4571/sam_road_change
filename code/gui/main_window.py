@@ -270,6 +270,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             key: StringVar(value=value)
             for key, value in {
                 "mode": "validation",
+                "execution_profile": "full",
                 "validation_area": "",
                 "truth_type_field": "",
                 "evaluate": "0",
@@ -1444,9 +1445,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                 return f"变化检测失败 {payload.get('grid')} / {payload.get('scope')}：{payload.get('error')}"
             return f"检测格网 {payload.get('grid')}：{payload.get('before_period')} → {payload.get('after_period')}。"
         if kind == "complete" and payload.get("stage") == "all":
+            change_label = "次变化成果" if payload.get("execution_profile") == "fast" else "次变化检测"
             return (
                 f"全部完成：{payload.get('grid_count')} 个格网、{payload.get('period_count')} 次提取、"
-                f"{payload.get('change_count')} 次变化检测、{payload.get('failure_count', 0)} 项失败"
+                f"{payload.get('change_count')} {change_label}、{payload.get('failure_count', 0)} 项失败"
                 f"{elapsed_text}。"
             )
         if kind == "complete" and payload.get("stage") == "preflight":

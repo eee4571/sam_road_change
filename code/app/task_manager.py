@@ -159,12 +159,18 @@ def build_pipeline_command(
     validation_areas: list[tuple[str, str]] | None = None,
     area_truths: list[tuple[str, str, str, str]] | None = None,
     area_periods: dict[str, list[tuple[str, str]]] | None = None,
+    execution_profile: str = "full",
 ) -> list[str]:
     """Build the backend command for the default validation or backup grid mode."""
     mode = str(mode or "validation").strip().casefold()
     if not str(output_root).strip():
         raise ValueError("请选择成果输出根目录。")
     args = ["all", "--mode", mode]
+    execution_profile = str(execution_profile or "full").strip().casefold()
+    if execution_profile not in {"full", "fast"}:
+        raise ValueError("处理模式必须是 full 或 fast。")
+    if execution_profile == "fast":
+        args.extend(("--execution-profile", "fast"))
     if mode == "validation":
         legacy_single_area = validation_areas is None
         area_rows = validation_areas or [((Path(validation_area).stem or "validation"), validation_area)]
@@ -238,6 +244,8 @@ def build_pipeline_command(
         if truth_map and str(truth_type_field).strip():
             args.extend(("--truth-type-field", str(truth_type_field).strip()))
     elif mode == "grid":
+        if execution_profile == "fast":
+            raise ValueError("快速模式需要规范项目中为每个相邻期次配置变化真值。")
         source = Path(str(source_root).strip()).expanduser()
         if not source.is_dir():
             raise ValueError("请选择存在的格网数据根目录。")

@@ -340,6 +340,7 @@ class ResultPublisher:
             ("removed", "removed_roads.shp"),
             ("widened", "widened_road_parts.shp"),
             ("narrowed", "narrowed_road_parts.shp"),
+            ("width_changed", "width_changed_road_parts.shp"),
         ), base_dir=base_dir)
         previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
         review_preview = result.get("review_change")

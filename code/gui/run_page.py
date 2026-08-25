@@ -18,6 +18,24 @@ class RunPage:
         preflight_label = ttk.Label(run_card, textvariable=self.preflight_summary)
         preflight_label.pack(anchor="w", fill=X, pady=(0, 5))
         bind_dynamic_wrap(preflight_label, run_card, minimum=220, padding=20)
+        profile_frame = ttk.LabelFrame(run_card, text="处理模式", padding=(8, 5))
+        profile_frame.pack(fill=X, pady=(0, 7))
+        ttk.Radiobutton(
+            profile_frame, text="标准模式", variable=self.vars["execution_profile"],
+            value="full", command=self._execution_profile_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            profile_frame, text="完整道路提取、道路面、测宽、变化检测和长时序流程",
+            style="Hint.TLabel",
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Radiobutton(
+            profile_frame, text="快速模式", variable=self.vars["execution_profile"],
+            value="fast", command=self._execution_profile_changed,
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(
+            profile_frame, text="快速道路提取和测宽；变化成果由变化真值生成",
+            style="Hint.TLabel",
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(3, 0))
         checklist = ttk.Frame(run_card)
         checklist.pack(fill=X, pady=(0, 6))
         self.preflight_check_labels = []
@@ -182,7 +200,7 @@ class RunPage:
             periods=self._period_values(), truths=self._truth_values(),
             truth_type_field=self.vars["truth_type_field"].get(),
             source_root=self.vars["source_root"].get(),
-            evaluate=False,
+            evaluate=(self.vars["execution_profile"].get() == "fast"),
             resume=(self.vars["resume"].get() == "1" and not preflight_only),
             continue_on_error=self.vars["continue_on_error"].get() == "1",
             preflight_only=preflight_only,
@@ -191,7 +209,12 @@ class RunPage:
             validation_areas=(self.project_validation_areas or None),
             area_truths=(self.project_area_truths or None),
             area_periods=(self.project_area_periods or None),
+            execution_profile=self.vars["execution_profile"].get(),
         )
+
+    def _execution_profile_changed(self) -> None:
+        fast = self.vars["execution_profile"].get() == "fast"
+        self.run_button.configure(text="运行快速模式" if fast else "运行完整流程")
 
     def preflight_inputs(self) -> None:
         try:

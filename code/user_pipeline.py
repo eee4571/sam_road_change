@@ -66,6 +66,13 @@ PERIOD_STAGE_DEFINITIONS = (
     ("finalize", "结果固化"),
     ("export", "道路产品导出"),
 )
+FAST_PERIOD_STAGE_DEFINITIONS = (
+    ("centerline", "道路模型推理"),
+    ("recover", "快速道路恢复"),
+    ("surface", "快速道路面"),
+    ("width", "快速道路宽度"),
+    ("export", "道路产品导出"),
+)
 
 
 def project_root() -> Path:
@@ -1896,7 +1903,10 @@ def run_command(
     return timing
 
 
-def _period_state_template(grid: str, period: str) -> dict:
+def _period_state_template(grid: str, period: str, execution_profile: str = "full") -> dict:
+    stage_definitions = (
+        FAST_PERIOD_STAGE_DEFINITIONS if execution_profile == "fast" else PERIOD_STAGE_DEFINITIONS
+    )
     return {
         "grid": grid,
         "period": period,
@@ -1907,23 +1917,25 @@ def _period_state_template(grid: str, period: str) -> dict:
         "last_completed_stage_label": None,
         "stages": {
             "prepare": "pending",
-            **{key: "pending" for key, _label in PERIOD_STAGE_DEFINITIONS},
+            **{key: "pending" for key, _label in stage_definitions},
         },
     }
 
 
-def _load_period_state(path: Path, grid: str, period: str, resume: bool) -> dict:
+def _load_period_state(
+    path: Path, grid: str, period: str, resume: bool, execution_profile: str = "full",
+) -> dict:
     if resume and path.is_file():
         try:
             state = read_json(path)
         except (OSError, UnicodeError, json.JSONDecodeError):
             state = {}
         if state.get("grid") == grid and state.get("period") == period:
-            merged = _period_state_template(grid, period)
+            merged = _period_state_template(grid, period, execution_profile)
             merged.update(state)
             merged["stages"].update(state.get("stages") or {})
             return merged
-    return _period_state_template(grid, period)
+    return _period_state_template(grid, period, execution_profile)
 
 
 def _write_pipeline_position(
@@ -2001,10 +2013,21 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
             f"{stem}_mask.png" in names or f"{stem}_mask.tif" in names
             for stem in stems
         )
-    if stage_key == "width":
+    if stage_key == "recover":
         return (
+            (context["recovery_dir"] / "fast_recovery_summary.json").is_file()
+            and _named_outputs_complete(
+                context["recovery_dir"], [f"{stem}_fast_recovery.json" for stem in stems],
+            )
+        )
+    if stage_key == "width":
+        ready = (
             (context["width_dir"] / "batch_width_summary.json").is_file()
             and _named_outputs_complete(context["width_dir"], [f"{stem}_summary.json" for stem in stems])
+        )
+        return ready and (
+            context.get("execution_profile") != "fast"
+            or (context["width_dir"] / "fast_products.gpkg").is_file()
         )
     if stage_key == "finalize":
         return (
@@ -2251,9 +2274,12 @@ def extract(args: argparse.Namespace) -> dict:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     grid = str(getattr(args, "grid", "") or getattr(args, "area_id", "") or workspace.name)
     period = str(getattr(args, "period", "") or "")
+    execution_profile = str(getattr(args, "execution_profile", "full") or "full").casefold()
+    if execution_profile not in {"full", "fast"}:
+        raise ValueError(f"Unknown execution profile: {execution_profile}")
     resume = bool(getattr(args, "resume", False))
     period_state_path = workspace / "period_state.json"
-    period_state = _load_period_state(period_state_path, grid, period, resume)
+    period_state = _load_period_state(period_state_path, grid, period, resume, execution_profile)
     period_state.update({
         "status": "running",
         "workspace": str(workspace),
@@ -2269,15 +2295,19 @@ def extract(args: argparse.Namespace) -> dict:
     pipeline_state_value = str(getattr(args, "pipeline_state", "") or "").strip()
     pipeline_state_path = Path(pipeline_state_value).expanduser() if pipeline_state_value else None
     image_stems = [path.stem for path in listed_rasters(images)]
+    inference_batch_dir = infer_dir / image_txt.stem
+    recovery_dir = run_root / "fast_recovery"
     stage_context = {
         "image_stems": image_stems,
-        "infer_dir": infer_dir / image_txt.stem,
+        "infer_dir": inference_batch_dir,
+        "recovery_dir": recovery_dir,
         "surface_mask_dir": surface_root / "masks" / image_txt.stem,
         "width_dir": width_dir,
         "final_dir": final_dir,
         "centerline": products / "road_centerlines.shp",
         "surface": products / "road_surfaces.shp",
         "gpkg": products / "roads.gpkg",
+        "execution_profile": execution_profile,
     }
     stage_timings = []
     centerline = products / "road_centerlines.shp"
@@ -2314,16 +2344,53 @@ def extract(args: argparse.Namespace) -> dict:
             "--visualization", str(products / "road_overview.png"),
         ], ROOT),
     }
+    stage_definitions = PERIOD_STAGE_DEFINITIONS
+    if execution_profile == "fast":
+        fast_script = ROOT / "engine" / "fast_pipeline.py"
+        probability_dir = inference_batch_dir / "mask"
+        graph_dir = inference_batch_dir / "graph"
+        surface_mask_dir = surface_root / "masks" / image_txt.stem
+        validation_value = str(getattr(args, "validation_area", "") or "").strip()
+        stage_commands = {
+            "centerline": ([
+                str(PYTHON), "inferencer.py", "--config", str(config), "--checkpoint", str(ckpt),
+                "--input_txt_dir", str(image_txt.parent), "--output_root", str(infer_root), "--output_dir", str(infer_dir),
+                "--device", device, "--rescale_to_model_gsd", args.rescale,
+                "--junction_node_mode", str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
+                "--execution-profile", "fast",
+            ], SAMROAD),
+            "recover": ([
+                str(PYTHON), str(fast_script), "recover", "--image-dir", str(images),
+                "--graph-dir", str(graph_dir), "--probability-dir", str(probability_dir),
+                "--output-dir", str(recovery_dir),
+            ], ROOT),
+            "surface": ([
+                str(PYTHON), str(fast_script), "surface", "--image-dir", str(images),
+                "--probability-dir", str(probability_dir), "--output-dir", str(surface_mask_dir),
+            ], ROOT),
+            "width": ([
+                str(PYTHON), str(fast_script), "width", "--image-dir", str(images),
+                "--graph-dir", str(graph_dir), "--surface-dir", str(surface_mask_dir),
+                "--probability-dir", str(probability_dir), "--output-dir", str(width_dir),
+                "--pixel-size", str(args.pixel_size),
+            ], ROOT),
+            "export": ([
+                str(PYTHON), str(fast_script), "export", "--width-dir", str(width_dir),
+                "--output-dir", str(products), "--image-dir", str(images),
+                *(["--validation-area", validation_value] if validation_value else []),
+            ], ROOT),
+        }
+        stage_definitions = FAST_PERIOD_STAGE_DEFINITIONS
     if resume:
         stage_commands["centerline"][0].append("--resume-existing-images")
         if pipeline_state_path is not None:
             stage_commands["centerline"][0].extend(("--pipeline-state", str(pipeline_state_path.resolve())))
     try:
-        for stage_index, (stage_key, stage_label) in enumerate(PERIOD_STAGE_DEFINITIONS, start=1):
+        for stage_index, (stage_key, stage_label) in enumerate(stage_definitions, start=1):
             event_context = {
                 "grid": grid, "period": period,
                 "stage_key": stage_key, "stage_index": stage_index,
-                "stage_total": len(PERIOD_STAGE_DEFINITIONS),
+                "stage_total": len(stage_definitions),
             }
             if (
                 resume
@@ -2408,6 +2475,10 @@ def extract(args: argparse.Namespace) -> dict:
         "road_probability": road_probability,
         "width_review": str(width_dir), "final_dir": str(final_dir),
         "period_state": str(period_state_path),
+        "execution_profile": execution_profile,
+        "road_extraction_source": "samroad_fast" if execution_profile == "fast" else "samroad",
+        "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
+        "width_source": "fast_measured" if execution_profile == "fast" else "full_measured",
     })
     result["fusion"] = build_fusion_metadata(final_dir)
     profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
@@ -3136,6 +3207,7 @@ def _task_input_spec(
     return {
         "pipeline_version": PIPELINE_VERSION,
         "mode": mode,
+        "execution_profile": str(getattr(args, "execution_profile", "full") or "full"),
         "validation_area": (
             {key: file_fingerprint(value) for key, value in validation_area.items()}
             if isinstance(validation_area, dict) else
@@ -3181,7 +3253,7 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
     }
     scalar_extraction_keys = (
         "pipeline_version", "mode", "device", "pixel_size", "rescale",
-        "junction_node_mode",
+        "junction_node_mode", "execution_profile",
     )
 
     def identity_tree_equal(previous, latest) -> bool:
@@ -3198,8 +3270,13 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
             )
         return previous == latest
 
+    def scalar_value(payload: dict, key: str):
+        if key == "execution_profile":
+            return str(payload.get(key, "full") or "full")
+        return payload.get(key)
+
     invalidate_all_extraction = (
-        any(prior.get(key) != current.get(key) for key in scalar_extraction_keys)
+        any(scalar_value(prior, key) != scalar_value(current, key) for key in scalar_extraction_keys)
         or not identity_tree_equal(prior.get("validation_area"), current.get("validation_area"))
         or not dependency_identity_equal(
             prior.get("checkpoint"), current.get("checkpoint"), kind="checkpoint",
@@ -3613,6 +3690,8 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
         rescale=str(input_spec.get("rescale") or "off"),
         run_id=f"roads_rerun_{int(time.time())}",
         junction_node_mode=str(input_spec.get("junction_node_mode") or "sparse"),
+        execution_profile=str(manifest.get("execution_profile") or input_spec.get("execution_profile") or "full"),
+        validation_area=str((manifest.get("validation_areas") or {}).get(grid) or manifest.get("validation_area") or ""),
     )))
     updated = {
         **old, **result, "result": str(result_path), "status": "completed",
@@ -3641,15 +3720,28 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     output = Path(str(old.get("output") or job_root / "grids" / clean_name(grid) / "changes" / f"{clean_name(before)}_to_{clean_name(after)}"))
     spec = manifest.get("input_spec") or {}
     started = time.monotonic()
-    result = _ensure_change_manifest_fields(change(argparse.Namespace(
-        before_result=str(before_entry["result"]), after_result=str(after_entry["result"]),
-        output=str(output), before_period=before, after_period=after,
-        absolute=str(spec.get("absolute") or old.get("absolute") or "2.0"),
-        ratio=str(spec.get("ratio") or old.get("ratio") or "0.2"),
-        tolerance=str(spec.get("tolerance") or old.get("tolerance") or "3.0"),
-        truth=str(old.get("truth") or ""), validation_area=str(old.get("validation_area") or ""),
-        truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or ""),
-    )), output)
+    if str(manifest.get("execution_profile") or "full") == "fast":
+        from engine.fast_pipeline import build_fast_change_from_truth
+
+        truth = Path(str(old.get("truth") or "")).expanduser()
+        if not truth.is_file():
+            raise FileNotFoundError(f"Fast 变化成果缺少真值：{grid} / {before} → {after}")
+        validation_value = str(old.get("validation_area") or "")
+        result = _ensure_change_manifest_fields(build_fast_change_from_truth(
+            truth, output, validation_area=Path(validation_value) if validation_value else None,
+            truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
+            before_period=before, after_period=after,
+        ), output)
+    else:
+        result = _ensure_change_manifest_fields(change(argparse.Namespace(
+            before_result=str(before_entry["result"]), after_result=str(after_entry["result"]),
+            output=str(output), before_period=before, after_period=after,
+            absolute=str(spec.get("absolute") or old.get("absolute") or "2.0"),
+            ratio=str(spec.get("ratio") or old.get("ratio") or "0.2"),
+            tolerance=str(spec.get("tolerance") or old.get("tolerance") or "3.0"),
+            truth=str(old.get("truth") or ""), validation_area=str(old.get("validation_area") or ""),
+            truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or ""),
+        )), output)
     updated = {
         **old, **result, "grid": grid, "before_period": before, "after_period": after,
         "status": "completed", "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
@@ -3673,9 +3765,36 @@ def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tup
 
 def _refresh_manifest_downstream(manifest: dict) -> None:
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
-    manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+    if str(manifest.get("execution_profile") or "full") == "fast":
+        manifest["temporal_results"] = []
+        manifest["temporal_status"] = "skipped_fast_profile"
+    else:
+        manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
     aggregate_change_evaluations(manifest, job_root)
     manifest["downstream_updated_at"] = now_text()
+
+
+def _evaluate_fast_manifest_pairs(
+    manifest_path: Path, pairs: list[tuple[str, str, str]],
+) -> None:
+    manifest = read_json(manifest_path)
+    if str(manifest.get("execution_profile") or "full") != "fast":
+        return
+    for grid, before, after in pairs:
+        entry = next(
+            item for item in manifest.get("change_results", [])
+            if str(item.get("grid")) == grid
+            and str(item.get("before_period")) == before
+            and str(item.get("after_period")) == after
+        )
+        evaluate_existing_changes(argparse.Namespace(
+            pipeline_manifest=str(manifest_path), grid=grid, before_period=before,
+            after_period=after, truth=str(entry.get("truth") or ""),
+            validation_area=str(entry.get("validation_area") or ""),
+            truth_type_field=str(entry.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
+            truth_added_value="", truth_width_changed_value="", truth_removed_value="",
+            evaluation_tolerance=5.0,
+        ))
 
 
 def rerun_pipeline_period(args: argparse.Namespace) -> dict:
@@ -3700,6 +3819,10 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest["status"] = "completed"
     manifest["updated_at"] = now_text()
     _persist_existing_pipeline(manifest, manifest_path)
+    if args.update_related:
+        _evaluate_fast_manifest_pairs(
+            manifest_path, [(grid, before, after) for before, after in pairs],
+        )
     result = {"grid": grid, "period": period, "affected_pairs": pairs, "updated_related": bool(args.update_related), "result": updated.get("result")}
     emit("complete", stage="rerun-period", **result)
     return result
@@ -3715,6 +3838,9 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
         manifest["temporal_status"] = "stale"
     manifest["status"] = "completed"
     _persist_existing_pipeline(manifest, manifest_path)
+    _evaluate_fast_manifest_pairs(
+        manifest_path, [(str(args.grid), str(args.before_period), str(args.after_period))],
+    )
     result = {"grid": args.grid, "before_period": args.before_period, "after_period": args.after_period, "updated_temporal": bool(args.update_temporal), "output": updated.get("output")}
     emit("complete", stage="rerun-change", **result)
     return result
@@ -3739,6 +3865,7 @@ def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     _refresh_manifest_downstream(manifest)
     manifest["status"] = "completed"
     _persist_existing_pipeline(manifest, manifest_path)
+    _evaluate_fast_manifest_pairs(manifest_path, change_keys)
     result = {"period_count": len(period_keys), "change_count": len(change_keys)}
     emit("complete", stage="rerun-all-periods", **result)
     return result
@@ -3832,6 +3959,11 @@ def run_all(args: argparse.Namespace) -> dict:
     mode = str(getattr(args, "mode", "grid") or "grid").strip().casefold()
     if mode not in {"validation", "grid"}:
         raise ValueError("--mode 必须是 validation 或 grid")
+    execution_profile = str(getattr(args, "execution_profile", "full") or "full").casefold()
+    if execution_profile not in {"full", "fast"}:
+        raise ValueError("--execution-profile 必须是 full 或 fast")
+    if execution_profile == "fast" and bool(getattr(args, "no_evaluation", False)):
+        raise ValueError("Fast 快速模式必须配置变化真值并执行现有精度评价，不能使用 --no-evaluation。")
     validation_area: str | dict[str, str] = ""
     truth_by_pair: dict[tuple, Path] = {}
     source_root = None
@@ -3840,6 +3972,8 @@ def run_all(args: argparse.Namespace) -> dict:
         truth_by_pair = truth_by_task
         validation_area = validation_areas
     else:
+        if execution_profile == "fast":
+            raise ValueError("Fast 快速模式需要逐相邻期配置变化真值，当前仅支持 validation 项目模式。")
         source_value = str(getattr(args, "source_root", "") or "").strip()
         if not source_value:
             raise ValueError("格网模式必须提供 --source-root PATH")
@@ -4028,6 +4162,11 @@ def run_all(args: argparse.Namespace) -> dict:
         "output_root": str(output_root),
         "result_index": str(layout.result_index_path),
         "mode": mode,
+        "execution_profile": execution_profile,
+        "road_extraction_source": "samroad_fast" if execution_profile == "fast" else "samroad",
+        "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
+        "width_source": "fast_measured" if execution_profile == "fast" else "full_measured",
+        "change_source": "ground_truth" if execution_profile == "fast" else "automatic_detection",
         "source_root": str(source_root) if source_root is not None else "",
         "validation_area": (
             next(iter(validation_area.values())) if isinstance(validation_area, dict) and len(validation_area) == 1
@@ -4173,6 +4312,8 @@ def run_all(args: argparse.Namespace) -> dict:
                             config=args.config, device=args.device, pixel_size=args.pixel_size,
                             rescale=args.rescale, run_id=base_run_id,
                             junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
+                            execution_profile=execution_profile,
+                            validation_area=(validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area),
                             grid=grid_name, period=period,
                             resume=internal_resume,
                             pipeline_state=str(state_path),
@@ -4212,7 +4353,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     manifest["change_results"].append(prior_entry)
                     manifest["processed_work"] += 1
                     progress(
-                        "变化检测", status="skipped", grid=grid_name,
+                        "变化成果生成" if execution_profile == "fast" else "变化检测", status="skipped", grid=grid_name,
                         before_period=before_period, after_period=after_period,
                         reason="已完成且成果完整",
                     )
@@ -4231,7 +4372,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     manifest["failures"].append(failure)
                     manifest["processed_work"] += 1
                     progress(
-                        "变化检测", status="skipped", grid=grid_name,
+                        "变化成果生成" if execution_profile == "fast" else "变化检测", status="skipped", grid=grid_name,
                         before_period=before_period, after_period=after_period,
                         reason=failure["error"],
                     )
@@ -4242,32 +4383,45 @@ def run_all(args: argparse.Namespace) -> dict:
                     f"{clean_name(before_period)}_to_{clean_name(after_period)}"
                 )
                 progress(
-                    "变化检测", grid=grid_name,
+                    "变化成果生成" if execution_profile == "fast" else "变化检测", grid=grid_name,
                     before_period=before_period, after_period=after_period,
                 )
                 manifest.update({
                     "current_grid": grid_name,
                     "current_period": f"{before_period} → {after_period}",
                     "current_stage": "change",
-                    "current_stage_label": "变化检测",
+                    "current_stage_label": "变化成果生成" if execution_profile == "fast" else "变化检测",
                     "period_state": None,
                 })
                 _persist_pipeline(manifest, job_root, output_root)
                 try:
-                    result = _ensure_change_manifest_fields(change(
-                        argparse.Namespace(
-                            before_result=before_entry["result"], after_result=after_entry["result"],
-                            output=str(change_output), before_period=before_period,
-                            after_period=after_period, absolute=args.absolute, ratio=args.ratio,
-                            tolerance=args.tolerance,
-                            truth=(
-                                "" if bool(getattr(args, "no_evaluation", False))
-                                else str(truth_by_pair.get((grid_name, before_period, after_period), ""))
-                            ),
-                            validation_area=(validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area),
-                            truth_type_field=str(getattr(args, "truth_type_field", "") or ""),
-                        )
-                    ), change_output)
+                    truth_value = str(truth_by_pair.get((grid_name, before_period, after_period), ""))
+                    validation_value = (
+                        validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area
+                    )
+                    if execution_profile == "fast":
+                        from engine.fast_pipeline import build_fast_change_from_truth
+
+                        if not truth_value:
+                            raise ValueError(f"Fast 变化成果缺少真值：{grid_name} / {before_period} → {after_period}")
+                        result = _ensure_change_manifest_fields(build_fast_change_from_truth(
+                            Path(truth_value), change_output,
+                            validation_area=Path(validation_value) if validation_value else None,
+                            truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
+                            before_period=before_period, after_period=after_period,
+                        ), change_output)
+                    else:
+                        result = _ensure_change_manifest_fields(change(
+                            argparse.Namespace(
+                                before_result=before_entry["result"], after_result=after_entry["result"],
+                                output=str(change_output), before_period=before_period,
+                                after_period=after_period, absolute=args.absolute, ratio=args.ratio,
+                                tolerance=args.tolerance,
+                                truth=("" if bool(getattr(args, "no_evaluation", False)) else truth_value),
+                                validation_area=validation_value,
+                                truth_type_field=str(getattr(args, "truth_type_field", "") or ""),
+                            )
+                        ), change_output)
                     entry = {
                         "grid": grid_name, "before_period": before_period,
                         "after_period": after_period,
@@ -4284,6 +4438,25 @@ def run_all(args: argparse.Namespace) -> dict:
                     )
                     if published:
                         entry["published"] = published
+                    if execution_profile == "fast":
+                        _persist_pipeline(manifest, job_root, output_root)
+                        evaluate_existing_changes(argparse.Namespace(
+                            pipeline_manifest=str(job_root / "pipeline_result.json"), grid=grid_name,
+                            before_period=before_period, after_period=after_period, truth=truth_value,
+                            validation_area=validation_value,
+                            truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
+                            truth_added_value="", truth_width_changed_value="", truth_removed_value="",
+                            evaluation_tolerance=5.0,
+                        ))
+                        evaluated_manifest = read_json(job_root / "pipeline_result.json")
+                        evaluated_entry = next(
+                            candidate for candidate in evaluated_manifest.get("change_results", [])
+                            if str(candidate.get("grid")) == str(grid_name)
+                            and str(candidate.get("before_period")) == str(before_period)
+                            and str(candidate.get("after_period")) == str(after_period)
+                        )
+                        entry.update(evaluated_entry)
+                        manifest["evaluation_summary"] = evaluated_manifest.get("evaluation_summary", {})
                 except Exception as exc:
                     failure = {
                         "type": "change", "grid": grid_name,
@@ -4292,7 +4465,7 @@ def run_all(args: argparse.Namespace) -> dict:
                         "elapsed_seconds": elapsed_seconds(unit_started), "failed_at": now_text(),
                     }
                     manifest["failures"].append(failure)
-                    emit("pipeline", stage="变化检测", **failure)
+                    emit("pipeline", stage="变化成果生成" if execution_profile == "fast" else "变化检测", **failure)
                     if not continue_on_error:
                         raise
                 finally:
@@ -4303,28 +4476,32 @@ def run_all(args: argparse.Namespace) -> dict:
 
         manifest["period_count"] = len(manifest["period_results"])
         manifest["change_count"] = len(manifest["change_results"])
-        temporal_started = time.monotonic()
-        emit(
-            "pipeline", stage="长时序道路汇总", status="running",
-            completed=total_work, total=total_work,
-        )
-        if reuse_completed_downstream:
-            manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
+        if execution_profile == "fast":
+            manifest["temporal_results"] = []
+            manifest["temporal_status"] = "skipped_fast_profile"
+        else:
+            temporal_started = time.monotonic()
             emit(
-                "pipeline", stage="长时序道路汇总", status="skipped",
-                reason="续跑复用已完成且完整的长时序成果",
+                "pipeline", stage="长时序道路汇总", status="running",
+                completed=total_work, total=total_work,
+            )
+            if reuse_completed_downstream:
+                manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
+                emit(
+                    "pipeline", stage="长时序道路汇总", status="skipped",
+                    reason="续跑复用已完成且完整的长时序成果",
+                    temporal_grid_count=len(manifest["temporal_results"]),
+                    completed=total_work, total=total_work,
+                )
+            else:
+                manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+                for entry in manifest["temporal_results"]:
+                    entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
+            emit(
+                "pipeline", stage="长时序道路汇总", status="complete",
                 temporal_grid_count=len(manifest["temporal_results"]),
                 completed=total_work, total=total_work,
             )
-        else:
-            manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
-            for entry in manifest["temporal_results"]:
-                entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
-        emit(
-            "pipeline", stage="长时序道路汇总", status="complete",
-            temporal_grid_count=len(manifest["temporal_results"]),
-            completed=total_work, total=total_work,
-        )
         manifest["completed_at"] = now_text()
         manifest["status"] = "completed_with_errors" if manifest["failures"] else "completed"
         update_elapsed()
@@ -4344,6 +4521,7 @@ def run_all(args: argparse.Namespace) -> dict:
             job_root=str(job_root), grid_count=len(grids),
             period_count=manifest["period_count"], change_count=manifest["change_count"],
             failure_count=len(manifest["failures"]), status=manifest["status"],
+            execution_profile=execution_profile,
             elapsed_seconds=manifest["elapsed_seconds"], completed=total_work, total=total_work,
         )
         return manifest
@@ -4439,6 +4617,7 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--evaluation-tolerance", type=float, default=5.0)
     a = sub.add_parser("all", help="验证模式默认按显式期次运行；格网模式保留旧布局扫描")
     a.add_argument("--mode", choices=["validation", "grid"], default="validation")
+    a.add_argument("--execution-profile", choices=["full", "fast"], default="full")
     a.add_argument(
         "--validation-area", action="append", nargs="+", default=[], metavar="AREA_OR_SHP",
         help="可重复：区域名 验证区SHP；单路径形式兼容旧任务",

@@ -731,6 +731,7 @@ def discover_project_result_context(
             ("changes", "road_changes.shp"), ("added", "added_roads.shp"),
             ("removed", "removed_roads.shp"), ("widened", "widened_road_parts.shp"),
             ("narrowed", "narrowed_road_parts.shp"), ("review", "review_changes.shp"),
+            ("width_changed", "width_changed_road_parts.shp"),
         ):
             path = directory / name
             if path.is_file():
@@ -806,12 +807,12 @@ def discover_project_result_context(
                 entry["published"] = {
                     key: value for key, value in products.items()
                     if key in {
-                        "changes", "added", "removed", "widened", "narrowed",
+                        "changes", "added", "removed", "widened", "narrowed", "width_changed",
                         "road_change", "review_change",
                     }
                 }
                 layers = entry.setdefault("layers", {})
-                for key in ("changes", "added", "removed", "widened", "narrowed"):
+                for key in ("changes", "added", "removed", "widened", "narrowed", "width_changed"):
                     if products.get(key):
                         layers.setdefault(key, products[key])
             temporal = area_value.get("temporal")
@@ -1021,6 +1022,7 @@ def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> l
     change_labels = {
         "changes": "全部变化", "added": "新增道路", "removed": "灭失道路",
         "widened": "拓宽道路部分", "narrowed": "变窄道路部分",
+        "width_changed": "宽度变化道路部分",
         "road_change": "变化结果图", "review_change": "待复核变化图",
     }
     temporal_labels = {

@@ -95,6 +95,10 @@ parser.add_argument(
     "--pipeline-state", default="",
     help="Optional pipeline job_state.json used only for safe legacy-output adoption.",
 )
+parser.add_argument(
+    "--execution-profile", choices=["full", "fast"], default="full",
+    help="Fast keeps model inference/TopoNet but skips the production weak-recovery pipeline.",
+)
 args = parser.parse_args()
 
 
@@ -240,6 +244,9 @@ def run_inference_on_images(
         # Threshold selection is per complete image.  Never mutate the shared
         # batch config, otherwise one weak image would leak into the next tile.
         image_config = copy.deepcopy(config)
+        if args.execution_profile == "fast":
+            image_config.RELATIVE_ROADNESS_ENABLED = False
+            image_config.RELATIVE_INJECT_INTO_TOPONET = False
         img_path = Path(img_path).expanduser().resolve()
         img_id = img_path.stem
         if resume_manager is not None:
@@ -328,39 +335,74 @@ def run_inference_on_images(
             )
 
         postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
-        relative_start_seconds = time.perf_counter()
-        relative_context, additional_relative_calls = resolve_relative_context_for_postprocess(
-            road_mask,
-            image_config,
-            scene_state=profile_decision["scene_confidence_state"],
-            distance_scale=postprocess_distance_scale,
-            precomputed_context=precomputed_relative_context,
-        )
-        performance_summary["relative_roadness_seconds"] += float(
-            time.perf_counter() - relative_start_seconds
-        )
-        performance_summary["relative_compute_call_count"] += int(additional_relative_calls)
-        relative_context["diagnostics"].update({
-            "relative_injected_into_toponet": performance_summary[
-                "relative_injected_into_toponet"
-            ],
-        })
-        profile_decision.update(relative_context.get("diagnostics", {}))
         bootstrap_candidate_audit = []
         weak_start_seconds = time.perf_counter()
-        pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
-            pred_nodes,
-            pred_edges,
-            road_mask,
-            image_config,
-            edge_scores=edge_confidences,
-            distance_scale=postprocess_distance_scale,
-            relative_context=relative_context,
-            bootstrap_candidate_audit=bootstrap_candidate_audit,
-            topology_candidate_nodes_rc=candidate_nodes,
-            topology_candidate_edges=candidate_edges,
-            topology_candidate_scores=candidate_confidences,
-        )
+        if args.execution_profile == "fast":
+            from engine.fast_pipeline import filter_fast_native_graph
+
+            pred_nodes, pred_edges = filter_fast_native_graph(pred_nodes, pred_edges)
+            edge_confidences = np.full(
+                pred_edges.shape[0], float(image_config.TOPO_THRESHOLD), dtype=np.float32,
+            )
+            edge_metadata = [
+                {
+                    "topology_probability": float(score), "line_source": "samroad_native_toponet",
+                    "recovery_score": 0.0, "center_conf": 0.0, "surface_conf": 0.0,
+                    "recovery_reason": "fast_native_filter", "qa_state": "auto",
+                    "recovery_id": "", "candidate_source": "absolute",
+                }
+                for score in edge_confidences
+            ]
+            zeros = np.zeros_like(road_mask, dtype=np.uint8)
+            relative_context = {
+                "relative_score": np.zeros_like(road_mask, dtype=np.float32),
+                "relative_candidate_mask": zeros,
+                "relative_skeleton": zeros,
+                "relative_skeleton_raw": zeros,
+                "relative_skeleton_normalized": zeros,
+                "relative_rejected_skeleton": zeros,
+                "junction_zone_mask": zeros,
+                "pruned_spur_mask": zeros,
+                "collapsed_zone_mask": zeros,
+                "diagnostics": {"fast_relative_deferred": True},
+            }
+            recovery_summary = {
+                "execution_profile": "fast", "centerline_method": "native_toponet_fast",
+                "strong_edge_count": int(pred_edges.shape[0]), "timing": {},
+            }
+            profile_decision.update(relative_context["diagnostics"])
+        else:
+            relative_start_seconds = time.perf_counter()
+            relative_context, additional_relative_calls = resolve_relative_context_for_postprocess(
+                road_mask,
+                image_config,
+                scene_state=profile_decision["scene_confidence_state"],
+                distance_scale=postprocess_distance_scale,
+                precomputed_context=precomputed_relative_context,
+            )
+            performance_summary["relative_roadness_seconds"] += float(
+                time.perf_counter() - relative_start_seconds
+            )
+            performance_summary["relative_compute_call_count"] += int(additional_relative_calls)
+            relative_context["diagnostics"].update({
+                "relative_injected_into_toponet": performance_summary[
+                    "relative_injected_into_toponet"
+                ],
+            })
+            profile_decision.update(relative_context.get("diagnostics", {}))
+            pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
+                pred_nodes,
+                pred_edges,
+                road_mask,
+                image_config,
+                edge_scores=edge_confidences,
+                distance_scale=postprocess_distance_scale,
+                relative_context=relative_context,
+                bootstrap_candidate_audit=bootstrap_candidate_audit,
+                topology_candidate_nodes_rc=candidate_nodes,
+                topology_candidate_edges=candidate_edges,
+                topology_candidate_scores=candidate_confidences,
+            )
         performance_summary["weak_postprocess_seconds"] = float(
             time.perf_counter() - weak_start_seconds
         )
@@ -1227,6 +1269,7 @@ if __name__ == "__main__":
         'input_gsd': args.input_gsd,
         'model_gsd': args.model_gsd,
         'max_image_megapixels': args.max_image_megapixels,
+        'execution_profile': args.execution_profile,
         'junction_node_mode': str(config.get('JUNCTION_NODE_MODE', '')),
         'topology_threshold': float(config.TOPO_THRESHOLD),
         'topology_candidate_threshold': float(config.get('TOPO_CANDIDATE_THRESHOLD', 0.20)),
@@ -1263,6 +1306,7 @@ if __name__ == "__main__":
         'checkpoint': str(checkpoint_path),
         'config': str(config_path),
         'device': resolved_device_name,
+        'execution_profile': args.execution_profile,
         'topology_threshold': identity_parameters['topology_threshold'],
         'topology_candidate_threshold': identity_parameters['topology_candidate_threshold'],
         'requested_road_threshold_profile': requested_profile,
