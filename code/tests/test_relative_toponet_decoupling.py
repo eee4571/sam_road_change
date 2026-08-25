@@ -220,7 +220,7 @@ class RelativeTopoNetDecouplingTests(unittest.TestCase):
         self.assertGreater(result[1].shape[0], 0)
         self.assertEqual(toponet.call_count, 1)
         self.assertGreaterEqual(result[9]["fast_graph_point_count"], result[9]["raw_graph_point_count"])
-        self.assertGreater(result[9]["relative_boost_pixel_count"], 0)
+        self.assertGreater(result[9]["relative_candidate_pixel_count"], 0)
         self.assertEqual(result[9]["relative_compute_call_count"], 0)
 
     def test_fast_toponet_replaces_only_enhanced_road_channel(self):

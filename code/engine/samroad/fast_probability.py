@@ -8,8 +8,9 @@ import numpy as np
 
 FAST_RELATIVE_SIGMA = 15.0
 FAST_RELATIVE_EPS = 0.005
-FAST_RELATIVE_RATIO_SATURATION = 4.0
-FAST_RELATIVE_THRESHOLD_MARGIN = 0.02
+FAST_RELATIVE_MIN_CONTRAST = 0.01
+FAST_RELATIVE_MIN_RATIO = 1.5
+FAST_RELATIVE_THRESHOLD_MARGIN = 0.01
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -24,18 +25,18 @@ def build_fast_enhanced_road_probability(
     *,
     high_threshold: float,
 ) -> tuple[np.ndarray, dict[str, float | int]]:
-    """Apply one bounded local-relative boost without making topology decisions."""
+    """Grant locally distinct Fast pixels eligibility for native graph extraction."""
     probability = _probability01(road_probability)
-    p50, p95, p99 = (
-        (float(value) for value in np.percentile(probability, (50, 95, 99)))
-        if probability.size else (0.0, 0.0, 0.0)
+    p50, p99 = (
+        (float(value) for value in np.percentile(probability, (50, 99)))
+        if probability.size else (0.0, 0.0)
     )
     adaptive_floor = float(np.clip(
         p50 + 0.05 * (p99 - p50),
         0.003,
         0.015,
     ))
-    boost_target = float(min(
+    graph_candidate_level = float(min(
         1.0,
         float(high_threshold) + FAST_RELATIVE_THRESHOLD_MARGIN,
     ))
@@ -47,33 +48,18 @@ def build_fast_enhanced_road_probability(
     )
     contrast = np.maximum(probability - local_background, 0.0)
     relative_ratio = contrast / (local_background + FAST_RELATIVE_EPS)
-    relative_confidence = np.clip(
-        relative_ratio / FAST_RELATIVE_RATIO_SATURATION,
-        0.0,
-        1.0,
+    relative_candidate = (
+        (probability >= adaptive_floor)
+        & (contrast >= FAST_RELATIVE_MIN_CONTRAST)
+        & (relative_ratio >= FAST_RELATIVE_MIN_RATIO)
     )
-    relative_confidence *= probability >= adaptive_floor
-    enhanced = np.maximum(
-        probability,
-        boost_target * relative_confidence,
-    ).clip(0.0, 1.0).astype(np.float32)
-    boosted = enhanced > probability + 1e-7
+    graph_probability = probability.copy()
+    graph_probability[relative_candidate] = np.maximum(
+        graph_probability[relative_candidate],
+        graph_candidate_level,
+    )
+    graph_probability = graph_probability.clip(0.0, 1.0).astype(np.float32)
     diagnostics: dict[str, float | int] = {
-        "raw_probability_p50": p50,
-        "raw_probability_p95": p95,
-        "raw_probability_p99": p99,
-        "relative_boost_pixel_count": int(np.count_nonzero(boosted)),
-        "raw_probability_mean": float(probability.mean()),
-        "enhanced_probability_mean": float(enhanced.mean()),
-        "enhanced_probability_max": float(enhanced.max()) if enhanced.size else 0.0,
-        "fast_graph_high_threshold": float(high_threshold),
-        "fast_relative_boost_target": boost_target,
-        "fast_relative_adaptive_floor": adaptive_floor,
-        "raw_pixels_above_graph_threshold": int(np.count_nonzero(
-            probability >= float(high_threshold)
-        )),
-        "enhanced_pixels_above_graph_threshold": int(np.count_nonzero(
-            enhanced >= float(high_threshold)
-        )),
+        "relative_candidate_pixel_count": int(np.count_nonzero(relative_candidate)),
     }
-    return enhanced, diagnostics
+    return graph_probability, diagnostics

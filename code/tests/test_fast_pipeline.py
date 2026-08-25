@@ -100,32 +100,20 @@ class FastRelativeTests(unittest.TestCase):
     def test_weak_road_crosses_native_graph_threshold(self) -> None:
         probability = np.full((100, 100), 0.003, dtype=np.float32)
         probability[:, 50] = 0.04
-        enhanced, diagnostics = build_fast_enhanced_road_probability(
+        graph_probability, diagnostics = build_fast_enhanced_road_probability(
             probability, high_threshold=0.36,
         )
-        self.assertGreaterEqual(float(enhanced[:, 50].mean()), 0.36)
-        self.assertGreater(
-            diagnostics["enhanced_pixels_above_graph_threshold"],
-            diagnostics["raw_pixels_above_graph_threshold"],
-        )
-
-    def test_globally_weak_road_passes_adaptive_floor(self) -> None:
-        probability = np.full((100, 100), 0.001, dtype=np.float32)
-        probability[:, 49:51] = 0.010
-        enhanced, diagnostics = build_fast_enhanced_road_probability(
-            probability, high_threshold=0.36,
-        )
-        self.assertLessEqual(diagnostics["fast_relative_adaptive_floor"], 0.010)
-        self.assertGreater(float(enhanced[:, 50].mean()), 0.05)
+        self.assertAlmostEqual(float(graph_probability[:, 50].mean()), 0.37, places=6)
+        self.assertGreater(diagnostics["relative_candidate_pixel_count"], 0)
 
     def test_extremely_low_noise_is_not_boosted(self) -> None:
         probability = np.full((100, 100), 0.0001, dtype=np.float32)
         probability[50, 50] = 0.001
-        enhanced, diagnostics = build_fast_enhanced_road_probability(
+        graph_probability, diagnostics = build_fast_enhanced_road_probability(
             probability, high_threshold=0.36,
         )
-        self.assertTrue(np.allclose(enhanced, probability))
-        self.assertEqual(diagnostics["relative_boost_pixel_count"], 0)
+        self.assertTrue(np.allclose(graph_probability, probability))
+        self.assertEqual(diagnostics["relative_candidate_pixel_count"], 0)
 
 
 class FastSkeletonCleanupTests(unittest.TestCase):

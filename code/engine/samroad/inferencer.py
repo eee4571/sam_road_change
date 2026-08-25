@@ -985,16 +985,16 @@ def get_batch_img_patches(img, batch_patch_info):
 def prepare_toponet_batch_mask(
     batch_mask,
     batch_patch_info,
-    enhanced_road_probability,
+    graph_road_probability,
     *,
     execution_profile,
 ):
-    """Replace only the Fast TopoNet road channel with aligned enhanced patches."""
+    """Replace only the Fast TopoNet road channel with aligned graph-probability patches."""
     if str(execution_profile).casefold() != "fast":
         return batch_mask
-    if enhanced_road_probability is None:
-        raise ValueError("Fast TopoNet requires enhanced road probability")
-    probability = np.asarray(enhanced_road_probability, dtype=np.float32)
+    if graph_road_probability is None:
+        raise ValueError("Fast TopoNet requires Fast graph probability")
+    probability = np.asarray(graph_road_probability, dtype=np.float32)
     road_patches = []
     for _, (x0, y0), (x1, y1) in batch_patch_info:
         road_patches.append(probability[y0:y1, x0:x1])
@@ -1122,18 +1122,18 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     )
     graph_points = native_graph_points
     fast_enhancement_context = None
-    enhanced_probability = None
+    fast_graph_probability = None
     if args.execution_profile == "fast":
         fast_graph_high_threshold, _fast_low_threshold, _fast_profile = (
             graph_extraction.resolve_road_thresholds(config)
         )
-        enhanced_probability, enhancement_diagnostics = (
+        fast_graph_probability, enhancement_diagnostics = (
             build_fast_enhanced_road_probability(
                 fast_float_probability,
                 high_threshold=fast_graph_high_threshold,
             )
         )
-        enhanced_road_mask = np.rint(enhanced_probability * 255.0).astype(np.uint8)
+        enhanced_road_mask = np.rint(fast_graph_probability * 255.0).astype(np.uint8)
         graph_points = graph_extraction.extract_graph_points(
             fused_keypoint_mask,
             enhanced_road_mask,
@@ -1258,7 +1258,7 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         batch_mask = prepare_toponet_batch_mask(
             img_mask[batch_index],
             batch_patch_info,
-            enhanced_probability,
+            fast_graph_probability,
             execution_profile=args.execution_profile,
         )
         # [B, N_sample, N_pair, 2]
