@@ -453,6 +453,12 @@ class FastAutomaticChangeTests(unittest.TestCase):
             self.assertFalse(changes.geometry.intersects(ambiguous_coverage_area).any())
             self.assertTrue(result["automatic_result"])
             self.assertFalse(result["ground_truth_derived"])
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            for timing_key in (
+                "presence_change_seconds", "width_change_seconds",
+                "merge_seconds", "write_seconds", "total_seconds",
+            ):
+                self.assertGreaterEqual(float(summary[timing_key]), 0.0)
             stable = detect_fast_changes(
                 after_result, after_result, root / "stable_changes",
                 before_period="2021", after_period="2022",

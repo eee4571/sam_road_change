@@ -1318,16 +1318,15 @@ def _fast_change_parts(
     return []
 
 
-def _fast_line_coverage(geometry, reference_geometry, tolerance: float) -> float:
+def _fast_line_coverage(geometry, reference_support) -> float:
     if geometry is None or geometry.is_empty or geometry.length <= 0:
         return 0.0
-    if reference_geometry is None or reference_geometry.is_empty:
+    if reference_support is None or reference_support.is_empty:
         return 0.0
-    support = (
-        reference_geometry.buffer(tolerance)
-        if tolerance > 0 else reference_geometry
+    return min(
+        1.0,
+        float(geometry.intersection(reference_support).length) / float(geometry.length),
     )
-    return min(1.0, float(geometry.intersection(support).length) / float(geometry.length))
 
 
 def _fast_line_parts(geometry) -> list:
@@ -1351,21 +1350,26 @@ def _fast_centerline_change_records(
     after_period: str,
     min_area: float,
     min_length: float,
-) -> list[dict]:
+) -> tuple[list[dict], float]:
     if source_centerlines.empty or source_surfaces.empty:
-        return []
+        return [], 0.0
     reference_network = (
         reference_centerlines.geometry.union_all()
         if not reference_centerlines.empty else None
     )
+    reference_support = (
+        reference_network.buffer(tolerance)
+        if reference_network is not None and tolerance > 0 else reference_network
+    )
     candidates = []
     for _index, row in source_centerlines.iterrows():
         geometry = row.geometry
-        coverage = _fast_line_coverage(geometry, reference_network, tolerance)
+        coverage = _fast_line_coverage(geometry, reference_support)
         if coverage <= FAST_CHANGE_CANDIDATE_COVERAGE:
             candidates.append((geometry, _fast_width_value(row)))
     if not candidates:
-        return []
+        return [], 0.0
+    merge_started = time.perf_counter()
     candidate_network = gpd.GeoSeries(
         [geometry for geometry, _width in candidates],
         crs=source_centerlines.crs,
@@ -1375,14 +1379,26 @@ def _fast_centerline_change_records(
         if candidate_network.geom_type in {"LineString", "LinearRing"} else
         linemerge(candidate_network)
     )
+    merge_seconds = time.perf_counter() - merge_started
+    candidate_widths = np.asarray(
+        [width for _geometry, width in candidates], dtype=np.float64,
+    )
+    candidate_frame = gpd.GeoDataFrame(
+        {"width_m": candidate_widths},
+        geometry=[geometry for geometry, _width in candidates],
+        crs=source_centerlines.crs,
+    )
+    candidate_index = candidate_frame.sindex
     surface_union = source_surfaces.geometry.union_all()
     records = []
     for line in _fast_line_parts(merged):
         if float(line.length) < min_length:
             continue
+        nearby_positions = candidate_index.query(line, predicate="intersects")
         nearby_widths = [
-            width for geometry, width in candidates
-            if width > 0 and geometry.intersects(line.buffer(1e-6))
+            float(candidate_widths[position])
+            for position in np.asarray(nearby_positions, dtype=int).reshape(-1).tolist()
+            if candidate_widths[position] > 0
         ]
         polygon_radius = max(
             tolerance,
@@ -1403,7 +1419,7 @@ def _fast_centerline_change_records(
                 "width_diff": np.nan,
                 "geometry": part,
             })
-    return records
+    return records, merge_seconds
 
 
 def _fast_width_value(row) -> float:
@@ -1437,8 +1453,13 @@ def _fast_width_change_records(
         before_line = before_row.geometry
         if before_line is None or before_line.is_empty or before_line.length <= 0:
             continue
-        query_geometry = before_line.buffer(tolerance) if tolerance > 0 else before_line
-        candidates = spatial_index.query(query_geometry, predicate="intersects")
+        candidates = (
+            spatial_index.query(
+                before_line, predicate="dwithin", distance=tolerance,
+            )
+            if tolerance > 0 else
+            spatial_index.query(before_line, predicate="intersects")
+        )
         best = None
         for after_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
             if after_position in used_after:
@@ -1450,14 +1471,11 @@ def _fast_width_change_records(
             distance = float(before_line.distance(after_line))
             if distance > tolerance:
                 continue
-            overlap_ratio = min(
-                _fast_line_coverage(before_line, after_line, tolerance),
-                _fast_line_coverage(after_line, before_line, tolerance),
+            score = (
+                distance,
+                abs(float(before_line.length) - float(after_line.length)),
             )
-            if overlap_ratio < FAST_CHANGE_EXISTING_COVERAGE:
-                continue
-            score = (overlap_ratio, -distance)
-            if best is None or score > best[0]:
+            if best is None or score < best[0]:
                 best = (score, after_position, after_row)
         if best is None:
             continue
@@ -1512,6 +1530,7 @@ def detect_fast_changes(
     min_change_length: float = FAST_CHANGE_MIN_LENGTH_M,
 ) -> dict:
     """Run the lightweight, rule-based Fast change detector without truth."""
+    total_started = time.perf_counter()
     before_payload = _load_fast_period_result(before_result)
     after_payload = _load_fast_period_result(after_result)
     before_surfaces = _read_fast_change_layer(before_payload, "surfaces", "corridors")
@@ -1542,20 +1561,26 @@ def detect_fast_changes(
     tolerance = max(0.0, float(position_tolerance))
     minimum_area = max(0.0, float(min_change_area))
     minimum_length = max(0.0, float(min_change_length))
+    presence_started = time.perf_counter()
+    added_records, added_merge_seconds = _fast_centerline_change_records(
+        after_centerlines, before_centerlines, after_surfaces,
+        tolerance=tolerance,
+        change_type="added", before_period=before_period, after_period=after_period,
+        min_area=minimum_area, min_length=minimum_length,
+    )
+    removed_records, removed_merge_seconds = _fast_centerline_change_records(
+        before_centerlines, after_centerlines, before_surfaces,
+        tolerance=tolerance,
+        change_type="removed", before_period=before_period, after_period=after_period,
+        min_area=minimum_area, min_length=minimum_length,
+    )
+    presence_change_seconds = time.perf_counter() - presence_started
+    merge_seconds = added_merge_seconds + removed_merge_seconds
     record_groups = {
-        "added": _fast_centerline_change_records(
-            after_centerlines, before_centerlines, after_surfaces,
-            tolerance=tolerance,
-            change_type="added", before_period=before_period, after_period=after_period,
-            min_area=minimum_area, min_length=minimum_length,
-        ),
-        "removed": _fast_centerline_change_records(
-            before_centerlines, after_centerlines, before_surfaces,
-            tolerance=tolerance,
-            change_type="removed", before_period=before_period, after_period=after_period,
-            min_area=minimum_area, min_length=minimum_length,
-        ),
+        "added": added_records,
+        "removed": removed_records,
     }
+    width_started = time.perf_counter()
     width_records = _fast_width_change_records(
         before_centerlines, after_centerlines,
         tolerance=tolerance,
@@ -1564,6 +1589,7 @@ def detect_fast_changes(
         before_period=before_period, after_period=after_period,
         min_area=minimum_area,
     )
+    width_change_seconds = time.perf_counter() - width_started
     record_groups["widened"] = [
         record for record in width_records if record["change_typ"] == "widened"
     ]
@@ -1601,6 +1627,7 @@ def detect_fast_changes(
     gpkg = output_dir / "road_changes.gpkg"
     gpkg.unlink(missing_ok=True)
     output_layers = {}
+    write_started = time.perf_counter()
     for index, (name, frame) in enumerate(layers.items()):
         target = output_dir / filenames[name]
         frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
@@ -1610,6 +1637,18 @@ def detect_fast_changes(
         )
         output_layers[name] = str(target.resolve())
 
+    if str(WIDTH_ROOT) not in sys.path:
+        sys.path.insert(0, str(WIDTH_ROOT))
+    from road_change_detection import render_change_preview  # noqa: PLC0415
+
+    preview_path = output_dir / "change_preview.png"
+    render_change_preview(
+        preview_path, changes, _empty_like(changes),
+        title=f"Fast Automatic Road Changes: {before_period} to {after_period}",
+        empty_message="No Fast road changes detected",
+    )
+    write_seconds = time.perf_counter() - write_started
+    total_seconds = time.perf_counter() - total_started
     summary = {
         "execution_profile": "fast", "change_source": "fast_automatic",
         "ground_truth_derived": False, "change_output_mode": "fast_automatic",
@@ -1621,19 +1660,21 @@ def detect_fast_changes(
         "minimum_continuous_length_m": minimum_length,
         "width_change_absolute_m": float(width_change_absolute),
         "width_change_ratio": float(width_change_ratio),
+        "presence_change_seconds": float(presence_change_seconds),
+        "width_change_seconds": float(width_change_seconds),
+        "merge_seconds": float(merge_seconds),
+        "write_seconds": float(write_seconds),
+        "total_seconds": float(total_seconds),
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
     summary_path = output_dir / "change_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    if str(WIDTH_ROOT) not in sys.path:
-        sys.path.insert(0, str(WIDTH_ROOT))
-    from road_change_detection import render_change_preview  # noqa: PLC0415
-
-    preview_path = output_dir / "change_preview.png"
-    render_change_preview(
-        preview_path, changes, _empty_like(changes),
-        title=f"Fast Automatic Road Changes: {before_period} to {after_period}",
-        empty_message="No Fast road changes detected",
+    print(
+        f"[Fast Change] {before_period}->{after_period}: "
+        f"presence={presence_change_seconds:.3f}s, "
+        f"width={width_change_seconds:.3f}s, merge={merge_seconds:.3f}s, "
+        f"write={write_seconds:.3f}s, total={total_seconds:.3f}s",
+        flush=True,
     )
     return {
         "output": str(output_dir), "summary": str(summary_path.resolve()),
