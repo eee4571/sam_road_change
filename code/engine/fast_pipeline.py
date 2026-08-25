@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -19,6 +21,23 @@ from shapely.geometry import LineString, shape
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
 FAST_LOCAL_STD_FLOOR = 1.0 / (255.0 * np.sqrt(12.0))
 FAST_SCALE_SUPPORT_THRESHOLD = 0.50
+FAST_MIN_SKELETON_COMPONENT_LENGTH_PX = 20.0
+FAST_MAX_WEAK_SPUR_LENGTH_PX = 8.0
+FAST_WEAK_SPUR_CONFIDENCE_RATIO = 0.80
+
+
+@dataclass(frozen=True)
+class FastRoadPath:
+    """One complete degree-2 skeleton chain between topology anchors."""
+
+    pixels: np.ndarray
+    length_px: float
+    start_degree: int
+    end_degree: int
+    mean_relative_score: float
+    low_relative_score: float
+    component_id: int
+    component_length_px: float
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -33,11 +52,9 @@ def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     if min_area <= 1 or not binary.any():
         return binary
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    kept = np.zeros_like(binary)
-    for label in range(1, count):
-        if int(stats[label, cv2.CC_STAT_AREA]) >= int(min_area):
-            kept[labels == label] = 1
-    return kept
+    keep_labels = stats[:, cv2.CC_STAT_AREA] >= int(min_area)
+    keep_labels[0] = False
+    return keep_labels[labels].astype(np.uint8)
 
 
 def _consistent_relative_score(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -68,111 +85,20 @@ def _relative_hysteresis_mask(relative_score: np.ndarray, min_area: int) -> np.n
     strong = np.asarray(relative_score) >= 1.30
     weak = (np.asarray(relative_score) >= 0.90).astype(np.uint8)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(weak, connectivity=8)
-    kept = np.zeros_like(weak)
-    for label in range(1, count):
-        component = labels == label
-        if (
-            int(stats[label, cv2.CC_STAT_AREA]) >= int(min_area)
-            and bool(np.any(strong & component))
-        ):
-            kept[component] = 1
-    return kept
-
-
-def build_fast_surface_mask(
-    probability: np.ndarray,
-    *,
-    absolute_threshold: float = 0.45,
-    min_area: int = 24,
-) -> tuple[np.ndarray, dict]:
-    """Build the single Fast road mask from absolute and local-relative evidence."""
-    values = _probability01(probability)
-    high = values >= float(absolute_threshold)
-    relative_score = _fast_relative_score(values)
-    relative = _relative_hysteresis_mask(relative_score, min_area)
-    relative_added = relative & ~high
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    final_mask = cv2.morphologyEx((high | relative).astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    final_mask = _remove_small_components(final_mask, min_area)
-    return final_mask, {
-        "raw_high_probability_pixel_count": int(np.count_nonzero(high)),
-        "relative_added_pixel_count": int(np.count_nonzero(relative_added)),
-        "final_mask_pixel_count": int(np.count_nonzero(final_mask)),
-    }
-
-
-def _prune_short_skeleton_spurs(skeleton: np.ndarray, max_length_px: int = 6) -> np.ndarray:
-    """Delete short endpoint-to-junction branches from a one-pixel skeleton."""
-    working = np.asarray(skeleton, dtype=bool).copy()
-    for _pass in range(max(1, int(max_length_px))):
-        points = {tuple(int(value) for value in point) for point in np.argwhere(working)}
-        adjacency = {
-            point: [
-                (point[0] + drow, point[1] + dcol)
-                for drow in (-1, 0, 1) for dcol in (-1, 0, 1)
-                if (drow or dcol) and (point[0] + drow, point[1] + dcol) in points
-            ]
-            for point in points
-        }
-        removed: set[tuple[int, int]] = set()
-        for endpoint in sorted(point for point, neighbors in adjacency.items() if len(neighbors) == 1):
-            if endpoint in removed:
-                continue
-            path = [endpoint]
-            previous = None
-            current = endpoint
-            while len(path) <= int(max_length_px) + 1:
-                candidates = [point for point in adjacency.get(current, []) if point != previous]
-                if not candidates:
-                    break
-                following = candidates[0]
-                path.append(following)
-                previous, current = current, following
-                if len(adjacency.get(current, [])) != 2:
-                    break
-            if len(adjacency.get(current, [])) >= 3 and len(path) - 1 <= int(max_length_px):
-                removed.update(path[:-1])
-        if not removed:
-            break
-        rows, cols = zip(*removed)
-        working[np.asarray(rows), np.asarray(cols)] = False
-    return working.astype(np.uint8)
-
-
-def _remove_short_isolated_skeleton_components(
-    skeleton: np.ndarray, min_length_px: float = 20.0,
-) -> np.ndarray:
-    """Remove isolated skeleton components with short total centerline length."""
-    binary = (np.asarray(skeleton) > 0).astype(np.uint8)
-    count, labels = cv2.connectedComponents(binary, connectivity=8)
-    kept = np.zeros_like(binary)
-    forward_neighbors = (
-        (0, 1, 1.0),
-        (1, -1, float(np.sqrt(2.0))),
-        (1, 0, 1.0),
-        (1, 1, float(np.sqrt(2.0))),
+    strong_counts = np.bincount(labels[strong], minlength=count)
+    keep_labels = (
+        (stats[:, cv2.CC_STAT_AREA] >= int(min_area))
+        & (strong_counts[:count] > 0)
     )
-    for label in range(1, count):
-        rows, cols = np.nonzero(labels == label)
-        length = 0.0
-        for row, col in zip(rows.tolist(), cols.tolist()):
-            for drow, dcol, weight in forward_neighbors:
-                neighbor_row, neighbor_col = row + drow, col + dcol
-                if (
-                    0 <= neighbor_row < labels.shape[0]
-                    and 0 <= neighbor_col < labels.shape[1]
-                    and labels[neighbor_row, neighbor_col] == label
-                ):
-                    length += weight
-        if length >= float(min_length_px):
-            kept[labels == label] = 1
-    return kept
+    keep_labels[0] = False
+    return keep_labels[labels].astype(np.uint8)
 
 
-def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _skeletonize_mask(mask: np.ndarray) -> np.ndarray:
     try:
         from skimage.morphology import skeletonize
-        skeleton = skeletonize(np.asarray(mask) > 0)
+
+        return skeletonize(np.asarray(mask) > 0).astype(np.uint8)
     except ImportError:
         skeleton = np.zeros_like(mask, dtype=np.uint8)
         working = (np.asarray(mask) > 0).astype(np.uint8)
@@ -181,70 +107,347 @@ def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             opened = cv2.morphologyEx(working, cv2.MORPH_OPEN, element)
             skeleton |= working & (1 - opened)
             working = cv2.erode(working, element)
-        skeleton = skeleton > 0
-    skeleton = _prune_short_skeleton_spurs(skeleton, max_length_px=6)
-    skeleton = _remove_short_isolated_skeleton_components(
-        skeleton, min_length_px=20.0,
-    ) > 0
-    points = [tuple(int(value) for value in point) for point in np.argwhere(skeleton).tolist()]
-    if not points:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.int32)
-    point_set = set(points)
-    adjacency = {
-        point: sorted(
-            (point[0] + drow, point[1] + dcol)
-            for drow in (-1, 0, 1) for dcol in (-1, 0, 1)
-            if (drow or dcol) and (point[0] + drow, point[1] + dcol) in point_set
-        )
-        for point in points
-    }
-    anchors = {point for point, neighbors in adjacency.items() if len(neighbors) != 2}
-    visited: set[tuple[tuple[int, int], tuple[int, int]]] = set()
-    node_index: dict[tuple[int, int], int] = {}
-    graph_edges: set[tuple[int, int]] = set()
+        return (skeleton > 0).astype(np.uint8)
 
-    def link(first, second):
+
+def _component_skeleton_lengths(labels: np.ndarray, count: int) -> np.ndarray:
+    """Measure all 8-connected component lengths without per-label image scans."""
+    lengths = np.zeros(int(count), dtype=np.float64)
+    height, width = labels.shape
+    for drow, dcol, weight in (
+        (0, 1, 1.0),
+        (1, -1, float(np.sqrt(2.0))),
+        (1, 0, 1.0),
+        (1, 1, float(np.sqrt(2.0))),
+    ):
+        row_stop = height - drow
+        source_cols = slice(max(0, -dcol), min(width, width - dcol))
+        target_cols = slice(max(0, dcol), min(width, width + dcol))
+        source = labels[:row_stop, source_cols]
+        target = labels[drow:, target_cols]
+        valid = (source > 0) & (source == target)
+        if np.any(valid):
+            lengths += np.bincount(
+                source[valid], weights=np.full(int(np.count_nonzero(valid)), weight),
+                minlength=count,
+            )[:count]
+    return lengths
+
+
+def _remove_short_isolated_skeleton_components(
+    skeleton: np.ndarray, min_length_px: float = 20.0,
+) -> np.ndarray:
+    """Remove short skeleton components using one label image and vectorized lengths."""
+    binary = (np.asarray(skeleton) > 0).astype(np.uint8)
+    count, labels = cv2.connectedComponents(binary, connectivity=8)
+    if count <= 1:
+        return binary
+    lengths = _component_skeleton_lengths(labels, count)
+    keep_labels = lengths >= float(min_length_px)
+    keep_labels[0] = False
+    return keep_labels[labels].astype(np.uint8)
+
+
+def _pixel_adjacency(skeleton: np.ndarray) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    """Build 8-neighbour adjacency while suppressing diagonal corner shortcuts."""
+    points = [tuple(int(value) for value in point) for point in np.argwhere(skeleton)]
+    point_set = set(points)
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for row, col in points:
+        neighbors = []
+        for drow in (-1, 0, 1):
+            for dcol in (-1, 0, 1):
+                if not (drow or dcol):
+                    continue
+                neighbor = (row + drow, col + dcol)
+                if neighbor not in point_set:
+                    continue
+                if drow and dcol and (
+                    (row + drow, col) in point_set or (row, col + dcol) in point_set
+                ):
+                    continue
+                neighbors.append(neighbor)
+        adjacency[(row, col)] = sorted(neighbors)
+    return adjacency
+
+
+def _trace_skeleton_paths(
+    skeleton: np.ndarray,
+    relative_score: np.ndarray | None = None,
+) -> list[FastRoadPath]:
+    """Trace one complete degree-2 chain for each endpoint/junction path."""
+    binary = (np.asarray(skeleton) > 0).astype(np.uint8)
+    if not binary.any():
+        return []
+    count, component_labels = cv2.connectedComponents(binary, connectivity=8)
+    component_lengths = _component_skeleton_lengths(component_labels, count)
+    adjacency = _pixel_adjacency(binary)
+    junction_mask = np.zeros_like(binary)
+    endpoints = []
+    for point, neighbors in adjacency.items():
+        if len(neighbors) >= 3:
+            junction_mask[point] = 1
+        elif len(neighbors) <= 1:
+            endpoints.append(point)
+    junction_count, junction_labels = cv2.connectedComponents(junction_mask, connectivity=8)
+    group_pixels: dict[int, list[tuple[int, int]]] = {}
+    anchor_group: dict[tuple[int, int], int] = {}
+    for point in adjacency:
+        junction_id = int(junction_labels[point])
+        if junction_id > 0:
+            group_pixels.setdefault(junction_id, []).append(point)
+            anchor_group[point] = junction_id
+    next_group = junction_count
+    for point in endpoints:
+        group_pixels[next_group] = [point]
+        anchor_group[point] = next_group
+        next_group += 1
+    representatives = {
+        group_id: np.mean(np.asarray(pixels, dtype=np.float32), axis=0)
+        for group_id, pixels in group_pixels.items()
+    }
+    external_links: dict[int, list[tuple[tuple[int, int], tuple[int, int]]]] = {
+        group_id: [] for group_id in group_pixels
+    }
+    for group_id, pixels in group_pixels.items():
+        for point in pixels:
+            for neighbor in adjacency[point]:
+                if anchor_group.get(neighbor) != group_id:
+                    external_links[group_id].append((point, neighbor))
+    group_degrees = {group_id: len(links) for group_id, links in external_links.items()}
+    visited: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    paths: list[FastRoadPath] = []
+
+    def link(first: tuple[int, int], second: tuple[int, int]):
         return tuple(sorted((first, second)))
 
-    def add_path(path: list[tuple[int, int]]) -> None:
-        sampled = path[::8]
-        if sampled[-1] != path[-1]:
-            sampled.append(path[-1])
-        for first, second in zip(sampled, sampled[1:]):
-            node_index.setdefault(first, len(node_index))
-            node_index.setdefault(second, len(node_index))
-            if first != second:
-                graph_edges.add(tuple(sorted((node_index[first], node_index[second]))))
+    def append_path(
+        pixels: list[np.ndarray | tuple[int, int]],
+        start_degree: int,
+        end_degree: int,
+        component_id: int,
+    ) -> None:
+        points = np.asarray(pixels, dtype=np.float32)
+        if points.shape[0] < 2:
+            return
+        keep = np.ones(points.shape[0], dtype=bool)
+        keep[1:] = np.any(points[1:] != points[:-1], axis=1)
+        points = points[keep]
+        if points.shape[0] < 2:
+            return
+        length_px = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        if length_px <= 0:
+            return
+        if relative_score is None:
+            scores = np.zeros(points.shape[0], dtype=np.float32)
+        else:
+            indices = np.rint(points).astype(np.int32)
+            indices[:, 0] = np.clip(indices[:, 0], 0, binary.shape[0] - 1)
+            indices[:, 1] = np.clip(indices[:, 1], 0, binary.shape[1] - 1)
+            scores = np.asarray(relative_score)[indices[:, 0], indices[:, 1]]
+        paths.append(FastRoadPath(
+            pixels=points,
+            length_px=length_px,
+            start_degree=int(start_degree),
+            end_degree=int(end_degree),
+            mean_relative_score=float(np.mean(scores)) if scores.size else 0.0,
+            low_relative_score=float(np.percentile(scores, 25)) if scores.size else 0.0,
+            component_id=int(component_id),
+            component_length_px=float(component_lengths[int(component_id)]),
+        ))
 
     seed_links = [
-        (point, neighbor) for point in sorted(anchors) for neighbor in adjacency[point]
-    ] + [
-        (point, neighbor) for point in points for neighbor in adjacency[point]
+        (group_id, point, neighbor)
+        for group_id in sorted(external_links)
+        for point, neighbor in external_links[group_id]
     ]
-    for start, first in seed_links:
-        if link(start, first) in visited:
+    for start_group, start_pixel, first in seed_links:
+        if link(start_pixel, first) in visited:
             continue
-        path = [start, first]
-        visited.add(link(start, first))
-        previous, current = start, first
-        while current not in anchors or current == start:
-            candidates = [neighbor for neighbor in adjacency[current] if neighbor != previous]
-            if not candidates:
-                break
-            following = next((neighbor for neighbor in candidates if link(current, neighbor) not in visited), None)
+        pixels: list[np.ndarray | tuple[int, int]] = [representatives[start_group], start_pixel, first]
+        visited.add(link(start_pixel, first))
+        previous, current = start_pixel, first
+        end_group = anchor_group.get(current)
+        while end_group is None:
+            following = next(
+                (
+                    neighbor for neighbor in adjacency[current]
+                    if neighbor != previous and link(current, neighbor) not in visited
+                ),
+                None,
+            )
             if following is None:
                 break
             visited.add(link(current, following))
-            path.append(following)
+            pixels.append(following)
             previous, current = current, following
-            if current == start:
-                break
-        if len(path) >= 2:
-            add_path(path)
-    nodes_array = np.zeros((len(node_index), 2), dtype=np.float32)
-    for point, index in node_index.items():
-        nodes_array[index] = point
-    return nodes_array, np.asarray(sorted(graph_edges), dtype=np.int32).reshape(-1, 2)
+            end_group = anchor_group.get(current)
+        if end_group is None:
+            continue
+        pixels.append(representatives[end_group])
+        append_path(
+            pixels, group_degrees[start_group], group_degrees[end_group],
+            int(component_labels[start_pixel]),
+        )
+
+    for start in sorted(adjacency):
+        for first in adjacency[start]:
+            if link(start, first) in visited or start in anchor_group or first in anchor_group:
+                continue
+            pixels = [start, first]
+            visited.add(link(start, first))
+            previous, current = start, first
+            while current != start:
+                following = next(
+                    (
+                        neighbor for neighbor in adjacency[current]
+                        if neighbor != previous and link(current, neighbor) not in visited
+                    ),
+                    None,
+                )
+                if following is None:
+                    break
+                visited.add(link(current, following))
+                pixels.append(following)
+                previous, current = current, following
+            append_path(
+                pixels, 2, 2, int(component_labels[start]),
+            )
+    return paths
+
+
+def _paths_to_skeleton(paths: list[FastRoadPath], shape_: tuple[int, int]) -> np.ndarray:
+    skeleton = np.zeros(shape_, dtype=np.uint8)
+    for path in paths:
+        points = np.rint(path.pixels).astype(np.int32)
+        skeleton[points[:, 0], points[:, 1]] = 1
+    return skeleton
+
+
+def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], int]:
+    """Remove only short endpoint branches clearly weaker than their main path."""
+    removed: set[int] = set()
+    incident: dict[tuple[int, int], list[int]] = {}
+    for path_id, path in enumerate(paths):
+        for point, degree in ((path.pixels[0], path.start_degree), (path.pixels[-1], path.end_degree)):
+            if degree >= 3:
+                incident.setdefault(tuple(np.rint(point).astype(int)), []).append(path_id)
+    for path_id, path in enumerate(paths):
+        branch_junction = None
+        if path.start_degree == 1 and path.end_degree >= 3:
+            branch_junction = tuple(np.rint(path.pixels[-1]).astype(int))
+        elif path.end_degree == 1 and path.start_degree >= 3:
+            branch_junction = tuple(np.rint(path.pixels[0]).astype(int))
+        if branch_junction is None or path.length_px > FAST_MAX_WEAK_SPUR_LENGTH_PX:
+            continue
+        peers = [
+            paths[peer_id].mean_relative_score
+            for peer_id in incident.get(branch_junction, []) if peer_id != path_id
+        ]
+        if peers and path.mean_relative_score < FAST_WEAK_SPUR_CONFIDENCE_RATIO * max(peers):
+            removed.add(path_id)
+    return [path for path_id, path in enumerate(paths) if path_id not in removed], len(removed)
+
+
+def _fill_small_holes(mask: np.ndarray, max_area: int = 64) -> np.ndarray:
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(1 - binary, connectivity=8)
+    border_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
+    fill = stats[:, cv2.CC_STAT_AREA] <= int(max_area)
+    fill[border_labels] = False
+    return (binary | fill[labels]).astype(np.uint8)
+
+
+def _build_fast_road_geometry(
+    probability: np.ndarray,
+    *,
+    absolute_threshold: float = 0.45,
+    min_area: int = 24,
+) -> tuple[np.ndarray, np.ndarray, list[FastRoadPath], dict]:
+    started = time.perf_counter()
+    values = _probability01(probability)
+    high = values >= float(absolute_threshold)
+    relative_score = _fast_relative_score(values)
+    relative = _relative_hysteresis_mask(relative_score, min_area)
+    relative_added = relative & ~high
+    relative_support = _remove_small_components(high | relative, min_area)
+    support_component_count = cv2.connectedComponents(relative_support, connectivity=8)[0] - 1
+
+    regularize_started = time.perf_counter()
+    final_mask = cv2.morphologyEx(
+        relative_support, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    final_mask = _fill_small_holes(final_mask, max_area=64)
+    final_mask = _remove_small_components(final_mask, min_area)
+    surface_count = cv2.connectedComponents(final_mask, connectivity=8)[0] - 1
+    surface_regularization_elapsed = time.perf_counter() - regularize_started
+
+    path_started = time.perf_counter()
+    raw_skeleton = _skeletonize_mask(final_mask)
+    skeleton_component_count = cv2.connectedComponents(raw_skeleton, connectivity=8)[0] - 1
+    skeleton = _remove_short_isolated_skeleton_components(
+        raw_skeleton, min_length_px=FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
+    )
+    evidence_score = np.maximum(relative_score, high.astype(np.float32) * 1.30)
+    paths = _trace_skeleton_paths(skeleton, evidence_score)
+    path_count = len(paths)
+    cleanup_removed = 0
+    for _pass in range(2):
+        paths, removed = _cleanup_road_paths(paths)
+        cleanup_removed += removed
+        cleaned_skeleton = _paths_to_skeleton(paths, final_mask.shape)
+        if removed == 0:
+            break
+        paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
+    final_paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
+    path_elapsed = time.perf_counter() - path_started
+
+    diagnostics = {
+        "raw_high_probability_pixel_count": int(np.count_nonzero(high)),
+        "relative_added_pixel_count": int(np.count_nonzero(relative_added)),
+        "relative_support_component_count": int(support_component_count),
+        "skeleton_component_count": int(skeleton_component_count),
+        "path_count": int(path_count),
+        "path_cleanup_removed_count": int(cleanup_removed),
+        "gap_bridge_added_count": 0,
+        "final_centerline_path_count": int(len(final_paths)),
+        "final_centerline_length_px": float(sum(path.length_px for path in final_paths)),
+        "final_road_surface_count": int(surface_count),
+        "final_mask_pixel_count": int(np.count_nonzero(final_mask)),
+        "surface_regularization_seconds": float(surface_regularization_elapsed),
+        "skeleton_path_processing_seconds": float(path_elapsed),
+        "fast_mask_elapsed_seconds": float(time.perf_counter() - started),
+    }
+    return final_mask, cleaned_skeleton, final_paths, diagnostics
+
+
+def build_fast_surface_mask(
+    probability: np.ndarray,
+    *,
+    absolute_threshold: float = 0.45,
+    min_area: int = 24,
+) -> tuple[np.ndarray, dict]:
+    """Regularize fixed Relative evidence into a surface, then derive its centerline."""
+    final_mask, _centerline, _paths, diagnostics = _build_fast_road_geometry(
+        probability, absolute_threshold=absolute_threshold, min_area=min_area,
+    )
+    return final_mask, diagnostics
+
+
+def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compatibility graph with one edge per complete topology path."""
+    paths = _trace_skeleton_paths(_skeletonize_mask(mask))
+    nodes: list[np.ndarray] = []
+    edges: list[tuple[int, int]] = []
+    for path in paths:
+        start = len(nodes)
+        nodes.extend((path.pixels[0], path.pixels[-1]))
+        edges.append((start, start + 1))
+    return (
+        np.asarray(nodes, dtype=np.float32).reshape(-1, 2),
+        np.asarray(edges, dtype=np.int32).reshape(-1, 2),
+    )
 
 
 def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path) -> dict:
@@ -255,17 +458,29 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
         probability = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
         if probability is None:
             raise FileNotFoundError(f"Cannot read SAMRoad probability: {source}")
-        mask, diagnostics = build_fast_surface_mask(probability)
+        mask, centerline, _paths, diagnostics = _build_fast_road_geometry(probability)
         target = output_dir / f"{image_path.stem}_mask.png"
         if not cv2.imwrite(str(target), mask * 255):
             raise OSError(f"Cannot write Fast surface mask: {target}")
-        row = {"image": str(image_path), "mask": str(target), **diagnostics}
+        centerline_target = output_dir / f"{image_path.stem}_centerline.png"
+        if not cv2.imwrite(str(centerline_target), centerline * 255):
+            raise OSError(f"Cannot write Fast centerline mask: {centerline_target}")
+        row = {
+            "image": str(image_path), "mask": str(target),
+            "centerline_mask": str(centerline_target), **diagnostics,
+        }
         rows.append(row)
         print(
             f"[Fast Mask] {image_path.stem}: "
             f"high={diagnostics['raw_high_probability_pixel_count']}, "
             f"relative_added={diagnostics['relative_added_pixel_count']}, "
-            f"final={diagnostics['final_mask_pixel_count']}"
+            f"support_components={diagnostics['relative_support_component_count']}, "
+            f"paths={diagnostics['path_count']}->{diagnostics['final_centerline_path_count']}, "
+            f"cleanup={diagnostics['path_cleanup_removed_count']}, "
+            f"bridges={diagnostics['gap_bridge_added_count']}, "
+            f"surfaces={diagnostics['final_road_surface_count']}, "
+            f"final={diagnostics['final_mask_pixel_count']}, "
+            f"elapsed={diagnostics['fast_mask_elapsed_seconds']:.3f}s"
         )
         (output_dir / f"{image_path.stem}_fast_surface.json").write_text(
             json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8",
@@ -285,6 +500,14 @@ def _world_line(transform, start: np.ndarray, end: np.ndarray) -> LineString:
         rasterio.transform.xy(transform, float(start[0]), float(start[1]), offset="center"),
         rasterio.transform.xy(transform, float(end[0]), float(end[1]), offset="center"),
     ])
+
+
+def _world_path(transform, points: np.ndarray) -> LineString:
+    coordinates = [
+        rasterio.transform.xy(transform, float(point[0]), float(point[1]), offset="center")
+        for point in np.asarray(points)
+    ]
+    return LineString(coordinates)
 
 
 def _robust_median(values: list[float]) -> float:
@@ -343,6 +566,80 @@ def measure_fast_edge_widths(
     return rows
 
 
+def _simplify_path_pixels(path: FastRoadPath, epsilon_px: float = 0.75) -> np.ndarray:
+    points = np.asarray(path.pixels, dtype=np.float32)
+    if points.shape[0] <= 2:
+        return points
+    closed = bool(np.array_equal(points[0], points[-1]))
+    simplified = cv2.approxPolyDP(
+        points.reshape(-1, 1, 2), float(epsilon_px), closed=closed,
+    ).reshape(-1, 2)
+    if simplified.shape[0] < 2:
+        return points[[0, -1]]
+    if not closed:
+        simplified[0] = points[0]
+        simplified[-1] = points[-1]
+    elif not np.array_equal(simplified[0], simplified[-1]):
+        simplified = np.vstack((simplified, simplified[0]))
+    return simplified.astype(np.float32)
+
+
+def measure_fast_path_widths(
+    paths: list[FastRoadPath],
+    binary: np.ndarray,
+    pixel_size: float,
+    *,
+    sample_function=None,
+) -> list[dict]:
+    """Reuse Fast normal probing while aggregating sparse samples by complete path."""
+    if not paths:
+        return []
+    if sample_function is None:
+        if str(WIDTH_ROOT) not in sys.path:
+            sys.path.insert(0, str(WIDTH_ROOT))
+        from molra_centerline_width import sample_widths_by_normal as sample_function
+    nodes: list[np.ndarray] = []
+    edges: list[tuple[int, int]] = []
+    path_by_edge: list[int] = []
+    for path_id, path in enumerate(paths):
+        simplified = _simplify_path_pixels(path)
+        base = len(nodes)
+        nodes.extend(simplified)
+        for index in range(simplified.shape[0] - 1):
+            if np.array_equal(simplified[index], simplified[index + 1]):
+                continue
+            edges.append((base + index, base + index + 1))
+            path_by_edge.append(path_id)
+    nodes_array = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
+    edges_array = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
+    sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
+    samples = sample_function(
+        nodes_array, edges_array, binary, sample_step_px=sample_step_px,
+        normal_step_px=1.0, max_search_px=max(20.0, 80.0 / max(pixel_size, 1e-6)),
+        pixel_size=pixel_size, snap_radius_px=6, junction_buffer_px=0.0,
+        border_margin_px=1, max_snap_distance_px=6.0, max_asymmetry_ratio=1.0,
+    ) if edges else []
+    by_path: dict[int, list[float]] = {}
+    for sample in samples:
+        edge_id = int(sample.get("edge_id", -1))
+        if (
+            0 <= edge_id < len(path_by_edge)
+            and sample.get("valid_width")
+            and float(sample.get("width_units", 0.0)) > 0
+        ):
+            by_path.setdefault(path_by_edge[edge_id], []).append(float(sample["width_units"]))
+    distance = cv2.distanceTransform((binary > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    rows = []
+    for path_id, path in enumerate(paths):
+        width = _robust_median(by_path.get(path_id, []))
+        source = "normal_fast"
+        if width <= 0:
+            width = _distance_width(distance, path.pixels[path.pixels.shape[0] // 2], pixel_size)
+            source = "distance_transform_fallback"
+        rows.append({"path_id": path_id, "width_units": width, "width_source": source})
+    return rows
+
+
 def measure_fast_widths(
     image_dir: Path,
     surface_dir: Path,
@@ -355,18 +652,26 @@ def measure_fast_widths(
         sys.path.insert(0, str(WIDTH_ROOT))
     from molra_centerline_width import sample_widths_by_normal
 
+    batch_started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     layer_records: dict[str, list[dict]] = {key: [] for key in ("centerlines", "surfaces", "width_segments", "corridors")}
     target_crs = None
     image_rows = []
     for image_path in _raster_paths(image_dir):
+        tile_started = time.perf_counter()
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
+        centerline_path = surface_dir / f"{image_path.stem}_centerline.png"
         probability_path = probability_dir / f"{image_path.stem}_road.png"
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Cannot read Fast surface mask: {mask_path}")
         binary = (mask > 0).astype(np.uint8)
-        nodes, edges = _skeleton_graph(binary)
+        centerline = cv2.imread(str(centerline_path), cv2.IMREAD_GRAYSCALE)
+        if centerline is None:
+            centerline = _remove_short_isolated_skeleton_components(
+                _skeletonize_mask(binary), min_length_px=FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
+            )
+        paths = _trace_skeleton_paths(centerline > 0)
         with rasterio.open(image_path) as dataset:
             if dataset.crs is None:
                 raise ValueError(f"Fast products require raster CRS: {image_path}")
@@ -376,21 +681,21 @@ def measure_fast_widths(
                 raise ValueError("Fast products currently require normalized period tiles in one CRS")
             transform = dataset.transform
             pixel_size = requested_pixel_size if requested_pixel_size > 0 else float(np.mean((abs(transform.a), abs(transform.e))))
-            width_rows = measure_fast_edge_widths(
-                nodes, edges, binary, pixel_size, sample_function=sample_widths_by_normal,
+            width_rows = measure_fast_path_widths(
+                paths, binary, pixel_size, sample_function=sample_widths_by_normal,
             )
-            for edge_id, (src, dst) in enumerate(edges.tolist()):
-                line = _world_line(transform, nodes[src], nodes[dst])
-                width = float(width_rows[edge_id]["width_units"])
-                width_source = str(width_rows[edge_id]["width_source"])
+            for path_id, path in enumerate(paths):
+                line = _world_path(transform, _simplify_path_pixels(path))
+                width = float(width_rows[path_id]["width_units"])
+                width_source = str(width_rows[path_id]["width_source"])
                 if width <= 0:
                     continue
                 common = {
-                    "tile": image_path.stem, "edge_id": int(edge_id),
+                    "tile": image_path.stem, "edge_id": int(path_id),
                     "width_m": float(width), "width_src": width_source,
                     "exec_prof": "fast", "geometry": line,
                 }
-                layer_records["centerlines"].append({**common, "source": "final_mask_skeleton"})
+                layer_records["centerlines"].append({**common, "source": "final_centerline_path"})
                 layer_records["width_segments"].append(common)
                 layer_records["corridors"].append({**common, "geometry": line.buffer(width / 2.0)})
             valid = dataset.dataset_mask() > 0
@@ -406,10 +711,7 @@ def measure_fast_widths(
         if probability_path.is_file():
             target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
             target_probability.write_bytes(probability_path.read_bytes())
-        centerline_length_px = float(sum(
-            np.linalg.norm(nodes[int(dst)] - nodes[int(src)])
-            for src, dst in edges.tolist()
-        ))
+        centerline_length_px = float(sum(path.length_px for path in paths))
         surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
         surface_diagnostics = {}
         if surface_diagnostics_path.is_file():
@@ -419,18 +721,31 @@ def measure_fast_widths(
                 surface_diagnostics = {}
         tile_summary = {
             "stem": image_path.stem, "image": str(image_path),
-            "surface_mask": str(mask_path), "edge_count": int(edges.shape[0]),
+            "surface_mask": str(mask_path), "centerline_mask": str(centerline_path),
+            "edge_count": int(len(paths)), "path_count": int(len(paths)),
+            "final_centerline_path_count": int(len(paths)),
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
+            "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,
             "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
             "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
             "final_mask_pixel_count": int(surface_diagnostics.get("final_mask_pixel_count", np.count_nonzero(binary))),
             "final_centerline_length": centerline_length_px * float(pixel_size),
             "final_centerline_length_px": centerline_length_px,
+            "relative_support_component_count": int(surface_diagnostics.get("relative_support_component_count", 0)),
+            "skeleton_component_count": int(surface_diagnostics.get("skeleton_component_count", 0)),
+            "path_cleanup_removed_count": int(surface_diagnostics.get("path_cleanup_removed_count", 0)),
+            "gap_bridge_added_count": int(surface_diagnostics.get("gap_bridge_added_count", 0)),
+            "final_road_surface_count": int(surface_diagnostics.get("final_road_surface_count", 0)),
+            "fast_mask_elapsed_seconds": float(surface_diagnostics.get("fast_mask_elapsed_seconds", 0.0)),
+            "skeleton_path_processing_seconds": float(surface_diagnostics.get("skeleton_path_processing_seconds", 0.0)),
+            "fast_width_elapsed_seconds": float(time.perf_counter() - tile_started),
         }
         print(
             f"[Fast Centerline] {image_path.stem}: "
-            f"length={tile_summary['final_centerline_length']:.3f}"
+            f"paths={tile_summary['final_centerline_path_count']}, "
+            f"length={tile_summary['final_centerline_length']:.3f}, "
+            f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
         )
         image_rows.append(tile_summary)
         (output_dir / f"{image_path.stem}_summary.json").write_text(json.dumps(tile_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -447,6 +762,7 @@ def measure_fast_widths(
     summary = {
         "execution_profile": "fast", "width_source": "fast_measured",
         "working_gpkg": str(working), "images": image_rows,
+        "fast_width_elapsed_seconds": float(time.perf_counter() - batch_started),
     }
     (output_dir / "batch_width_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

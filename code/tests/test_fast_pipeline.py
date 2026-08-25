@@ -28,10 +28,14 @@ from engine.fast_pipeline import (
     build_fast_surfaces,
     export_fast_products,
     measure_fast_edge_widths,
+    measure_fast_path_widths,
     measure_fast_widths,
+    _build_fast_road_geometry,
+    _cleanup_road_paths,
     _consistent_relative_score,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
+    _trace_skeleton_paths,
 )
 from engine.samroad.image_resume import required_image_outputs
 
@@ -166,6 +170,49 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         self.assertEqual(int(cleaned[50, 10:91].sum()), 81)
         self.assertEqual(int(cleaned[30:51, 50].sum()), 21)
 
+    def test_straight_degree_two_chain_is_one_complete_path(self) -> None:
+        skeleton = np.zeros((60, 80), dtype=np.uint8)
+        skeleton[30, 10:71] = 1
+        paths = _trace_skeleton_paths(skeleton)
+        self.assertEqual(len(paths), 1)
+        self.assertAlmostEqual(paths[0].length_px, 60.0, delta=0.01)
+        self.assertEqual(paths[0].pixels.shape[0], 61)
+
+    def test_t_junction_is_split_only_at_the_junction(self) -> None:
+        skeleton = np.zeros((80, 100), dtype=np.uint8)
+        skeleton[50, 10:91] = 1
+        skeleton[20:51, 50] = 1
+        paths = _trace_skeleton_paths(skeleton)
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(sorted(round(path.length_px) for path in paths), [30, 40, 40])
+
+    def test_short_weak_endpoint_branch_is_removed_but_strong_branch_stays(self) -> None:
+        skeleton = np.zeros((80, 100), dtype=np.uint8)
+        skeleton[50, 10:91] = 1
+        skeleton[43:51, 50] = 1
+        score = np.zeros_like(skeleton, dtype=np.float32)
+        score[50, 10:91] = 2.0
+        score[43:50, 50] = 0.6
+        paths = _trace_skeleton_paths(skeleton, score)
+        kept, removed = _cleanup_road_paths(paths)
+        self.assertEqual(removed, 1)
+        self.assertEqual(len(kept), 2)
+
+        score[43:50, 50] = 1.8
+        kept, removed = _cleanup_road_paths(_trace_skeleton_paths(skeleton, score))
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(kept), 3)
+
+    def test_centerline_is_derived_from_regularized_surface(self) -> None:
+        probability = np.full((100, 100), 0.04, dtype=np.float32)
+        probability[45:55, 10:47] = 0.24
+        probability[45:55, 49:90] = 0.24
+        surface, centerline, paths, diagnostics = _build_fast_road_geometry(probability)
+        self.assertGreater(int(surface[45:55, 47:50].sum()), 0)
+        self.assertTrue(np.all(surface[centerline > 0] > 0))
+        self.assertGreater(len(paths), 0)
+        self.assertEqual(diagnostics["gap_bridge_added_count"], 0)
+
 
 class FastWidthTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -208,6 +255,9 @@ class FastWidthTests(unittest.TestCase):
             self.assertFalse((root / "graphs").exists())
             self.assertGreater(summary["images"][0]["final_centerline_length"], 0)
             self.assertGreater(summary["images"][0]["measured_edge_count"], 0)
+            centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
+            self.assertEqual(len(centerlines), 1)
+            self.assertGreater(len(centerlines.geometry.iloc[0].coords), 2)
 
     def test_distance_transform_is_used_when_normal_probe_fails(self) -> None:
         rows = measure_fast_edge_widths(
@@ -215,6 +265,14 @@ class FastWidthTests(unittest.TestCase):
             sample_function=lambda *_args, **_kwargs: [],
         )
         self.assertEqual(rows[0]["width_source"], "distance_transform_fallback")
+        self.assertAlmostEqual(rows[0]["width_units"], 10.0, delta=2.0)
+
+    def test_path_width_is_aggregated_for_one_complete_polyline(self) -> None:
+        skeleton = np.zeros_like(self.mask)
+        skeleton[10:71, 35] = 1
+        paths = _trace_skeleton_paths(skeleton)
+        rows = measure_fast_path_widths(paths, self.mask, 1.0)
+        self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["width_units"], 10.0, delta=2.0)
 
 
