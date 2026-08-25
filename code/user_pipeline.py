@@ -2008,6 +2008,7 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
                     context["infer_dir"] / "mask",
                     [name for stem in stems for name in (
                         f"{stem}_road.png", f"{stem}_fast_enhanced.png",
+                        f"{stem}_fast_boost.png",
                     )],
                 )
                 and _named_outputs_complete(

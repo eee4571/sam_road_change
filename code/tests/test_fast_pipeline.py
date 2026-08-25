@@ -39,10 +39,7 @@ from engine.fast_pipeline import (
     _trace_skeleton_paths,
 )
 from engine.samroad.image_resume import required_image_outputs
-from engine.samroad.fast_probability import (
-    FAST_RELATIVE_ABSOLUTE_FLOOR,
-    build_fast_enhanced_road_probability,
-)
+from engine.samroad.fast_probability import build_fast_enhanced_road_probability
 
 
 class FastCommandTests(unittest.TestCase):
@@ -72,11 +69,15 @@ class FastCommandTests(unittest.TestCase):
         outputs = required_image_outputs(Path("output"), "tile", "fast")
         self.assertEqual(
             [item["role"] for item in outputs],
-            ["road_probability", "fast_enhanced_probability", "fast_topology"],
+            [
+                "road_probability", "fast_enhanced_probability",
+                "fast_probability_boost", "fast_topology",
+            ],
         )
         self.assertTrue(str(outputs[0]["path"]).endswith("tile_road.png"))
         self.assertTrue(str(outputs[1]["path"]).endswith("tile_fast_enhanced.png"))
-        self.assertTrue(str(outputs[2]["path"]).endswith("tile_fast_topology.npz"))
+        self.assertTrue(str(outputs[2]["path"]).endswith("tile_fast_boost.png"))
+        self.assertTrue(str(outputs[3]["path"]).endswith("tile_fast_topology.npz"))
 
     def test_legacy_full_resume_treats_missing_profile_as_full(self) -> None:
         prior = {
@@ -96,33 +97,35 @@ class FastCommandTests(unittest.TestCase):
 
 
 class FastRelativeTests(unittest.TestCase):
-    def test_normal_road_is_not_changed(self) -> None:
-        probability = np.full((100, 100), 0.01, dtype=np.float32)
-        probability[:, 47:53] = 0.30
-        enhanced, diagnostics = build_fast_enhanced_road_probability(probability)
-        self.assertTrue(np.allclose(enhanced[:, 47:53], 0.30))
-        self.assertEqual(diagnostics["relative_boost_pixel_count"], 0)
-
-    def test_weak_locally_prominent_road_is_boosted(self) -> None:
+    def test_weak_road_crosses_native_graph_threshold(self) -> None:
         probability = np.full((100, 100), 0.003, dtype=np.float32)
-        probability[:, 49:51] = 0.04
-        enhanced, _diagnostics = build_fast_enhanced_road_probability(probability)
-        self.assertGreater(float(enhanced[:, 50].mean()), 0.20)
-        self.assertGreater(float(enhanced[:, 50].mean()), float(probability[:, 50].mean()))
+        probability[:, 50] = 0.04
+        enhanced, diagnostics = build_fast_enhanced_road_probability(
+            probability, high_threshold=0.36,
+        )
+        self.assertGreaterEqual(float(enhanced[:, 50].mean()), 0.36)
+        self.assertGreater(
+            diagnostics["enhanced_pixels_above_graph_threshold"],
+            diagnostics["raw_pixels_above_graph_threshold"],
+        )
 
-    def test_extremely_low_noise_below_floor_is_not_boosted(self) -> None:
+    def test_globally_weak_road_passes_adaptive_floor(self) -> None:
+        probability = np.full((100, 100), 0.001, dtype=np.float32)
+        probability[:, 49:51] = 0.010
+        enhanced, diagnostics = build_fast_enhanced_road_probability(
+            probability, high_threshold=0.36,
+        )
+        self.assertLessEqual(diagnostics["fast_relative_adaptive_floor"], 0.010)
+        self.assertGreater(float(enhanced[:, 50].mean()), 0.05)
+
+    def test_extremely_low_noise_is_not_boosted(self) -> None:
         probability = np.full((100, 100), 0.0001, dtype=np.float32)
         probability[50, 50] = 0.001
-        self.assertLess(float(probability.max()), FAST_RELATIVE_ABSOLUTE_FLOOR)
-        enhanced, diagnostics = build_fast_enhanced_road_probability(probability)
+        enhanced, diagnostics = build_fast_enhanced_road_probability(
+            probability, high_threshold=0.36,
+        )
         self.assertTrue(np.allclose(enhanced, probability))
         self.assertEqual(diagnostics["relative_boost_pixel_count"], 0)
-
-    def test_low_contrast_region_is_not_promoted_to_high_confidence(self) -> None:
-        probability = np.full((100, 100), 0.015, dtype=np.float32)
-        probability[35:65, 35:65] = 0.020
-        enhanced, _diagnostics = build_fast_enhanced_road_probability(probability)
-        self.assertLess(float(enhanced.max()), 0.05)
 
 
 class FastSkeletonCleanupTests(unittest.TestCase):

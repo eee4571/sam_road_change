@@ -138,6 +138,11 @@ def required_image_outputs(
                 "kind": "png",
             },
             {
+                "role": "fast_probability_boost",
+                "path": root / "mask" / f"{stem}_fast_boost.png",
+                "kind": "png",
+            },
+            {
                 "role": "fast_topology",
                 "path": root / "graph" / f"{stem}_fast_topology.npz",
                 "kind": "npz",

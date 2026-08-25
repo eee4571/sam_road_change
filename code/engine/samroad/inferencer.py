@@ -377,6 +377,15 @@ def run_inference_on_images(
                 fast_enhanced_mask if fast_enhanced_mask is not None else road_mask,
             ):
                 raise OSError(f"Cannot write enhanced Fast road probability: {enhanced_path}")
+            boost_path = os.path.join(mask_save_dir, f"{img_id}_fast_boost.png")
+            boost_mask = np.clip(
+                (fast_enhanced_mask if fast_enhanced_mask is not None else road_mask).astype(np.int16)
+                - road_mask.astype(np.int16),
+                0,
+                255,
+            ).astype(np.uint8)
+            if not cv2.imwrite(boost_path, boost_mask):
+                raise OSError(f"Cannot write Fast probability boost: {boost_path}")
             graph_save_dir = os.path.join(output_dir, "graph")
             os.makedirs(graph_save_dir, exist_ok=True)
             np.savez_compressed(
@@ -392,6 +401,9 @@ def run_inference_on_images(
                 f"graph points={performance_summary['raw_graph_point_count']}"
                 f"->{performance_summary['fast_graph_point_count']}, "
                 f"edges={pred_edges.shape[0]}, "
+                f"threshold pixels="
+                f"{performance_summary['raw_pixels_above_graph_threshold']}"
+                f"->{performance_summary['enhanced_pixels_above_graph_threshold']}, "
                 f"boosted pixels={performance_summary['relative_boost_pixel_count']}."
             )
             continue
@@ -1081,8 +1093,14 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     graph_points = native_graph_points
     fast_enhancement_context = None
     if args.execution_profile == "fast":
+        fast_graph_high_threshold, _fast_low_threshold, _fast_profile = (
+            graph_extraction.resolve_road_thresholds(config)
+        )
         enhanced_probability, enhancement_diagnostics = (
-            build_fast_enhanced_road_probability(fast_float_probability)
+            build_fast_enhanced_road_probability(
+                fast_float_probability,
+                high_threshold=fast_graph_high_threshold,
+            )
         )
         enhanced_road_mask = np.rint(enhanced_probability * 255.0).astype(np.uint8)
         graph_points = graph_extraction.extract_graph_points(

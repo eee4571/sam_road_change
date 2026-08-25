@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Small, fixed local-contrast enhancement used only by Fast inference."""
+"""Small, threshold-aligned local-contrast enhancement for Fast inference."""
 
 import cv2
 import numpy as np
@@ -8,9 +8,8 @@ import numpy as np
 
 FAST_RELATIVE_SIGMA = 15.0
 FAST_RELATIVE_EPS = 0.005
-FAST_RELATIVE_ABSOLUTE_FLOOR = 0.015
 FAST_RELATIVE_RATIO_SATURATION = 4.0
-FAST_RELATIVE_MAX_BOOST = 0.25
+FAST_RELATIVE_THRESHOLD_MARGIN = 0.02
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -22,9 +21,24 @@ def _probability01(probability: np.ndarray) -> np.ndarray:
 
 def build_fast_enhanced_road_probability(
     road_probability: np.ndarray,
+    *,
+    high_threshold: float,
 ) -> tuple[np.ndarray, dict[str, float | int]]:
     """Apply one bounded local-relative boost without making topology decisions."""
     probability = _probability01(road_probability)
+    p50, p95, p99 = (
+        (float(value) for value in np.percentile(probability, (50, 95, 99)))
+        if probability.size else (0.0, 0.0, 0.0)
+    )
+    adaptive_floor = float(np.clip(
+        p50 + 0.05 * (p99 - p50),
+        0.003,
+        0.015,
+    ))
+    boost_target = float(min(
+        1.0,
+        float(high_threshold) + FAST_RELATIVE_THRESHOLD_MARGIN,
+    ))
     local_background = cv2.GaussianBlur(
         probability,
         (0, 0),
@@ -38,19 +52,28 @@ def build_fast_enhanced_road_probability(
         0.0,
         1.0,
     )
-    relative_confidence *= probability >= FAST_RELATIVE_ABSOLUTE_FLOOR
+    relative_confidence *= probability >= adaptive_floor
     enhanced = np.maximum(
         probability,
-        FAST_RELATIVE_MAX_BOOST * relative_confidence,
+        boost_target * relative_confidence,
     ).clip(0.0, 1.0).astype(np.float32)
     boosted = enhanced > probability + 1e-7
     diagnostics: dict[str, float | int] = {
-        "raw_probability_p50": float(np.percentile(probability, 50)),
-        "raw_probability_p95": float(np.percentile(probability, 95)),
-        "raw_probability_p99": float(np.percentile(probability, 99)),
+        "raw_probability_p50": p50,
+        "raw_probability_p95": p95,
+        "raw_probability_p99": p99,
         "relative_boost_pixel_count": int(np.count_nonzero(boosted)),
         "raw_probability_mean": float(probability.mean()),
         "enhanced_probability_mean": float(enhanced.mean()),
         "enhanced_probability_max": float(enhanced.max()) if enhanced.size else 0.0,
+        "fast_graph_high_threshold": float(high_threshold),
+        "fast_relative_boost_target": boost_target,
+        "fast_relative_adaptive_floor": adaptive_floor,
+        "raw_pixels_above_graph_threshold": int(np.count_nonzero(
+            probability >= float(high_threshold)
+        )),
+        "enhanced_pixels_above_graph_threshold": int(np.count_nonzero(
+            enhanced >= float(high_threshold)
+        )),
     }
     return enhanced, diagnostics
