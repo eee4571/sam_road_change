@@ -343,8 +343,8 @@ class FastTruthChangeTests(unittest.TestCase):
             root = Path(temporary)
             truth_path = root / "truth.shp"
             truth = gpd.GeoDataFrame(
-                {"BHBM": [2] * 40},
-                geometry=[box(index * 5, 0, index * 5 + 2, 2) for index in range(40)],
+                {"BHBM": [2] * 20},
+                geometry=[box(index * 5, 0, index * 5 + 2, 2) for index in range(20)],
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
@@ -356,13 +356,21 @@ class FastTruthChangeTests(unittest.TestCase):
                 truth_path, root / "second", period_key="area:2021->2022",
                 change_type="added", global_seed=20260826,
             )
-            first_frame = gpd.read_file(first["layers"]["added"])
-            second_frame = gpd.read_file(second["layers"]["added"])
+            first_frame = gpd.read_file(first["road_changes"])
+            second_frame = gpd.read_file(second["road_changes"])
             self.assertEqual(len(first_frame), len(second_frame))
             self.assertEqual(
                 first_frame.geometry.to_wkb().tolist(),
                 second_frame.geometry.to_wkb().tolist(),
             )
+            combined = first_frame
+            self.assertEqual(int((combined["change_typ"] != "added").sum()), 1)
+            classified_count = 0
+            for type_name in ("added", "width_changed", "removed"):
+                classified = gpd.read_file(first["layers"][type_name])
+                self.assertTrue(classified.empty or (classified["change_typ"] == type_name).all())
+                classified_count += len(classified)
+            self.assertEqual(classified_count, len(combined))
 
 
 if __name__ == "__main__":

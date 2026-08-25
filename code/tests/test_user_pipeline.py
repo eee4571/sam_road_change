@@ -489,12 +489,12 @@ class ValidationInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             entries = []
-            for index, values in enumerate(((8, 2, 10, 20, 5, 30), (12, 8, 30, 10, 15, 40))):
-                tp, fn, truth_len, pred_len, truth_integral, pred_integral = values
+            for index, values in enumerate(((8, 2, 4, 10, 20, 5, 30), (12, 8, 6, 30, 10, 15, 40))):
+                tp, fn, fp, truth_len, pred_len, truth_integral, pred_integral = values
                 output = root / f"task_{index}"; output.mkdir()
                 summary = output / "change_summary.json"
                 summary.write_text(json.dumps({"evaluation": {"metrics": [{
-                    "class": "all", "tp_m2": tp, "fp_m2": 0, "fn_m2": fn,
+                    "class": "all", "tp_m2": tp, "fp_m2": fp, "fn_m2": fn,
                     "tn_m2": 0, "truth_axis_length_m": truth_len,
                     "predicted_axis_length_m": pred_len,
                     "truth_distance_integral_m2": truth_integral,
@@ -505,6 +505,7 @@ class ValidationInputTests(unittest.TestCase):
             result = user_pipeline.aggregate_change_evaluations(manifest, root)
             total = result["metrics"][0]
             self.assertAlmostEqual(total["recall"], 20 / 30)
+            self.assertAlmostEqual(total["precision"], 20 / 30)
             self.assertAlmostEqual(total["truth_to_pred_avg_m"], 20 / 40)
             self.assertAlmostEqual(total["pred_to_truth_avg_m"], 70 / 30)
             self.assertAlmostEqual(total["centerline_avg_offset_m"], 90 / 70)

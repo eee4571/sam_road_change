@@ -2892,6 +2892,7 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
         "evaluated_task_count": completed,
         "aggregate_metrics": aggregate.get("json"),
         "change_area_recall": overall.get("change_area_recall", overall.get("recall", 0)),
+        "precision": overall.get("precision", 0),
         "type_judgment_accuracy": overall.get("type_judgment_accuracy", 0),
         "centerline_avg_offset_m": overall.get("centerline_avg_offset_m"),
     }

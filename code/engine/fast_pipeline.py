@@ -34,6 +34,7 @@ FAST_CHANGE_MISS_PROB = 0.05
 FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.02
 FAST_CHANGE_SHIFT_MAX_PX = 1.5
 FAST_CHANGE_BUFFER_JITTER_PX = 1.0
+FAST_CHANGE_TYPE_ERROR_PROB = 0.03
 
 
 @dataclass(frozen=True)
@@ -1069,12 +1070,36 @@ def _pseudo_fast_change_type(
         keep = rng.random(len(source)) >= FAST_CHANGE_MISS_PROB
         if not np.any(keep):
             keep[int(rng.integers(0, len(source)))] = True
+        kept_positions = np.flatnonzero(keep).tolist()
+        type_error_positions: set[int] = set()
+        if change_type in {"added", "width_changed", "removed"}:
+            type_error_count = int(np.floor(
+                len(kept_positions) * FAST_CHANGE_TYPE_ERROR_PROB + 0.5
+            ))
+            if len(source) >= 10 and kept_positions:
+                type_error_count = max(1, type_error_count)
+            if type_error_count:
+                type_error_positions = set(np.asarray(
+                    rng.choice(
+                        kept_positions,
+                        size=min(type_error_count, len(kept_positions)),
+                        replace=False,
+                    ),
+                ).reshape(-1).tolist())
         records = []
-        for position in np.flatnonzero(keep).tolist():
+        for position in kept_positions:
             row = source.iloc[position].to_dict()
             row[source.geometry.name] = _jitter_fast_change_geometry(
                 source.geometry.iloc[position], rng,
             )
+            predicted_type = str(change_type)
+            if position in type_error_positions:
+                alternatives = [
+                    value for value in ("added", "width_changed", "removed")
+                    if value != change_type
+                ]
+                predicted_type = alternatives[int(rng.integers(0, len(alternatives)))]
+            row["change_typ"] = predicted_type
             records.append(row)
 
         false_positive_count = int(np.floor(
@@ -1095,6 +1120,7 @@ def _pseudo_fast_change_type(
                 yoff=float(np.sin(angle) * distance),
             )
             row[source.geometry.name] = _jitter_fast_change_geometry(nearby, rng)
+            row["change_typ"] = str(change_type)
             records.append(row)
         result = gpd.GeoDataFrame(
             records,
@@ -1102,7 +1128,8 @@ def _pseudo_fast_change_type(
             crs=source.crs,
         )
 
-    result["change_typ"] = str(change_type)
+    if "change_typ" not in result.columns:
+        result["change_typ"] = str(change_type)
     result["period_key"] = str(period_key)
     result["source"] = "synthetic_from_truth"
     result["seed"] = int(local_seed)
@@ -1150,26 +1177,31 @@ def build_fast_change_from_truth(
         raise ValueError(f"Unsupported Fast change type: {', '.join(sorted(unknown_types))}")
     source_changes = truth.loc[truth["change_typ"].isin(selected_types)].copy()
     output_dir.mkdir(parents=True, exist_ok=True)
-    typed_layers = {}
+    pseudo_frames = []
     for type_name in ("added", "removed", "width_changed", "widened", "narrowed"):
         typed_source = source_changes.loc[source_changes["change_typ"] == type_name].copy()
-        typed_layers[type_name] = _pseudo_fast_change_type(
+        pseudo = _pseudo_fast_change_type(
             typed_source,
             period_key=period_key,
             change_type=type_name,
             global_seed=global_seed,
         )
-        typed_layers[type_name]["before_per"] = str(before_period)
-        typed_layers[type_name]["after_per"] = str(after_period)
-    nonempty_layers = [frame for frame in typed_layers.values() if not frame.empty]
+        pseudo["before_per"] = str(before_period)
+        pseudo["after_per"] = str(after_period)
+        pseudo_frames.append(pseudo)
+    nonempty_layers = [frame for frame in pseudo_frames if not frame.empty]
     changes = (
         gpd.GeoDataFrame(
             [record for frame in nonempty_layers for record in frame.to_dict(orient="records")],
             geometry=truth.geometry.name,
             crs=truth.crs,
         )
-        if nonempty_layers else _empty_like(typed_layers["added"])
+        if nonempty_layers else _empty_like(pseudo_frames[0])
     )
+    typed_layers = {
+        type_name: changes.loc[changes["change_typ"] == type_name].copy()
+        for type_name in ("added", "removed", "width_changed", "widened", "narrowed")
+    }
     layers = {"changes": changes, **typed_layers}
     filenames = {
         "changes": "road_changes.shp", "added": "added_roads.shp",
@@ -1188,6 +1220,7 @@ def build_fast_change_from_truth(
         "execution_profile": "fast", "change_source": "synthetic_from_truth",
         "ground_truth_derived": True, "change_output_mode": "fast_synthetic_from_truth",
         "period_key": str(period_key), "global_seed": int(global_seed),
+        "type_error_probability": FAST_CHANGE_TYPE_ERROR_PROB,
         "automatic_result": False,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }

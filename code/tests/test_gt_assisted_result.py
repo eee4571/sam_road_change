@@ -142,6 +142,32 @@ class GTAssistedConstructionTests(unittest.TestCase):
         self.assertEqual(width_row["centerline_offset_status"], "excluded")
         self.assertIn("BHBM=3", metadata["centerline_offset_definition"])
 
+    def test_centerline_offset_uses_only_same_class_object_true_positives(self) -> None:
+        truth = gpd.GeoDataFrame(
+            {"BHBM": [2, 2]},
+            geometry=[box(0, 0, 10, 10), box(100, 0, 110, 10)],
+            crs="EPSG:3857",
+        )
+        predicted = gpd.GeoDataFrame(
+            {"change_typ": ["added", "added"]},
+            geometry=[box(1, 0, 11, 10), box(111, 0, 121, 10)],
+            crs=truth.crs,
+        )
+        rows, _metadata = evaluate_changes(
+            predicted,
+            truth,
+            truth_type_field="BHBM",
+            evaluation_tolerance=5.0,
+            class_mode="three",
+            object_iou_threshold=0.1,
+        )
+        added = next(row for row in rows if row["class"] == "added")
+        self.assertEqual(added["object_tp"], 1)
+        self.assertEqual(added["object_fp"], 1)
+        self.assertEqual(added["object_fn"], 1)
+        self.assertEqual(added["included_truth_feature_count"], 1)
+        self.assertEqual(added["excluded_truth_feature_count"], 1)
+
 
 class GTAssistedMainTests(unittest.TestCase):
     def _write_inputs(self, root: Path) -> tuple[Path, Path, Path]:

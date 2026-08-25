@@ -1110,12 +1110,50 @@ def _metric_row(name: str, predicted: BaseGeometry, truth: BaseGeometry, validat
     }
 
 
+def _matched_object_pairs(
+    predicted: gpd.GeoDataFrame,
+    truth: gpd.GeoDataFrame,
+    line_tolerance: float,
+    iou_threshold: float,
+) -> list[tuple[int, int]]:
+    predicted_support = [
+        _support_geometry(predicted.iloc[[index]], line_tolerance)
+        for index in range(len(predicted))
+    ]
+    truth_support = [
+        _support_geometry(truth.iloc[[index]], line_tolerance)
+        for index in range(len(truth))
+    ]
+    candidates = []
+    for predicted_index, predicted_geometry in enumerate(predicted_support):
+        for truth_index, truth_geometry in enumerate(truth_support):
+            intersection = float(predicted_geometry.intersection(truth_geometry).area)
+            if intersection <= 0:
+                continue
+            union = float(predicted_geometry.union(truth_geometry).area)
+            iou = intersection / union if union else 0.0
+            if iou >= iou_threshold:
+                candidates.append((iou, predicted_index, truth_index))
+    matched_predicted = set()
+    matched_truth = set()
+    pairs = []
+    for _iou, predicted_index, truth_index in sorted(candidates, reverse=True):
+        if predicted_index in matched_predicted or truth_index in matched_truth:
+            continue
+        matched_predicted.add(predicted_index)
+        matched_truth.add(truth_index)
+        pairs.append((predicted_index, truth_index))
+    return pairs
+
+
 def _centerline_offset_metrics(
     predicted: gpd.GeoDataFrame,
     truth: gpd.GeoDataFrame,
     evaluation_tolerance: float,
+    object_iou_threshold: float = 0.1,
 ) -> dict:
-    """Measure matched road-corridor axes, merging dual carriageways first."""
+    """Measure axes only for same-class object true-positive pairs."""
+    total_truth_count = int(len(truth))
     result = {
         "centerline_offset_status": "unavailable",
         "centerline_offset_reason": "",
@@ -1126,12 +1164,22 @@ def _centerline_offset_metrics(
         "predicted_axis_length_m": 0.0,
         "truth_distance_integral_m2": 0.0,
         "predicted_distance_integral_m2": 0.0,
-        "included_truth_feature_count": int(len(truth)),
-        "excluded_truth_feature_count": 0,
+        "included_truth_feature_count": 0,
+        "excluded_truth_feature_count": total_truth_count,
     }
     if predicted.empty or truth.empty:
         result["centerline_offset_reason"] = "预测或真值中没有可配对的变化面"
         return result
+    matched_pairs = _matched_object_pairs(
+        predicted, truth, evaluation_tolerance, object_iou_threshold,
+    )
+    if not matched_pairs:
+        result["centerline_offset_reason"] = "同类型预测与真值中没有对象级真阳性配对"
+        return result
+    matched_predicted = sorted({predicted_index for predicted_index, _truth_index in matched_pairs})
+    matched_truth = sorted({truth_index for _predicted_index, truth_index in matched_pairs})
+    predicted = predicted.iloc[matched_predicted].reset_index(drop=True)
+    truth = truth.iloc[matched_truth].reset_index(drop=True)
     predicted_supports = [
         _support_geometry(predicted.iloc[[index]], evaluation_tolerance)
         for index in range(len(predicted))
@@ -1174,8 +1222,6 @@ def _centerline_offset_metrics(
 
     if not groups:
         result["centerline_offset_reason"] = "没有空间对应的预测与真值变化对象"
-        result["excluded_truth_feature_count"] = int(len(truth))
-        result["included_truth_feature_count"] = 0
         return result
 
     truth_length = predicted_length = truth_integral = predicted_integral = 0.0
@@ -1238,7 +1284,7 @@ def _centerline_offset_metrics(
     predicted_to_truth = predicted_integral / predicted_length
     result.update({
         "centerline_offset_status": "computed",
-        "centerline_offset_reason": "仅统计空间匹配变化对象；双线道路先合并为走廊，再计算双向长度加权骨架偏移",
+        "centerline_offset_reason": "仅统计同类型对象级真阳性配对；双线道路先合并为走廊，再计算双向长度加权骨架偏移",
         "centerline_avg_offset_m": (
             (truth_integral + predicted_integral) / (truth_length + predicted_length)
         ),
@@ -1249,7 +1295,7 @@ def _centerline_offset_metrics(
         "truth_distance_integral_m2": truth_integral,
         "predicted_distance_integral_m2": predicted_integral,
         "included_truth_feature_count": len(included_truth),
-        "excluded_truth_feature_count": int(len(truth) - len(included_truth)),
+        "excluded_truth_feature_count": int(total_truth_count - len(included_truth)),
     })
     return result
 
@@ -1260,31 +1306,11 @@ def _object_metric_values(
     line_tolerance: float,
     iou_threshold: float,
 ) -> dict:
-    predicted_support = [
-        _support_geometry(predicted.iloc[[index]], line_tolerance)
-        for index in range(len(predicted))
-    ]
-    truth_support = [
-        _support_geometry(truth.iloc[[index]], line_tolerance)
-        for index in range(len(truth))
-    ]
-    candidates = []
-    for predicted_index, predicted_geometry in enumerate(predicted_support):
-        for truth_index, truth_geometry in enumerate(truth_support):
-            intersection = float(predicted_geometry.intersection(truth_geometry).area)
-            if intersection <= 0:
-                continue
-            union = float(predicted_geometry.union(truth_geometry).area)
-            iou = intersection / union if union else 0.0
-            if iou >= iou_threshold:
-                candidates.append((iou, predicted_index, truth_index))
-    matched_predicted = set()
-    matched_truth = set()
-    for _iou, predicted_index, truth_index in sorted(candidates, reverse=True):
-        if predicted_index in matched_predicted or truth_index in matched_truth:
-            continue
-        matched_predicted.add(predicted_index)
-        matched_truth.add(truth_index)
+    matched_pairs = _matched_object_pairs(
+        predicted, truth, line_tolerance, iou_threshold,
+    )
+    matched_predicted = {predicted_index for predicted_index, _truth_index in matched_pairs}
+    matched_truth = {truth_index for _predicted_index, truth_index in matched_pairs}
     true_positive = len(matched_predicted)
     false_positive = len(predicted) - true_positive
     false_negative = len(truth) - len(matched_truth)
@@ -1363,7 +1389,12 @@ def evaluate_changes(
                 )
             row.update(_object_metric_values(pred_part, truth_part, evaluation_tolerance, object_iou_threshold))
             if change_type in {"added", "removed"}:
-                row.update(_centerline_offset_metrics(pred_part, truth_part, evaluation_tolerance))
+                row.update(_centerline_offset_metrics(
+                    pred_part,
+                    truth_part,
+                    evaluation_tolerance,
+                    object_iou_threshold,
+                ))
             elif change_type == "width_changed":
                 row.update({
                     "centerline_offset_status": "excluded",
@@ -1384,7 +1415,7 @@ def evaluate_changes(
         if truth_length > 0.0 and predicted_length > 0.0:
             overall.update({
                 "centerline_offset_status": "computed",
-                "centerline_offset_reason": "新增和灭失分别配对后，按中心轴长度汇总；宽度变化已排除",
+                "centerline_offset_reason": "新增和灭失分别按对象级真阳性配对后汇总；宽度变化及对象级假阳性/假阴性已排除",
                 "centerline_avg_offset_m": (truth_integral + predicted_integral) / (truth_length + predicted_length),
                 "truth_to_pred_avg_m": truth_integral / truth_length,
                 "pred_to_truth_avg_m": predicted_integral / predicted_length,
