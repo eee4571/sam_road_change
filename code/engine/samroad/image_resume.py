@@ -133,6 +133,11 @@ def required_image_outputs(
         return [
             {"role": "road_probability", "path": root / "mask" / f"{stem}_road.png", "kind": "png"},
             {
+                "role": "fast_enhanced_probability",
+                "path": root / "mask" / f"{stem}_fast_enhanced.png",
+                "kind": "png",
+            },
+            {
                 "role": "fast_topology",
                 "path": root / "graph" / f"{stem}_fast_topology.npz",
                 "kind": "npz",

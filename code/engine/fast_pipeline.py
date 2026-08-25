@@ -26,6 +26,7 @@ FAST_MAX_WEAK_SPUR_LENGTH_PX = 8.0
 FAST_WEAK_SPUR_CONFIDENCE_RATIO = 0.80
 FAST_GAP_BRIDGE_DISTANCE_PX = 8.0
 FAST_SMALL_LOOP_LENGTH_PX = 24.0
+FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 
 
 @dataclass(frozen=True)
@@ -502,26 +503,31 @@ def _rasterize_fast_topology(
     return raster, len(unique_links)
 
 
+def _unique_topology_edges(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    point_count = int(np.asarray(nodes).reshape(-1, 2).shape[0])
+    unique_links = sorted({
+        tuple(sorted((int(src), int(dst))))
+        for src, dst in np.asarray(edges, dtype=np.int32).reshape(-1, 2).tolist()
+        if 0 <= int(src) < point_count and 0 <= int(dst) < point_count and int(src) != int(dst)
+    })
+    return np.asarray(unique_links, dtype=np.int32).reshape(-1, 2)
+
+
 def _build_fast_road_geometry(
     probability: np.ndarray,
     *,
-    absolute_threshold: float = 0.45,
+    absolute_threshold: float = FAST_SURFACE_PROBABILITY_THRESHOLD,
     min_area: int = 24,
     topology_nodes: np.ndarray | None = None,
     topology_edges: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[FastRoadPath], dict]:
+    """Build a simple surface and raster preview of the native TopoNet graph."""
     started = time.perf_counter()
     values = _probability01(probability)
     high = values >= float(absolute_threshold)
-    relative_score = _fast_relative_score(values)
-    relative = _relative_hysteresis_mask(relative_score, min_area)
-    relative_added = relative & ~high
-    relative_support = _remove_small_components(high | relative, min_area)
-    support_component_count = cv2.connectedComponents(relative_support, connectivity=8)[0] - 1
-
     regularize_started = time.perf_counter()
     final_mask = cv2.morphologyEx(
-        relative_support, cv2.MORPH_CLOSE,
+        high.astype(np.uint8), cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
     )
     final_mask = _fill_small_holes(final_mask, max_area=64)
@@ -529,82 +535,52 @@ def _build_fast_road_geometry(
     surface_count = cv2.connectedComponents(final_mask, connectivity=8)[0] - 1
     surface_regularization_elapsed = time.perf_counter() - regularize_started
 
-    path_started = time.perf_counter()
-    relative_skeleton = _skeletonize_mask(final_mask)
-    topology_skeleton, topology_edge_count = _rasterize_fast_topology(
+    topology_centerline, topology_edge_count = _rasterize_fast_topology(
         final_mask.shape, topology_nodes, topology_edges,
     )
-    topology_paths = _trace_skeleton_paths(topology_skeleton)
-    if topology_skeleton.any():
-        topology_corridor = cv2.dilate(
-            topology_skeleton,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-        ) > 0
-        raw_skeleton = (relative_skeleton > 0) & ~topology_corridor
-        raw_skeleton = (raw_skeleton | (topology_skeleton > 0)).astype(np.uint8)
-    else:
-        raw_skeleton = relative_skeleton
-    skeleton_component_count = cv2.connectedComponents(raw_skeleton, connectivity=8)[0] - 1
-    evidence_score = np.maximum(relative_score, high.astype(np.float32) * 1.30)
-    evidence_score = np.maximum(evidence_score, topology_skeleton.astype(np.float32) * 1.30)
-    paths = _trace_skeleton_paths(raw_skeleton, evidence_score)
-    path_count = len(paths)
-    bridge_support = (
-        (final_mask > 0)
-        | (relative_score >= FAST_SCALE_SUPPORT_THRESHOLD)
-        | (cv2.dilate(topology_skeleton, np.ones((3, 3), dtype=np.uint8)) > 0)
-    ).astype(np.uint8)
-    bridged_skeleton, gap_bridge_count = _bridge_small_supported_gaps(
-        raw_skeleton, paths, bridge_support,
+    unique_edges = _unique_topology_edges(
+        np.empty((0, 2), dtype=np.float32) if topology_nodes is None else topology_nodes,
+        np.empty((0, 2), dtype=np.int32) if topology_edges is None else topology_edges,
     )
-    paths = _trace_skeleton_paths(bridged_skeleton, evidence_score)
-    bridged_path_count = len(paths)
-    cleanup_counts = {"isolated": 0, "spur": 0, "loop": 0, "total": 0}
-    cleaned_skeleton = bridged_skeleton
-    for _pass in range(2):
-        paths, removed = _cleanup_road_paths(paths)
-        for key in cleanup_counts:
-            cleanup_counts[key] += int(removed[key])
-        cleaned_skeleton = _paths_to_skeleton(paths, final_mask.shape)
-        if removed["total"] == 0:
-            break
-        paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
-    final_paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
-    path_elapsed = time.perf_counter() - path_started
+    points = np.empty((0, 2), dtype=np.float32) if topology_nodes is None else np.asarray(topology_nodes).reshape(-1, 2)
+    centerline_length_px = float(sum(
+        np.linalg.norm(points[src] - points[dst]) for src, dst in unique_edges.tolist()
+    ))
+    centerline_components = cv2.connectedComponents(topology_centerline, connectivity=8)[0] - 1
 
     diagnostics = {
         "raw_high_probability_pixel_count": int(np.count_nonzero(high)),
-        "relative_added_pixel_count": int(np.count_nonzero(relative_added)),
-        "relative_support_component_count": int(support_component_count),
+        "relative_added_pixel_count": 0,
+        "relative_support_component_count": 0,
         "toponet_node_count": int(0 if topology_nodes is None else np.asarray(topology_nodes).reshape(-1, 2).shape[0]),
         "toponet_edge_count": int(topology_edge_count),
-        "toponet_backbone_path_count": int(len(topology_paths)),
-        "skeleton_component_count": int(skeleton_component_count),
-        "path_count": int(path_count),
-        "bridged_path_count": int(bridged_path_count),
-        "path_cleanup_removed_count": int(cleanup_counts["total"]),
-        "path_cleanup_isolated_count": int(cleanup_counts["isolated"]),
-        "path_cleanup_spur_count": int(cleanup_counts["spur"]),
-        "path_cleanup_loop_count": int(cleanup_counts["loop"]),
-        "gap_bridge_added_count": int(gap_bridge_count),
-        "final_centerline_path_count": int(len(final_paths)),
-        "final_centerline_length_px": float(sum(path.length_px for path in final_paths)),
+        "toponet_backbone_path_count": int(topology_edge_count),
+        "skeleton_component_count": int(centerline_components),
+        "path_count": int(topology_edge_count),
+        "bridged_path_count": int(topology_edge_count),
+        "path_cleanup_removed_count": 0,
+        "path_cleanup_isolated_count": 0,
+        "path_cleanup_spur_count": 0,
+        "path_cleanup_loop_count": 0,
+        "gap_bridge_added_count": 0,
+        "final_centerline_path_count": int(topology_edge_count),
+        "final_centerline_length_px": centerline_length_px,
         "final_road_surface_count": int(surface_count),
         "final_mask_pixel_count": int(np.count_nonzero(final_mask)),
         "surface_regularization_seconds": float(surface_regularization_elapsed),
-        "skeleton_path_processing_seconds": float(path_elapsed),
+        "skeleton_path_processing_seconds": 0.0,
         "fast_mask_elapsed_seconds": float(time.perf_counter() - started),
     }
-    return final_mask, cleaned_skeleton, final_paths, diagnostics
+    return final_mask, topology_centerline, [], diagnostics
 
 
 def build_fast_surface_mask(
     probability: np.ndarray,
     *,
-    absolute_threshold: float = 0.45,
+    absolute_threshold: float = FAST_SURFACE_PROBABILITY_THRESHOLD,
     min_area: int = 24,
 ) -> tuple[np.ndarray, dict]:
-    """Regularize fixed Relative evidence into a surface, then derive its centerline."""
+    """Regularize enhanced Fast probability into a lightweight surface."""
     final_mask, _centerline, _paths, diagnostics = _build_fast_road_geometry(
         probability, absolute_threshold=absolute_threshold, min_area=min_area,
     )
@@ -630,7 +606,8 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for image_path in _raster_paths(image_dir):
-        source = probability_dir / f"{image_path.stem}_road.png"
+        enhanced_source = probability_dir / f"{image_path.stem}_fast_enhanced.png"
+        source = enhanced_source if enhanced_source.is_file() else probability_dir / f"{image_path.stem}_road.png"
         probability = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
         if probability is None:
             raise FileNotFoundError(f"Cannot read SAMRoad probability: {source}")
@@ -659,25 +636,15 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
         rows.append(row)
         print(
             f"[Fast Mask] {image_path.stem}: "
-            f"high={diagnostics['raw_high_probability_pixel_count']}, "
-            f"relative_added={diagnostics['relative_added_pixel_count']}, "
-            f"support_components={diagnostics['relative_support_component_count']}, "
-            f"toponet={diagnostics['toponet_edge_count']} edges/"
-            f"{diagnostics['toponet_backbone_path_count']} paths, "
-            f"paths={diagnostics['path_count']}->{diagnostics['final_centerline_path_count']}, "
-            f"cleanup={diagnostics['path_cleanup_removed_count']}"
-            f"(isolated={diagnostics['path_cleanup_isolated_count']}, "
-            f"spur={diagnostics['path_cleanup_spur_count']}, "
-            f"loop={diagnostics['path_cleanup_loop_count']}), "
-            f"bridges={diagnostics['gap_bridge_added_count']}, "
+            f"surface_pixels={diagnostics['final_mask_pixel_count']}, "
+            f"toponet_edges={diagnostics['toponet_edge_count']}, "
             f"surfaces={diagnostics['final_road_surface_count']}, "
-            f"final={diagnostics['final_mask_pixel_count']}, "
             f"elapsed={diagnostics['fast_mask_elapsed_seconds']:.3f}s"
         )
         (output_dir / f"{image_path.stem}_fast_surface.json").write_text(
             json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8",
         )
-    summary = {"execution_profile": "fast", "surface_source": "final_fast_mask", "images": rows}
+    summary = {"execution_profile": "fast", "surface_source": "enhanced_probability", "images": rows}
     (output_dir / "batch_surface_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
@@ -854,16 +821,16 @@ def measure_fast_widths(
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
         centerline_path = surface_dir / f"{image_path.stem}_centerline.png"
         probability_path = probability_dir / f"{image_path.stem}_road.png"
+        topology_path = probability_dir.parent / "graph" / f"{image_path.stem}_fast_topology.npz"
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Cannot read Fast surface mask: {mask_path}")
         binary = (mask > 0).astype(np.uint8)
-        centerline = cv2.imread(str(centerline_path), cv2.IMREAD_GRAYSCALE)
-        if centerline is None:
-            centerline = _remove_short_isolated_skeleton_components(
-                _skeletonize_mask(binary), min_length_px=FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
-            )
-        paths = _trace_skeleton_paths(centerline > 0)
+        if not topology_path.is_file():
+            raise FileNotFoundError(f"Fast native TopoNet graph is missing: {topology_path}")
+        with np.load(topology_path, allow_pickle=False) as topology:
+            nodes = np.asarray(topology["nodes"], dtype=np.float32).reshape(-1, 2)
+            edges = _unique_topology_edges(nodes, topology["edges"])
         with rasterio.open(image_path) as dataset:
             if dataset.crs is None:
                 raise ValueError(f"Fast products require raster CRS: {image_path}")
@@ -873,21 +840,21 @@ def measure_fast_widths(
                 raise ValueError("Fast products currently require normalized period tiles in one CRS")
             transform = dataset.transform
             pixel_size = requested_pixel_size if requested_pixel_size > 0 else float(np.mean((abs(transform.a), abs(transform.e))))
-            width_rows = measure_fast_path_widths(
-                paths, binary, pixel_size, sample_function=sample_widths_by_normal,
+            width_rows = measure_fast_edge_widths(
+                nodes, edges, binary, pixel_size, sample_function=sample_widths_by_normal,
             )
-            for path_id, path in enumerate(paths):
-                line = _world_path(transform, _simplify_path_pixels(path))
-                width = float(width_rows[path_id]["width_units"])
-                width_source = str(width_rows[path_id]["width_source"])
+            for edge_id, (src, dst) in enumerate(edges.tolist()):
+                line = _world_line(transform, nodes[src], nodes[dst])
+                width = float(width_rows[edge_id]["width_units"])
+                width_source = str(width_rows[edge_id]["width_source"])
                 if width <= 0:
                     continue
                 common = {
-                    "tile": image_path.stem, "edge_id": int(path_id),
+                    "tile": image_path.stem, "edge_id": int(edge_id),
                     "width_m": float(width), "width_src": width_source,
                     "exec_prof": "fast", "geometry": line,
                 }
-                layer_records["centerlines"].append({**common, "source": "final_centerline_path"})
+                layer_records["centerlines"].append({**common, "source": "native_toponet"})
                 layer_records["width_segments"].append(common)
                 layer_records["corridors"].append({**common, "geometry": line.buffer(width / 2.0)})
             valid = dataset.dataset_mask() > 0
@@ -903,7 +870,9 @@ def measure_fast_widths(
         if probability_path.is_file():
             target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
             target_probability.write_bytes(probability_path.read_bytes())
-        centerline_length_px = float(sum(path.length_px for path in paths))
+        centerline_length_px = float(sum(
+            np.linalg.norm(nodes[src] - nodes[dst]) for src, dst in edges.tolist()
+        ))
         surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
         surface_diagnostics = {}
         if surface_diagnostics_path.is_file():
@@ -914,8 +883,8 @@ def measure_fast_widths(
         tile_summary = {
             "stem": image_path.stem, "image": str(image_path),
             "surface_mask": str(mask_path), "centerline_mask": str(centerline_path),
-            "edge_count": int(len(paths)), "path_count": int(len(paths)),
-            "final_centerline_path_count": int(len(paths)),
+            "edge_count": int(len(edges)), "path_count": int(len(edges)),
+            "final_centerline_path_count": int(len(edges)),
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,

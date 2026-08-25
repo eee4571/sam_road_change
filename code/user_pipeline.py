@@ -2003,8 +2003,17 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
     stems = context["image_stems"]
     if stage_key == "centerline":
         if context.get("execution_profile") == "fast":
-            return _named_outputs_complete(
-                context["infer_dir"] / "mask", [f"{stem}_road.png" for stem in stems],
+            return (
+                _named_outputs_complete(
+                    context["infer_dir"] / "mask",
+                    [name for stem in stems for name in (
+                        f"{stem}_road.png", f"{stem}_fast_enhanced.png",
+                    )],
+                )
+                and _named_outputs_complete(
+                    context["infer_dir"] / "graph",
+                    [f"{stem}_fast_topology.npz" for stem in stems],
+                )
             )
         return _named_outputs_complete(context["infer_dir"], [f"{stem}.p" for stem in stems])
     if stage_key == "surface":

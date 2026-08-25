@@ -37,6 +37,7 @@ from image_resume import (
     ensure_unique_output_stems,
     marker_summaries,
 )
+from fast_probability import build_fast_enhanced_road_probability
 
 try:
     import rasterio
@@ -316,6 +317,11 @@ def run_inference_on_images(
 
         itsc_mask = itsc_mask[:infer_height, :infer_width]
         road_mask = road_mask[:infer_height, :infer_width]
+        fast_enhanced_mask = None
+        if args.execution_profile == "fast" and isinstance(precomputed_relative_context, dict):
+            fast_enhanced_mask = np.asarray(
+                precomputed_relative_context.get("enhanced_road_mask"), dtype=np.uint8,
+            )[:infer_height, :infer_width]
         candidate_nodes, candidate_edges, candidate_confidences = filter_graph_to_image_bounds(
             pred_nodes, candidate_edges, infer_height, infer_width, candidate_confidences
         )
@@ -325,6 +331,12 @@ def run_inference_on_images(
         if resize_factor != 1.0:
             itsc_mask = cv2.resize(itsc_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
             road_mask = cv2.resize(road_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
+            if fast_enhanced_mask is not None:
+                fast_enhanced_mask = cv2.resize(
+                    fast_enhanced_mask,
+                    (original_width, original_height),
+                    interpolation=cv2.INTER_AREA,
+                )
             pred_nodes = pred_nodes.astype(np.float32) / float(resize_factor)
             candidate_nodes = candidate_nodes.astype(np.float32) / float(resize_factor)
             candidate_nodes, candidate_edges, candidate_confidences = filter_graph_to_image_bounds(
@@ -349,7 +361,7 @@ def run_inference_on_images(
                 "tile": img_id,
                 **profile_decision,
                 "execution_profile": "fast",
-                "centerline_method": "fast_toponet_relative_hybrid",
+                "centerline_method": "native_toponet_on_fast_enhanced_probability",
                 **performance_summary,
             }
             profile_decisions.append(profile_decision)
@@ -359,6 +371,12 @@ def run_inference_on_images(
             probability_path = os.path.join(mask_save_dir, f"{img_id}_road.png")
             if not cv2.imwrite(probability_path, road_mask):
                 raise OSError(f"Cannot write Fast road probability: {probability_path}")
+            enhanced_path = os.path.join(mask_save_dir, f"{img_id}_fast_enhanced.png")
+            if not cv2.imwrite(
+                enhanced_path,
+                fast_enhanced_mask if fast_enhanced_mask is not None else road_mask,
+            ):
+                raise OSError(f"Cannot write enhanced Fast road probability: {enhanced_path}")
             graph_save_dir = os.path.join(output_dir, "graph")
             os.makedirs(graph_save_dir, exist_ok=True)
             np.savez_compressed(
@@ -371,7 +389,10 @@ def run_inference_on_images(
                 resume_manager.complete(img_path, recovery_summary, profile_decision)
             print(
                 f"Done Fast probability + native TopoNet for {img_id}: "
-                f"nodes={pred_nodes.shape[0]}, edges={pred_edges.shape[0]}."
+                f"graph points={performance_summary['raw_graph_point_count']}"
+                f"->{performance_summary['fast_graph_point_count']}, "
+                f"edges={pred_edges.shape[0]}, "
+                f"boosted pixels={performance_summary['relative_boost_pixel_count']}."
             )
             continue
 
@@ -1008,6 +1029,10 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         fused_road_mask / torch.clamp(pixel_counter, min=1.0),
         torch.zeros_like(fused_road_mask),
     )
+    fast_float_probability = (
+        fused_road_mask.detach().cpu().numpy().astype(np.float32, copy=False)
+        if args.execution_profile == "fast" else None
+    )
     # range 0-1 -> 0-255
     fused_keypoint_mask = (fused_keypoint_mask * 255).to(torch.uint8).cpu().numpy()
     fused_road_mask = (fused_road_mask * 255).to(torch.uint8).cpu().numpy()
@@ -1054,7 +1079,23 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         relative_context=None,
     )
     graph_points = native_graph_points
-    if relative_injected:
+    fast_enhancement_context = None
+    if args.execution_profile == "fast":
+        enhanced_probability, enhancement_diagnostics = (
+            build_fast_enhanced_road_probability(fast_float_probability)
+        )
+        enhanced_road_mask = np.rint(enhanced_probability * 255.0).astype(np.uint8)
+        graph_points = graph_extraction.extract_graph_points(
+            fused_keypoint_mask,
+            enhanced_road_mask,
+            config,
+            relative_context=None,
+        )
+        fast_enhancement_context = {
+            "enhanced_road_mask": enhanced_road_mask,
+            "diagnostics": enhancement_diagnostics,
+        }
+    elif relative_injected:
         graph_points = graph_extraction.extract_graph_points(
             fused_keypoint_mask,
             fused_road_mask,
@@ -1070,12 +1111,18 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         "relative_injected_into_toponet": relative_injected,
         "relative_compute_call_count": relative_compute_call_count,
         "native_graph_point_count": int(native_graph_points.shape[0]),
+        "raw_graph_point_count": int(native_graph_points.shape[0]),
+        "fast_graph_point_count": int(graph_points.shape[0]),
         "relative_graph_point_count": 0,
         "toponet_graph_point_count": int(graph_points.shape[0]),
         "toponet_candidate_edge_count": 0,
         "toponet_pred_edge_count": 0,
+        "toponet_final_edge_count": 0,
+        "final_centerline_length_px": 0.0,
         "relative_final_centerline_length": 0.0,
     }
+    if fast_enhancement_context is not None:
+        performance_summary.update(fast_enhancement_context["diagnostics"])
     profile_decision.update({
         "relative_injected_into_toponet": relative_injected,
         "native_graph_point_count": performance_summary["native_graph_point_count"],
@@ -1094,7 +1141,8 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         return (
             graph_points, empty_edges, empty_scores, empty_edges, empty_scores,
             fused_keypoint_mask, fused_road_mask, profile_decision,
-            relative_context_unpadded, performance_summary,
+            fast_enhancement_context if args.execution_profile == "fast" else relative_context_unpadded,
+            performance_summary,
         )
     # for box query
     graph_rtree = rtree.index.Index()
@@ -1208,6 +1256,15 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     )
     performance_summary["toponet_candidate_edge_count"] = int(candidate_edges.shape[0])
     performance_summary["toponet_pred_edge_count"] = int(pred_edges.shape[0])
+    performance_summary["toponet_final_edge_count"] = int(pred_edges.shape[0])
+    unique_pred_edges = {
+        tuple(sorted((int(src), int(dst))))
+        for src, dst in pred_edges.tolist() if int(src) != int(dst)
+    }
+    performance_summary["final_centerline_length_px"] = float(sum(
+        np.linalg.norm(pred_nodes[src] - pred_nodes[dst])
+        for src, dst in unique_pred_edges
+    ))
 
     return (
         pred_nodes,
@@ -1218,7 +1275,7 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         fused_keypoint_mask,
         fused_road_mask,
         profile_decision,
-        relative_context_unpadded,
+        fast_enhancement_context if args.execution_profile == "fast" else relative_context_unpadded,
         performance_summary,
     )
 

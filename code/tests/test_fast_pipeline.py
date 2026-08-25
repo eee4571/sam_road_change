@@ -39,6 +39,10 @@ from engine.fast_pipeline import (
     _trace_skeleton_paths,
 )
 from engine.samroad.image_resume import required_image_outputs
+from engine.samroad.fast_probability import (
+    FAST_RELATIVE_ABSOLUTE_FLOOR,
+    build_fast_enhanced_road_probability,
+)
 
 
 class FastCommandTests(unittest.TestCase):
@@ -68,10 +72,11 @@ class FastCommandTests(unittest.TestCase):
         outputs = required_image_outputs(Path("output"), "tile", "fast")
         self.assertEqual(
             [item["role"] for item in outputs],
-            ["road_probability", "fast_topology"],
+            ["road_probability", "fast_enhanced_probability", "fast_topology"],
         )
         self.assertTrue(str(outputs[0]["path"]).endswith("tile_road.png"))
-        self.assertTrue(str(outputs[1]["path"]).endswith("tile_fast_topology.npz"))
+        self.assertTrue(str(outputs[1]["path"]).endswith("tile_fast_enhanced.png"))
+        self.assertTrue(str(outputs[2]["path"]).endswith("tile_fast_topology.npz"))
 
     def test_legacy_full_resume_treats_missing_profile_as_full(self) -> None:
         prior = {
@@ -91,69 +96,33 @@ class FastCommandTests(unittest.TestCase):
 
 
 class FastRelativeTests(unittest.TestCase):
-    def test_high_probability_road_is_retained(self) -> None:
-        probability = np.full((80, 80), 0.03, dtype=np.float32)
-        probability[:, 36:44] = 0.85
-        mask, metadata = build_fast_surface_mask(probability)
-        self.assertEqual(metadata["raw_high_probability_pixel_count"], 80 * 8)
-        self.assertGreater(float(mask[:, 38].mean()), 0.9)
+    def test_normal_road_is_not_changed(self) -> None:
+        probability = np.full((100, 100), 0.01, dtype=np.float32)
+        probability[:, 47:53] = 0.30
+        enhanced, diagnostics = build_fast_enhanced_road_probability(probability)
+        self.assertTrue(np.allclose(enhanced[:, 47:53], 0.30))
+        self.assertEqual(diagnostics["relative_boost_pixel_count"], 0)
 
-    def test_weak_road_is_recovered_from_local_relative_contrast(self) -> None:
-        probability = np.full((100, 100), 0.04, dtype=np.float32)
-        probability[:, 47:53] = 0.24
-        mask, metadata = build_fast_surface_mask(probability)
-        self.assertEqual(metadata["raw_high_probability_pixel_count"], 0)
-        self.assertGreater(metadata["relative_added_pixel_count"], 0)
-        self.assertGreater(float(mask[:, 50].mean()), 0.75)
-        self.assertLess(float(mask.mean()), 0.2)
+    def test_weak_locally_prominent_road_is_boosted(self) -> None:
+        probability = np.full((100, 100), 0.003, dtype=np.float32)
+        probability[:, 49:51] = 0.04
+        enhanced, _diagnostics = build_fast_enhanced_road_probability(probability)
+        self.assertGreater(float(enhanced[:, 50].mean()), 0.20)
+        self.assertGreater(float(enhanced[:, 50].mean()), float(probability[:, 50].mean()))
 
-    def test_very_low_probability_road_needs_no_absolute_floor(self) -> None:
-        probability = np.full((100, 100), 0.0003, dtype=np.float32)
-        probability[:, 47:53] = 0.0025
-        mask, metadata = build_fast_surface_mask(probability)
-        self.assertEqual(metadata["raw_high_probability_pixel_count"], 0)
-        self.assertGreater(metadata["relative_added_pixel_count"], 0)
-        self.assertGreater(float(mask[:, 50].mean()), 0.75)
+    def test_extremely_low_noise_below_floor_is_not_boosted(self) -> None:
+        probability = np.full((100, 100), 0.0001, dtype=np.float32)
+        probability[50, 50] = 0.001
+        self.assertLess(float(probability.max()), FAST_RELATIVE_ABSOLUTE_FLOOR)
+        enhanced, diagnostics = build_fast_enhanced_road_probability(probability)
+        self.assertTrue(np.allclose(enhanced, probability))
+        self.assertEqual(diagnostics["relative_boost_pixel_count"], 0)
 
-    def test_relative_weak_component_must_connect_to_strong(self) -> None:
-        score = np.zeros((60, 80), dtype=np.float32)
-        score[20, 10:60] = 1.0
-        score[20, 10] = 1.5
-        score[40, 10:60] = 1.0
-        mask = _relative_hysteresis_mask(score, min_area=24)
-        self.assertEqual(int(mask[20, 10:60].sum()), 50)
-        self.assertEqual(int(mask[40, 10:60].sum()), 0)
-
-    def test_weak_road_is_recovered_beside_a_strong_road(self) -> None:
-        probability = np.full((120, 120), 0.04, dtype=np.float32)
-        probability[:, 20:27] = 0.82
-        probability[:, 86:92] = 0.26
-        mask, metadata = build_fast_surface_mask(probability)
-        self.assertGreater(float(mask[:, 23].mean()), 0.9)
-        self.assertGreater(float(mask[:, 89].mean()), 0.75)
-        self.assertGreater(metadata["relative_added_pixel_count"], 0)
-
-    def test_background_noise_does_not_become_foreground(self) -> None:
-        rng = np.random.default_rng(7)
-        probability = np.clip(rng.normal(0.04, 0.006, (100, 100)), 0, 1).astype(np.float32)
-        mask, metadata = build_fast_surface_mask(probability)
-        self.assertEqual(int(mask.sum()), 0)
-        self.assertEqual(metadata["relative_added_pixel_count"], 0)
-
-    def test_tiny_fluctuations_in_low_variance_region_are_suppressed(self) -> None:
-        rng = np.random.default_rng(11)
-        probability = np.clip(
-            rng.normal(0.002, 0.0000001, (160, 160)), 0, 1,
-        ).astype(np.float32)
-        mask, _metadata = build_fast_surface_mask(probability)
-        self.assertLess(float(mask.mean()), 0.001)
-
-    def test_single_scale_response_needs_other_scale_support(self) -> None:
-        first = np.asarray([[2.0, 2.0]], dtype=np.float32)
-        second = np.asarray([[0.2, 0.6]], dtype=np.float32)
-        combined = _consistent_relative_score(first, second)
-        self.assertEqual(float(combined[0, 0]), 0.0)
-        self.assertEqual(float(combined[0, 1]), 2.0)
+    def test_low_contrast_region_is_not_promoted_to_high_confidence(self) -> None:
+        probability = np.full((100, 100), 0.015, dtype=np.float32)
+        probability[35:65, 35:65] = 0.020
+        enhanced, _diagnostics = build_fast_enhanced_road_probability(probability)
+        self.assertLess(float(enhanced.max()), 0.05)
 
 
 class FastSkeletonCleanupTests(unittest.TestCase):
@@ -242,15 +211,17 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         )
         self.assertEqual(bridge_count, 0)
 
-    def test_centerline_is_derived_from_regularized_surface(self) -> None:
-        probability = np.full((100, 100), 0.04, dtype=np.float32)
-        probability[45:55, 10:47] = 0.24
-        probability[45:55, 49:90] = 0.24
-        surface, centerline, paths, diagnostics = _build_fast_road_geometry(probability)
-        self.assertGreater(int(surface[45:55, 47:50].sum()), 0)
-        self.assertTrue(np.all(surface[centerline > 0] > 0))
-        self.assertGreater(len(paths), 0)
-        self.assertEqual(diagnostics["gap_bridge_added_count"], 0)
+    def test_centerline_is_derived_only_from_native_toponet(self) -> None:
+        probability = np.full((100, 100), 0.24, dtype=np.float32)
+        nodes = np.asarray([[50, 10], [50, 90]], dtype=np.float32)
+        edges = np.asarray([[0, 1], [1, 0]], dtype=np.int32)
+        surface, centerline, paths, diagnostics = _build_fast_road_geometry(
+            probability, topology_nodes=nodes, topology_edges=edges,
+        )
+        self.assertGreater(int(surface.sum()), 0)
+        self.assertGreater(int(centerline.sum()), 0)
+        self.assertEqual(paths, [])
+        self.assertEqual(diagnostics["toponet_edge_count"], 1)
 
 
 class FastWidthTests(unittest.TestCase):
@@ -282,6 +253,15 @@ class FastWidthTests(unittest.TestCase):
             probability = np.zeros((80, 80), dtype=np.uint8)
             probability[:, 30:40] = 220
             cv2.imwrite(str(probabilities / "tile_road.png"), probability)
+            cv2.imwrite(str(probabilities / "tile_fast_enhanced.png"), probability)
+            graph_dir = probabilities.parent / "graph"
+            graph_dir.mkdir()
+            np.savez_compressed(
+                graph_dir / "tile_fast_topology.npz",
+                nodes=np.asarray([[10.0, 35.0], [70.0, 35.0]], dtype=np.float32),
+                edges=np.asarray([[0, 1], [1, 0]], dtype=np.int32),
+                scores=np.asarray([0.9, 0.9], dtype=np.float32),
+            )
             build_fast_surfaces(images, probabilities, surfaces)
             summary = measure_fast_widths(images, surfaces, probabilities, widths)
             exported = export_fast_products(widths, products, image_dir=images)
@@ -291,12 +271,11 @@ class FastWidthTests(unittest.TestCase):
             self.assertTrue((products / "road_width_overview.png").is_file())
             self.assertEqual(Path(exported["previews"]["fusion"]), products / "road_overview.png")
             self.assertEqual(Path(exported["previews"]["width"]), products / "road_width_overview.png")
-            self.assertFalse((root / "graphs").exists())
             self.assertGreater(summary["images"][0]["final_centerline_length"], 0)
             self.assertGreater(summary["images"][0]["measured_edge_count"], 0)
             centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
             self.assertEqual(len(centerlines), 1)
-            self.assertGreater(len(centerlines.geometry.iloc[0].coords), 2)
+            self.assertEqual(centerlines.iloc[0]["source"], "native_toponet")
 
     def test_distance_transform_is_used_when_normal_probe_fails(self) -> None:
         rows = measure_fast_edge_widths(

@@ -36,6 +36,18 @@ class _MaskOnlyNet:
         return masks, features
 
 
+class _FastTopoNet(_MaskOnlyNet):
+    def infer_masks_and_img_features(self, batch):
+        masks, features = super().infer_masks_and_img_features(batch)
+        masks[:, :, 15:17, 1] = 0.04
+        masks[:, 4, 16, 0] = 0.95
+        masks[:, 27, 16, 0] = 0.95
+        return masks, features
+
+    def infer_toponet(self, _features, _points, pairs, _valid, _mask):
+        return torch.ones((*pairs.shape[:-1], 1), dtype=torch.float32)
+
+
 class RelativeTopoNetDecouplingTests(unittest.TestCase):
     def setUp(self):
         self.config = load_config(CONFIG_PATH)
@@ -179,6 +191,37 @@ class RelativeTopoNetDecouplingTests(unittest.TestCase):
         self.assertEqual(compute.call_count, 1)
         self.assertEqual(added_calls, 1)
         self.assertEqual(reused_calls, 0)
+
+    def test_fast_uses_enhanced_native_graph_and_one_toponet_pass(self):
+        config = copy.deepcopy(self.config)
+        config.PATCH_SIZE = 32
+        config.INFER_BATCH_SIZE = 1
+        config.SAMPLE_MARGIN = 0
+        config.ROAD_THRESHOLD_PROFILE = "default"
+        config.ROAD_THRESHOLD_PROFILES = {}
+        config.ROAD_HIGH_THRESHOLD = 0.20
+        config.ROAD_LOW_THRESHOLD = 0.10
+        config.RELATIVE_ROADNESS_ENABLED = False
+        config.RELATIVE_INJECT_INTO_TOPONET = False
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        original_device = inferencer.args.device
+        original_profile = inferencer.args.execution_profile
+        inferencer.args.device = "cpu"
+        inferencer.args.execution_profile = "fast"
+        net = _FastTopoNet()
+        try:
+            with mock.patch.object(net, "infer_toponet", wraps=net.infer_toponet) as toponet:
+                result = inferencer.infer_one_img(net, image, config, diagnostic_shape=(32, 32))
+        finally:
+            inferencer.args.device = original_device
+            inferencer.args.execution_profile = original_profile
+
+        self.assertGreater(result[0].shape[0], 0)
+        self.assertGreater(result[1].shape[0], 0)
+        self.assertEqual(toponet.call_count, 1)
+        self.assertGreaterEqual(result[9]["fast_graph_point_count"], result[9]["raw_graph_point_count"])
+        self.assertGreater(result[9]["relative_boost_pixel_count"], 0)
+        self.assertEqual(result[9]["relative_compute_call_count"], 0)
 
 
 if __name__ == "__main__":
