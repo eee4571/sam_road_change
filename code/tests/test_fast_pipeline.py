@@ -400,19 +400,24 @@ class FastAutomaticChangeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             before_lines = [
-                LineString([(0, 0), (30, 0)]),
+                LineString([(0, 0), (15, 0)]),
+                LineString([(15, 0), (30, 0)]),
                 LineString([(0, 20), (30, 20)]),
                 LineString([(0, 40), (30, 40)]),
                 LineString([(0, 60), (30, 60)]),
+                LineString([(0, 120), (30, 120)]),
             ]
             after_lines = [
                 LineString([(0, 20), (30, 20)]),
                 LineString([(0, 40), (30, 40)]),
                 LineString([(0, 61), (30, 61)]),
-                LineString([(0, 80), (30, 80)]),
+                LineString([(0, 80), (15, 80)]),
+                LineString([(15, 80), (30, 80)]),
+                LineString([(0, 100), (10, 100)]),
+                LineString([(15, 120), (45, 120)]),
             ]
-            before_widths = [4.0, 4.0, 8.0, 4.0]
-            after_widths = [8.0, 4.0, 4.0, 4.0]
+            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0]
+            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
 
             def write_period(name, lines, widths):
                 directory = root / name
@@ -442,6 +447,10 @@ class FastAutomaticChangeTests(unittest.TestCase):
             changes = gpd.read_file(result["road_changes"])
             shifted_road_area = box(-5, 55, 35, 65)
             self.assertFalse(changes.geometry.intersects(shifted_road_area).any())
+            short_fragment_area = box(-5, 95, 15, 105)
+            self.assertFalse(changes.geometry.intersects(short_fragment_area).any())
+            ambiguous_coverage_area = box(-5, 115, 50, 125)
+            self.assertFalse(changes.geometry.intersects(ambiguous_coverage_area).any())
             self.assertTrue(result["automatic_result"])
             self.assertFalse(result["ground_truth_derived"])
             stable = detect_fast_changes(

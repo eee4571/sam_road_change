@@ -18,6 +18,7 @@ from rasterio.features import shapes
 from shapely import make_valid
 from shapely.affinity import translate
 from shapely.geometry import LineString, shape
+from shapely.ops import linemerge
 
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
@@ -36,8 +37,9 @@ FAST_CHANGE_SHIFT_MAX_PX = 1.5
 FAST_CHANGE_BUFFER_JITTER_PX = 1.0
 FAST_CHANGE_TYPE_ERROR_PROB = 0.03
 FAST_CHANGE_MIN_AREA_M2 = 4.0
-FAST_CHANGE_MIN_LENGTH_M = 5.0
-FAST_CHANGE_MIN_MATCH_OVERLAP = 0.25
+FAST_CHANGE_MIN_LENGTH_M = 30.0
+FAST_CHANGE_EXISTING_COVERAGE = 0.70
+FAST_CHANGE_CANDIDATE_COVERAGE = 0.20
 
 
 @dataclass(frozen=True)
@@ -1316,9 +1318,32 @@ def _fast_change_parts(
     return []
 
 
-def _fast_surface_change_records(
-    source: gpd.GeoDataFrame,
-    reference: gpd.GeoDataFrame,
+def _fast_line_coverage(geometry, reference_geometry, tolerance: float) -> float:
+    if geometry is None or geometry.is_empty or geometry.length <= 0:
+        return 0.0
+    if reference_geometry is None or reference_geometry.is_empty:
+        return 0.0
+    support = (
+        reference_geometry.buffer(tolerance)
+        if tolerance > 0 else reference_geometry
+    )
+    return min(1.0, float(geometry.intersection(support).length) / float(geometry.length))
+
+
+def _fast_line_parts(geometry) -> list:
+    if geometry is None or geometry.is_empty:
+        return []
+    if geometry.geom_type in {"LineString", "LinearRing"}:
+        return [LineString(geometry)]
+    if hasattr(geometry, "geoms"):
+        return [part for child in geometry.geoms for part in _fast_line_parts(child)]
+    return []
+
+
+def _fast_centerline_change_records(
+    source_centerlines: gpd.GeoDataFrame,
+    reference_centerlines: gpd.GeoDataFrame,
+    source_surfaces: gpd.GeoDataFrame,
     *,
     tolerance: float,
     change_type: str,
@@ -1327,26 +1352,58 @@ def _fast_surface_change_records(
     min_area: float,
     min_length: float,
 ) -> list[dict]:
-    if source.empty:
+    if source_centerlines.empty or source_surfaces.empty:
         return []
-    source_union = source.geometry.union_all()
-    difference = (
-        source_union
-        if reference.empty else
-        source_union.difference(reference.geometry.union_all().buffer(tolerance))
+    reference_network = (
+        reference_centerlines.geometry.union_all()
+        if not reference_centerlines.empty else None
     )
-    return [{
-        "change_typ": change_type,
-        "before_per": str(before_period),
-        "after_per": str(after_period),
-        "source": "fast_automatic",
-        "width_bef": np.nan,
-        "width_aft": np.nan,
-        "width_diff": np.nan,
-        "geometry": part,
-    } for part in _fast_change_parts(
-        difference, min_area=min_area, min_length=min_length,
-    )]
+    candidates = []
+    for _index, row in source_centerlines.iterrows():
+        geometry = row.geometry
+        coverage = _fast_line_coverage(geometry, reference_network, tolerance)
+        if coverage <= FAST_CHANGE_CANDIDATE_COVERAGE:
+            candidates.append((geometry, _fast_width_value(row)))
+    if not candidates:
+        return []
+    candidate_network = gpd.GeoSeries(
+        [geometry for geometry, _width in candidates],
+        crs=source_centerlines.crs,
+    ).union_all()
+    merged = (
+        candidate_network
+        if candidate_network.geom_type in {"LineString", "LinearRing"} else
+        linemerge(candidate_network)
+    )
+    surface_union = source_surfaces.geometry.union_all()
+    records = []
+    for line in _fast_line_parts(merged):
+        if float(line.length) < min_length:
+            continue
+        nearby_widths = [
+            width for geometry, width in candidates
+            if width > 0 and geometry.intersects(line.buffer(1e-6))
+        ]
+        polygon_radius = max(
+            tolerance,
+            max(nearby_widths, default=0.0) / 2.0,
+            0.5,
+        )
+        change_polygon = surface_union.intersection(line.buffer(polygon_radius))
+        for part in _fast_change_parts(
+            change_polygon, min_area=min_area, min_length=0.0,
+        ):
+            records.append({
+                "change_typ": change_type,
+                "before_per": str(before_period),
+                "after_per": str(after_period),
+                "source": "fast_automatic",
+                "width_bef": np.nan,
+                "width_aft": np.nan,
+                "width_diff": np.nan,
+                "geometry": part,
+            })
+    return records
 
 
 def _fast_width_value(row) -> float:
@@ -1370,7 +1427,6 @@ def _fast_width_change_records(
     before_period: str,
     after_period: str,
     min_area: float,
-    min_length: float,
 ) -> list[dict]:
     if before.empty or after.empty:
         return []
@@ -1381,7 +1437,8 @@ def _fast_width_change_records(
         before_line = before_row.geometry
         if before_line is None or before_line.is_empty or before_line.length <= 0:
             continue
-        candidates = spatial_index.query(before_line.buffer(tolerance), predicate="intersects")
+        query_geometry = before_line.buffer(tolerance) if tolerance > 0 else before_line
+        candidates = spatial_index.query(query_geometry, predicate="intersects")
         best = None
         for after_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
             if after_position in used_after:
@@ -1393,14 +1450,11 @@ def _fast_width_change_records(
             distance = float(before_line.distance(after_line))
             if distance > tolerance:
                 continue
-            overlap_length = min(
-                float(before_line.intersection(after_line.buffer(tolerance)).length),
-                float(after_line.intersection(before_line.buffer(tolerance)).length),
+            overlap_ratio = min(
+                _fast_line_coverage(before_line, after_line, tolerance),
+                _fast_line_coverage(after_line, before_line, tolerance),
             )
-            overlap_ratio = overlap_length / max(
-                min(float(before_line.length), float(after_line.length)), 1e-9,
-            )
-            if overlap_ratio < FAST_CHANGE_MIN_MATCH_OVERLAP:
+            if overlap_ratio < FAST_CHANGE_EXISTING_COVERAGE:
                 continue
             score = (overlap_ratio, -distance)
             if best is None or score > best[0]:
@@ -1429,7 +1483,7 @@ def _fast_width_change_records(
         )
         change_type = "widened" if widened else "narrowed"
         for part in _fast_change_parts(
-            change_geometry, min_area=min_area, min_length=min_length,
+            change_geometry, min_area=min_area, min_length=0.0,
         ):
             records.append({
                 "change_typ": change_type,
@@ -1489,13 +1543,15 @@ def detect_fast_changes(
     minimum_area = max(0.0, float(min_change_area))
     minimum_length = max(0.0, float(min_change_length))
     record_groups = {
-        "added": _fast_surface_change_records(
-            after_surfaces, before_surfaces, tolerance=tolerance,
+        "added": _fast_centerline_change_records(
+            after_centerlines, before_centerlines, after_surfaces,
+            tolerance=tolerance,
             change_type="added", before_period=before_period, after_period=after_period,
             min_area=minimum_area, min_length=minimum_length,
         ),
-        "removed": _fast_surface_change_records(
-            before_surfaces, after_surfaces, tolerance=tolerance,
+        "removed": _fast_centerline_change_records(
+            before_centerlines, after_centerlines, before_surfaces,
+            tolerance=tolerance,
             change_type="removed", before_period=before_period, after_period=after_period,
             min_area=minimum_area, min_length=minimum_length,
         ),
@@ -1506,7 +1562,7 @@ def detect_fast_changes(
         absolute_threshold=max(0.0, float(width_change_absolute)),
         ratio_threshold=max(0.0, float(width_change_ratio)),
         before_period=before_period, after_period=after_period,
-        min_area=minimum_area, min_length=minimum_length,
+        min_area=minimum_area,
     )
     record_groups["widened"] = [
         record for record in width_records if record["change_typ"] == "widened"
@@ -1560,6 +1616,9 @@ def detect_fast_changes(
         "automatic_result": True,
         "before_period": str(before_period), "after_period": str(after_period),
         "position_tolerance_m": tolerance,
+        "existing_coverage_threshold": FAST_CHANGE_EXISTING_COVERAGE,
+        "candidate_coverage_threshold": FAST_CHANGE_CANDIDATE_COVERAGE,
+        "minimum_continuous_length_m": minimum_length,
         "width_change_absolute_m": float(width_change_absolute),
         "width_change_ratio": float(width_change_ratio),
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
