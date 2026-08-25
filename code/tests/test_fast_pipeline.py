@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import box
+from shapely.geometry import LineString, box
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,7 @@ from engine.fast_pipeline import (
     build_fast_change_from_truth,
     build_fast_surface_mask,
     build_fast_surfaces,
+    detect_fast_changes,
     export_fast_products,
     measure_fast_edge_widths,
     measure_fast_path_widths,
@@ -64,6 +65,27 @@ class FastCommandTests(unittest.TestCase):
             fast = build_pipeline_command(**common, execution_profile="fast")
             self.assertNotIn("--execution-profile", full)
             self.assertEqual(fast[fast.index("--execution-profile") + 1], "fast")
+
+    def test_fast_command_allows_missing_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            area = root / "area.shp"
+            before = root / "2021.txt"
+            after = root / "2022.txt"
+            for path in (area, before, after):
+                path.touch()
+            command = build_pipeline_command(
+                mode="validation", output_root=str(root / "output"),
+                checkpoint="model.pth", config="config.yml", device="cpu",
+                pixel_size="1", rescale="off", absolute="2", ratio="0.2",
+                tolerance="3", validation_area=str(area),
+                periods=[("2021", str(before)), ("2022", str(after))],
+                truths=[], execution_profile="fast", runtime_preflight=False,
+            )
+            self.assertEqual(
+                command[command.index("--execution-profile") + 1], "fast",
+            )
+            self.assertNotIn("--truth", command)
 
     def test_fast_resume_requires_probability_and_native_topology(self) -> None:
         outputs = required_image_outputs(Path("output"), "tile", "fast")
@@ -371,6 +393,63 @@ class FastTruthChangeTests(unittest.TestCase):
                 self.assertTrue(classified.empty or (classified["change_typ"] == type_name).all())
                 classified_count += len(classified)
             self.assertEqual(classified_count, len(combined))
+
+
+class FastAutomaticChangeTests(unittest.TestCase):
+    def test_added_removed_width_changes_and_small_shift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before_lines = [
+                LineString([(0, 0), (30, 0)]),
+                LineString([(0, 20), (30, 20)]),
+                LineString([(0, 40), (30, 40)]),
+                LineString([(0, 60), (30, 60)]),
+            ]
+            after_lines = [
+                LineString([(0, 20), (30, 20)]),
+                LineString([(0, 40), (30, 40)]),
+                LineString([(0, 61), (30, 61)]),
+                LineString([(0, 80), (30, 80)]),
+            ]
+            before_widths = [4.0, 4.0, 8.0, 4.0]
+            after_widths = [8.0, 4.0, 4.0, 4.0]
+
+            def write_period(name, lines, widths):
+                directory = root / name
+                directory.mkdir()
+                centerlines = directory / "road_centerlines.shp"
+                surfaces = directory / "road_surfaces.shp"
+                gpd.GeoDataFrame(
+                    {"width_m": widths}, geometry=lines, crs="EPSG:3857",
+                ).to_file(centerlines)
+                gpd.GeoDataFrame(
+                    {"source": ["fast"] * len(lines)},
+                    geometry=[line.buffer(width / 2.0) for line, width in zip(lines, widths)],
+                    crs="EPSG:3857",
+                ).to_file(surfaces)
+                return {"centerlines": str(centerlines), "surfaces": str(surfaces)}
+
+            before_result = write_period("before", before_lines, before_widths)
+            after_result = write_period("after", after_lines, after_widths)
+            result = detect_fast_changes(
+                before_result, after_result,
+                root / "changes", before_period="2021", after_period="2022",
+                position_tolerance=2.0, width_change_absolute=2.0,
+                width_change_ratio=0.2,
+            )
+            for change_type in ("added", "removed", "widened", "narrowed"):
+                self.assertGreater(len(gpd.read_file(result["layers"][change_type])), 0)
+            changes = gpd.read_file(result["road_changes"])
+            shifted_road_area = box(-5, 55, 35, 65)
+            self.assertFalse(changes.geometry.intersects(shifted_road_area).any())
+            self.assertTrue(result["automatic_result"])
+            self.assertFalse(result["ground_truth_derived"])
+            stable = detect_fast_changes(
+                after_result, after_result, root / "stable_changes",
+                before_period="2021", after_period="2022",
+                position_tolerance=2.0,
+            )
+            self.assertTrue(gpd.read_file(stable["road_changes"]).empty)
 
 
 if __name__ == "__main__":

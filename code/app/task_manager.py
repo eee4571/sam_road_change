@@ -214,7 +214,10 @@ def build_pipeline_command(
             (name, before, after) for name, _area in normalized_areas
             for before, after in pairs_by_area[name]
         }
-        if evaluate and (set(truth_map) != expected_truths or any(not truth_map.get(key) for key in expected_truths)):
+        if (
+            evaluate and execution_profile != "fast"
+            and (set(truth_map) != expected_truths or any(not truth_map.get(key) for key in expected_truths))
+        ):
             missing = [f"{name} / {before} → {after}" for name, before, after in sorted(expected_truths) if not truth_map.get((name, before, after))]
             raise ValueError("请为每个相邻期次选择变化真值：" + "、".join(missing or ["期次对应关系不一致"]))
         for name, area in normalized_areas:
@@ -244,8 +247,6 @@ def build_pipeline_command(
         if truth_map and str(truth_type_field).strip():
             args.extend(("--truth-type-field", str(truth_type_field).strip()))
     elif mode == "grid":
-        if execution_profile == "fast":
-            raise ValueError("快速模式需要规范项目中为每个相邻期次配置变化真值。")
         source = Path(str(source_root).strip()).expanduser()
         if not source.is_dir():
             raise ValueError("请选择存在的格网数据根目录。")

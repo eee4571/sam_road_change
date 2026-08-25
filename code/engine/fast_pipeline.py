@@ -35,6 +35,9 @@ FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.02
 FAST_CHANGE_SHIFT_MAX_PX = 1.5
 FAST_CHANGE_BUFFER_JITTER_PX = 1.0
 FAST_CHANGE_TYPE_ERROR_PROB = 0.03
+FAST_CHANGE_MIN_AREA_M2 = 4.0
+FAST_CHANGE_MIN_LENGTH_M = 5.0
+FAST_CHANGE_MIN_MATCH_OVERLAP = 0.25
 
 
 @dataclass(frozen=True)
@@ -1240,6 +1243,341 @@ def build_fast_change_from_truth(
     )
     return {
         "output": str(output_dir.resolve()), "summary": str(summary_path.resolve()),
+        "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
+        "layers": output_layers,
+        "previews": {"change": str(preview_path.resolve())},
+        "road_change": str(preview_path.resolve()),
+        **summary,
+    }
+
+
+def _load_fast_period_result(result: Path | dict) -> dict:
+    if isinstance(result, dict):
+        return dict(result)
+    path = Path(result).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Fast period result is missing: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_fast_change_layer(
+    result: dict,
+    primary: str,
+    *fallbacks: str,
+) -> gpd.GeoDataFrame:
+    empty_frame = None
+    for key in (primary, *fallbacks):
+        value = str(result.get(key) or "").strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if path.is_file():
+            frame = gpd.read_file(path)
+            if frame.crs is None:
+                raise ValueError(f"Fast {key} layer lacks CRS: {path}")
+            frame = frame.loc[frame.geometry.notna() & ~frame.geometry.is_empty].copy()
+            if not frame.empty:
+                return frame
+            empty_frame = frame
+    if empty_frame is not None:
+        return empty_frame
+    names = ", ".join((primary, *fallbacks))
+    raise FileNotFoundError(f"Fast period result lacks usable layer: {names}")
+
+
+def _align_fast_change_frame(
+    frame: gpd.GeoDataFrame,
+    crs,
+) -> gpd.GeoDataFrame:
+    return frame if frame.crs == crs else frame.to_crs(crs)
+
+
+def _fast_change_parts(
+    geometry,
+    *,
+    min_area: float,
+    min_length: float,
+) -> list:
+    geometry = make_valid(geometry)
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Polygon":
+        minx, miny, maxx, maxy = geometry.bounds
+        extent = max(float(maxx - minx), float(maxy - miny))
+        return [geometry] if float(geometry.area) >= min_area and extent >= min_length else []
+    if hasattr(geometry, "geoms"):
+        return [
+            part
+            for child in geometry.geoms
+            for part in _fast_change_parts(
+                child, min_area=min_area, min_length=min_length,
+            )
+        ]
+    return []
+
+
+def _fast_surface_change_records(
+    source: gpd.GeoDataFrame,
+    reference: gpd.GeoDataFrame,
+    *,
+    tolerance: float,
+    change_type: str,
+    before_period: str,
+    after_period: str,
+    min_area: float,
+    min_length: float,
+) -> list[dict]:
+    if source.empty:
+        return []
+    source_union = source.geometry.union_all()
+    difference = (
+        source_union
+        if reference.empty else
+        source_union.difference(reference.geometry.union_all().buffer(tolerance))
+    )
+    return [{
+        "change_typ": change_type,
+        "before_per": str(before_period),
+        "after_per": str(after_period),
+        "source": "fast_automatic",
+        "width_bef": np.nan,
+        "width_aft": np.nan,
+        "width_diff": np.nan,
+        "geometry": part,
+    } for part in _fast_change_parts(
+        difference, min_area=min_area, min_length=min_length,
+    )]
+
+
+def _fast_width_value(row) -> float:
+    for field in ("width_m", "width_map", "width_units"):
+        try:
+            value = float(row.get(field, np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0:
+            return value
+    return 0.0
+
+
+def _fast_width_change_records(
+    before: gpd.GeoDataFrame,
+    after: gpd.GeoDataFrame,
+    *,
+    tolerance: float,
+    absolute_threshold: float,
+    ratio_threshold: float,
+    before_period: str,
+    after_period: str,
+    min_area: float,
+    min_length: float,
+) -> list[dict]:
+    if before.empty or after.empty:
+        return []
+    spatial_index = after.sindex
+    used_after: set[int] = set()
+    records: list[dict] = []
+    for _before_index, before_row in before.iterrows():
+        before_line = before_row.geometry
+        if before_line is None or before_line.is_empty or before_line.length <= 0:
+            continue
+        candidates = spatial_index.query(before_line.buffer(tolerance), predicate="intersects")
+        best = None
+        for after_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
+            if after_position in used_after:
+                continue
+            after_row = after.iloc[after_position]
+            after_line = after_row.geometry
+            if after_line is None or after_line.is_empty or after_line.length <= 0:
+                continue
+            distance = float(before_line.distance(after_line))
+            if distance > tolerance:
+                continue
+            overlap_length = min(
+                float(before_line.intersection(after_line.buffer(tolerance)).length),
+                float(after_line.intersection(before_line.buffer(tolerance)).length),
+            )
+            overlap_ratio = overlap_length / max(
+                min(float(before_line.length), float(after_line.length)), 1e-9,
+            )
+            if overlap_ratio < FAST_CHANGE_MIN_MATCH_OVERLAP:
+                continue
+            score = (overlap_ratio, -distance)
+            if best is None or score > best[0]:
+                best = (score, after_position, after_row)
+        if best is None:
+            continue
+        _score, after_position, after_row = best
+        used_after.add(after_position)
+        before_width = _fast_width_value(before_row)
+        after_width = _fast_width_value(after_row)
+        if before_width <= 0 or after_width <= 0:
+            continue
+        width_delta = after_width - before_width
+        relative_delta = abs(width_delta) / max(before_width, 1e-9)
+        if (
+            abs(width_delta) < absolute_threshold
+            or relative_delta < ratio_threshold
+        ):
+            continue
+        widened = width_delta > 0
+        axis = after_row.geometry if widened else before_row.geometry
+        outer_width = after_width if widened else before_width
+        inner_width = before_width if widened else after_width
+        change_geometry = axis.buffer(outer_width / 2.0).difference(
+            axis.buffer(inner_width / 2.0)
+        )
+        change_type = "widened" if widened else "narrowed"
+        for part in _fast_change_parts(
+            change_geometry, min_area=min_area, min_length=min_length,
+        ):
+            records.append({
+                "change_typ": change_type,
+                "before_per": str(before_period),
+                "after_per": str(after_period),
+                "source": "fast_automatic",
+                "width_bef": float(before_width),
+                "width_aft": float(after_width),
+                "width_diff": float(width_delta),
+                "geometry": part,
+            })
+    return records
+
+
+def detect_fast_changes(
+    before_result: Path | dict,
+    after_result: Path | dict,
+    output_dir: Path,
+    *,
+    before_period: str = "before",
+    after_period: str = "after",
+    position_tolerance: float = 3.0,
+    width_change_absolute: float = 2.0,
+    width_change_ratio: float = 0.2,
+    min_change_area: float = FAST_CHANGE_MIN_AREA_M2,
+    min_change_length: float = FAST_CHANGE_MIN_LENGTH_M,
+) -> dict:
+    """Run the lightweight, rule-based Fast change detector without truth."""
+    before_payload = _load_fast_period_result(before_result)
+    after_payload = _load_fast_period_result(after_result)
+    before_surfaces = _read_fast_change_layer(before_payload, "surfaces", "corridors")
+    after_surfaces = _align_fast_change_frame(
+        _read_fast_change_layer(after_payload, "surfaces", "corridors"),
+        before_surfaces.crs,
+    )
+    before_centerlines = _align_fast_change_frame(
+        _read_fast_change_layer(before_payload, "centerlines", "width_segments"),
+        before_surfaces.crs,
+    )
+    after_centerlines = _align_fast_change_frame(
+        _read_fast_change_layer(after_payload, "centerlines", "width_segments"),
+        before_surfaces.crs,
+    )
+    if not any(field in before_centerlines.columns for field in ("width_m", "width_map", "width_units")):
+        before_centerlines = _align_fast_change_frame(
+            _read_fast_change_layer(before_payload, "width_segments"),
+            before_surfaces.crs,
+        )
+    if not any(field in after_centerlines.columns for field in ("width_m", "width_map", "width_units")):
+        after_centerlines = _align_fast_change_frame(
+            _read_fast_change_layer(after_payload, "width_segments"),
+            before_surfaces.crs,
+        )
+    after_centerlines = _align_fast_change_frame(after_centerlines, before_surfaces.crs)
+
+    tolerance = max(0.0, float(position_tolerance))
+    minimum_area = max(0.0, float(min_change_area))
+    minimum_length = max(0.0, float(min_change_length))
+    record_groups = {
+        "added": _fast_surface_change_records(
+            after_surfaces, before_surfaces, tolerance=tolerance,
+            change_type="added", before_period=before_period, after_period=after_period,
+            min_area=minimum_area, min_length=minimum_length,
+        ),
+        "removed": _fast_surface_change_records(
+            before_surfaces, after_surfaces, tolerance=tolerance,
+            change_type="removed", before_period=before_period, after_period=after_period,
+            min_area=minimum_area, min_length=minimum_length,
+        ),
+    }
+    width_records = _fast_width_change_records(
+        before_centerlines, after_centerlines,
+        tolerance=tolerance,
+        absolute_threshold=max(0.0, float(width_change_absolute)),
+        ratio_threshold=max(0.0, float(width_change_ratio)),
+        before_period=before_period, after_period=after_period,
+        min_area=minimum_area, min_length=minimum_length,
+    )
+    record_groups["widened"] = [
+        record for record in width_records if record["change_typ"] == "widened"
+    ]
+    record_groups["narrowed"] = [
+        record for record in width_records if record["change_typ"] == "narrowed"
+    ]
+    record_groups["width_changed"] = []
+    columns = {
+        "change_typ": [], "before_per": [], "after_per": [], "source": [],
+        "width_bef": [], "width_aft": [], "width_diff": [],
+    }
+
+    def frame_from(records: list[dict]) -> gpd.GeoDataFrame:
+        if records:
+            return gpd.GeoDataFrame(records, geometry="geometry", crs=before_surfaces.crs)
+        return gpd.GeoDataFrame(
+            columns.copy(), geometry=gpd.GeoSeries([], crs=before_surfaces.crs),
+            crs=before_surfaces.crs,
+        )
+
+    typed_layers = {name: frame_from(records) for name, records in record_groups.items()}
+    all_records = [
+        record for name in ("added", "removed", "widened", "narrowed")
+        for record in record_groups[name]
+    ]
+    changes = frame_from(all_records)
+    layers = {"changes": changes, **typed_layers}
+    filenames = {
+        "changes": "road_changes.shp", "added": "added_roads.shp",
+        "removed": "removed_roads.shp", "width_changed": "width_changed_road_parts.shp",
+        "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp",
+    }
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    gpkg = output_dir / "road_changes.gpkg"
+    gpkg.unlink(missing_ok=True)
+    output_layers = {}
+    for index, (name, frame) in enumerate(layers.items()):
+        target = output_dir / filenames[name]
+        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
+        frame.to_file(
+            gpkg, layer="road_changes" if name == "changes" else name,
+            driver="GPKG", mode="w" if index == 0 else "a",
+        )
+        output_layers[name] = str(target.resolve())
+
+    summary = {
+        "execution_profile": "fast", "change_source": "fast_automatic",
+        "ground_truth_derived": False, "change_output_mode": "fast_automatic",
+        "automatic_result": True,
+        "before_period": str(before_period), "after_period": str(after_period),
+        "position_tolerance_m": tolerance,
+        "width_change_absolute_m": float(width_change_absolute),
+        "width_change_ratio": float(width_change_ratio),
+        **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
+    }
+    summary_path = output_dir / "change_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if str(WIDTH_ROOT) not in sys.path:
+        sys.path.insert(0, str(WIDTH_ROOT))
+    from road_change_detection import render_change_preview  # noqa: PLC0415
+
+    preview_path = output_dir / "change_preview.png"
+    render_change_preview(
+        preview_path, changes, _empty_like(changes),
+        title=f"Fast Automatic Road Changes: {before_period} to {after_period}",
+        empty_message="No Fast road changes detected",
+    )
+    return {
+        "output": str(output_dir), "summary": str(summary_path.resolve()),
         "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
         "layers": output_layers,
         "previews": {"change": str(preview_path.resolve())},

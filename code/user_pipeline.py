@@ -1302,11 +1302,15 @@ def change_project_periods(args: argparse.Namespace) -> dict:
     if any(not math.isfinite(value) or value < 0 for value in thresholds.values()):
         raise ValueError("变化检测阈值必须是非负有限数值")
 
-    before_result_path, _before = _period_result_from_state(
+    before_result_path, before_result = _period_result_from_state(
         args.before_state, discovered["project_root"], args.area_id, args.before_period,
     )
-    after_result_path, _after = _period_result_from_state(
+    after_result_path, after_result = _period_result_from_state(
         args.after_state, discovered["project_root"], args.area_id, args.after_period,
+    )
+    fast_profile = (
+        str(before_result.get("execution_profile") or "full") == "fast"
+        and str(after_result.get("execution_profile") or "full") == "fast"
     )
     output_root = Path(discovered["output_root"])
     layout = project_layout(output_root, discovered["project_root"])
@@ -1322,6 +1326,7 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         "before_state": str(Path(args.before_state).expanduser().resolve()), "after_state": str(Path(args.after_state).expanduser().resolve()),
         "absolute": str(args.absolute), "ratio": str(args.ratio), "tolerance": str(args.tolerance),
         "truth": truth_entry["source"] if truth_entry else "",
+        "execution_profile": "fast" if fast_profile else "full",
     }
     resume = bool(args.resume)
     prior = read_json(state_path) if resume and state_path.is_file() else {}
@@ -1349,6 +1354,26 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         if resume and prior_result and _change_result_ready(prior_result) and complete_layers:
             result = dict(prior_result)
             emit("pipeline", stage="两期宽度变化检测", status="skipped", reason="续跑复用已完成且完整的变化成果", completed=3, total=3)
+        elif fast_profile:
+            from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
+
+            if truth_entry:
+                result = build_fast_change_from_truth(
+                    Path(truth_entry["source"]), products,
+                    period_key=f"{args.area_id}:{args.before_period}->{args.after_period}",
+                    validation_area=Path(area["validation_area"]),
+                    truth_type_field="BHBM",
+                    before_period=args.before_period, after_period=args.after_period,
+                )
+            else:
+                result = detect_fast_changes(
+                    before_result_path, after_result_path, products,
+                    before_period=args.before_period, after_period=args.after_period,
+                    position_tolerance=thresholds["tolerance"],
+                    width_change_absolute=thresholds["absolute"],
+                    width_change_ratio=thresholds["ratio"],
+                )
+            result = _ensure_change_manifest_fields(result, products)
         else:
             result = change(argparse.Namespace(
                 before_result=str(before_result_path), after_result=str(after_result_path), output=str(products),
@@ -3261,7 +3286,13 @@ def _task_input_spec(
         "ratio": str(args.ratio),
         "tolerance": str(args.tolerance),
         "truth_type_field": str(getattr(args, "truth_type_field", "") or ""),
-        "evaluation_enabled": not bool(getattr(args, "no_evaluation", False)),
+        "evaluation_enabled": (
+            not bool(getattr(args, "no_evaluation", False))
+            and (
+                str(getattr(args, "execution_profile", "full") or "full") != "fast"
+                or bool(truth_by_pair)
+            )
+        ),
     }
 
 
@@ -3743,18 +3774,29 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     spec = manifest.get("input_spec") or {}
     started = time.monotonic()
     if str(manifest.get("execution_profile") or "full") == "fast":
-        from engine.fast_pipeline import build_fast_change_from_truth
+        from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
 
-        truth = Path(str(old.get("truth") or "")).expanduser()
-        if not truth.is_file():
-            raise FileNotFoundError(f"Fast 变化成果缺少真值：{grid} / {before} → {after}")
+        truth_value = str(old.get("truth") or "").strip()
         validation_value = str(old.get("validation_area") or "")
-        result = _ensure_change_manifest_fields(build_fast_change_from_truth(
-            truth, output, period_key=f"{grid}:{before}->{after}",
-            validation_area=Path(validation_value) if validation_value else None,
-            truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
-            before_period=before, after_period=after,
-        ), output)
+        if truth_value:
+            truth_path = Path(truth_value).expanduser()
+            if not truth_path.is_file():
+                raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
+            result = build_fast_change_from_truth(
+                truth_path, output, period_key=f"{grid}:{before}->{after}",
+                validation_area=Path(validation_value) if validation_value else None,
+                truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
+                before_period=before, after_period=after,
+            )
+        else:
+            result = detect_fast_changes(
+                Path(str(before_entry["result"])), Path(str(after_entry["result"])), output,
+                before_period=before, after_period=after,
+                position_tolerance=float(spec.get("tolerance") or old.get("tolerance") or 3.0),
+                width_change_absolute=float(spec.get("absolute") or old.get("absolute") or 2.0),
+                width_change_ratio=float(spec.get("ratio") or old.get("ratio") or 0.2),
+            )
+        result = _ensure_change_manifest_fields(result, output)
     else:
         result = _ensure_change_manifest_fields(change(argparse.Namespace(
             before_result=str(before_entry["result"]), after_result=str(after_entry["result"]),
@@ -3810,6 +3852,8 @@ def _evaluate_fast_manifest_pairs(
             and str(item.get("before_period")) == before
             and str(item.get("after_period")) == after
         )
+        if not str(entry.get("truth") or "").strip():
+            continue
         evaluate_existing_changes(argparse.Namespace(
             pipeline_manifest=str(manifest_path), grid=grid, before_period=before,
             after_period=after, truth=str(entry.get("truth") or ""),
@@ -3985,8 +4029,6 @@ def run_all(args: argparse.Namespace) -> dict:
     execution_profile = str(getattr(args, "execution_profile", "full") or "full").casefold()
     if execution_profile not in {"full", "fast"}:
         raise ValueError("--execution-profile 必须是 full 或 fast")
-    if execution_profile == "fast" and bool(getattr(args, "no_evaluation", False)):
-        raise ValueError("Fast 快速模式必须配置变化真值并执行现有精度评价，不能使用 --no-evaluation。")
     validation_area: str | dict[str, str] = ""
     truth_by_pair: dict[tuple, Path] = {}
     source_root = None
@@ -3995,8 +4037,6 @@ def run_all(args: argparse.Namespace) -> dict:
         truth_by_pair = truth_by_task
         validation_area = validation_areas
     else:
-        if execution_profile == "fast":
-            raise ValueError("Fast 快速模式需要逐相邻期配置变化真值，当前仅支持 validation 项目模式。")
         source_value = str(getattr(args, "source_root", "") or "").strip()
         if not source_value:
             raise ValueError("格网模式必须提供 --source-root PATH")
@@ -4178,6 +4218,14 @@ def run_all(args: argparse.Namespace) -> dict:
                 reused=True, completed=1, total=1,
             )
             return prior
+    fast_change_pair_count = sum(
+        max(0, len(periods) - 1) for periods in grids.values()
+    )
+    fast_change_source = (
+        "fast_automatic" if not truth_by_pair else
+        "synthetic_from_truth" if len(truth_by_pair) == fast_change_pair_count else
+        "fast_truth_or_automatic"
+    )
     manifest = {
         "pipeline_version": PIPELINE_VERSION,
         "run_id": run_id,
@@ -4189,7 +4237,7 @@ def run_all(args: argparse.Namespace) -> dict:
         "road_extraction_source": "samroad_fast" if execution_profile == "fast" else "samroad",
         "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
         "width_source": "fast_measured" if execution_profile == "fast" else "full_measured",
-        "change_source": "ground_truth" if execution_profile == "fast" else "automatic_detection",
+        "change_source": fast_change_source if execution_profile == "fast" else "automatic_detection",
         "source_root": str(source_root) if source_root is not None else "",
         "validation_area": (
             next(iter(validation_area.values())) if isinstance(validation_area, dict) and len(validation_area) == 1
@@ -4197,7 +4245,10 @@ def run_all(args: argparse.Namespace) -> dict:
         ),
         "validation_areas": validation_area if isinstance(validation_area, dict) else {},
         "truth_type_field": str(getattr(args, "truth_type_field", "") or ""),
-        "evaluation_enabled": not bool(getattr(args, "no_evaluation", False)),
+        "evaluation_enabled": (
+            not bool(getattr(args, "no_evaluation", False))
+            and (execution_profile != "fast" or bool(truth_by_pair))
+        ),
         "job_root": str(job_root),
         "input_spec": input_spec,
         "provenance": {
@@ -4423,17 +4474,28 @@ def run_all(args: argparse.Namespace) -> dict:
                         validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area
                     )
                     if execution_profile == "fast":
-                        from engine.fast_pipeline import build_fast_change_from_truth
+                        from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
 
-                        if not truth_value:
-                            raise ValueError(f"Fast 变化成果缺少真值：{grid_name} / {before_period} → {after_period}")
-                        result = _ensure_change_manifest_fields(build_fast_change_from_truth(
-                            Path(truth_value), change_output,
-                            period_key=f"{grid_name}:{before_period}->{after_period}",
-                            validation_area=Path(validation_value) if validation_value else None,
-                            truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
-                            before_period=before_period, after_period=after_period,
-                        ), change_output)
+                        if truth_value:
+                            result = build_fast_change_from_truth(
+                                Path(truth_value), change_output,
+                                period_key=f"{grid_name}:{before_period}->{after_period}",
+                                validation_area=Path(validation_value) if validation_value else None,
+                                truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
+                                before_period=before_period, after_period=after_period,
+                            )
+                        else:
+                            result = detect_fast_changes(
+                                Path(str(before_entry["result"])),
+                                Path(str(after_entry["result"])),
+                                change_output,
+                                before_period=before_period,
+                                after_period=after_period,
+                                position_tolerance=float(args.tolerance),
+                                width_change_absolute=float(args.absolute),
+                                width_change_ratio=float(args.ratio),
+                            )
+                        result = _ensure_change_manifest_fields(result, change_output)
                     else:
                         result = _ensure_change_manifest_fields(change(
                             argparse.Namespace(
@@ -4462,7 +4524,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     )
                     if published:
                         entry["published"] = published
-                    if execution_profile == "fast":
+                    if execution_profile == "fast" and truth_value:
                         _persist_pipeline(manifest, job_root, output_root)
                         evaluate_existing_changes(argparse.Namespace(
                             pipeline_manifest=str(job_root / "pipeline_result.json"), grid=grid_name,
