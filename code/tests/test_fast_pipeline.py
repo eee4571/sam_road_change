@@ -31,6 +31,7 @@ from engine.fast_pipeline import (
     measure_fast_path_widths,
     measure_fast_widths,
     _build_fast_road_geometry,
+    _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
     _remove_short_isolated_skeleton_components,
@@ -195,13 +196,47 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         score[43:50, 50] = 0.6
         paths = _trace_skeleton_paths(skeleton, score)
         kept, removed = _cleanup_road_paths(paths)
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed["spur"], 1)
         self.assertEqual(len(kept), 2)
 
         score[43:50, 50] = 1.8
         kept, removed = _cleanup_road_paths(_trace_skeleton_paths(skeleton, score))
-        self.assertEqual(removed, 0)
+        self.assertEqual(removed["total"], 0)
         self.assertEqual(len(kept), 3)
+
+    def test_gap_bridge_happens_before_short_fragment_cleanup(self) -> None:
+        skeleton = np.zeros((50, 70), dtype=np.uint8)
+        skeleton[25, 8:22] = 1
+        skeleton[25, 26:42] = 1
+        paths = _trace_skeleton_paths(skeleton)
+        support = np.zeros_like(skeleton)
+        support[25, 8:42] = 1
+        bridged, bridge_count = _bridge_small_supported_gaps(skeleton, paths, support)
+        self.assertEqual(bridge_count, 1)
+        bridged_paths = _trace_skeleton_paths(bridged)
+        kept, removed = _cleanup_road_paths(bridged_paths)
+        self.assertEqual(removed["isolated"], 0)
+        self.assertEqual(len(kept), 1)
+        self.assertGreater(kept[0].length_px, 30.0)
+
+    def test_small_weak_loop_is_removed_at_path_level(self) -> None:
+        skeleton = np.zeros((50, 50), dtype=np.uint8)
+        cv2.circle(skeleton, (25, 25), 3, 1, 1)
+        score = np.full_like(skeleton, 0.7, dtype=np.float32)
+        paths = _trace_skeleton_paths(skeleton, score)
+        kept, removed = _cleanup_road_paths(paths)
+        self.assertEqual(removed["loop"], 1)
+        self.assertEqual(len(kept), 0)
+
+    def test_gap_bridge_rejects_missing_support(self) -> None:
+        skeleton = np.zeros((50, 70), dtype=np.uint8)
+        skeleton[25, 8:22] = 1
+        skeleton[25, 26:42] = 1
+        paths = _trace_skeleton_paths(skeleton)
+        _bridged, bridge_count = _bridge_small_supported_gaps(
+            skeleton, paths, np.zeros_like(skeleton),
+        )
+        self.assertEqual(bridge_count, 0)
 
     def test_centerline_is_derived_from_regularized_surface(self) -> None:
         probability = np.full((100, 100), 0.04, dtype=np.float32)

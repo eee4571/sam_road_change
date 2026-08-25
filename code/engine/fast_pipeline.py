@@ -24,6 +24,8 @@ FAST_SCALE_SUPPORT_THRESHOLD = 0.50
 FAST_MIN_SKELETON_COMPONENT_LENGTH_PX = 20.0
 FAST_MAX_WEAK_SPUR_LENGTH_PX = 8.0
 FAST_WEAK_SPUR_CONFIDENCE_RATIO = 0.80
+FAST_GAP_BRIDGE_DISTANCE_PX = 8.0
+FAST_SMALL_LOOP_LENGTH_PX = 24.0
 
 
 @dataclass(frozen=True)
@@ -320,19 +322,133 @@ def _paths_to_skeleton(paths: list[FastRoadPath], shape_: tuple[int, int]) -> np
     skeleton = np.zeros(shape_, dtype=np.uint8)
     for path in paths:
         points = np.rint(path.pixels).astype(np.int32)
-        skeleton[points[:, 0], points[:, 1]] = 1
+        if points.shape[0] == 1:
+            skeleton[points[0, 0], points[0, 1]] = 1
+            continue
+        for first, second in zip(points, points[1:]):
+            cv2.line(
+                skeleton,
+                (int(first[1]), int(first[0])),
+                (int(second[1]), int(second[0])),
+                1,
+                1,
+            )
     return skeleton
 
 
-def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], int]:
-    """Remove only short endpoint branches clearly weaker than their main path."""
+def _endpoint_direction(path: FastRoadPath, at_start: bool) -> np.ndarray:
+    points = np.asarray(path.pixels, dtype=np.float32)
+    step = min(5, points.shape[0] - 1)
+    vector = points[0] - points[step] if at_start else points[-1] - points[-1 - step]
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else vector
+
+
+def _bridge_small_supported_gaps(
+    skeleton: np.ndarray,
+    paths: list[FastRoadPath],
+    bridge_support: np.ndarray,
+    max_distance_px: float = FAST_GAP_BRIDGE_DISTANCE_PX,
+) -> tuple[np.ndarray, int]:
+    """Bridge close facing endpoints from different components using local support."""
+    endpoints: list[tuple[tuple[int, int], np.ndarray, int]] = []
+    for path in paths:
+        if path.start_degree == 1:
+            endpoints.append((
+                tuple(np.rint(path.pixels[0]).astype(int)),
+                _endpoint_direction(path, True), path.component_id,
+            ))
+        if path.end_degree == 1:
+            endpoints.append((
+                tuple(np.rint(path.pixels[-1]).astype(int)),
+                _endpoint_direction(path, False), path.component_id,
+            ))
+    if len(endpoints) < 2:
+        return (np.asarray(skeleton) > 0).astype(np.uint8), 0
+    cell_size = max(1, int(np.ceil(max_distance_px)))
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for endpoint_id, (point, _direction, _component_id) in enumerate(endpoints):
+        buckets.setdefault((point[0] // cell_size, point[1] // cell_size), []).append(endpoint_id)
+    support = cv2.dilate(
+        (np.asarray(bridge_support) > 0).astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+    ) > 0
+    direction_cosine = float(np.cos(np.deg2rad(35.0)))
+    candidates: list[tuple[float, int, int]] = []
+    for first_id, (first, first_direction, first_component) in enumerate(endpoints):
+        bucket = (first[0] // cell_size, first[1] // cell_size)
+        nearby: list[int] = []
+        for drow in (-1, 0, 1):
+            for dcol in (-1, 0, 1):
+                nearby.extend(buckets.get((bucket[0] + drow, bucket[1] + dcol), []))
+        for second_id in nearby:
+            if second_id <= first_id:
+                continue
+            second, second_direction, second_component = endpoints[second_id]
+            if first_component == second_component:
+                continue
+            delta = np.asarray(second, dtype=np.float32) - np.asarray(first, dtype=np.float32)
+            distance = float(np.linalg.norm(delta))
+            if distance < 2.0 or distance > float(max_distance_px):
+                continue
+            connector = delta / distance
+            if (
+                float(np.dot(first_direction, connector)) < direction_cosine
+                or float(np.dot(second_direction, -connector)) < direction_cosine
+            ):
+                continue
+            sample_count = max(3, int(np.ceil(distance)) + 1)
+            rows = np.rint(np.linspace(first[0], second[0], sample_count)).astype(np.int32)
+            cols = np.rint(np.linspace(first[1], second[1], sample_count)).astype(np.int32)
+            if float(np.mean(support[rows, cols])) < 0.60:
+                continue
+            candidates.append((distance, first_id, second_id))
+    bridged = (np.asarray(skeleton) > 0).astype(np.uint8).copy()
+    used: set[int] = set()
+    bridge_count = 0
+    for _distance, first_id, second_id in sorted(candidates):
+        if first_id in used or second_id in used:
+            continue
+        first = endpoints[first_id][0]
+        second = endpoints[second_id][0]
+        cv2.line(bridged, (first[1], first[0]), (second[1], second[0]), 1, 1)
+        used.update((first_id, second_id))
+        bridge_count += 1
+    return bridged, bridge_count
+
+
+def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], dict]:
+    """Remove isolated fragments, weak short spurs, and weak small loops by path."""
     removed: set[int] = set()
+    reasons = {"isolated": 0, "spur": 0, "loop": 0}
+    for path_id, path in enumerate(paths):
+        closed_loop = (
+            path.start_degree == 2 and path.end_degree == 2
+            and float(np.linalg.norm(path.pixels[0] - path.pixels[-1])) <= 1.5
+        )
+        if (
+            closed_loop and path.length_px <= FAST_SMALL_LOOP_LENGTH_PX
+            and path.mean_relative_score < 1.30
+        ):
+            removed.add(path_id)
+            reasons["loop"] += 1
+    component_paths: dict[int, list[int]] = {}
+    for path_id, path in enumerate(paths):
+        component_paths.setdefault(path.component_id, []).append(path_id)
+    for path_ids in component_paths.values():
+        remaining_ids = [path_id for path_id in path_ids if path_id not in removed]
+        total_length = float(sum(paths[path_id].length_px for path_id in remaining_ids))
+        if remaining_ids and total_length < FAST_MIN_SKELETON_COMPONENT_LENGTH_PX:
+            removed.update(remaining_ids)
+            reasons["isolated"] += len(remaining_ids)
     incident: dict[tuple[int, int], list[int]] = {}
     for path_id, path in enumerate(paths):
         for point, degree in ((path.pixels[0], path.start_degree), (path.pixels[-1], path.end_degree)):
             if degree >= 3:
                 incident.setdefault(tuple(np.rint(point).astype(int)), []).append(path_id)
     for path_id, path in enumerate(paths):
+        if path_id in removed:
+            continue
         branch_junction = None
         if path.start_degree == 1 and path.end_degree >= 3:
             branch_junction = tuple(np.rint(path.pixels[-1]).astype(int))
@@ -346,7 +462,9 @@ def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], 
         ]
         if peers and path.mean_relative_score < FAST_WEAK_SPUR_CONFIDENCE_RATIO * max(peers):
             removed.add(path_id)
-    return [path for path_id, path in enumerate(paths) if path_id not in removed], len(removed)
+            reasons["spur"] += 1
+    reasons["total"] = len(removed)
+    return [path for path_id, path in enumerate(paths) if path_id not in removed], reasons
 
 
 def _fill_small_holes(mask: np.ndarray, max_area: int = 64) -> np.ndarray:
@@ -386,18 +504,26 @@ def _build_fast_road_geometry(
     path_started = time.perf_counter()
     raw_skeleton = _skeletonize_mask(final_mask)
     skeleton_component_count = cv2.connectedComponents(raw_skeleton, connectivity=8)[0] - 1
-    skeleton = _remove_short_isolated_skeleton_components(
-        raw_skeleton, min_length_px=FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
-    )
     evidence_score = np.maximum(relative_score, high.astype(np.float32) * 1.30)
-    paths = _trace_skeleton_paths(skeleton, evidence_score)
+    paths = _trace_skeleton_paths(raw_skeleton, evidence_score)
     path_count = len(paths)
-    cleanup_removed = 0
+    bridge_support = (
+        (final_mask > 0)
+        | (relative_score >= FAST_SCALE_SUPPORT_THRESHOLD)
+    ).astype(np.uint8)
+    bridged_skeleton, gap_bridge_count = _bridge_small_supported_gaps(
+        raw_skeleton, paths, bridge_support,
+    )
+    paths = _trace_skeleton_paths(bridged_skeleton, evidence_score)
+    bridged_path_count = len(paths)
+    cleanup_counts = {"isolated": 0, "spur": 0, "loop": 0, "total": 0}
+    cleaned_skeleton = bridged_skeleton
     for _pass in range(2):
         paths, removed = _cleanup_road_paths(paths)
-        cleanup_removed += removed
+        for key in cleanup_counts:
+            cleanup_counts[key] += int(removed[key])
         cleaned_skeleton = _paths_to_skeleton(paths, final_mask.shape)
-        if removed == 0:
+        if removed["total"] == 0:
             break
         paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
     final_paths = _trace_skeleton_paths(cleaned_skeleton, evidence_score)
@@ -409,8 +535,12 @@ def _build_fast_road_geometry(
         "relative_support_component_count": int(support_component_count),
         "skeleton_component_count": int(skeleton_component_count),
         "path_count": int(path_count),
-        "path_cleanup_removed_count": int(cleanup_removed),
-        "gap_bridge_added_count": 0,
+        "bridged_path_count": int(bridged_path_count),
+        "path_cleanup_removed_count": int(cleanup_counts["total"]),
+        "path_cleanup_isolated_count": int(cleanup_counts["isolated"]),
+        "path_cleanup_spur_count": int(cleanup_counts["spur"]),
+        "path_cleanup_loop_count": int(cleanup_counts["loop"]),
+        "gap_bridge_added_count": int(gap_bridge_count),
         "final_centerline_path_count": int(len(final_paths)),
         "final_centerline_length_px": float(sum(path.length_px for path in final_paths)),
         "final_road_surface_count": int(surface_count),
@@ -476,7 +606,10 @@ def build_fast_surfaces(image_dir: Path, probability_dir: Path, output_dir: Path
             f"relative_added={diagnostics['relative_added_pixel_count']}, "
             f"support_components={diagnostics['relative_support_component_count']}, "
             f"paths={diagnostics['path_count']}->{diagnostics['final_centerline_path_count']}, "
-            f"cleanup={diagnostics['path_cleanup_removed_count']}, "
+            f"cleanup={diagnostics['path_cleanup_removed_count']}"
+            f"(isolated={diagnostics['path_cleanup_isolated_count']}, "
+            f"spur={diagnostics['path_cleanup_spur_count']}, "
+            f"loop={diagnostics['path_cleanup_loop_count']}), "
             f"bridges={diagnostics['gap_bridge_added_count']}, "
             f"surfaces={diagnostics['final_road_surface_count']}, "
             f"final={diagnostics['final_mask_pixel_count']}, "
@@ -734,7 +867,12 @@ def measure_fast_widths(
             "final_centerline_length_px": centerline_length_px,
             "relative_support_component_count": int(surface_diagnostics.get("relative_support_component_count", 0)),
             "skeleton_component_count": int(surface_diagnostics.get("skeleton_component_count", 0)),
+            "traced_path_count": int(surface_diagnostics.get("path_count", 0)),
+            "bridged_path_count": int(surface_diagnostics.get("bridged_path_count", 0)),
             "path_cleanup_removed_count": int(surface_diagnostics.get("path_cleanup_removed_count", 0)),
+            "path_cleanup_isolated_count": int(surface_diagnostics.get("path_cleanup_isolated_count", 0)),
+            "path_cleanup_spur_count": int(surface_diagnostics.get("path_cleanup_spur_count", 0)),
+            "path_cleanup_loop_count": int(surface_diagnostics.get("path_cleanup_loop_count", 0)),
             "gap_bridge_added_count": int(surface_diagnostics.get("gap_bridge_added_count", 0)),
             "final_road_surface_count": int(surface_diagnostics.get("final_road_surface_count", 0)),
             "fast_mask_elapsed_seconds": float(surface_diagnostics.get("fast_mask_elapsed_seconds", 0.0)),
