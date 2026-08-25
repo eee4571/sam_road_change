@@ -24,18 +24,10 @@ class RunPage:
             profile_frame, text="标准模式", variable=self.vars["execution_profile"],
             value="full", command=self._execution_profile_changed,
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            profile_frame, text="完整道路提取、道路面、测宽、变化检测和长时序流程",
-            style="Hint.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Radiobutton(
             profile_frame, text="快速模式", variable=self.vars["execution_profile"],
             value="fast", command=self._execution_profile_changed,
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
-        ttk.Label(
-            profile_frame, text="快速道路提取和测宽；变化成果由变化真值生成",
-            style="Hint.TLabel",
-        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(3, 0))
         checklist = ttk.Frame(run_card)
         checklist.pack(fill=X, pady=(0, 6))
         self.preflight_check_labels = []
@@ -50,7 +42,7 @@ class RunPage:
         self.preflight_button = ttk.Button(actions, text="检查数据", command=self.preflight_inputs)
         self.preflight_button.pack(side=LEFT)
         self.run_button = ttk.Button(
-            actions, text="运行完整流程", style="Hero.TButton", command=self.run_all,
+            actions, text="运行快速模式", style="Hero.TButton", command=self.run_all,
         )
         self.run_button.pack(side=RIGHT)
         self.cancel_button = ttk.Button(actions, text="取消任务", command=self.cancel_task)

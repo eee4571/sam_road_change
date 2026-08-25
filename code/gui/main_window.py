@@ -270,7 +270,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             key: StringVar(value=value)
             for key, value in {
                 "mode": "validation",
-                "execution_profile": "full",
+                "execution_profile": "fast",
                 "validation_area": "",
                 "truth_type_field": "",
                 "evaluate": "0",
