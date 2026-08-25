@@ -33,6 +33,7 @@ from engine.fast_pipeline import (
     measure_fast_widths,
     _build_fast_road_geometry,
     _apply_fast_presence_guard,
+    _apply_fast_width_guard,
     _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
@@ -408,7 +409,7 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 LineString([(0, 40), (100, 40)]),
                 LineString([(0, 60), (100, 60)]),
                 LineString([(0, 120), (100, 120)]),
-                *[LineString([(0, y), (100, y)]) for y in (140, 160, 180, 200, 220)],
+                *[LineString([(0, y), (100, y)]) for y in range(140, 340, 20)],
             ]
             after_lines = [
                 LineString([(0, 20), (100, 20)]),
@@ -418,10 +419,10 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 LineString([(50, 80), (100, 80)]),
                 LineString([(0, 100), (10, 100)]),
                 LineString([(50, 120), (150, 120)]),
-                *[LineString([(0, y), (100, y)]) for y in (140, 160, 180, 200, 220)],
+                *[LineString([(0, y), (100, y)]) for y in range(140, 340, 20)],
             ]
-            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0, *([4.0] * 5)]
-            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, *([4.0] * 5)]
+            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0, *([4.0] * 10)]
+            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, *([4.0] * 10)]
 
             def write_period(name, lines, widths):
                 directory = root / name
@@ -429,7 +430,11 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 centerlines = directory / "road_centerlines.shp"
                 surfaces = directory / "road_surfaces.shp"
                 gpd.GeoDataFrame(
-                    {"width_m": widths}, geometry=lines, crs="EPSG:3857",
+                    {
+                        "width_m": widths,
+                        "width_src": ["normal_fast"] * len(lines),
+                    },
+                    geometry=lines, crs="EPSG:3857",
                 ).to_file(centerlines)
                 gpd.GeoDataFrame(
                     {"source": ["fast"] * len(lines)},
@@ -464,6 +469,7 @@ class FastAutomaticChangeTests(unittest.TestCase):
             ):
                 self.assertGreaterEqual(float(summary[timing_key]), 0.0)
             self.assertEqual(summary["presence_guard_mode"], "normal")
+            self.assertEqual(summary["width_guard_mode"], "normal")
             stable = detect_fast_changes(
                 after_result, after_result, root / "stable_changes",
                 before_period="2021", after_period="2022",
@@ -496,11 +502,14 @@ class FastAutomaticChangeTests(unittest.TestCase):
 
     def test_width_match_rejects_crossing_and_large_length_mismatch(self) -> None:
         before = gpd.GeoDataFrame(
-            {"width_m": [4.0]},
+            {"width_m": [4.0], "width_src": ["normal_fast"]},
             geometry=[LineString([(0, 0), (100, 0)])], crs="EPSG:3857",
         )
         invalid_after = gpd.GeoDataFrame(
-            {"width_m": [10.0, 10.0]},
+            {
+                "width_m": [10.0, 10.0],
+                "width_src": ["normal_fast", "normal_fast"],
+            },
             geometry=[
                 LineString([(50, -50), (50, 50)]),
                 LineString([(0, 0), (30, 0)]),
@@ -510,17 +519,39 @@ class FastAutomaticChangeTests(unittest.TestCase):
         common = dict(
             tolerance=2.0, absolute_threshold=2.0, ratio_threshold=0.2,
             before_period="2021", after_period="2022", min_area=4.0,
+            min_length=75.0,
         )
-        self.assertEqual(
-            _fast_width_change_records(before, invalid_after, **common), [],
+        invalid_records, invalid_matched = _fast_width_change_records(
+            before, invalid_after, **common,
         )
+        self.assertEqual(invalid_records, [])
+        self.assertEqual(invalid_matched, 0.0)
         valid_after = gpd.GeoDataFrame(
-            {"width_m": [10.0]},
+            {"width_m": [10.0], "width_src": ["normal_fast"]},
             geometry=[LineString([(0, 1), (100, 1)])], crs="EPSG:3857",
         )
-        self.assertGreater(
-            len(_fast_width_change_records(before, valid_after, **common)), 0,
+        valid_records, valid_matched = _fast_width_change_records(
+            before, valid_after, **common,
         )
+        self.assertGreater(len(valid_records), 0)
+        self.assertEqual(valid_matched, 100.0)
+
+        fallback_after = valid_after.copy()
+        fallback_after["width_src"] = "distance_transform_fallback"
+        fallback_records, fallback_matched = _fast_width_change_records(
+            before, fallback_after, **common,
+        )
+        self.assertEqual(fallback_records, [])
+        self.assertEqual(fallback_matched, 0.0)
+
+    def test_width_change_guard_suppresses_unstable_network(self) -> None:
+        records, summary = _apply_fast_width_guard(
+            [{"_match_key": "0:0", "_match_len": 200.0, "geometry": box(0, 0, 1, 1)}],
+            matched_total_length=1000.0,
+        )
+        self.assertEqual(records, [])
+        self.assertEqual(summary["width_guard_mode"], "suppressed_unreliable")
+        self.assertFalse(summary["width_result_reliable"])
 
 
 if __name__ == "__main__":

@@ -46,6 +46,9 @@ FAST_CHANGE_GUARD_MAX_PATHS = 10
 FAST_WIDTH_DIRECTION_SIMILARITY = 0.95
 FAST_WIDTH_LENGTH_RATIO_MIN = 0.50
 FAST_WIDTH_LENGTH_RATIO_MAX = 2.00
+FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M = 4.0
+FAST_WIDTH_MIN_RELATIVE_CHANGE = 0.40
+FAST_WIDTH_CHANGE_GUARD_RATIO = 0.15
 
 
 @dataclass(frozen=True)
@@ -1524,6 +1527,81 @@ def _fast_width_value(row) -> float:
     return 0.0
 
 
+def _fast_width_source_reliable(row) -> bool:
+    """Only normal Fast transect measurements are stable enough across periods."""
+    source = str(row.get("width_src") or row.get("width_source") or "")
+    return source.strip().casefold() == "normal_fast"
+
+
+def _fast_nearest_width_matches(
+    source: gpd.GeoDataFrame,
+    target: gpd.GeoDataFrame,
+    *,
+    tolerance: float,
+) -> dict[int, int]:
+    """Find each reliable line's cheapest nearby candidate without intersections."""
+    if source.empty or target.empty:
+        return {}
+    spatial_index = target.sindex
+    matches: dict[int, int] = {}
+    for source_position in range(len(source)):
+        source_row = source.iloc[source_position]
+        source_line = source_row.geometry
+        if (
+            not _fast_width_source_reliable(source_row)
+            or source_line is None
+            or source_line.is_empty
+            or source_line.length <= 0
+        ):
+            continue
+        source_length = float(source_line.length)
+        candidates = (
+            spatial_index.query(
+                source_line, predicate="dwithin", distance=tolerance,
+            )
+            if tolerance > 0 else
+            spatial_index.query(source_line, predicate="intersects")
+        )
+        best = None
+        for target_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
+            target_row = target.iloc[target_position]
+            target_line = target_row.geometry
+            if (
+                not _fast_width_source_reliable(target_row)
+                or target_line is None
+                or target_line.is_empty
+                or target_line.length <= 0
+            ):
+                continue
+            distance = float(source_line.distance(target_line))
+            if distance > tolerance:
+                continue
+            target_length = float(target_line.length)
+            length_ratio = target_length / max(source_length, 1e-9)
+            if not (
+                FAST_WIDTH_LENGTH_RATIO_MIN
+                <= length_ratio
+                <= FAST_WIDTH_LENGTH_RATIO_MAX
+            ):
+                continue
+            direction_similarity = _fast_direction_similarity(
+                source_line, target_line,
+            )
+            if direction_similarity < FAST_WIDTH_DIRECTION_SIMILARITY:
+                continue
+            score = (
+                distance,
+                -direction_similarity,
+                abs(source_length - target_length),
+                target_position,
+            )
+            if best is None or score < best[0]:
+                best = (score, target_position)
+        if best is not None:
+            matches[source_position] = best[1]
+    return matches
+
+
 def _fast_width_change_records(
     before: gpd.GeoDataFrame,
     after: gpd.GeoDataFrame,
@@ -1534,59 +1612,37 @@ def _fast_width_change_records(
     before_period: str,
     after_period: str,
     min_area: float,
-) -> list[dict]:
+    min_length: float,
+) -> tuple[list[dict], float]:
     if before.empty or after.empty:
-        return []
-    spatial_index = after.sindex
-    used_after: set[int] = set()
+        return [], 0.0
+    before_to_after = _fast_nearest_width_matches(
+        before, after, tolerance=tolerance,
+    )
+    after_to_before = _fast_nearest_width_matches(
+        after, before, tolerance=tolerance,
+    )
+    absolute_threshold = max(
+        float(absolute_threshold), FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M,
+    )
+    ratio_threshold = max(
+        float(ratio_threshold), FAST_WIDTH_MIN_RELATIVE_CHANGE,
+    )
     records: list[dict] = []
-    for _before_index, before_row in before.iterrows():
+    matched_total_length = 0.0
+    for before_position, after_position in before_to_after.items():
+        if after_to_before.get(after_position) != before_position:
+            continue
+        before_row = before.iloc[before_position]
+        after_row = after.iloc[after_position]
         before_line = before_row.geometry
-        if before_line is None or before_line.is_empty or before_line.length <= 0:
-            continue
         before_length = float(before_line.length)
-        candidates = (
-            spatial_index.query(
-                before_line, predicate="dwithin", distance=tolerance,
-            )
-            if tolerance > 0 else
-            spatial_index.query(before_line, predicate="intersects")
-        )
-        best = None
-        for after_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
-            if after_position in used_after:
-                continue
-            after_row = after.iloc[after_position]
-            after_line = after_row.geometry
-            if after_line is None or after_line.is_empty or after_line.length <= 0:
-                continue
-            distance = float(before_line.distance(after_line))
-            if distance > tolerance:
-                continue
-            after_length = float(after_line.length)
-            length_ratio = after_length / max(before_length, 1e-9)
-            if not (
-                FAST_WIDTH_LENGTH_RATIO_MIN
-                <= length_ratio
-                <= FAST_WIDTH_LENGTH_RATIO_MAX
-            ):
-                continue
-            direction_similarity = _fast_direction_similarity(
-                before_line, after_line,
-            )
-            if direction_similarity < FAST_WIDTH_DIRECTION_SIMILARITY:
-                continue
-            score = (
-                distance,
-                -direction_similarity,
-                abs(before_length - after_length),
-            )
-            if best is None or score < best[0]:
-                best = (score, after_position, after_row)
-        if best is None:
+        after_line = after_row.geometry
+        after_length = float(after_line.length)
+        matched_length = min(before_length, after_length)
+        matched_total_length += matched_length
+        if matched_length < min_length:
             continue
-        _score, after_position, after_row = best
-        used_after.add(after_position)
         before_width = _fast_width_value(before_row)
         after_width = _fast_width_value(after_row)
         if before_width <= 0 or after_width <= 0:
@@ -1606,8 +1662,9 @@ def _fast_width_change_records(
             axis.buffer(inner_width / 2.0)
         )
         change_type = "widened" if widened else "narrowed"
+        match_key = f"{before_position}:{after_position}"
         for part in _fast_change_parts(
-            change_geometry, min_area=min_area, min_length=0.0,
+            change_geometry, min_area=min_area, min_length=min_length,
         ):
             records.append({
                 "change_typ": change_type,
@@ -1617,9 +1674,45 @@ def _fast_width_change_records(
                 "width_bef": float(before_width),
                 "width_aft": float(after_width),
                 "width_diff": float(width_delta),
+                "_match_key": match_key,
+                "_match_len": matched_length,
                 "geometry": part,
             })
-    return records
+    return records, matched_total_length
+
+
+def _apply_fast_width_guard(
+    records: list[dict],
+    *,
+    matched_total_length: float,
+) -> tuple[list[dict], dict]:
+    match_lengths = {}
+    for record in records:
+        key = str(record.get("_match_key") or "")
+        if key:
+            match_lengths[key] = max(
+                float(match_lengths.get(key, 0.0)),
+                float(record.get("_match_len") or 0.0),
+            )
+    raw_length = float(sum(match_lengths.values()))
+    change_ratio = raw_length / max(float(matched_total_length), 1e-9)
+    reliable = change_ratio <= FAST_WIDTH_CHANGE_GUARD_RATIO
+    retained = records if reliable else []
+    cleaned = [
+        {
+            key: value for key, value in record.items()
+            if key not in {"_match_key", "_match_len"}
+        }
+        for record in retained
+    ]
+    return cleaned, {
+        "width_guard_mode": "normal" if reliable else "suppressed_unreliable",
+        "width_result_reliable": reliable,
+        "matched_width_length_m": float(matched_total_length),
+        "raw_width_change_length_m": raw_length,
+        "retained_width_change_length_m": raw_length if reliable else 0.0,
+        "width_network_change_ratio": float(change_ratio),
+    }
 
 
 def detect_fast_changes(
@@ -1692,13 +1785,16 @@ def detect_fast_changes(
         "removed": removed_records,
     }
     width_started = time.perf_counter()
-    width_records = _fast_width_change_records(
+    width_records, matched_width_length = _fast_width_change_records(
         before_centerlines, after_centerlines,
         tolerance=tolerance,
         absolute_threshold=max(0.0, float(width_change_absolute)),
         ratio_threshold=max(0.0, float(width_change_ratio)),
         before_period=before_period, after_period=after_period,
-        min_area=minimum_area,
+        min_area=minimum_area, min_length=minimum_length,
+    )
+    width_records, width_guard = _apply_fast_width_guard(
+        width_records, matched_total_length=matched_width_length,
     )
     width_change_seconds = time.perf_counter() - width_started
     record_groups["widened"] = [
@@ -1775,12 +1871,20 @@ def detect_fast_changes(
         "width_length_ratio_max": FAST_WIDTH_LENGTH_RATIO_MAX,
         "width_change_absolute_m": float(width_change_absolute),
         "width_change_ratio": float(width_change_ratio),
+        "fast_width_change_absolute_m": max(
+            float(width_change_absolute), FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M,
+        ),
+        "fast_width_change_ratio": max(
+            float(width_change_ratio), FAST_WIDTH_MIN_RELATIVE_CHANGE,
+        ),
+        "width_guard_ratio": FAST_WIDTH_CHANGE_GUARD_RATIO,
         "presence_change_seconds": float(presence_change_seconds),
         "width_change_seconds": float(width_change_seconds),
         "merge_seconds": float(merge_seconds),
         "write_seconds": float(write_seconds),
         "total_seconds": float(total_seconds),
         **presence_guard,
+        **width_guard,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
     summary_path = output_dir / "change_summary.json"
@@ -1791,7 +1895,9 @@ def detect_fast_changes(
         f"width={width_change_seconds:.3f}s, merge={merge_seconds:.3f}s, "
         f"write={write_seconds:.3f}s, total={total_seconds:.3f}s, "
         f"guard={presence_guard['presence_guard_mode']}, "
-        f"change_ratio={presence_guard['presence_change_ratio']:.3f}",
+        f"change_ratio={presence_guard['presence_change_ratio']:.3f}, "
+        f"width_guard={width_guard['width_guard_mode']}, "
+        f"width_ratio={width_guard['width_network_change_ratio']:.3f}",
         flush=True,
     )
     return {
