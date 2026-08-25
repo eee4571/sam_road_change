@@ -72,6 +72,10 @@ class DetectionConfig:
     width_exclude_low_quality: bool = True
     width_min_valid_ratio: float = 0.60
     width_same_direction_ratio: float = 0.70
+    paired_width_sample_spacing: float = 2.0
+    paired_width_normal_half_length: float = 60.0
+    paired_width_min_samples: int = 5
+    paired_width_max_mad: float = 1.0
     allow_legacy_absence_without_valid_mask: bool = False
 
 
@@ -1442,6 +1446,36 @@ def evaluate_changes(
     return rows, metadata
 
 
+def _write_paired_width_debug(
+    output_dir: Path,
+    artifacts: dict[str, gpd.GeoDataFrame] | None,
+) -> dict[str, str]:
+    """Write diagnostics below the internal change workspace only.
+
+    ResultPublisher copies an explicit allow-list of business products, so the
+    private ``_debug`` subtree is never published to the user-facing results.
+    """
+    debug_dir = output_dir / "_debug" / "paired_width"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, str] = {}
+    for key, filename in (
+        ("paired_width_samples", "paired_width_samples.csv"),
+        ("paired_width_decisions", "paired_width_decisions.csv"),
+    ):
+        frame = (artifacts or {}).get(key)
+        if frame is None:
+            frame = gpd.GeoDataFrame({"canonical_id": pd.Series(dtype="object")}, geometry=[])
+        table = pd.DataFrame(frame.drop(columns="geometry", errors="ignore")).copy()
+        if "geometry" in frame.columns:
+            table["geometry_wkt"] = frame.geometry.map(
+                lambda geometry: geometry.wkt if geometry is not None and not geometry.is_empty else ""
+            )
+        path = debug_dir / filename
+        table.to_csv(path, index=False, encoding="utf-8-sig")
+        outputs[key] = str(path)
+    return outputs
+
+
 def _write_outputs(
     output_dir: Path,
     added: gpd.GeoDataFrame,
@@ -1784,6 +1818,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width-min-polygon-area", type=float, default=20.0)
     parser.add_argument("--width-min-valid-ratio", type=float, default=0.60)
     parser.add_argument("--width-same-direction-ratio", type=float, default=0.70)
+    parser.add_argument("--paired-width-sample-spacing", type=float, default=2.0)
+    parser.add_argument("--paired-width-min-samples", type=int, default=5)
+    parser.add_argument("--paired-width-max-mad", type=float, default=1.0)
     parser.add_argument("--truth", default="", help="Optional vector truth of road changes.")
     parser.add_argument("--validation-area", default="", help="Optional polygon boundary for evaluation.")
     parser.add_argument("--truth-type-field", default="")
@@ -1796,7 +1833,8 @@ def main(argv: list[str] | None = None) -> int:
     if (
         args.position_tolerance < 0 or args.min_line_length < 0 or args.min_polygon_area < 0
         or args.width_change_absolute < 0 or args.width_min_overlap_length < 0
-        or args.width_min_polygon_area < 0
+        or args.width_min_polygon_area < 0 or args.paired_width_sample_spacing <= 0
+        or args.paired_width_min_samples <= 0 or args.paired_width_max_mad < 0
     ):
         raise ValueError("Detection thresholds cannot be negative.")
     if (
@@ -1842,6 +1880,9 @@ def main(argv: list[str] | None = None) -> int:
             width_min_polygon_area=args.width_min_polygon_area,
             width_min_valid_ratio=args.width_min_valid_ratio,
             width_same_direction_ratio=args.width_same_direction_ratio,
+            paired_width_sample_spacing=args.paired_width_sample_spacing,
+            paired_width_min_samples=args.paired_width_min_samples,
+            paired_width_max_mad=args.paired_width_max_mad,
         ),
         args.before_period,
         args.after_period,
@@ -1855,6 +1896,7 @@ def main(argv: list[str] | None = None) -> int:
         after_probability,
         artifacts,
     )
+    summary["paired_width_debug"] = _write_paired_width_debug(output_dir, artifacts)
     # Detection always runs first.  The hidden development mode only selects
     # which already-built frame becomes the active result written at the stable
     # root paths consumed by the GUI and evaluation commands.
@@ -1967,7 +2009,8 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(summary, file, ensure_ascii=False, indent=2)
     audit_keys = [
         key for key in summary
-        if key.startswith("width_rejected_") or key.startswith("presence_")
+        if key.startswith("width_rejected_") or key.startswith("width_review_")
+        or key.startswith("presence_")
         or key.startswith("rejected_") or key.startswith("unmatched_")
         or key in {"spatial_candidate_count", "valid_candidate_count"}
     ]

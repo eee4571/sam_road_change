@@ -27,6 +27,15 @@ from road_existence_evidence import (
     evidence_audit_fields,
     evaluate_road_existence_evidence,
 )
+from paired_width_profile import (
+    PairedWidthConfig,
+    PairedWidthProfile,
+    candidate_change_runs,
+    evaluate_change_run,
+    measure_paired_width_profile,
+    profile_debug_rows,
+    robust_change_statistics,
+)
 
 
 def _parts(geometry: BaseGeometry, family: str) -> Iterable[BaseGeometry]:
@@ -287,30 +296,71 @@ def detect_corridor_changes(
             "before_part": before_part, "after_part": after_part, "canonical": canonical,
         })
 
+    paired_config = PairedWidthConfig(
+        sample_spacing=float(getattr(config, "paired_width_sample_spacing", 2.0)),
+        normal_half_length=float(getattr(config, "paired_width_normal_half_length", 60.0)),
+        absolute_change=float(config.width_change_absolute),
+        relative_change=float(config.width_change_ratio),
+        maximum_relative_change=float(config.width_change_max_ratio),
+        minimum_valid_ratio=float(config.width_min_valid_ratio),
+        minimum_continuous_length=float(config.width_min_overlap_length),
+        minimum_samples=int(getattr(config, "paired_width_min_samples", 5)),
+        minimum_direction_ratio=float(config.width_same_direction_ratio),
+        maximum_diff_mad=float(getattr(config, "paired_width_max_mad", 1.0)),
+    )
     canonical_rows = []
     match_rows = []
     width_candidates: list[dict] = []
+    paired_profiles: dict[str, PairedWidthProfile] = {}
+    profile_decisions: dict[str, str] = {}
+    paired_decision_rows: list[dict] = []
     rejected_quality: set[tuple[str, str]] = set()
     rejected_missing: set[tuple[str, str]] = set()
     rejected_excessive: set[tuple[str, str]] = set()
+    rejected_low_valid: set[tuple[str, str]] = set()
+    rejected_samples: set[tuple[str, str]] = set()
+    rejected_mad: set[tuple[str, str]] = set()
+    review_missing_surface: set[tuple[str, str]] = set()
     for pair_index, pair in enumerate(reliable_pairs):
         before_row, after_row = pair["before"], pair["after"]
-        before_width = float(before_row.get("width_m", 0.0) or 0.0)
-        after_width = float(after_row.get("width_m", 0.0) or 0.0)
-        width_delta = after_width - before_width
-        relative = abs(width_delta) / max(before_width, after_width, 0.1)
+        legacy_before_width = float(before_row.get("width_m", 0.0) or 0.0)
+        legacy_after_width = float(after_row.get("width_m", 0.0) or 0.0)
         canonical_id = f"C{pair_index + 1:08d}"
+        pair["canonical_id"] = canonical_id
         qa_state = "review" if "review" in {
             str(before_row.get("qa_state", "")), str(after_row.get("qa_state", "")),
         } else "auto"
+        rejection_key = (
+            str(before_row.get("parent_id", pair["before_id"])),
+            str(after_row.get("parent_id", pair["after_id"])),
+        )
+        profile = measure_paired_width_profile(
+            canonical_id,
+            pair["canonical"],
+            pair["before_part"],
+            pair["after_part"],
+            before_surface,
+            after_surface,
+            paired_config,
+        )
+        paired_profiles[canonical_id] = profile
+        profile_stats = robust_change_statistics(profile.valid_samples)
+        measured_before = float(profile_stats["before_width"])
+        measured_after = float(profile_stats["after_width"])
+        before_width = measured_before if int(profile_stats["sample_count"]) else legacy_before_width
+        after_width = measured_after if int(profile_stats["sample_count"]) else legacy_after_width
+        width_delta = after_width - before_width
         common = {
             "canonical_id": canonical_id, "match_id": pair["match_id"], "relation": pair["relation"],
             "before_seg": str(before_row.get("segment_id", pair["before_id"])),
             "after_seg": str(after_row.get("segment_id", pair["after_id"])),
             "before_w": before_width, "after_w": after_width, "width_diff": width_delta,
             "match_score": pair["match_score"], "qa_state": qa_state,
+            "valid_ratio": profile.valid_ratio,
+            "sample_count": int(profile_stats["sample_count"]),
+            "width_mad": float(profile_stats["diff_mad"]),
+            "uncertainty": float(profile_stats["uncertainty"]),
         }
-        rejection_key = (str(before_row.get("parent_id", pair["before_id"])), str(after_row.get("parent_id", pair["after_id"])))
         canonical_rows.append({**common, "length_m": float(pair["canonical"].length), "geometry": pair["canonical"]})
         match_rows.append({
             **common,
@@ -318,87 +368,210 @@ def detect_corridor_changes(
             "after_cov": float(pair["after_part"].length) / max(float(after_row.geometry.length), 1e-9),
             "geometry": pair["canonical"],
         })
-        grade_ok = str(before_row.get("width_quality", "C")) != "C" and str(after_row.get("width_quality", "C")) != "C"
-        valid_ratio = min(float(before_row.get("valid_ratio", 0.0)), float(after_row.get("valid_ratio", 0.0)))
-        same_direction_ratio = min(
-            float(before_row.get("same_dir_ratio", 1.0) or 1.0),
-            float(after_row.get("same_dir_ratio", 1.0) or 1.0),
+        grade_ok = (
+            str(before_row.get("width_quality", "C")) != "C"
+            and str(after_row.get("width_quality", "C")) != "C"
         )
-        threshold_met = abs(width_delta) >= config.width_change_absolute and relative >= config.width_change_ratio
-        if threshold_met and relative > config.width_change_max_ratio:
-            rejected_excessive.add(rejection_key)
-        elif threshold_met and (before_width <= 0 or after_width <= 0):
-            rejected_missing.add(rejection_key)
-        elif threshold_met and not grade_ok:
+        runs = candidate_change_runs(profile, paired_config)
+        if before_surface is None or after_surface is None:
+            legacy_delta = legacy_after_width - legacy_before_width
+            legacy_relative = abs(legacy_delta) / max(legacy_before_width, legacy_after_width, 0.1)
+            legacy_threshold = (
+                legacy_before_width > 0 and legacy_after_width > 0
+                and abs(legacy_delta) >= paired_config.absolute_change
+                and legacy_relative >= paired_config.relative_change
+            )
+            if legacy_threshold and legacy_relative > paired_config.maximum_relative_change:
+                rejected_excessive.add(rejection_key)
+                profile_decisions[canonical_id] = "no_change:paired_width_relative_change_excessive"
+            elif legacy_threshold and not grade_ok:
+                rejected_quality.add(rejection_key)
+                profile_decisions[canonical_id] = "no_change:paired_width_quality_rejected"
+            elif legacy_threshold:
+                review_missing_surface.add(rejection_key)
+                profile_decisions[canonical_id] = "review:paired_width_surface_missing"
+                width_candidates.append({
+                    **common,
+                    "canonical": pair["canonical"],
+                    "sign": 1 if legacy_delta > 0 else -1,
+                    "before_w": legacy_before_width,
+                    "after_w": legacy_after_width,
+                    "width_diff": legacy_delta,
+                    "samples": tuple(),
+                    "valid_ratio": 0.0,
+                    "fallback_review": True,
+                    "rejection_key": rejection_key,
+                    "qa_state": "review",
+                })
+            else:
+                if legacy_before_width <= 0 or legacy_after_width <= 0:
+                    rejected_missing.add(rejection_key)
+                profile_decisions[canonical_id] = "no_change:paired_width_surface_missing"
+            continue
+        if runs and not grade_ok:
             rejected_quality.add(rejection_key)
-        elif (
-            threshold_met and grade_ok and valid_ratio >= config.width_min_valid_ratio
-            and same_direction_ratio >= config.width_same_direction_ratio
-            and relative <= config.width_change_max_ratio
-        ):
-            before_evidence = evaluate_road_existence_evidence(
-                pair["canonical"], centerline_cover=before_network_cover,
-                road_surface=before_surface, valid_area=before_valid,
-                probability=before_probability, crs=crs, road_width=before_width,
-                position_tolerance=config.position_tolerance,
-                allow_legacy_absence_without_valid_mask=bool(getattr(
-                    config, "allow_legacy_absence_without_valid_mask", False
-                )),
-            )
-            after_evidence = evaluate_road_existence_evidence(
-                pair["canonical"], centerline_cover=after_network_cover,
-                road_surface=after_surface, valid_area=after_valid,
-                probability=after_probability, crs=crs, road_width=after_width,
-                position_tolerance=config.position_tolerance,
-                allow_legacy_absence_without_valid_mask=bool(getattr(
-                    config, "allow_legacy_absence_without_valid_mask", False
-                )),
-            )
-            evidence_qa = (
-                "auto"
-                if before_evidence.existence_state == after_evidence.existence_state == "present"
-                else "review"
-            )
+            profile_decisions[canonical_id] = "no_change:paired_width_quality_rejected"
+            continue
+        if profile.valid_ratio < paired_config.minimum_valid_ratio:
+            rejected_low_valid.add(rejection_key)
+            profile_decisions[canonical_id] = "no_change:paired_width_valid_ratio_too_low"
+            continue
+        if not runs:
+            profile_decisions[canonical_id] = "no_change"
+            continue
+        profile_decisions[canonical_id] = "candidate"
+        for run in runs:
             width_candidates.append({
-                **common, "canonical": pair["canonical"], "before_part": pair["before_part"],
-                "after_part": pair["after_part"], "sign": 1 if width_delta > 0 else -1,
-                "valid_ratio": valid_ratio, "same_dir": same_direction_ratio,
-                "qa_state": "review" if qa_state == "review" or evidence_qa == "review" else "auto",
-                "evidence_fields": evidence_audit_fields(before_evidence, after_evidence),
+                **common,
+                "canonical": run.axis,
+                "sign": run.sign,
+                "before_w": run.before_width,
+                "after_w": run.after_width,
+                "width_diff": run.width_diff,
+                "samples": run.samples,
+                "valid_ratio": profile.valid_ratio,
+                "fallback_review": False,
+                "rejection_key": rejection_key,
+                "qa_state": qa_state,
             })
 
     positive_rows: list[dict] = []
     negative_rows: list[dict] = []
     width_changed_count = 0
     width_rejected_short = 0
-    for component in _line_components(width_candidates, tolerance=max(0.5, config.position_tolerance * 0.25)):
+    for component_index, component in enumerate(
+        _line_components(width_candidates, tolerance=max(0.5, config.position_tolerance * 0.25)),
+        start=1,
+    ):
         selected = [width_candidates[index] for index in component]
-        axis_length = float(union_all(np.asarray([row["canonical"] for row in selected], dtype=object)).length)
-        if axis_length < config.width_min_overlap_length:
-            width_rejected_short += 1
+        component_axis = union_all(np.asarray([row["canonical"] for row in selected], dtype=object))
+        axis_length = float(component_axis.length)
+        fallback_review = any(bool(row.get("fallback_review")) for row in selected)
+        samples = tuple(sample for row in selected for sample in row.get("samples", tuple()))
+        valid_ratio = min(float(row.get("valid_ratio", 0.0)) for row in selected)
+        if fallback_review:
+            before_width = float(np.median([row["before_w"] for row in selected]))
+            after_width = float(np.median([row["after_w"] for row in selected]))
+            width_diff = after_width - before_width
+            stats = {
+                "accepted": axis_length >= paired_config.minimum_continuous_length,
+                "decision": "review" if axis_length >= paired_config.minimum_continuous_length else "no_change",
+                "reject_reason": "" if axis_length >= paired_config.minimum_continuous_length else "paired_width_continuous_length_too_short",
+                "before_width": before_width, "after_width": after_width, "width_diff": width_diff,
+                "diff_mad": 0.0, "uncertainty": 0.0, "direction_ratio": 1.0,
+                "sample_count": 0, "valid_ratio": 0.0, "relative_change": abs(width_diff) / max(before_width, after_width, 0.1),
+            }
+        else:
+            stats = evaluate_change_run(
+                samples,
+                axis_length=axis_length,
+                valid_ratio=valid_ratio,
+                config=paired_config,
+            )
+        accepted = bool(stats["accepted"])
+        reject_reason = str(stats["reject_reason"])
+        if not accepted:
+            if reject_reason == "paired_width_continuous_length_too_short":
+                width_rejected_short += 1
+            elif reject_reason == "paired_width_sample_count_too_low":
+                rejected_samples.update(row["rejection_key"] for row in selected)
+            elif reject_reason == "paired_width_relative_change_excessive":
+                rejected_excessive.update(row["rejection_key"] for row in selected)
+            elif reject_reason == "paired_width_valid_ratio_too_low":
+                rejected_low_valid.update(row["rejection_key"] for row in selected)
+            elif reject_reason == "paired_width_mad_too_large":
+                rejected_mad.update(row["rejection_key"] for row in selected)
+            for row in selected:
+                profile_decisions[row["canonical_id"]] = f"no_change:{reject_reason}"
+        qa_value = "review" if fallback_review or any(row["qa_state"] == "review" for row in selected) else "auto"
+        evidence_fields = {}
+        if accepted and not fallback_review:
+            before_evidence = evaluate_road_existence_evidence(
+                component_axis, centerline_cover=before_network_cover,
+                road_surface=before_surface, valid_area=before_valid,
+                probability=before_probability, crs=crs, road_width=float(stats["before_width"]),
+                position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
+            )
+            after_evidence = evaluate_road_existence_evidence(
+                component_axis, centerline_cover=after_network_cover,
+                road_surface=after_surface, valid_area=after_valid,
+                probability=after_probability, crs=crs, road_width=float(stats["after_width"]),
+                position_tolerance=config.position_tolerance,
+                allow_legacy_absence_without_valid_mask=bool(getattr(
+                    config, "allow_legacy_absence_without_valid_mask", False
+                )),
+            )
+            if before_evidence.existence_state != "present" or after_evidence.existence_state != "present":
+                qa_value = "review"
+            evidence_fields = evidence_audit_fields(before_evidence, after_evidence)
+        paired_decision_rows.append({
+            "decision_id": f"PW{component_index:08d}",
+            "canonical_id": ",".join(sorted({row["canonical_id"] for row in selected})),
+            "before_width": float(stats["before_width"]),
+            "after_width": float(stats["after_width"]),
+            "width_diff": float(stats["width_diff"]),
+            "mad": float(stats["diff_mad"]),
+            "uncertainty": float(stats["uncertainty"]),
+            "valid_ratio": float(stats["valid_ratio"]),
+            "sample_count": int(stats["sample_count"]),
+            "direction_ratio": float(stats["direction_ratio"]),
+            "axis_length_m": axis_length,
+            "change_decision": str(stats["decision"]),
+            "reject_reason": reject_reason,
+            "qa_state": qa_value if accepted else "",
+            "geometry": component_axis,
+        })
+        if not accepted:
             continue
-        width_changed_count += 1
-        before_buffers = [row["canonical"].buffer(row["before_w"] * 0.5, cap_style="flat", join_style="round") for row in selected]
-        after_buffers = [row["canonical"].buffer(row["after_w"] * 0.5, cap_style="flat", join_style="round") for row in selected]
+        before_buffers = [
+            row["canonical"].buffer(row["before_w"] * 0.5, cap_style="flat", join_style="round")
+            for row in selected
+        ]
+        after_buffers = [
+            row["canonical"].buffer(row["after_w"] * 0.5, cap_style="flat", join_style="round")
+            for row in selected
+        ]
         before_union = union_all(np.asarray(before_buffers, dtype=object))
         after_union = union_all(np.asarray(after_buffers, dtype=object))
-        widened = selected[0]["sign"] > 0
+        widened = float(stats["width_diff"]) > 0
         geometry = after_union.difference(before_union) if widened else before_union.difference(after_union)
         target_rows = positive_rows if widened else negative_rows
         change_type = "widened" if widened else "narrowed"
+        audit_reason = (
+            "paired_width_surface_missing_review" if fallback_review
+            else "paired_width_change_thresholds_met"
+        )
         values = {
             "change_typ": change_type, "source_fid": selected[0]["canonical_id"],
             "src_period": after_period if widened else before_period,
             "length_m": 0.0, "axis_len_m": axis_length,
-            "class_rule": "canonical_axis_local_width_buffer_difference",
-            "before_w": float(np.median([row["before_w"] for row in selected])),
-            "after_w": float(np.median([row["after_w"] for row in selected])),
-            "width_diff": float(np.median([row["width_diff"] for row in selected])),
-            "qa_state": "review" if any(row["qa_state"] == "review" for row in selected) else "auto",
-            "audit_reason": "local_width_change_thresholds_met",
-            **selected[0].get("evidence_fields", {}),
+            "class_rule": "canonical_axis_paired_normal_width_buffer_difference",
+            "before_w": float(stats["before_width"]),
+            "after_w": float(stats["after_width"]),
+            "width_diff": float(stats["width_diff"]),
+            "width_mad": float(stats["diff_mad"]),
+            "uncertainty": float(stats["uncertainty"]),
+            "valid_ratio": float(stats["valid_ratio"]),
+            "sample_count": int(stats["sample_count"]),
+            "same_dir_ratio": float(stats["direction_ratio"]),
+            "qa_state": qa_value,
+            "audit_reason": audit_reason,
+            **evidence_fields,
         }
-        _append_change(target_rows, geometry, max(config.min_polygon_area, config.width_min_polygon_area), values)
+        rows_before = len(target_rows)
+        _append_change(
+            target_rows,
+            geometry,
+            max(config.min_polygon_area, config.width_min_polygon_area),
+            values,
+        )
+        if len(target_rows) > rows_before and qa_value == "auto":
+            width_changed_count += 1
+        for row in selected:
+            profile_decisions[row["canonical_id"]] = f"{qa_value}:{change_type}"
 
     presence_confirmed = presence_review = 0
     audit_counts = defaultdict(int)
@@ -582,8 +755,33 @@ def detect_corridor_changes(
         before_segments.assign(period=before_period), after_segments.assign(period=after_period),
     ], ignore_index=True), geometry="geometry", crs=crs)
     period_corridors = gpd.GeoDataFrame(pd.concat([before_corridors, after_corridors], ignore_index=True), geometry="geometry", crs=crs)
+    paired_sample_rows = []
+    for canonical_id, profile in paired_profiles.items():
+        paired_sample_rows.extend(profile_debug_rows(
+            profile,
+            profile_decisions.get(canonical_id, "no_change"),
+        ))
+    paired_samples = (
+        gpd.GeoDataFrame(paired_sample_rows, geometry="geometry", crs=crs)
+        if paired_sample_rows else gpd.GeoDataFrame({
+            "canonical_id": pd.Series(dtype="object"),
+            "sample_position_m": pd.Series(dtype="float64"),
+            "valid": pd.Series(dtype="bool"),
+            "reject_reason": pd.Series(dtype="object"),
+            "change_decision": pd.Series(dtype="object"),
+        }, geometry=[], crs=crs)
+    )
+    paired_decisions = (
+        gpd.GeoDataFrame(paired_decision_rows, geometry="geometry", crs=crs)
+        if paired_decision_rows else gpd.GeoDataFrame({
+            "canonical_id": pd.Series(dtype="object"),
+            "change_decision": pd.Series(dtype="object"),
+            "reject_reason": pd.Series(dtype="object"),
+        }, geometry=[], crs=crs)
+    )
     summary = {
         "classification_method": "two_stage_geometry_candidate_then_symmetric_existence_evidence",
+        "width_measurement_method": "canonical_axis_cross_period_paired_normals",
         "matched_centerline_count": len(reliable_pairs),
         "width_changed_centerline_count": width_changed_count,
         "width_change_absolute_m": config.width_change_absolute,
@@ -592,11 +790,20 @@ def detect_corridor_changes(
         "width_min_overlap_length_m": config.width_min_overlap_length,
         "width_min_valid_ratio": config.width_min_valid_ratio,
         "width_same_direction_ratio": config.width_same_direction_ratio,
+        "paired_width_sample_spacing_m": paired_config.sample_spacing,
+        "paired_width_min_samples": paired_config.minimum_samples,
+        "paired_width_max_mad_m": paired_config.maximum_diff_mad,
+        "paired_width_sample_count": len(paired_samples),
+        "paired_width_valid_sample_count": int(paired_samples["valid"].sum()) if not paired_samples.empty else 0,
         "width_rejected_match_count": max(0, len(matches) - len(reliable_pairs)),
         "width_rejected_short_count": width_rejected_short,
         "width_rejected_quality_count": len(rejected_quality),
         "width_rejected_missing_count": len(rejected_missing),
         "width_rejected_excessive_count": len(rejected_excessive),
+        "width_rejected_low_valid_ratio_count": len(rejected_low_valid),
+        "width_rejected_min_samples_count": len(rejected_samples),
+        "width_rejected_mad_count": len(rejected_mad),
+        "width_review_missing_surface_count": len(review_missing_surface),
         "presence_confirmed_count": presence_confirmed,
         "presence_review_count": presence_review,
         "presence_suppressed_low_confidence_count": 0,
@@ -611,5 +818,7 @@ def detect_corridor_changes(
         "road_corridors": period_corridors,
         "road_matches": match_output,
         "canonical_roads": canonical,
+        "paired_width_samples": paired_samples,
+        "paired_width_decisions": paired_decisions,
     }
     return positive, negative, unchanged, summary, artifacts
