@@ -29,6 +29,8 @@ from engine.fast_pipeline import (
     export_fast_products,
     measure_fast_edge_widths,
     measure_fast_widths,
+    _consistent_relative_score,
+    _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
 )
 from engine.samroad.image_resume import required_image_outputs
@@ -128,6 +130,41 @@ class FastRelativeTests(unittest.TestCase):
         mask, metadata = build_fast_surface_mask(probability)
         self.assertEqual(int(mask.sum()), 0)
         self.assertEqual(metadata["relative_added_pixel_count"], 0)
+
+    def test_tiny_fluctuations_in_low_variance_region_are_suppressed(self) -> None:
+        rng = np.random.default_rng(11)
+        probability = np.clip(
+            rng.normal(0.002, 0.0000001, (160, 160)), 0, 1,
+        ).astype(np.float32)
+        mask, _metadata = build_fast_surface_mask(probability)
+        self.assertLess(float(mask.mean()), 0.001)
+
+    def test_single_scale_response_needs_other_scale_support(self) -> None:
+        first = np.asarray([[2.0, 2.0]], dtype=np.float32)
+        second = np.asarray([[0.2, 0.6]], dtype=np.float32)
+        combined = _consistent_relative_score(first, second)
+        self.assertEqual(float(combined[0, 0]), 0.0)
+        self.assertEqual(float(combined[0, 1]), 2.0)
+
+
+class FastSkeletonCleanupTests(unittest.TestCase):
+    def test_isolated_short_fragment_is_removed(self) -> None:
+        skeleton = np.zeros((60, 80), dtype=np.uint8)
+        skeleton[20, 10:21] = 1
+        cleaned = _remove_short_isolated_skeleton_components(
+            skeleton, min_length_px=20.0,
+        )
+        self.assertEqual(int(cleaned.sum()), 0)
+
+    def test_long_road_and_connected_branch_are_retained(self) -> None:
+        skeleton = np.zeros((80, 100), dtype=np.uint8)
+        skeleton[50, 10:91] = 1
+        skeleton[30:51, 50] = 1
+        cleaned = _remove_short_isolated_skeleton_components(
+            skeleton, min_length_px=20.0,
+        )
+        self.assertEqual(int(cleaned[50, 10:91].sum()), 81)
+        self.assertEqual(int(cleaned[30:51, 50].sum()), 21)
 
 
 class FastWidthTests(unittest.TestCase):

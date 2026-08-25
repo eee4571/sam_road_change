@@ -17,6 +17,8 @@ from shapely.geometry import LineString, shape
 
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
+FAST_LOCAL_STD_FLOOR = 1.0 / (255.0 * np.sqrt(12.0))
+FAST_SCALE_SUPPORT_THRESHOLD = 0.50
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -38,8 +40,17 @@ def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return kept
 
 
+def _consistent_relative_score(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Accept the stronger scale only when the other scale has fixed positive support."""
+    stronger = np.maximum(first, second)
+    weaker = np.minimum(first, second)
+    return np.where(
+        weaker >= FAST_SCALE_SUPPORT_THRESHOLD, stronger, 0.0,
+    ).astype(np.float32)
+
+
 def _fast_relative_score(values: np.ndarray) -> np.ndarray:
-    """Return the strongest positive local z-score across two background scales."""
+    """Return a fixed-floor, scale-consistent local Relative score."""
     scores = []
     for sigma in (3.0, 15.0):
         local_mean = cv2.GaussianBlur(values, (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -47,8 +58,9 @@ def _fast_relative_score(values: np.ndarray) -> np.ndarray:
             values * values, (0, 0), sigmaX=sigma, sigmaY=sigma,
         )
         local_std = np.sqrt(np.maximum(local_square_mean - local_mean * local_mean, 0.0))
-        scores.append(np.maximum(values - local_mean, 0.0) / (local_std + 1e-6))
-    return np.maximum(scores[0], scores[1])
+        effective_std = np.maximum(local_std, FAST_LOCAL_STD_FLOOR)
+        scores.append(np.maximum(values - local_mean, 0.0) / effective_std)
+    return _consistent_relative_score(scores[0], scores[1])
 
 
 def _relative_hysteresis_mask(relative_score: np.ndarray, min_area: int) -> np.ndarray:
@@ -127,6 +139,36 @@ def _prune_short_skeleton_spurs(skeleton: np.ndarray, max_length_px: int = 6) ->
     return working.astype(np.uint8)
 
 
+def _remove_short_isolated_skeleton_components(
+    skeleton: np.ndarray, min_length_px: float = 20.0,
+) -> np.ndarray:
+    """Remove isolated skeleton components with short total centerline length."""
+    binary = (np.asarray(skeleton) > 0).astype(np.uint8)
+    count, labels = cv2.connectedComponents(binary, connectivity=8)
+    kept = np.zeros_like(binary)
+    forward_neighbors = (
+        (0, 1, 1.0),
+        (1, -1, float(np.sqrt(2.0))),
+        (1, 0, 1.0),
+        (1, 1, float(np.sqrt(2.0))),
+    )
+    for label in range(1, count):
+        rows, cols = np.nonzero(labels == label)
+        length = 0.0
+        for row, col in zip(rows.tolist(), cols.tolist()):
+            for drow, dcol, weight in forward_neighbors:
+                neighbor_row, neighbor_col = row + drow, col + dcol
+                if (
+                    0 <= neighbor_row < labels.shape[0]
+                    and 0 <= neighbor_col < labels.shape[1]
+                    and labels[neighbor_row, neighbor_col] == label
+                ):
+                    length += weight
+        if length >= float(min_length_px):
+            kept[labels == label] = 1
+    return kept
+
+
 def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     try:
         from skimage.morphology import skeletonize
@@ -140,7 +182,10 @@ def _skeleton_graph(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             skeleton |= working & (1 - opened)
             working = cv2.erode(working, element)
         skeleton = skeleton > 0
-    skeleton = _prune_short_skeleton_spurs(skeleton, max_length_px=6) > 0
+    skeleton = _prune_short_skeleton_spurs(skeleton, max_length_px=6)
+    skeleton = _remove_short_isolated_skeleton_components(
+        skeleton, min_length_px=20.0,
+    ) > 0
     points = [tuple(int(value) for value in point) for point in np.argwhere(skeleton).tolist()]
     if not points:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.int32)
