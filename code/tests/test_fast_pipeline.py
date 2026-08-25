@@ -32,12 +32,14 @@ from engine.fast_pipeline import (
     measure_fast_path_widths,
     measure_fast_widths,
     _build_fast_road_geometry,
+    _apply_fast_presence_guard,
     _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
     _trace_skeleton_paths,
+    _fast_width_change_records,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
@@ -400,24 +402,26 @@ class FastAutomaticChangeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             before_lines = [
-                LineString([(0, 0), (15, 0)]),
-                LineString([(15, 0), (30, 0)]),
-                LineString([(0, 20), (30, 20)]),
-                LineString([(0, 40), (30, 40)]),
-                LineString([(0, 60), (30, 60)]),
-                LineString([(0, 120), (30, 120)]),
+                LineString([(0, 0), (50, 0)]),
+                LineString([(50, 0), (100, 0)]),
+                LineString([(0, 20), (100, 20)]),
+                LineString([(0, 40), (100, 40)]),
+                LineString([(0, 60), (100, 60)]),
+                LineString([(0, 120), (100, 120)]),
+                *[LineString([(0, y), (100, y)]) for y in (140, 160, 180, 200, 220)],
             ]
             after_lines = [
-                LineString([(0, 20), (30, 20)]),
-                LineString([(0, 40), (30, 40)]),
-                LineString([(0, 61), (30, 61)]),
-                LineString([(0, 80), (15, 80)]),
-                LineString([(15, 80), (30, 80)]),
+                LineString([(0, 20), (100, 20)]),
+                LineString([(0, 40), (100, 40)]),
+                LineString([(0, 61), (100, 61)]),
+                LineString([(0, 80), (50, 80)]),
+                LineString([(50, 80), (100, 80)]),
                 LineString([(0, 100), (10, 100)]),
-                LineString([(15, 120), (45, 120)]),
+                LineString([(50, 120), (150, 120)]),
+                *[LineString([(0, y), (100, y)]) for y in (140, 160, 180, 200, 220)],
             ]
-            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0]
-            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0, *([4.0] * 5)]
+            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, *([4.0] * 5)]
 
             def write_period(name, lines, widths):
                 directory = root / name
@@ -445,11 +449,11 @@ class FastAutomaticChangeTests(unittest.TestCase):
             for change_type in ("added", "removed", "widened", "narrowed"):
                 self.assertGreater(len(gpd.read_file(result["layers"][change_type])), 0)
             changes = gpd.read_file(result["road_changes"])
-            shifted_road_area = box(-5, 55, 35, 65)
+            shifted_road_area = box(-5, 55, 105, 65)
             self.assertFalse(changes.geometry.intersects(shifted_road_area).any())
             short_fragment_area = box(-5, 95, 15, 105)
             self.assertFalse(changes.geometry.intersects(short_fragment_area).any())
-            ambiguous_coverage_area = box(-5, 115, 50, 125)
+            ambiguous_coverage_area = box(-5, 115, 155, 125)
             self.assertFalse(changes.geometry.intersects(ambiguous_coverage_area).any())
             self.assertTrue(result["automatic_result"])
             self.assertFalse(result["ground_truth_derived"])
@@ -459,12 +463,64 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 "merge_seconds", "write_seconds", "total_seconds",
             ):
                 self.assertGreaterEqual(float(summary[timing_key]), 0.0)
+            self.assertEqual(summary["presence_guard_mode"], "normal")
             stable = detect_fast_changes(
                 after_result, after_result, root / "stable_changes",
                 before_period="2021", after_period="2022",
                 position_tolerance=2.0,
             )
             self.assertTrue(gpd.read_file(stable["road_changes"]).empty)
+
+    def test_presence_guard_suppresses_global_instability(self) -> None:
+        added, removed, summary = _apply_fast_presence_guard(
+            [{"_line_key": "added:0", "_line_len": 400.0}],
+            [{"_line_key": "removed:0", "_line_len": 400.0}],
+            before_total_length=500.0, after_total_length=500.0,
+        )
+        self.assertEqual(added, [])
+        self.assertEqual(removed, [])
+        self.assertEqual(summary["presence_guard_mode"], "suppressed_unreliable")
+        self.assertFalse(summary["presence_result_reliable"])
+
+    def test_presence_guard_keeps_only_long_paths_in_conservative_mode(self) -> None:
+        added, removed, summary = _apply_fast_presence_guard(
+            [
+                {"_line_key": "added:0", "_line_len": 160.0},
+                {"_line_key": "added:1", "_line_len": 80.0},
+            ],
+            [], before_total_length=500.0, after_total_length=500.0,
+        )
+        self.assertEqual(len(added), 1)
+        self.assertEqual(removed, [])
+        self.assertEqual(summary["presence_guard_mode"], "conservative")
+
+    def test_width_match_rejects_crossing_and_large_length_mismatch(self) -> None:
+        before = gpd.GeoDataFrame(
+            {"width_m": [4.0]},
+            geometry=[LineString([(0, 0), (100, 0)])], crs="EPSG:3857",
+        )
+        invalid_after = gpd.GeoDataFrame(
+            {"width_m": [10.0, 10.0]},
+            geometry=[
+                LineString([(50, -50), (50, 50)]),
+                LineString([(0, 0), (30, 0)]),
+            ],
+            crs="EPSG:3857",
+        )
+        common = dict(
+            tolerance=2.0, absolute_threshold=2.0, ratio_threshold=0.2,
+            before_period="2021", after_period="2022", min_area=4.0,
+        )
+        self.assertEqual(
+            _fast_width_change_records(before, invalid_after, **common), [],
+        )
+        valid_after = gpd.GeoDataFrame(
+            {"width_m": [10.0]},
+            geometry=[LineString([(0, 1), (100, 1)])], crs="EPSG:3857",
+        )
+        self.assertGreater(
+            len(_fast_width_change_records(before, valid_after, **common)), 0,
+        )
 
 
 if __name__ == "__main__":

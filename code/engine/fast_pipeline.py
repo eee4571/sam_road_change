@@ -37,9 +37,15 @@ FAST_CHANGE_SHIFT_MAX_PX = 1.5
 FAST_CHANGE_BUFFER_JITTER_PX = 1.0
 FAST_CHANGE_TYPE_ERROR_PROB = 0.03
 FAST_CHANGE_MIN_AREA_M2 = 4.0
-FAST_CHANGE_MIN_LENGTH_M = 30.0
-FAST_CHANGE_EXISTING_COVERAGE = 0.70
-FAST_CHANGE_CANDIDATE_COVERAGE = 0.20
+FAST_CHANGE_MIN_LENGTH_M = 75.0
+FAST_CHANGE_CANDIDATE_COVERAGE = 0.05
+FAST_CHANGE_GUARD_RATIO = 0.15
+FAST_CHANGE_SUPPRESS_RATIO = 0.30
+FAST_CHANGE_GUARD_MIN_LENGTH_M = 150.0
+FAST_CHANGE_GUARD_MAX_PATHS = 10
+FAST_WIDTH_DIRECTION_SIMILARITY = 0.95
+FAST_WIDTH_LENGTH_RATIO_MIN = 0.50
+FAST_WIDTH_LENGTH_RATIO_MAX = 2.00
 
 
 @dataclass(frozen=True)
@@ -1339,6 +1345,27 @@ def _fast_line_parts(geometry) -> list:
     return []
 
 
+def _fast_line_direction(geometry) -> np.ndarray | None:
+    parts = _fast_line_parts(geometry)
+    if not parts:
+        return None
+    line = max(parts, key=lambda part: float(part.length))
+    coordinates = np.asarray(line.coords, dtype=np.float64)
+    if coordinates.shape[0] < 2:
+        return None
+    direction = coordinates[-1] - coordinates[0]
+    norm = float(np.linalg.norm(direction))
+    return direction / norm if norm > 1e-9 else None
+
+
+def _fast_direction_similarity(first, second) -> float:
+    first_direction = _fast_line_direction(first)
+    second_direction = _fast_line_direction(second)
+    if first_direction is None or second_direction is None:
+        return 0.0
+    return float(abs(np.dot(first_direction, second_direction)))
+
+
 def _fast_centerline_change_records(
     source_centerlines: gpd.GeoDataFrame,
     reference_centerlines: gpd.GeoDataFrame,
@@ -1391,7 +1418,7 @@ def _fast_centerline_change_records(
     candidate_index = candidate_frame.sindex
     surface_union = source_surfaces.geometry.union_all()
     records = []
-    for line in _fast_line_parts(merged):
+    for line_index, line in enumerate(_fast_line_parts(merged)):
         if float(line.length) < min_length:
             continue
         nearby_positions = candidate_index.query(line, predicate="intersects")
@@ -1417,9 +1444,73 @@ def _fast_centerline_change_records(
                 "width_bef": np.nan,
                 "width_aft": np.nan,
                 "width_diff": np.nan,
+                "_line_key": f"{change_type}:{line_index}",
+                "_line_len": float(line.length),
                 "geometry": part,
             })
     return records, merge_seconds
+
+
+def _apply_fast_presence_guard(
+    added_records: list[dict],
+    removed_records: list[dict],
+    *,
+    before_total_length: float,
+    after_total_length: float,
+) -> tuple[list[dict], list[dict], dict]:
+    all_records = [*added_records, *removed_records]
+    path_lengths = {}
+    for record in all_records:
+        key = str(record.get("_line_key") or "")
+        if key:
+            path_lengths[key] = max(
+                float(path_lengths.get(key, 0.0)),
+                float(record.get("_line_len") or 0.0),
+            )
+    raw_length = float(sum(path_lengths.values()))
+    network_length = max(
+        float(before_total_length) + float(after_total_length), 1e-9,
+    )
+    change_ratio = raw_length / network_length
+    selected_keys = set(path_lengths)
+    guard_mode = "normal"
+    reliable = True
+    if change_ratio > FAST_CHANGE_SUPPRESS_RATIO:
+        selected_keys.clear()
+        guard_mode = "suppressed_unreliable"
+        reliable = False
+    elif change_ratio > FAST_CHANGE_GUARD_RATIO:
+        ranked = sorted(
+            (
+                (length, key) for key, length in path_lengths.items()
+                if length >= FAST_CHANGE_GUARD_MIN_LENGTH_M
+            ),
+            reverse=True,
+        )
+        selected_keys = {
+            key for _length, key in ranked[:FAST_CHANGE_GUARD_MAX_PATHS]
+        }
+        guard_mode = "conservative"
+
+    def retained(records: list[dict]) -> list[dict]:
+        return [
+            {
+                key: value for key, value in record.items()
+                if key not in {"_line_key", "_line_len"}
+            }
+            for record in records
+            if str(record.get("_line_key") or "") in selected_keys
+        ]
+
+    return retained(added_records), retained(removed_records), {
+        "presence_guard_mode": guard_mode,
+        "presence_result_reliable": reliable,
+        "raw_presence_change_length_m": raw_length,
+        "retained_presence_change_length_m": float(sum(
+            length for key, length in path_lengths.items() if key in selected_keys
+        )),
+        "presence_change_ratio": float(change_ratio),
+    }
 
 
 def _fast_width_value(row) -> float:
@@ -1453,6 +1544,7 @@ def _fast_width_change_records(
         before_line = before_row.geometry
         if before_line is None or before_line.is_empty or before_line.length <= 0:
             continue
+        before_length = float(before_line.length)
         candidates = (
             spatial_index.query(
                 before_line, predicate="dwithin", distance=tolerance,
@@ -1471,9 +1563,23 @@ def _fast_width_change_records(
             distance = float(before_line.distance(after_line))
             if distance > tolerance:
                 continue
+            after_length = float(after_line.length)
+            length_ratio = after_length / max(before_length, 1e-9)
+            if not (
+                FAST_WIDTH_LENGTH_RATIO_MIN
+                <= length_ratio
+                <= FAST_WIDTH_LENGTH_RATIO_MAX
+            ):
+                continue
+            direction_similarity = _fast_direction_similarity(
+                before_line, after_line,
+            )
+            if direction_similarity < FAST_WIDTH_DIRECTION_SIMILARITY:
+                continue
             score = (
                 distance,
-                abs(float(before_line.length) - float(after_line.length)),
+                -direction_similarity,
+                abs(before_length - after_length),
             )
             if best is None or score < best[0]:
                 best = (score, after_position, after_row)
@@ -1574,6 +1680,11 @@ def detect_fast_changes(
         change_type="removed", before_period=before_period, after_period=after_period,
         min_area=minimum_area, min_length=minimum_length,
     )
+    added_records, removed_records, presence_guard = _apply_fast_presence_guard(
+        added_records, removed_records,
+        before_total_length=float(before_centerlines.geometry.length.sum()),
+        after_total_length=float(after_centerlines.geometry.length.sum()),
+    )
     presence_change_seconds = time.perf_counter() - presence_started
     merge_seconds = added_merge_seconds + removed_merge_seconds
     record_groups = {
@@ -1655,9 +1766,13 @@ def detect_fast_changes(
         "automatic_result": True,
         "before_period": str(before_period), "after_period": str(after_period),
         "position_tolerance_m": tolerance,
-        "existing_coverage_threshold": FAST_CHANGE_EXISTING_COVERAGE,
         "candidate_coverage_threshold": FAST_CHANGE_CANDIDATE_COVERAGE,
         "minimum_continuous_length_m": minimum_length,
+        "presence_guard_ratio": FAST_CHANGE_GUARD_RATIO,
+        "presence_suppress_ratio": FAST_CHANGE_SUPPRESS_RATIO,
+        "width_direction_similarity_threshold": FAST_WIDTH_DIRECTION_SIMILARITY,
+        "width_length_ratio_min": FAST_WIDTH_LENGTH_RATIO_MIN,
+        "width_length_ratio_max": FAST_WIDTH_LENGTH_RATIO_MAX,
         "width_change_absolute_m": float(width_change_absolute),
         "width_change_ratio": float(width_change_ratio),
         "presence_change_seconds": float(presence_change_seconds),
@@ -1665,6 +1780,7 @@ def detect_fast_changes(
         "merge_seconds": float(merge_seconds),
         "write_seconds": float(write_seconds),
         "total_seconds": float(total_seconds),
+        **presence_guard,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
     summary_path = output_dir / "change_summary.json"
@@ -1673,7 +1789,9 @@ def detect_fast_changes(
         f"[Fast Change] {before_period}->{after_period}: "
         f"presence={presence_change_seconds:.3f}s, "
         f"width={width_change_seconds:.3f}s, merge={merge_seconds:.3f}s, "
-        f"write={write_seconds:.3f}s, total={total_seconds:.3f}s",
+        f"write={write_seconds:.3f}s, total={total_seconds:.3f}s, "
+        f"guard={presence_guard['presence_guard_mode']}, "
+        f"change_ratio={presence_guard['presence_change_ratio']:.3f}",
         flush=True,
     )
     return {
