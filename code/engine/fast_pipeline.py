@@ -1749,7 +1749,7 @@ def augment_fast_changes_with_truth(
         float(evaluation_tolerance),
         class_mode="three",
     )
-    evaluation = _fast_evaluation_payload(
+    auto_evaluation = _fast_evaluation_payload(
         auto_metrics,
         auto_metadata,
         evaluation_source="fast_automatic_vs_ground_truth",
@@ -1779,6 +1779,19 @@ def augment_fast_changes_with_truth(
     changes = (
         gpd.GeoDataFrame(combined_records, geometry="geometry", crs=target_crs)
         if combined_records else _empty_like(final_layers["added"])
+    )
+    final_metrics, final_metadata = evaluate_changes(
+        changes,
+        truth_evaluation,
+        validation,
+        evaluation_type_field,
+        float(evaluation_tolerance),
+        class_mode="three",
+    )
+    evaluation = _fast_evaluation_payload(
+        final_metrics,
+        final_metadata,
+        evaluation_source="gt_assisted_final_vs_ground_truth",
     )
     layers = {"changes": changes, **final_layers}
     filenames = {
@@ -1820,7 +1833,7 @@ def augment_fast_changes_with_truth(
         "automatic_road_changes": str(automatic_result.get("road_changes") or ""),
         "automatic_summary": str(automatic_result.get("summary") or ""),
         "evaluation": evaluation,
-        "auto_evaluation": evaluation,
+        "auto_evaluation": auto_evaluation,
         "gt_assisted_pixel_size": pixel_size,
         "auto_added_count": int(len(automatic["added"])),
         "auto_removed_count": int(len(automatic["removed"])),

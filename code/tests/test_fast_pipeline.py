@@ -484,14 +484,28 @@ class FastTruthChangeTests(unittest.TestCase):
                 summary["ground_truth_usage"],
                 "augment_auto_misses_with_perturbed_geometry",
             )
-            self.assertEqual(summary["evaluation"], summary["auto_evaluation"])
-            overall = next(
+            final_overall = next(
                 row for row in summary["evaluation"]["metrics"]
                 if row["class"] == "all"
             )
-            self.assertIsNotNone(overall["change_recall"])
-            self.assertIsNotNone(overall["change_precision"])
-            self.assertIn("change_type_accuracy", overall)
+            auto_overall = next(
+                row for row in summary["auto_evaluation"]["metrics"]
+                if row["class"] == "all"
+            )
+            self.assertEqual(
+                summary["evaluation"]["metadata"]["evaluation_source"],
+                "gt_assisted_final_vs_ground_truth",
+            )
+            self.assertEqual(
+                summary["auto_evaluation"]["metadata"]["evaluation_source"],
+                "fast_automatic_vs_ground_truth",
+            )
+            self.assertGreaterEqual(
+                final_overall["change_recall"], auto_overall["change_recall"],
+            )
+            self.assertNotEqual(summary["evaluation"], summary["auto_evaluation"])
+            self.assertIsNotNone(final_overall["change_precision"])
+            self.assertIn("change_type_accuracy", final_overall)
             self.assertEqual(summary["auto_added_count"], 2)
             self.assertEqual(summary["gt_assisted_added_count"], 1)
             self.assertEqual(summary["gt_assisted_removed_count"], 1)
@@ -525,12 +539,24 @@ class FastTruthChangeTests(unittest.TestCase):
             )
             self.assertEqual(
                 updated_summary["evaluation"]["metadata"]["evaluation_source"],
-                "fast_automatic_vs_ground_truth",
-            )
-            self.assertEqual(
-                updated_summary["assisted_evaluation"]["metadata"]["evaluation_source"],
                 "gt_assisted_final_vs_ground_truth",
             )
+            self.assertEqual(
+                updated_summary["auto_evaluation"]["metadata"]["evaluation_source"],
+                "fast_automatic_vs_ground_truth",
+            )
+            updated_final = next(
+                row for row in updated_summary["evaluation"]["metrics"]
+                if row["class"] == "all"
+            )
+            updated_auto = next(
+                row for row in updated_summary["auto_evaluation"]["metrics"]
+                if row["class"] == "all"
+            )
+            self.assertGreaterEqual(
+                updated_final["change_recall"], updated_auto["change_recall"],
+            )
+            self.assertAlmostEqual(evaluated["change_recall"], updated_final["change_recall"])
 
     def test_truth_codes_generate_three_semantic_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2913,7 +2913,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         )
     validation_value = str(args.validation_area or entry.get("validation_area") or manifest.get("validation_area") or "").strip()
     validation = gpd.read_file(validation_value) if validation_value else None
-    assisted_rows, assisted_metadata = evaluate_changes(
+    rows, metadata = evaluate_changes(
         predicted,
         truth,
         validation,
@@ -2921,8 +2921,13 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         float(args.evaluation_tolerance),
         class_mode="three",
     )
-    rows, metadata = assisted_rows, assisted_metadata
+    auto_rows = None
+    auto_metadata = None
     if is_fast_gt_assisted:
+        metadata = {
+            **metadata,
+            "evaluation_source": "gt_assisted_final_vs_ground_truth",
+        }
         automatic_path = Path(str(
             entry.get("automatic_road_changes")
             or summary.get("automatic_road_changes")
@@ -2930,7 +2935,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         )).expanduser()
         if automatic_path.is_file():
             automatic_predicted = gpd.read_file(automatic_path)
-            rows, metadata = evaluate_changes(
+            auto_rows, auto_metadata = evaluate_changes(
                 automatic_predicted,
                 truth,
                 validation,
@@ -2940,7 +2945,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
             )
         else:
             stored_evaluation = (
-                summary.get("evaluation") or summary.get("auto_evaluation") or {}
+                summary.get("auto_evaluation") or {}
             )
             stored_rows = stored_evaluation.get("metrics", [])
             if not isinstance(stored_rows, list) or not stored_rows:
@@ -2948,15 +2953,11 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
                     "Fast 自动变化成果不存在，且摘要中没有可复用的 Auto vs GT 评价："
                     f"{automatic_path}"
                 )
-            rows = [dict(row) for row in stored_rows]
-            metadata = dict(stored_evaluation.get("metadata") or {})
-        metadata = {
-            **metadata,
+            auto_rows = [dict(row) for row in stored_rows]
+            auto_metadata = dict(stored_evaluation.get("metadata") or {})
+        auto_metadata = {
+            **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
-        }
-        assisted_metadata = {
-            **assisted_metadata,
-            "evaluation_source": "gt_assisted_final_vs_ground_truth",
         }
 
     for row in rows:
@@ -2966,7 +2967,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
             )
             row["change_precision"] = row.get("precision")
             row["change_type_accuracy"] = row.get("type_judgment_accuracy")
-    for row in assisted_rows:
+    for row in auto_rows or []:
         if row.get("class") == "all":
             row["change_recall"] = row.get(
                 "change_area_recall", row.get("recall")
@@ -3015,17 +3016,17 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
 
     summary["evaluation"] = {"metadata": metadata, "metrics": rows}
     if is_fast_gt_assisted:
-        summary["auto_evaluation"] = summary["evaluation"]
-        summary["assisted_evaluation"] = {
-            "metadata": assisted_metadata,
-            "metrics": assisted_rows,
+        summary["auto_evaluation"] = {
+            "metadata": auto_metadata,
+            "metrics": auto_rows,
         }
+        summary.pop("assisted_evaluation", None)
     if configured_values:
         summary["evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
         summary["evaluation"]["metadata"]["truth_value_map"] = truth_value_map
         if is_fast_gt_assisted:
-            summary["assisted_evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
-            summary["assisted_evaluation"]["metadata"]["truth_value_map"] = truth_value_map
+            summary["auto_evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
+            summary["auto_evaluation"]["metadata"]["truth_value_map"] = truth_value_map
     write_json(summary_path, summary)
 
     entry["truth"] = str(truth_path)
