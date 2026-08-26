@@ -25,6 +25,7 @@ from app.task_manager import build_pipeline_command
 import user_pipeline
 from engine.fast_pipeline import (
     FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX,
+    augment_fast_changes_with_truth,
     build_fast_change_from_truth,
     build_fast_surface_mask,
     build_fast_surfaces,
@@ -357,6 +358,116 @@ class FastTruthChangeTests(unittest.TestCase):
             }), encoding="utf-8")
             result_paths.append(result_path)
         return result_paths[0], result_paths[1], stable
+
+    def test_gt_augmentation_preserves_auto_adds_missing_truth_and_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            auto_root = root / "automatic"
+            auto_root.mkdir()
+            crs = "EPSG:3857"
+
+            def frame(change_type, geometries):
+                return gpd.GeoDataFrame(
+                    {
+                        "change_typ": [change_type] * len(geometries),
+                        "before_per": ["2021"] * len(geometries),
+                        "after_per": ["2022"] * len(geometries),
+                        "source": ["fast_automatic"] * len(geometries),
+                        "width_bef": [np.nan] * len(geometries),
+                        "width_aft": [np.nan] * len(geometries),
+                        "width_diff": [np.nan] * len(geometries),
+                    },
+                    geometry=geometries,
+                    crs=crs,
+                )
+
+            auto_frames = {
+                "added": frame("added", [box(0, 0, 20, 5), box(40, 0, 60, 5)]),
+                "removed": frame("removed", [box(0, 20, 20, 25)]),
+                "width_changed": frame("width_changed", []),
+                "widened": frame("widened", [box(0, 40, 20, 45)]),
+                "narrowed": frame("narrowed", []),
+            }
+            filenames = {
+                "added": "added_roads.shp", "removed": "removed_roads.shp",
+                "width_changed": "width_changed_road_parts.shp",
+                "widened": "widened_road_parts.shp",
+                "narrowed": "narrowed_road_parts.shp",
+            }
+            layers = {}
+            for name, auto_frame in auto_frames.items():
+                path = auto_root / filenames[name]
+                auto_frame.to_file(path)
+                layers[name] = str(path)
+            auto_changes = gpd.GeoDataFrame(
+                [
+                    record
+                    for name in ("added", "removed", "widened", "narrowed")
+                    for record in auto_frames[name].to_dict(orient="records")
+                ],
+                geometry="geometry",
+                crs=crs,
+            )
+            auto_changes_path = auto_root / "road_changes.shp"
+            auto_changes.to_file(auto_changes_path)
+            auto_summary_path = auto_root / "change_summary.json"
+            auto_summary_path.write_text(json.dumps({
+                "execution_profile": "fast", "automatic_result": True,
+            }), encoding="utf-8")
+            automatic_result = {
+                "output": str(auto_root), "road_changes": str(auto_changes_path),
+                "summary": str(auto_summary_path), "layers": layers,
+            }
+
+            truth_path = root / "truth.shp"
+            truth = gpd.GeoDataFrame(
+                {"BHBM": [2, 2, 4]},
+                geometry=[
+                    box(1, 0, 21, 5),
+                    box(80, 0, 100, 5),
+                    box(80, 20, 100, 25),
+                ],
+                crs=crs,
+            )
+            truth.to_file(truth_path)
+            result = augment_fast_changes_with_truth(
+                automatic_result,
+                truth_path,
+                root / "final",
+                before_period="2021",
+                after_period="2022",
+                position_tolerance=1.0,
+            )
+            final_added = gpd.read_file(result["layers"]["added"])
+            final_removed = gpd.read_file(result["layers"]["removed"])
+            final_widened = gpd.read_file(result["layers"]["widened"])
+            self.assertEqual(len(final_added), 3)
+            self.assertEqual(len(final_removed), 2)
+            self.assertEqual(len(final_widened), 1)
+            self.assertEqual(
+                set(final_added["change_src"]), {"AUTO", "GT", "AUTO_GT"},
+            )
+            expected_added = gpd.GeoSeries(
+                [*auto_frames["added"].geometry, *truth.iloc[:2].geometry],
+                crs=crs,
+            ).union_all()
+            self.assertLess(
+                final_added.geometry.union_all().symmetric_difference(
+                    expected_added
+                ).area,
+                1e-8,
+            )
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                summary["detection_source"], "fast_automatic_change_detection",
+            )
+            self.assertEqual(
+                summary["ground_truth_usage"],
+                "augment_missing_reference_changes",
+            )
+            self.assertIn("auto_evaluation", summary)
+            self.assertEqual(summary["auto_added_count"], 2)
+            self.assertEqual(summary["final_added_count"], 3)
 
     def test_truth_codes_generate_three_semantic_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

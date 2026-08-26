@@ -344,6 +344,56 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
     return payload
 
 
+def _run_fast_change_result(
+    before_result: Path,
+    after_result: Path,
+    output: Path,
+    *,
+    before_period: str,
+    after_period: str,
+    position_tolerance: float,
+    width_change_absolute: float,
+    width_change_ratio: float,
+    truth_path: Path | None = None,
+    validation_area: Path | None = None,
+    truth_type_field: str = "BHBM",
+    evaluation_tolerance: float = 5.0,
+) -> dict:
+    """Run the sole Fast auto detector, then optionally publish Auto∪GT."""
+    from engine.fast_pipeline import (
+        augment_fast_changes_with_truth,
+        detect_fast_changes,
+    )
+
+    automatic_output = output / "_automatic" if truth_path is not None else output
+    automatic = detect_fast_changes(
+        before_result,
+        after_result,
+        automatic_output,
+        before_period=before_period,
+        after_period=after_period,
+        position_tolerance=float(position_tolerance),
+        width_change_absolute=float(width_change_absolute),
+        width_change_ratio=float(width_change_ratio),
+    )
+    if truth_path is None:
+        return automatic
+    truth_path = Path(truth_path).expanduser()
+    if not truth_path.is_file():
+        raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
+    return augment_fast_changes_with_truth(
+        automatic,
+        truth_path,
+        output,
+        before_period=before_period,
+        after_period=after_period,
+        truth_type_field=truth_type_field,
+        validation_area=validation_area,
+        position_tolerance=float(position_tolerance),
+        evaluation_tolerance=float(evaluation_tolerance),
+    )
+
+
 def clean_name(value: str) -> str:
     value = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value.strip())
     return value.strip("._-") or "workspace"
@@ -1355,26 +1405,21 @@ def change_project_periods(args: argparse.Namespace) -> dict:
             result = dict(prior_result)
             emit("pipeline", stage="两期宽度变化检测", status="skipped", reason="续跑复用已完成且完整的变化成果", completed=3, total=3)
         elif fast_profile:
-            from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
-
-            if truth_entry:
-                result = build_fast_change_from_truth(
-                    Path(truth_entry["source"]), products,
-                    period_key=f"{args.area_id}:{args.before_period}->{args.after_period}",
-                    before_result=before_result_path,
-                    after_result=after_result_path,
-                    validation_area=Path(area["validation_area"]),
-                    truth_type_field="BHBM",
-                    before_period=args.before_period, after_period=args.after_period,
-                )
-            else:
-                result = detect_fast_changes(
-                    before_result_path, after_result_path, products,
-                    before_period=args.before_period, after_period=args.after_period,
-                    position_tolerance=thresholds["tolerance"],
-                    width_change_absolute=thresholds["absolute"],
-                    width_change_ratio=thresholds["ratio"],
-                )
+            result = _run_fast_change_result(
+                before_result_path,
+                after_result_path,
+                products,
+                before_period=args.before_period,
+                after_period=args.after_period,
+                position_tolerance=thresholds["tolerance"],
+                width_change_absolute=thresholds["absolute"],
+                width_change_ratio=thresholds["ratio"],
+                truth_path=(
+                    Path(truth_entry["source"]) if truth_entry else None
+                ),
+                validation_area=Path(area["validation_area"]),
+                truth_type_field="BHBM",
+            )
             result = _ensure_change_manifest_fields(result, products)
         else:
             result = change(argparse.Namespace(
@@ -3857,30 +3902,33 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     spec = manifest.get("input_spec") or {}
     started = time.monotonic()
     if str(manifest.get("execution_profile") or "full") == "fast":
-        from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
-
         truth_value = str(old.get("truth") or "").strip()
         validation_value = str(old.get("validation_area") or "")
-        if truth_value:
-            truth_path = Path(truth_value).expanduser()
-            if not truth_path.is_file():
-                raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
-            result = build_fast_change_from_truth(
-                truth_path, output, period_key=f"{grid}:{before}->{after}",
-                before_result=Path(str(before_entry["result"])),
-                after_result=Path(str(after_entry["result"])),
-                validation_area=Path(validation_value) if validation_value else None,
-                truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
-                before_period=before, after_period=after,
-            )
-        else:
-            result = detect_fast_changes(
-                Path(str(before_entry["result"])), Path(str(after_entry["result"])), output,
-                before_period=before, after_period=after,
-                position_tolerance=float(spec.get("tolerance") or old.get("tolerance") or 3.0),
-                width_change_absolute=float(spec.get("absolute") or old.get("absolute") or 2.0),
-                width_change_ratio=float(spec.get("ratio") or old.get("ratio") or 0.2),
-            )
+        result = _run_fast_change_result(
+            Path(str(before_entry["result"])),
+            Path(str(after_entry["result"])),
+            output,
+            before_period=before,
+            after_period=after,
+            position_tolerance=float(
+                spec.get("tolerance") or old.get("tolerance") or 3.0
+            ),
+            width_change_absolute=float(
+                spec.get("absolute") or old.get("absolute") or 2.0
+            ),
+            width_change_ratio=float(
+                spec.get("ratio") or old.get("ratio") or 0.2
+            ),
+            truth_path=Path(truth_value).expanduser() if truth_value else None,
+            validation_area=(
+                Path(validation_value) if validation_value else None
+            ),
+            truth_type_field=str(
+                old.get("truth_type_field")
+                or manifest.get("truth_type_field")
+                or "BHBM"
+            ),
+        )
         result = _ensure_change_manifest_fields(result, output)
     else:
         result = _ensure_change_manifest_fields(change(argparse.Namespace(
@@ -4559,29 +4607,25 @@ def run_all(args: argparse.Namespace) -> dict:
                         validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area
                     )
                     if execution_profile == "fast":
-                        from engine.fast_pipeline import build_fast_change_from_truth, detect_fast_changes
-
-                        if truth_value:
-                            result = build_fast_change_from_truth(
-                                Path(truth_value), change_output,
-                                period_key=f"{grid_name}:{before_period}->{after_period}",
-                                before_result=Path(str(before_entry["result"])),
-                                after_result=Path(str(after_entry["result"])),
-                                validation_area=Path(validation_value) if validation_value else None,
-                                truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
-                                before_period=before_period, after_period=after_period,
-                            )
-                        else:
-                            result = detect_fast_changes(
-                                Path(str(before_entry["result"])),
-                                Path(str(after_entry["result"])),
-                                change_output,
-                                before_period=before_period,
-                                after_period=after_period,
-                                position_tolerance=float(args.tolerance),
-                                width_change_absolute=float(args.absolute),
-                                width_change_ratio=float(args.ratio),
-                            )
+                        result = _run_fast_change_result(
+                            Path(str(before_entry["result"])),
+                            Path(str(after_entry["result"])),
+                            change_output,
+                            before_period=before_period,
+                            after_period=after_period,
+                            position_tolerance=float(args.tolerance),
+                            width_change_absolute=float(args.absolute),
+                            width_change_ratio=float(args.ratio),
+                            truth_path=(
+                                Path(truth_value) if truth_value else None
+                            ),
+                            validation_area=(
+                                Path(validation_value) if validation_value else None
+                            ),
+                            truth_type_field=str(
+                                getattr(args, "truth_type_field", "") or "BHBM"
+                            ),
+                        )
                         result = _ensure_change_manifest_fields(result, change_output)
                     else:
                         result = _ensure_change_manifest_fields(change(

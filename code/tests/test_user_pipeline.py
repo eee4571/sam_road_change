@@ -360,6 +360,65 @@ class ProjectBatchExtractionTests(unittest.TestCase):
 
 
 class ProjectPeriodChangeTests(unittest.TestCase):
+    def test_fast_without_truth_publishes_automatic_result_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            output = root / "changes"
+            automatic = {"output": str(output), "automatic_result": True}
+            with (
+                patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
+                patch("engine.fast_pipeline.augment_fast_changes_with_truth") as augment_mock,
+            ):
+                result = user_pipeline._run_fast_change_result(
+                    root / "before.json",
+                    root / "after.json",
+                    output,
+                    before_period="2021",
+                    after_period="2022",
+                    position_tolerance=3.0,
+                    width_change_absolute=2.0,
+                    width_change_ratio=0.2,
+                )
+
+            self.assertEqual(result, automatic)
+            self.assertEqual(detect_mock.call_args.args[2], output)
+            augment_mock.assert_not_called()
+
+    def test_fast_truth_runs_auto_then_augmentation_without_legacy_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            before_result = root / "before.json"
+            after_result = root / "after.json"
+            truth = root / "truth.shp"
+            output = root / "changes"
+            for path in (before_result, after_result, truth):
+                path.touch()
+
+            automatic = {"output": str(output / "_automatic")}
+            final = {"output": str(output), "change_source": "fast_automatic_gt_augmented"}
+            with (
+                patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
+                patch("engine.fast_pipeline.augment_fast_changes_with_truth", return_value=final) as augment_mock,
+                patch("engine.fast_pipeline.build_fast_change_from_truth") as legacy_mock,
+            ):
+                result = user_pipeline._run_fast_change_result(
+                    before_result,
+                    after_result,
+                    output,
+                    before_period="2021",
+                    after_period="2022",
+                    position_tolerance=3.0,
+                    width_change_absolute=2.0,
+                    width_change_ratio=0.2,
+                    truth_path=truth,
+                )
+
+            self.assertEqual(result, final)
+            self.assertEqual(detect_mock.call_args.args[2], output / "_automatic")
+            augment_mock.assert_called_once()
+            self.assertEqual(augment_mock.call_args.args[:3], (automatic, truth, output))
+            legacy_mock.assert_not_called()
+
     def test_accepts_completed_historical_latest_result_as_period_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()

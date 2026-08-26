@@ -1319,6 +1319,8 @@ def _pseudo_fast_change_type(
     return result
 
 
+# Legacy Fast+GT detector retained temporarily. It is not used by the current
+# Fast execution path, which always runs detect_fast_changes() first.
 def build_fast_change_from_truth(
     truth_path: Path,
     output_dir: Path,
@@ -1527,6 +1529,255 @@ def build_fast_change_from_truth(
         "truth_change_centerlines": str(truth_axes_path.resolve()),
         "predicted_change_centerlines": str(predicted_axes_path.resolve()),
         "road_centerline_pixel_size": pixel_size,
+        "layers": output_layers,
+        "previews": {"change": str(preview_path.resolve())},
+        "road_change": str(preview_path.resolve()),
+        **summary,
+    }
+
+
+def _fast_gt_augmentation_truth(
+    truth_path: Path,
+    *,
+    truth_type_field: str,
+    validation_area: Path | None,
+    polygon_tolerance: float,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, str]:
+    truth = gpd.read_file(truth_path)
+    if truth.crs is None:
+        raise ValueError(f"Change truth lacks CRS: {truth_path}")
+    truth = truth.loc[truth.geometry.notna() & ~truth.geometry.is_empty].copy()
+    truth.geometry = truth.geometry.map(make_valid)
+    truth = truth.loc[~truth.geometry.is_empty].copy()
+    if validation_area is not None and validation_area.is_file():
+        truth = _clip_frame(truth, validation_area)
+    field = next((
+        column for column in truth.columns
+        if str(column).casefold() == str(truth_type_field).casefold()
+    ), None)
+    if field is None and not truth.empty:
+        raise ValueError(
+            f"Change truth is missing type field {truth_type_field}: {truth_path}"
+        )
+    aliases = {
+        "2": "added", "added": "added", "新增": "added",
+        "4": "removed", "removed": "removed", "灭失": "removed",
+    }
+    augmented = truth.copy()
+    augmented["change_typ"] = (
+        augmented[field].map(
+            lambda value: aliases.get(str(value).strip().casefold(), "")
+        )
+        if field is not None else ""
+    )
+    augmented = augmented.loc[
+        augmented["change_typ"].isin(("added", "removed"))
+    ].copy()
+    tolerance = max(float(polygon_tolerance), 1e-9)
+    augmented.geometry = augmented.geometry.map(
+        lambda geometry: make_valid(geometry.buffer(tolerance))
+        if geometry.geom_type in {"LineString", "MultiLineString"}
+        else geometry
+    )
+    augmented = augmented.loc[~augmented.geometry.is_empty].copy()
+    return truth, augmented, str(field or truth_type_field)
+
+
+def _augment_fast_typed_layer(
+    automatic: gpd.GeoDataFrame,
+    truth: gpd.GeoDataFrame,
+    *,
+    change_type: str,
+    before_period: str,
+    after_period: str,
+    tolerance: float,
+) -> gpd.GeoDataFrame:
+    automatic = automatic.copy()
+    automatic["change_src"] = "AUTO"
+    records = automatic.to_dict(orient="records")
+    automatic_positions = set(range(len(records)))
+    for geometry in truth.loc[truth["change_typ"] == change_type].geometry:
+        support = geometry.buffer(max(float(tolerance), 0.0))
+        matches = [
+            position for position in automatic_positions
+            if records[position] is not None
+            and records[position][automatic.geometry.name].intersects(support)
+        ]
+        if matches:
+            first = matches[0]
+            merged = gpd.GeoSeries(
+                [geometry, *[
+                    records[position][automatic.geometry.name]
+                    for position in matches
+                ]],
+                crs=automatic.crs,
+            ).union_all()
+            records[first][automatic.geometry.name] = make_valid(merged)
+            records[first]["change_src"] = "AUTO_GT"
+            records[first]["source"] = "fast_automatic_gt"
+            for position in matches[1:]:
+                records[position] = None
+                automatic_positions.discard(position)
+            continue
+        records.append({
+            "change_typ": change_type,
+            "before_per": str(before_period),
+            "after_per": str(after_period),
+            "source": "ground_truth_augmentation",
+            "change_src": "GT",
+            "width_bef": np.nan,
+            "width_aft": np.nan,
+            "width_diff": np.nan,
+            automatic.geometry.name: geometry,
+        })
+    records = [record for record in records if record is not None]
+    if records:
+        return gpd.GeoDataFrame(
+            records, geometry=automatic.geometry.name, crs=automatic.crs,
+        )
+    columns = {
+        "change_typ": [], "before_per": [], "after_per": [], "source": [],
+        "change_src": [], "width_bef": [], "width_aft": [], "width_diff": [],
+    }
+    return gpd.GeoDataFrame(
+        columns, geometry=gpd.GeoSeries([], crs=automatic.crs), crs=automatic.crs,
+    )
+
+
+def augment_fast_changes_with_truth(
+    automatic_result: dict,
+    truth_path: Path,
+    output_dir: Path,
+    *,
+    before_period: str = "before",
+    after_period: str = "after",
+    truth_type_field: str = "BHBM",
+    validation_area: Path | None = None,
+    position_tolerance: float = 3.0,
+    evaluation_tolerance: float = 5.0,
+) -> dict:
+    """Publish Auto∪GT while retaining Auto-vs-GT evaluation separately."""
+    auto_layers = dict(automatic_result.get("layers") or {})
+    automatic = {
+        name: _read_fast_change_layer(auto_layers, name)
+        for name in ("added", "removed", "width_changed", "widened", "narrowed")
+    }
+    target_crs = automatic["added"].crs
+    for name, frame in automatic.items():
+        automatic[name] = _align_fast_change_frame(frame, target_crs)
+    auto_changes = _read_fast_change_layer(
+        {"changes": automatic_result.get("road_changes")}, "changes",
+    )
+    auto_changes = _align_fast_change_frame(auto_changes, target_crs)
+    truth_evaluation, truth_augmentation, evaluation_type_field = (
+        _fast_gt_augmentation_truth(
+        Path(truth_path),
+        truth_type_field=truth_type_field,
+        validation_area=validation_area,
+        polygon_tolerance=position_tolerance,
+        )
+    )
+    truth_augmentation = _align_fast_change_frame(truth_augmentation, target_crs)
+    validation = (
+        gpd.read_file(validation_area)
+        if validation_area is not None and validation_area.is_file() else None
+    )
+    if str(WIDTH_ROOT) not in sys.path:
+        sys.path.insert(0, str(WIDTH_ROOT))
+    from road_change_detection import evaluate_changes, render_change_preview  # noqa: PLC0415
+
+    auto_metrics, auto_metadata = evaluate_changes(
+        auto_changes,
+        truth_evaluation,
+        validation,
+        evaluation_type_field,
+        float(evaluation_tolerance),
+        class_mode="three",
+    )
+    final_layers = {
+        "added": _augment_fast_typed_layer(
+            automatic["added"], truth_augmentation,
+            change_type="added", before_period=before_period,
+            after_period=after_period, tolerance=position_tolerance,
+        ),
+        "removed": _augment_fast_typed_layer(
+            automatic["removed"], truth_augmentation,
+            change_type="removed", before_period=before_period,
+            after_period=after_period, tolerance=position_tolerance,
+        ),
+    }
+    for name in ("width_changed", "widened", "narrowed"):
+        final_layers[name] = automatic[name].copy()
+        final_layers[name]["change_src"] = "AUTO"
+    combined_records = [
+        record
+        for name in ("added", "removed", "widened", "narrowed")
+        for record in final_layers[name].to_dict(orient="records")
+    ]
+    changes = (
+        gpd.GeoDataFrame(combined_records, geometry="geometry", crs=target_crs)
+        if combined_records else _empty_like(final_layers["added"])
+    )
+    layers = {"changes": changes, **final_layers}
+    filenames = {
+        "changes": "road_changes.shp", "added": "added_roads.shp",
+        "removed": "removed_roads.shp",
+        "width_changed": "width_changed_road_parts.shp",
+        "widened": "widened_road_parts.shp",
+        "narrowed": "narrowed_road_parts.shp",
+    }
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    gpkg = output_dir / "road_changes.gpkg"
+    gpkg.unlink(missing_ok=True)
+    output_layers = {}
+    for index, (name, frame) in enumerate(layers.items()):
+        target = output_dir / filenames[name]
+        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
+        frame.to_file(
+            gpkg, layer="road_changes" if name == "changes" else name,
+            driver="GPKG", mode="w" if index == 0 else "a",
+        )
+        output_layers[name] = str(target.resolve())
+    preview_path = output_dir / "change_preview.png"
+    render_change_preview(
+        preview_path, changes, _empty_like(changes),
+        title=f"Fast Auto + Ground Truth: {before_period} to {after_period}",
+        empty_message="No Fast road changes detected",
+    )
+    auto_summary_path = Path(str(automatic_result.get("summary") or ""))
+    auto_summary = (
+        json.loads(auto_summary_path.read_text(encoding="utf-8"))
+        if auto_summary_path.is_file() else {}
+    )
+    summary = {
+        **auto_summary,
+        "execution_profile": "fast",
+        "change_source": "fast_automatic_gt_augmented",
+        "change_output_mode": "fast_auto_plus_ground_truth",
+        "detection_source": "fast_automatic_change_detection",
+        "ground_truth_usage": "augment_missing_reference_changes",
+        "ground_truth_derived": True,
+        "automatic_result": False,
+        "automatic_output": str(automatic_result.get("output") or ""),
+        "automatic_road_changes": str(automatic_result.get("road_changes") or ""),
+        "automatic_summary": str(automatic_result.get("summary") or ""),
+        "auto_evaluation": {"metadata": auto_metadata, "metrics": auto_metrics},
+        "auto_added_count": int(len(automatic["added"])),
+        "auto_removed_count": int(len(automatic["removed"])),
+        "gt_added_count": int((truth_augmentation["change_typ"] == "added").sum()),
+        "gt_removed_count": int((truth_augmentation["change_typ"] == "removed").sum()),
+        "final_added_count": int(len(final_layers["added"])),
+        "final_removed_count": int(len(final_layers["removed"])),
+        **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
+    }
+    summary_path = output_dir / "change_summary.json"
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return {
+        "output": str(output_dir), "summary": str(summary_path.resolve()),
+        "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
         "layers": output_layers,
         "previews": {"change": str(preview_path.resolve())},
         "road_change": str(preview_path.resolve()),
