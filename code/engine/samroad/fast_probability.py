@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 
-FAST_RELATIVE_SIGMA = 25.0
+FAST_RELATIVE_SIGMA_PX = 25.0
 FAST_RELATIVE_EPS = 0.003
 FAST_RELATIVE_MIN_CONTRAST = 0.004
 FAST_RELATIVE_MIN_RATIO = 0.8
@@ -42,8 +42,8 @@ def build_fast_enhanced_road_probability(
     local_background = cv2.GaussianBlur(
         probability,
         (0, 0),
-        sigmaX=FAST_RELATIVE_SIGMA,
-        sigmaY=FAST_RELATIVE_SIGMA,
+        sigmaX=FAST_RELATIVE_SIGMA_PX,
+        sigmaY=FAST_RELATIVE_SIGMA_PX,
     )
     contrast = np.maximum(probability - local_background, 0.0)
     relative_ratio = contrast / (local_background + FAST_RELATIVE_EPS)

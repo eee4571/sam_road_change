@@ -24,17 +24,20 @@ from shapely.ops import linemerge, substring
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
 FAST_LOCAL_STD_FLOOR = 1.0 / (255.0 * np.sqrt(12.0))
 FAST_SCALE_SUPPORT_THRESHOLD = 0.50
+FAST_RELATIVE_BACKGROUND_SIGMAS_PX = (3.0, 15.0)
 FAST_MIN_SKELETON_COMPONENT_LENGTH_PX = 20.0
 FAST_MAX_WEAK_SPUR_LENGTH_PX = 8.0
 FAST_WEAK_SPUR_CONFIDENCE_RATIO = 0.80
 FAST_GAP_BRIDGE_DISTANCE_PX = 8.0
 FAST_SMALL_LOOP_LENGTH_PX = 24.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
+FAST_SURFACE_MIN_COMPONENT_AREA_PX2 = 24
+FAST_SURFACE_MAX_HOLE_AREA_PX2 = 64
 FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
 FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN = 0.25
 FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX = 0.33
-FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M = 40.0
+FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX = 40.0
 FAST_CHANGE_FALSE_POSITIVE_MAX_COUNT = 8
 FAST_CHANGE_SHIFT_MAX_PX = 3.0
 FAST_CHANGE_BUFFER_JITTER_PX = 1.5
@@ -81,12 +84,12 @@ def _probability01(probability: np.ndarray) -> np.ndarray:
     return np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
 
 
-def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+def _remove_small_components(mask: np.ndarray, min_area_px2: int) -> np.ndarray:
     binary = (np.asarray(mask) > 0).astype(np.uint8)
-    if min_area <= 1 or not binary.any():
+    if min_area_px2 <= 1 or not binary.any():
         return binary
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    keep_labels = stats[:, cv2.CC_STAT_AREA] >= int(min_area)
+    keep_labels = stats[:, cv2.CC_STAT_AREA] >= int(min_area_px2)
     keep_labels[0] = False
     return keep_labels[labels].astype(np.uint8)
 
@@ -103,7 +106,7 @@ def _consistent_relative_score(first: np.ndarray, second: np.ndarray) -> np.ndar
 def _fast_relative_score(values: np.ndarray) -> np.ndarray:
     """Return a fixed-floor, scale-consistent local Relative score."""
     scores = []
-    for sigma in (3.0, 15.0):
+    for sigma in FAST_RELATIVE_BACKGROUND_SIGMAS_PX:
         local_mean = cv2.GaussianBlur(values, (0, 0), sigmaX=sigma, sigmaY=sigma)
         local_square_mean = cv2.GaussianBlur(
             values * values, (0, 0), sigmaX=sigma, sigmaY=sigma,
@@ -114,14 +117,14 @@ def _fast_relative_score(values: np.ndarray) -> np.ndarray:
     return _consistent_relative_score(scores[0], scores[1])
 
 
-def _relative_hysteresis_mask(relative_score: np.ndarray, min_area: int) -> np.ndarray:
+def _relative_hysteresis_mask(relative_score: np.ndarray, min_area_px2: int) -> np.ndarray:
     """Keep medium Relative evidence only inside components containing Strong evidence."""
     strong = np.asarray(relative_score) >= 1.30
     weak = (np.asarray(relative_score) >= 0.90).astype(np.uint8)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(weak, connectivity=8)
     strong_counts = np.bincount(labels[strong], minlength=count)
     keep_labels = (
-        (stats[:, cv2.CC_STAT_AREA] >= int(min_area))
+        (stats[:, cv2.CC_STAT_AREA] >= int(min_area_px2))
         & (strong_counts[:count] > 0)
     )
     keep_labels[0] = False
@@ -499,11 +502,14 @@ def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], 
     return [path for path_id, path in enumerate(paths) if path_id not in removed], reasons
 
 
-def _fill_small_holes(mask: np.ndarray, max_area: int = 64) -> np.ndarray:
+def _fill_small_holes(
+    mask: np.ndarray,
+    max_area_px2: int = FAST_SURFACE_MAX_HOLE_AREA_PX2,
+) -> np.ndarray:
     binary = (np.asarray(mask) > 0).astype(np.uint8)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(1 - binary, connectivity=8)
     border_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
-    fill = stats[:, cv2.CC_STAT_AREA] <= int(max_area)
+    fill = stats[:, cv2.CC_STAT_AREA] <= int(max_area_px2)
     fill[border_labels] = False
     return (binary | fill[labels]).astype(np.uint8)
 
@@ -548,11 +554,14 @@ def _build_fast_road_geometry(
     probability: np.ndarray,
     *,
     absolute_threshold: float = FAST_SURFACE_PROBABILITY_THRESHOLD,
-    min_area: int = 24,
+    min_area_px2: int = FAST_SURFACE_MIN_COMPONENT_AREA_PX2,
+    min_area: int | None = None,
     topology_nodes: np.ndarray | None = None,
     topology_edges: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[FastRoadPath], dict]:
     """Build a simple surface and raster preview of the native TopoNet graph."""
+    if min_area is not None:
+        min_area_px2 = int(min_area)
     started = time.perf_counter()
     values = _probability01(probability)
     high = values >= float(absolute_threshold)
@@ -561,8 +570,8 @@ def _build_fast_road_geometry(
         high.astype(np.uint8), cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
     )
-    final_mask = _fill_small_holes(final_mask, max_area=64)
-    final_mask = _remove_small_components(final_mask, min_area)
+    final_mask = _fill_small_holes(final_mask)
+    final_mask = _remove_small_components(final_mask, min_area_px2)
     surface_count = cv2.connectedComponents(final_mask, connectivity=8)[0] - 1
     surface_regularization_elapsed = time.perf_counter() - regularize_started
 
@@ -609,11 +618,15 @@ def build_fast_surface_mask(
     probability: np.ndarray,
     *,
     absolute_threshold: float = FAST_SURFACE_PROBABILITY_THRESHOLD,
-    min_area: int = 24,
+    min_area_px2: int = FAST_SURFACE_MIN_COMPONENT_AREA_PX2,
+    min_area: int | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Regularize enhanced Fast probability into a lightweight surface."""
+    if min_area is not None:
+        min_area_px2 = int(min_area)
     final_mask, _centerline, _paths, diagnostics = _build_fast_road_geometry(
-        probability, absolute_threshold=absolute_threshold, min_area=min_area,
+        probability, absolute_threshold=absolute_threshold,
+        min_area_px2=min_area_px2,
     )
     return final_mask, diagnostics
 
@@ -1094,10 +1107,14 @@ def _degrade_fast_change_geometry(
     return geometry if degraded.is_empty else degraded
 
 
-def _jitter_fast_change_geometry(geometry, rng: np.random.Generator):
+def _jitter_fast_change_geometry(
+    geometry,
+    rng: np.random.Generator,
+    pixel_size: float,
+):
     angle = float(rng.uniform(0.0, 2.0 * np.pi))
     distance = float(
-        FAST_CHANGE_SHIFT_MAX_PX * rng.beta(1.0, 4.0)
+        FAST_CHANGE_SHIFT_MAX_PX * rng.beta(1.0, 4.0) * pixel_size
     )
     shifted = translate(
         geometry,
@@ -1109,7 +1126,7 @@ def _jitter_fast_change_geometry(geometry, rng: np.random.Generator):
             -FAST_CHANGE_BUFFER_JITTER_PX,
             0.0,
             FAST_CHANGE_BUFFER_JITTER_PX,
-        ))
+        ) * pixel_size)
         buffered = shifted.buffer(distance)
         if not buffered.is_empty:
             shifted = buffered
@@ -1185,6 +1202,7 @@ def _pseudo_fast_change_type(
     period_key: str,
     change_type: str,
     global_seed: int,
+    pixel_size: float,
 ) -> gpd.GeoDataFrame:
     local_seed = _fast_change_local_seed(global_seed, period_key, change_type)
     rng = np.random.default_rng(local_seed)
@@ -1251,7 +1269,7 @@ def _pseudo_fast_change_type(
             retained_measure += _fast_change_geometry_measure(degraded)
             retained_truth_count += 1
             row[source.geometry.name] = _jitter_fast_change_geometry(
-                degraded, rng,
+                degraded, rng, pixel_size,
             )
             predicted_type = str(change_type)
             if position in type_error_positions:
@@ -1328,6 +1346,7 @@ def build_fast_change_from_truth(
     if unknown_types:
         raise ValueError(f"Unsupported Fast change type: {', '.join(sorted(unknown_types))}")
     source_changes = truth.loc[truth["change_typ"].isin(selected_types)].copy()
+    pixel_size = _fast_truth_change_pixel_size(before_result, after_result)
     output_dir.mkdir(parents=True, exist_ok=True)
     pseudo_frames = []
     truth_support = truth.geometry.union_all()
@@ -1345,6 +1364,7 @@ def build_fast_change_from_truth(
             period_key=period_key,
             change_type=type_name,
             global_seed=global_seed,
+            pixel_size=pixel_size,
         )
         for metric, value in pseudo.attrs.get("synthetic_metrics", {}).items():
             synthetic_metrics[metric] += value
@@ -1369,6 +1389,7 @@ def build_fast_change_from_truth(
             truth_support=truth_support,
             period_key=period_key,
             global_seed=global_seed,
+            pixel_size=pixel_size,
         )
     )
     if not stable_false_positives.empty:
@@ -1434,6 +1455,7 @@ def build_fast_change_from_truth(
         "false_positive_area_ratio_min": FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN,
         "false_positive_area_ratio_max": FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX,
         "false_positive_source": "stable_unchanged_roads",
+        "false_positive_min_length_px": FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX,
         "false_positive_target_total_area": float(target_fp_area),
         "false_positive_total_area": float(actual_fp_area),
         "retained_true_positive_area": float(actual_tp_area),
@@ -1501,6 +1523,20 @@ def _fast_period_pixel_size(result: dict) -> float:
         y_size = abs(float(dataset.transform.e))
     valid = [value for value in (x_size, y_size) if value > 1e-9]
     return float(sum(valid) / len(valid)) if valid else 1.0
+
+
+def _fast_truth_change_pixel_size(
+    before_result: Path | dict | None,
+    after_result: Path | dict | None,
+) -> float:
+    if before_result is None or after_result is None:
+        return 1.0
+    before = _load_fast_period_result(before_result)
+    after = _load_fast_period_result(after_result)
+    return float(np.mean([
+        _fast_period_pixel_size(before),
+        _fast_period_pixel_size(after),
+    ]))
 
 
 def _empty_fast_change_axes(crs) -> gpd.GeoDataFrame:
@@ -1651,8 +1687,12 @@ def _stable_road_false_positives(
     if stable_fp_area_budget <= 1e-9:
         return _empty_like(source_changes), target_total_fp_area
     tolerance = max(
-        3.0,
+        1e-9,
         FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX * pixel_size,
+    )
+    minimum_fp_length = max(
+        1e-9,
+        FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX * pixel_size,
     )
     after_support = after_centerlines.geometry.union_all().buffer(tolerance)
     before_network = before_centerlines.geometry.union_all()
@@ -1690,7 +1730,7 @@ def _stable_road_false_positives(
     for geometry in _fast_line_parts(merged_before):
         if _fast_line_coverage(geometry, after_support) < FAST_CHANGE_STABLE_ROAD_COVERAGE:
             continue
-        if float(geometry.length) >= FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M:
+        if float(geometry.length) >= minimum_fp_length:
             candidates.append((geometry, representative_width))
     if not candidates:
         return _empty_like(source_changes), target_total_fp_area
@@ -1709,9 +1749,9 @@ def _stable_road_false_positives(
             for minx, miny, maxx, maxy in source_changes.geometry.bounds.to_numpy()
         ]
     typical_length = max(
-        FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+        minimum_fp_length,
         float(np.median(truth_lengths))
-        if truth_lengths else FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+        if truth_lengths else minimum_fp_length,
     )
     records = []
     created_support = None
@@ -1729,14 +1769,14 @@ def _stable_road_false_positives(
         length = float(line.length)
         remaining_area = max(0.0, stable_fp_area_budget - created_area)
         reference_length = max(
-            FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+            minimum_fp_length,
             float(rng.choice(truth_lengths)) * float(rng.uniform(0.85, 1.15)),
         )
         budget_length = remaining_area / max(width, 2.0 * pixel_size)
         segment_length = min(
             length,
             max(
-                FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+                minimum_fp_length,
                 min(reference_length * 1.5, max(reference_length, budget_length)),
             ),
         )
@@ -1795,10 +1835,11 @@ def _build_fast_truth_synthetic_geometry(
     truth_support,
     period_key: str,
     global_seed: int,
+    pixel_size: float,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
     empty_axes = _empty_fast_change_axes(source_changes.crs)
     if before_result is None or after_result is None:
-        return _empty_like(source_changes), empty_axes, empty_axes.copy(), 1.0, 0.0
+        return _empty_like(source_changes), empty_axes, empty_axes.copy(), pixel_size, 0.0
     before = _load_fast_period_result(before_result)
     after = _load_fast_period_result(after_result)
     before_centerlines = _align_fast_change_frame(
@@ -1807,9 +1848,6 @@ def _build_fast_truth_synthetic_geometry(
     after_centerlines = _align_fast_change_frame(
         _read_fast_change_layer(after, "centerlines"), source_changes.crs,
     )
-    pixel_size = float(np.mean([
-        _fast_period_pixel_size(before), _fast_period_pixel_size(after),
-    ]))
     truth_axes = _truth_change_axes_from_period_roads(
         source_changes,
         before_centerlines,

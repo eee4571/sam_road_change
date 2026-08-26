@@ -23,6 +23,7 @@ if str(CODE_ROOT) not in sys.path:
 from app.task_manager import build_pipeline_command
 import user_pipeline
 from engine.fast_pipeline import (
+    FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX,
     build_fast_change_from_truth,
     build_fast_surface_mask,
     build_fast_surfaces,
@@ -42,6 +43,7 @@ from engine.fast_pipeline import (
     _relative_hysteresis_mask,
     _trace_skeleton_paths,
     _fast_width_change_records,
+    _jitter_fast_change_geometry,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
@@ -316,6 +318,8 @@ class FastTruthChangeTests(unittest.TestCase):
         self,
         root: Path,
         truth: gpd.GeoDataFrame,
+        *,
+        pixel_size: float = 1.0,
     ) -> tuple[Path, Path, gpd.GeoDataFrame]:
         roads = []
         for geometry in truth.geometry:
@@ -345,7 +349,7 @@ class FastTruthChangeTests(unittest.TestCase):
             with rasterio.open(
                 probability_path, "w", driver="GTiff", width=128, height=64,
                 count=1, dtype="uint8", crs=truth.crs,
-                transform=from_origin(0, 64, 1, 1),
+                transform=from_origin(0, 64 * pixel_size, pixel_size, pixel_size),
             ) as dataset:
                 dataset.write(np.zeros((1, 64, 128), dtype=np.uint8))
             result_path = period_root / "latest_result.json"
@@ -436,7 +440,9 @@ class FastTruthChangeTests(unittest.TestCase):
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
-            before_result, after_result, stable = self._period_results(root, truth)
+            before_result, after_result, stable = self._period_results(
+                root, truth, pixel_size=0.5,
+            )
             first = build_fast_change_from_truth(
                 truth_path, root / "first", period_key="area:2021->2022",
                 change_type="added", global_seed=20260826,
@@ -472,7 +478,10 @@ class FastTruthChangeTests(unittest.TestCase):
                 max(
                     geometry.bounds[2] - geometry.bounds[0],
                     geometry.bounds[3] - geometry.bounds[1],
-                ) >= 40.0
+                ) >= (
+                    FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX
+                    * first["road_centerline_pixel_size"]
+                )
                 for geometry in false_positives.geometry
             ))
             classified_count = 0
@@ -492,6 +501,21 @@ class FastTruthChangeTests(unittest.TestCase):
         self.assertLessEqual(retained_ratio, 0.90)
         self.assertEqual(degraded.geom_type, "Polygon")
         self.assertTrue(source.covers(degraded))
+
+    def test_synthetic_jitter_converts_pixel_distances_to_map_units(self) -> None:
+        source = box(0, 0, 100, 20)
+        small = _jitter_fast_change_geometry(
+            source, np.random.default_rng(20260826), 0.5,
+        )
+        large = _jitter_fast_change_geometry(
+            source, np.random.default_rng(20260826), 2.0,
+        )
+        small_shift = source.centroid.distance(small.centroid)
+        large_shift = source.centroid.distance(large.centroid)
+        self.assertAlmostEqual(large_shift, 4.0 * small_shift, places=6)
+        small_buffer = abs((small.bounds[2] - small.bounds[0]) - 100.0) / 2.0
+        large_buffer = abs((large.bounds[2] - large.bounds[0]) - 100.0) / 2.0
+        self.assertAlmostEqual(large_buffer, 4.0 * small_buffer, places=6)
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
