@@ -14,7 +14,9 @@ import cv2
 import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.features import shapes
+from rasterio.enums import Resampling
+from rasterio.features import rasterize, shapes
+from rasterio.warp import reproject
 from shapely import make_valid
 from shapely.affinity import translate
 from shapely.geometry import LineString, box, shape
@@ -52,15 +54,17 @@ FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
 FAST_CHANGE_STABLE_ROAD_COVERAGE = 0.80
 FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX = 4.0
 FAST_CHANGE_MIN_AREA_M2 = 4.0
-FAST_CHANGE_MIN_LENGTH_M = 50.0
-FAST_CHANGE_CANDIDATE_COVERAGE = 0.12
-FAST_CHANGE_RETAIN_RATIO = 0.05
-FAST_WIDTH_DIRECTION_SIMILARITY = 0.95
-FAST_WIDTH_LENGTH_RATIO_MIN = 0.50
-FAST_WIDTH_LENGTH_RATIO_MAX = 2.00
-FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M = 4.0
-FAST_WIDTH_MIN_RELATIVE_CHANGE = 0.40
-FAST_WIDTH_RETAIN_RATIO = 0.05
+FAST_PRESENCE_HIGH_THRESHOLD = 0.45
+FAST_PRESENCE_LOW_THRESHOLD = 0.20
+FAST_PRESENCE_DELTA_THRESHOLD = 0.25
+FAST_PRESENCE_ALIGNMENT_RADIUS_PX = 2
+FAST_PRESENCE_MORPH_KERNEL_PX = 3
+FAST_PRESENCE_MIN_BLOB_AREA_PX2 = 12
+FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY = 0.90
+FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
+FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
+FAST_PAIRED_WIDTH_MIN_SAMPLES = 3
+FAST_PAIRED_WIDTH_MAX_SEARCH_M = 80.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,17 @@ class FastRoadPath:
     low_relative_score: float
     component_id: int
     component_length_px: float
+
+
+@dataclass(frozen=True)
+class FastProbabilityGrid:
+    """Two period probabilities normalized onto the before-period raster grid."""
+
+    before: np.ndarray
+    after: np.ndarray
+    transform: object
+    crs: object
+    pixel_size: float
 
 
 def _probability01(probability: np.ndarray) -> np.ndarray:
@@ -1907,26 +1922,17 @@ def _align_fast_change_frame(
     return frame if frame.crs == crs else frame.to_crs(crs)
 
 
-def _fast_change_parts(
-    geometry,
-    *,
-    min_area: float,
-    min_length: float,
-) -> list:
+def _fast_polygon_parts(geometry, *, min_area: float) -> list:
     geometry = make_valid(geometry)
     if geometry.is_empty:
         return []
     if geometry.geom_type == "Polygon":
-        minx, miny, maxx, maxy = geometry.bounds
-        extent = max(float(maxx - minx), float(maxy - miny))
-        return [geometry] if float(geometry.area) >= min_area and extent >= min_length else []
+        return [geometry] if float(geometry.area) >= min_area else []
     if hasattr(geometry, "geoms"):
         return [
             part
             for child in geometry.geoms
-            for part in _fast_change_parts(
-                child, min_area=min_area, min_length=min_length,
-            )
+            for part in _fast_polygon_parts(child, min_area=min_area)
         ]
     return []
 
@@ -1973,79 +1979,133 @@ def _fast_direction_similarity(first, second) -> float:
     return float(abs(np.dot(first_direction, second_direction)))
 
 
-def _fast_centerline_change_records(
-    source_centerlines: gpd.GeoDataFrame,
-    reference_centerlines: gpd.GeoDataFrame,
-    source_surfaces: gpd.GeoDataFrame,
+def _fast_probability_grid(
+    before_result: dict,
+    after_result: dict,
+) -> FastProbabilityGrid:
+    before_path = Path(str(before_result.get("road_probability") or "")).expanduser()
+    after_path = Path(str(after_result.get("road_probability") or "")).expanduser()
+    if not before_path.is_file() or not after_path.is_file():
+        raise FileNotFoundError(
+            "Fast automatic change detection requires both road_probability rasters"
+        )
+    with rasterio.open(before_path) as before_dataset:
+        if before_dataset.crs is None:
+            raise ValueError(f"Fast probability raster lacks CRS: {before_path}")
+        before = _probability01(before_dataset.read(1, masked=True).filled(0.0))
+        transform = before_dataset.transform
+        crs = before_dataset.crs
+        shape_2d = before_dataset.shape
+    with rasterio.open(after_path) as after_dataset:
+        if after_dataset.crs is None:
+            raise ValueError(f"Fast probability raster lacks CRS: {after_path}")
+        after_source = _probability01(after_dataset.read(1, masked=True).filled(0.0))
+        if (
+            after_dataset.crs == crs
+            and after_dataset.transform == transform
+            and after_dataset.shape == shape_2d
+        ):
+            after = after_source
+        else:
+            after = np.zeros(shape_2d, dtype=np.float32)
+            reproject(
+                source=after_source,
+                destination=after,
+                src_transform=after_dataset.transform,
+                src_crs=after_dataset.crs,
+                dst_transform=transform,
+                dst_crs=crs,
+                resampling=Resampling.bilinear,
+            )
+    x_size = float(np.hypot(transform.a, transform.d))
+    y_size = float(np.hypot(transform.b, transform.e))
+    valid_sizes = [value for value in (x_size, y_size) if value > 1e-9]
+    pixel_size = float(np.mean(valid_sizes)) if valid_sizes else 1.0
+    return FastProbabilityGrid(before, after, transform, crs, pixel_size)
+
+
+def _fast_rasterize_frame(
+    frame: gpd.GeoDataFrame,
+    grid: FastProbabilityGrid,
     *,
-    tolerance: float,
+    buffer_distance: float = 0.0,
+) -> np.ndarray:
+    geometries = []
+    for geometry in frame.geometry:
+        if geometry is None or geometry.is_empty:
+            continue
+        candidate = geometry.buffer(buffer_distance) if buffer_distance > 0 else geometry
+        if not candidate.is_empty:
+            geometries.append((candidate, 1))
+    if not geometries:
+        return np.zeros(grid.before.shape, dtype=np.uint8)
+    return rasterize(
+        geometries,
+        out_shape=grid.before.shape,
+        transform=grid.transform,
+        fill=0,
+        all_touched=True,
+        dtype="uint8",
+    )
+
+
+def _fast_period_road_masks(
+    surfaces: gpd.GeoDataFrame,
+    centerlines: gpd.GeoDataFrame,
+    grid: FastProbabilityGrid,
+) -> tuple[np.ndarray, np.ndarray]:
+    surface_mask = _fast_rasterize_frame(surfaces, grid)
+    line_mask = _fast_rasterize_frame(
+        centerlines,
+        grid,
+        buffer_distance=0.75 * grid.pixel_size,
+    )
+    return surface_mask, line_mask
+
+
+def _clean_fast_presence_mask(
+    mask: np.ndarray,
+    centerline_anchor: np.ndarray,
+) -> np.ndarray:
+    binary = np.asarray(mask, dtype=np.uint8)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (FAST_PRESENCE_MORPH_KERNEL_PX, FAST_PRESENCE_MORPH_KERNEL_PX),
+    )
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        closed, connectivity=8,
+    )
+    anchor_counts = np.bincount(
+        labels[np.asarray(centerline_anchor) > 0], minlength=count,
+    )
+    keep_labels = (
+        (stats[:, cv2.CC_STAT_AREA] >= FAST_PRESENCE_MIN_BLOB_AREA_PX2)
+        & (anchor_counts[:count] > 0)
+    )
+    keep_labels[0] = False
+    return keep_labels[labels].astype(np.uint8)
+
+
+def _fast_presence_records(
+    mask: np.ndarray,
+    source_surfaces: gpd.GeoDataFrame,
+    grid: FastProbabilityGrid,
+    *,
     change_type: str,
     before_period: str,
     after_period: str,
     min_area: float,
-    min_length: float,
-) -> tuple[list[dict], float]:
-    if source_centerlines.empty or source_surfaces.empty:
-        return [], 0.0
-    reference_network = (
-        reference_centerlines.geometry.union_all()
-        if not reference_centerlines.empty else None
-    )
-    reference_support = (
-        reference_network.buffer(tolerance)
-        if reference_network is not None and tolerance > 0 else reference_network
-    )
-    candidates = []
-    for _index, row in source_centerlines.iterrows():
-        geometry = row.geometry
-        coverage = _fast_line_coverage(geometry, reference_support)
-        if coverage <= FAST_CHANGE_CANDIDATE_COVERAGE:
-            candidates.append((geometry, _fast_width_value(row)))
-    if not candidates:
-        return [], 0.0
-    merge_started = time.perf_counter()
-    candidate_network = gpd.GeoSeries(
-        [geometry for geometry, _width in candidates],
-        crs=source_centerlines.crs,
-    ).union_all()
-    merged = (
-        candidate_network
-        if candidate_network.geom_type in {"LineString", "LinearRing"} else
-        linemerge(candidate_network)
-    )
-    merge_seconds = time.perf_counter() - merge_started
-    candidate_widths = np.asarray(
-        [width for _geometry, width in candidates], dtype=np.float64,
-    )
-    candidate_frame = gpd.GeoDataFrame(
-        {"width_m": candidate_widths},
-        geometry=[geometry for geometry, _width in candidates],
-        crs=source_centerlines.crs,
-    )
-    candidate_index = candidate_frame.sindex
+) -> list[dict]:
     surface_union = source_surfaces.geometry.union_all()
     records = []
-    for line_index, line in enumerate(_fast_line_parts(merged)):
-        line_length = float(line.length)
-        if line_length < min_length:
+    for mapping, value in shapes(
+        mask.astype(np.uint8), mask=mask.astype(bool), transform=grid.transform,
+    ):
+        if int(value) != 1:
             continue
-        line_coverage = _fast_line_coverage(line, reference_support)
-        line_score = line_length * max(0.0, 1.0 - line_coverage)
-        nearby_positions = candidate_index.query(line, predicate="intersects")
-        nearby_widths = [
-            float(candidate_widths[position])
-            for position in np.asarray(nearby_positions, dtype=int).reshape(-1).tolist()
-            if candidate_widths[position] > 0
-        ]
-        polygon_radius = max(
-            tolerance,
-            max(nearby_widths, default=0.0) / 2.0,
-            0.5,
-        )
-        change_polygon = surface_union.intersection(line.buffer(polygon_radius))
-        for part in _fast_change_parts(
-            change_polygon, min_area=min_area, min_length=0.0,
-        ):
+        change_geometry = make_valid(shape(mapping)).intersection(surface_union)
+        for part in _fast_polygon_parts(change_geometry, min_area=min_area):
             records.append({
                 "change_typ": change_type,
                 "before_per": str(before_period),
@@ -2054,97 +2114,69 @@ def _fast_centerline_change_records(
                 "width_bef": np.nan,
                 "width_aft": np.nan,
                 "width_diff": np.nan,
-                "_line_key": f"{change_type}:{line_index}",
-                "_line_len": line_length,
-                "_line_cov": line_coverage,
-                "_line_score": line_score,
                 "geometry": part,
             })
-    return records, merge_seconds
+    return records
 
 
-def _ranked_keys_with_length_budget(
-    metrics: dict[str, tuple[float, float]],
+def _detect_probability_presence_changes(
+    grid: FastProbabilityGrid,
+    before_surfaces: gpd.GeoDataFrame,
+    after_surfaces: gpd.GeoDataFrame,
+    before_centerlines: gpd.GeoDataFrame,
+    after_centerlines: gpd.GeoDataFrame,
     *,
-    network_length: float,
-    retain_ratio: float,
-) -> tuple[set[str], str]:
-    """Keep the strongest candidates within a soft network-length budget."""
-    if not metrics:
-        return set(), "normal"
-    raw_length = float(sum(length for length, _score in metrics.values()))
-    budget = max(0.0, float(network_length) * float(retain_ratio))
-    if raw_length <= budget:
-        return set(metrics), "normal"
-    ranked = sorted(
-        metrics,
-        key=lambda key: (metrics[key][1], metrics[key][0], key),
-        reverse=True,
+    before_period: str,
+    after_period: str,
+    min_area: float,
+) -> tuple[dict[str, list[dict]], dict, np.ndarray, np.ndarray]:
+    radius = FAST_PRESENCE_ALIGNMENT_RADIUS_PX
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+    before_neighborhood = cv2.dilate(grid.before, kernel)
+    after_neighborhood = cv2.dilate(grid.after, kernel)
+    added_raw = (
+        (grid.after >= FAST_PRESENCE_HIGH_THRESHOLD)
+        & (before_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
+        & ((grid.after - before_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
     )
-    selected: set[str] = set()
-    selected_length = 0.0
-    for key in ranked:
-        length = metrics[key][0]
-        if not selected or selected_length + length <= budget:
-            selected.add(key)
-            selected_length += length
-    return selected, "ranked_limited"
-
-
-def _apply_fast_presence_guard(
-    added_records: list[dict],
-    removed_records: list[dict],
-    *,
-    before_total_length: float,
-    after_total_length: float,
-) -> tuple[list[dict], list[dict], dict]:
-    all_records = [*added_records, *removed_records]
-    path_metrics: dict[str, tuple[float, float]] = {}
-    for record in all_records:
-        key = str(record.get("_line_key") or "")
-        if not key:
-            continue
-        length = float(record.get("_line_len") or 0.0)
-        score = float(record.get("_line_score") or length)
-        previous = path_metrics.get(key, (0.0, 0.0))
-        path_metrics[key] = (max(previous[0], length), max(previous[1], score))
-    network_length = max(
-        float(before_total_length) + float(after_total_length), 1e-9,
+    removed_raw = (
+        (grid.before >= FAST_PRESENCE_HIGH_THRESHOLD)
+        & (after_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
+        & ((grid.before - after_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
     )
-    selected_keys, guard_mode = _ranked_keys_with_length_budget(
-        path_metrics,
-        network_length=network_length,
-        retain_ratio=FAST_CHANGE_RETAIN_RATIO,
+    before_surface_mask, before_line_anchor = _fast_period_road_masks(
+        before_surfaces, before_centerlines, grid,
     )
-    raw_length = float(sum(length for length, _score in path_metrics.values()))
-    retained_length = float(sum(
-        length for key, (length, _score) in path_metrics.items()
-        if key in selected_keys
-    ))
-
-    def retained(records: list[dict]) -> list[dict]:
-        return [
-            {
-                key: value for key, value in record.items()
-                if key not in {
-                    "_line_key", "_line_len", "_line_cov", "_line_score",
-                }
-            }
-            for record in records
-            if str(record.get("_line_key") or "") in selected_keys
-        ]
-
-    return retained(added_records), retained(removed_records), {
-        "presence_guard_mode": guard_mode,
-        "presence_result_reliable": True,
-        "raw_presence_candidate_count": int(len(path_metrics)),
-        "retained_presence_candidate_count": int(len(selected_keys)),
-        "raw_presence_change_length_m": raw_length,
-        "retained_presence_change_length_m": retained_length,
-        "raw_presence_change_ratio": float(raw_length / network_length),
-        "retained_presence_change_ratio": float(retained_length / network_length),
-        "presence_change_ratio": float(raw_length / network_length),
+    after_surface_mask, after_line_anchor = _fast_period_road_masks(
+        after_surfaces, after_centerlines, grid,
+    )
+    added_mask = _clean_fast_presence_mask(
+        added_raw & (after_surface_mask > 0), after_line_anchor,
+    )
+    removed_mask = _clean_fast_presence_mask(
+        removed_raw & (before_surface_mask > 0), before_line_anchor,
+    )
+    records = {
+        "added": _fast_presence_records(
+            added_mask, after_surfaces, grid, change_type="added",
+            before_period=before_period, after_period=after_period,
+            min_area=min_area,
+        ),
+        "removed": _fast_presence_records(
+            removed_mask, before_surfaces, grid, change_type="removed",
+            before_period=before_period, after_period=after_period,
+            min_area=min_area,
+        ),
     }
+    diagnostics = {
+        "added_raw_pixel_count": int(added_raw.sum()),
+        "removed_raw_pixel_count": int(removed_raw.sum()),
+        "added_final_pixel_count": int(added_mask.sum()),
+        "removed_final_pixel_count": int(removed_mask.sum()),
+        "added_feature_count": int(len(records["added"])),
+        "removed_feature_count": int(len(records["removed"])),
+    }
+    return records, diagnostics, before_surface_mask, after_surface_mask
 
 
 def _fast_width_value(row) -> float:
@@ -2158,74 +2190,73 @@ def _fast_width_value(row) -> float:
     return 0.0
 
 
-def _fast_width_source_reliable(row) -> bool:
-    """Only normal Fast transect measurements are stable enough across periods."""
-    source = str(row.get("width_src") or row.get("width_source") or "")
-    return source.strip().casefold() == "normal_fast"
+def _fast_main_line(geometry) -> LineString | None:
+    parts = _fast_line_parts(geometry)
+    return max(parts, key=lambda part: float(part.length)) if parts else None
 
 
-def _fast_nearest_width_matches(
+def _fast_sample_distances(line: LineString, spacing: float) -> np.ndarray:
+    length = float(line.length)
+    if length <= 0:
+        return np.empty(0, dtype=np.float64)
+    spacing = max(float(spacing), 1e-6)
+    distances = np.arange(spacing / 2.0, length, spacing, dtype=np.float64)
+    if not distances.size:
+        distances = np.asarray([length / 2.0], dtype=np.float64)
+    return distances
+
+
+def _fast_sampled_line_coverage(
+    source: LineString,
+    target: LineString,
+    *,
+    tolerance: float,
+) -> float:
+    distances = _fast_sample_distances(source, FAST_PAIRED_WIDTH_SAMPLE_SPACING_M)
+    if not distances.size:
+        return 0.0
+    covered = sum(
+        source.interpolate(float(distance)).distance(target) <= tolerance
+        for distance in distances
+    )
+    return float(covered / distances.size)
+
+
+def _fast_nearest_centerline_matches(
     source: gpd.GeoDataFrame,
     target: gpd.GeoDataFrame,
     *,
     tolerance: float,
 ) -> dict[int, int]:
-    """Find each reliable line's cheapest nearby candidate without intersections."""
     if source.empty or target.empty:
         return {}
-    spatial_index = target.sindex
+    target_index = target.sindex
     matches: dict[int, int] = {}
     for source_position in range(len(source)):
-        source_row = source.iloc[source_position]
-        source_line = source_row.geometry
-        if (
-            not _fast_width_source_reliable(source_row)
-            or source_line is None
-            or source_line.is_empty
-            or source_line.length <= 0
-        ):
+        source_line = _fast_main_line(source.iloc[source_position].geometry)
+        if source_line is None or source_line.length <= 0:
             continue
-        source_length = float(source_line.length)
         candidates = (
-            spatial_index.query(
-                source_line, predicate="dwithin", distance=tolerance,
-            )
-            if tolerance > 0 else
-            spatial_index.query(source_line, predicate="intersects")
+            target_index.query(source_line, predicate="dwithin", distance=tolerance)
+            if tolerance > 0 else target_index.query(source_line, predicate="intersects")
         )
         best = None
         for target_position in np.asarray(candidates, dtype=int).reshape(-1).tolist():
-            target_row = target.iloc[target_position]
-            target_line = target_row.geometry
-            if (
-                not _fast_width_source_reliable(target_row)
-                or target_line is None
-                or target_line.is_empty
-                or target_line.length <= 0
-            ):
+            target_line = _fast_main_line(target.iloc[target_position].geometry)
+            if target_line is None or target_line.length <= 0:
                 continue
             distance = float(source_line.distance(target_line))
-            if distance > tolerance:
-                continue
-            target_length = float(target_line.length)
-            length_ratio = target_length / max(source_length, 1e-9)
-            if not (
-                FAST_WIDTH_LENGTH_RATIO_MIN
-                <= length_ratio
-                <= FAST_WIDTH_LENGTH_RATIO_MAX
+            direction_similarity = _fast_direction_similarity(source_line, target_line)
+            coverage = _fast_sampled_line_coverage(
+                source_line, target_line, tolerance=tolerance,
+            )
+            if (
+                distance > tolerance
+                or direction_similarity < FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY
+                or coverage < FAST_PAIRED_WIDTH_MATCH_COVERAGE
             ):
                 continue
-            direction_similarity = _fast_direction_similarity(
-                source_line, target_line,
-            )
-            if direction_similarity < FAST_WIDTH_DIRECTION_SIMILARITY:
-                continue
-            score = (
-                distance,
-                -direction_similarity,
-                abs(source_length - target_length),
-                target_position,
-            )
+            score = (-coverage, distance, -direction_similarity, target_position)
             if best is None or score < best[0]:
                 best = (score, target_position)
         if best is not None:
@@ -2233,9 +2264,131 @@ def _fast_nearest_width_matches(
     return matches
 
 
-def _fast_width_change_records(
+def _fast_mutual_centerline_matches(
     before: gpd.GeoDataFrame,
     after: gpd.GeoDataFrame,
+    *,
+    tolerance: float,
+) -> list[tuple[int, int]]:
+    before_to_after = _fast_nearest_centerline_matches(
+        before, after, tolerance=tolerance,
+    )
+    after_to_before = _fast_nearest_centerline_matches(
+        after, before, tolerance=tolerance,
+    )
+    return [
+        (before_position, after_position)
+        for before_position, after_position in before_to_after.items()
+        if after_to_before.get(after_position) == before_position
+    ]
+
+
+def _fast_local_normal(line: LineString, distance: float, spacing: float) -> np.ndarray | None:
+    half_window = min(max(spacing * 0.20, 1.0), float(line.length) / 4.0)
+    start = line.interpolate(max(0.0, distance - half_window))
+    end = line.interpolate(min(float(line.length), distance + half_window))
+    tangent = np.asarray([end.x - start.x, end.y - start.y], dtype=np.float64)
+    norm = float(np.linalg.norm(tangent))
+    if norm <= 1e-9:
+        return None
+    return np.asarray([-tangent[1], tangent[0]], dtype=np.float64) / norm
+
+
+def _fast_mask_width_at_position(
+    mask: np.ndarray,
+    transform,
+    point_xy: tuple[float, float],
+    normal_xy: np.ndarray,
+) -> float:
+    inverse = ~transform
+    center_col, center_row = inverse * point_xy
+    normal_col, normal_row = inverse * (
+        point_xy[0] + float(normal_xy[0]),
+        point_xy[1] + float(normal_xy[1]),
+    )
+    pixel_direction = np.asarray(
+        [normal_col - center_col, normal_row - center_row], dtype=np.float64,
+    )
+    direction_norm = float(np.linalg.norm(pixel_direction))
+    if direction_norm <= 1e-9:
+        return 0.0
+    pixel_direction /= direction_norm
+    map_dx = transform.a * pixel_direction[0] + transform.b * pixel_direction[1]
+    map_dy = transform.d * pixel_direction[0] + transform.e * pixel_direction[1]
+    map_step_per_pixel = float(np.hypot(map_dx, map_dy))
+    if map_step_per_pixel <= 1e-9:
+        return 0.0
+
+    def inside(offset_px: float) -> bool:
+        col = int(round(center_col + offset_px * pixel_direction[0]))
+        row = int(round(center_row + offset_px * pixel_direction[1]))
+        return 0 <= row < mask.shape[0] and 0 <= col < mask.shape[1] and bool(mask[row, col])
+
+    if not inside(0.0):
+        return 0.0
+    maximum_pixels = FAST_PAIRED_WIDTH_MAX_SEARCH_M / map_step_per_pixel
+    extents = []
+    for sign in (-1.0, 1.0):
+        last_inside = 0.0
+        for offset in np.arange(0.5, maximum_pixels + 0.5, 0.5):
+            if not inside(sign * float(offset)):
+                break
+            last_inside = float(offset)
+        extents.append(last_inside)
+    return float((extents[0] + extents[1] + 1.0) * map_step_per_pixel)
+
+
+def _fast_paired_width_samples(
+    before_line: LineString,
+    after_line: LineString,
+    before_surface_mask: np.ndarray,
+    after_surface_mask: np.ndarray,
+    grid: FastProbabilityGrid,
+    *,
+    tolerance: float,
+) -> list[dict]:
+    samples = []
+    for distance in _fast_sample_distances(
+        before_line, FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
+    ):
+        before_point = before_line.interpolate(float(distance))
+        after_distance = float(after_line.project(before_point))
+        after_point = after_line.interpolate(after_distance)
+        if before_point.distance(after_point) > tolerance:
+            continue
+        normal = _fast_local_normal(
+            before_line, float(distance), FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
+        )
+        if normal is None:
+            continue
+        common_xy = (
+            (float(before_point.x) + float(after_point.x)) / 2.0,
+            (float(before_point.y) + float(after_point.y)) / 2.0,
+        )
+        before_width = _fast_mask_width_at_position(
+            before_surface_mask, grid.transform, common_xy, normal,
+        )
+        after_width = _fast_mask_width_at_position(
+            after_surface_mask, grid.transform, common_xy, normal,
+        )
+        if before_width <= 0 or after_width <= 0:
+            continue
+        samples.append({
+            "distance": float(distance),
+            "point": common_xy,
+            "before_width": before_width,
+            "after_width": after_width,
+            "delta": after_width - before_width,
+        })
+    return samples
+
+
+def _detect_sparse_paired_width_changes(
+    before_centerlines: gpd.GeoDataFrame,
+    after_centerlines: gpd.GeoDataFrame,
+    before_surface_mask: np.ndarray,
+    after_surface_mask: np.ndarray,
+    grid: FastProbabilityGrid,
     *,
     tolerance: float,
     absolute_threshold: float,
@@ -2243,128 +2396,62 @@ def _fast_width_change_records(
     before_period: str,
     after_period: str,
     min_area: float,
-    min_length: float,
-) -> tuple[list[dict], float]:
-    if before.empty or after.empty:
-        return [], 0.0
-    before_to_after = _fast_nearest_width_matches(
-        before, after, tolerance=tolerance,
-    )
-    after_to_before = _fast_nearest_width_matches(
-        after, before, tolerance=tolerance,
-    )
-    absolute_threshold = max(
-        float(absolute_threshold), FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M,
-    )
-    ratio_threshold = max(
-        float(ratio_threshold), FAST_WIDTH_MIN_RELATIVE_CHANGE,
+) -> tuple[list[dict], dict]:
+    matches = _fast_mutual_centerline_matches(
+        before_centerlines, after_centerlines, tolerance=tolerance,
     )
     records: list[dict] = []
-    matched_total_length = 0.0
-    for before_position, after_position in before_to_after.items():
-        if after_to_before.get(after_position) != before_position:
+    valid_sample_count = 0
+    sufficient_pair_count = 0
+    for before_position, after_position in matches:
+        before_line = _fast_main_line(before_centerlines.iloc[before_position].geometry)
+        after_line = _fast_main_line(after_centerlines.iloc[after_position].geometry)
+        if before_line is None or after_line is None:
             continue
-        before_row = before.iloc[before_position]
-        after_row = after.iloc[after_position]
-        before_line = before_row.geometry
-        before_length = float(before_line.length)
-        after_line = after_row.geometry
-        after_length = float(after_line.length)
-        matched_length = min(before_length, after_length)
-        matched_total_length += matched_length
-        if matched_length < min_length:
+        samples = _fast_paired_width_samples(
+            before_line, after_line, before_surface_mask, after_surface_mask, grid,
+            tolerance=tolerance,
+        )
+        valid_sample_count += len(samples)
+        if len(samples) < FAST_PAIRED_WIDTH_MIN_SAMPLES:
             continue
-        before_width = _fast_width_value(before_row)
-        after_width = _fast_width_value(after_row)
-        if before_width <= 0 or after_width <= 0:
-            continue
-        width_delta = after_width - before_width
+        sufficient_pair_count += 1
+        before_width = float(np.median([sample["before_width"] for sample in samples]))
+        after_width = float(np.median([sample["after_width"] for sample in samples]))
+        width_delta = float(np.median([sample["delta"] for sample in samples]))
         relative_delta = abs(width_delta) / max(before_width, 1e-9)
         if (
             abs(width_delta) < absolute_threshold
             or relative_delta < ratio_threshold
         ):
             continue
+        points = [sample["point"] for sample in samples]
+        if len(points) < 2:
+            continue
+        common_axis = LineString(points)
         widened = width_delta > 0
-        absolute_delta = abs(width_delta)
-        width_score = absolute_delta * relative_delta
-        axis = after_row.geometry if widened else before_row.geometry
         outer_width = after_width if widened else before_width
         inner_width = before_width if widened else after_width
-        change_geometry = axis.buffer(outer_width / 2.0).difference(
-            axis.buffer(inner_width / 2.0)
+        change_geometry = common_axis.buffer(outer_width / 2.0).difference(
+            common_axis.buffer(inner_width / 2.0)
         )
         change_type = "widened" if widened else "narrowed"
-        match_key = f"{before_position}:{after_position}"
-        for part in _fast_change_parts(
-            change_geometry, min_area=min_area, min_length=min_length,
-        ):
+        for part in _fast_polygon_parts(change_geometry, min_area=min_area):
             records.append({
                 "change_typ": change_type,
                 "before_per": str(before_period),
                 "after_per": str(after_period),
                 "source": "fast_automatic",
-                "width_bef": float(before_width),
-                "width_aft": float(after_width),
-                "width_diff": float(width_delta),
-                "_match_key": match_key,
-                "_match_len": matched_length,
-                "_width_abs": absolute_delta,
-                "_width_rel": relative_delta,
-                "_width_score": width_score,
+                "width_bef": before_width,
+                "width_aft": after_width,
+                "width_diff": width_delta,
                 "geometry": part,
             })
-    return records, matched_total_length
-
-
-def _apply_fast_width_guard(
-    records: list[dict],
-    *,
-    matched_total_length: float,
-) -> tuple[list[dict], dict]:
-    match_metrics: dict[str, tuple[float, float]] = {}
-    for record in records:
-        key = str(record.get("_match_key") or "")
-        if key:
-            length = float(record.get("_match_len") or 0.0)
-            score = float(record.get("_width_score") or 0.0)
-            previous = match_metrics.get(key, (0.0, 0.0))
-            match_metrics[key] = (
-                max(previous[0], length), max(previous[1], score),
-            )
-    network_length = max(float(matched_total_length), 1e-9)
-    selected_keys, guard_mode = _ranked_keys_with_length_budget(
-        match_metrics,
-        network_length=network_length,
-        retain_ratio=FAST_WIDTH_RETAIN_RATIO,
-    )
-    raw_length = float(sum(length for length, _score in match_metrics.values()))
-    retained_length = float(sum(
-        length for key, (length, _score) in match_metrics.items()
-        if key in selected_keys
-    ))
-    cleaned = [
-        {
-            key: value for key, value in record.items()
-            if key not in {
-                "_match_key", "_match_len", "_width_abs", "_width_rel",
-                "_width_score",
-            }
-        }
-        for record in records
-        if str(record.get("_match_key") or "") in selected_keys
-    ]
-    return cleaned, {
-        "width_guard_mode": guard_mode,
-        "width_result_reliable": True,
-        "matched_width_length_m": float(matched_total_length),
-        "raw_width_candidate_count": int(len(match_metrics)),
-        "retained_width_candidate_count": int(len(selected_keys)),
-        "raw_width_change_length_m": raw_length,
-        "retained_width_change_length_m": retained_length,
-        "raw_width_change_ratio": float(raw_length / network_length),
-        "retained_width_change_ratio": float(retained_length / network_length),
-        "width_network_change_ratio": float(raw_length / network_length),
+    return records, {
+        "matched_centerline_pair_count": int(len(matches)),
+        "sufficient_paired_width_pair_count": int(sufficient_pair_count),
+        "valid_paired_width_sample_count": int(valid_sample_count),
+        "width_change_feature_count": int(len(records)),
     }
 
 
@@ -2379,75 +2466,64 @@ def detect_fast_changes(
     width_change_absolute: float = 2.0,
     width_change_ratio: float = 0.2,
     min_change_area: float = FAST_CHANGE_MIN_AREA_M2,
-    min_change_length: float = FAST_CHANGE_MIN_LENGTH_M,
+    min_change_length: float | None = None,
 ) -> dict:
-    """Run the lightweight, rule-based Fast change detector without truth."""
+    """Detect no-truth Fast changes from probability presence and paired widths."""
     total_started = time.perf_counter()
     before_payload = _load_fast_period_result(before_result)
     after_payload = _load_fast_period_result(after_result)
-    before_surfaces = _read_fast_change_layer(before_payload, "surfaces", "corridors")
+    grid = _fast_probability_grid(before_payload, after_payload)
+    before_surfaces = _align_fast_change_frame(
+        _read_fast_change_layer(before_payload, "surfaces", "corridors"),
+        grid.crs,
+    )
     after_surfaces = _align_fast_change_frame(
         _read_fast_change_layer(after_payload, "surfaces", "corridors"),
-        before_surfaces.crs,
+        grid.crs,
     )
     before_centerlines = _align_fast_change_frame(
         _read_fast_change_layer(before_payload, "centerlines", "width_segments"),
-        before_surfaces.crs,
+        grid.crs,
     )
     after_centerlines = _align_fast_change_frame(
         _read_fast_change_layer(after_payload, "centerlines", "width_segments"),
-        before_surfaces.crs,
+        grid.crs,
     )
-    if not any(field in before_centerlines.columns for field in ("width_m", "width_map", "width_units")):
-        before_centerlines = _align_fast_change_frame(
-            _read_fast_change_layer(before_payload, "width_segments"),
-            before_surfaces.crs,
-        )
-    if not any(field in after_centerlines.columns for field in ("width_m", "width_map", "width_units")):
-        after_centerlines = _align_fast_change_frame(
-            _read_fast_change_layer(after_payload, "width_segments"),
-            before_surfaces.crs,
-        )
-    after_centerlines = _align_fast_change_frame(after_centerlines, before_surfaces.crs)
 
     tolerance = max(0.0, float(position_tolerance))
     minimum_area = max(0.0, float(min_change_area))
-    minimum_length = max(0.0, float(min_change_length))
+    _ = min_change_length  # Accepted for the stable external API; no longer a detector rule.
     presence_started = time.perf_counter()
-    added_records, added_merge_seconds = _fast_centerline_change_records(
-        after_centerlines, before_centerlines, after_surfaces,
-        tolerance=tolerance,
-        change_type="added", before_period=before_period, after_period=after_period,
-        min_area=minimum_area, min_length=minimum_length,
-    )
-    removed_records, removed_merge_seconds = _fast_centerline_change_records(
-        before_centerlines, after_centerlines, before_surfaces,
-        tolerance=tolerance,
-        change_type="removed", before_period=before_period, after_period=after_period,
-        min_area=minimum_area, min_length=minimum_length,
-    )
-    added_records, removed_records, presence_guard = _apply_fast_presence_guard(
-        added_records, removed_records,
-        before_total_length=float(before_centerlines.geometry.length.sum()),
-        after_total_length=float(after_centerlines.geometry.length.sum()),
+    presence_records, presence_diagnostics, before_surface_mask, after_surface_mask = (
+        _detect_probability_presence_changes(
+            grid,
+            before_surfaces,
+            after_surfaces,
+            before_centerlines,
+            after_centerlines,
+            before_period=before_period,
+            after_period=after_period,
+            min_area=minimum_area,
+        )
     )
     presence_change_seconds = time.perf_counter() - presence_started
-    merge_seconds = added_merge_seconds + removed_merge_seconds
     record_groups = {
-        "added": added_records,
-        "removed": removed_records,
+        "added": presence_records["added"],
+        "removed": presence_records["removed"],
     }
     width_started = time.perf_counter()
-    width_records, matched_width_length = _fast_width_change_records(
-        before_centerlines, after_centerlines,
+    width_records, width_diagnostics = _detect_sparse_paired_width_changes(
+        before_centerlines,
+        after_centerlines,
+        before_surface_mask,
+        after_surface_mask,
+        grid,
         tolerance=tolerance,
         absolute_threshold=max(0.0, float(width_change_absolute)),
         ratio_threshold=max(0.0, float(width_change_ratio)),
-        before_period=before_period, after_period=after_period,
-        min_area=minimum_area, min_length=minimum_length,
-    )
-    width_records, width_guard = _apply_fast_width_guard(
-        width_records, matched_total_length=matched_width_length,
+        before_period=before_period,
+        after_period=after_period,
+        min_area=minimum_area,
     )
     width_change_seconds = time.perf_counter() - width_started
     record_groups["widened"] = [
@@ -2514,29 +2590,28 @@ def detect_fast_changes(
         "ground_truth_derived": False, "change_output_mode": "fast_automatic",
         "automatic_result": True,
         "before_period": str(before_period), "after_period": str(after_period),
+        "presence_change_source": "enhanced_probability_difference",
+        "width_change_source": "shared_position_sparse_width",
+        "probability_grid_crs": str(grid.crs),
+        "probability_pixel_size": float(grid.pixel_size),
+        "presence_high_threshold": FAST_PRESENCE_HIGH_THRESHOLD,
+        "presence_low_threshold": FAST_PRESENCE_LOW_THRESHOLD,
+        "presence_delta_threshold": FAST_PRESENCE_DELTA_THRESHOLD,
+        "presence_alignment_radius_px": FAST_PRESENCE_ALIGNMENT_RADIUS_PX,
+        "presence_min_blob_area_px2": FAST_PRESENCE_MIN_BLOB_AREA_PX2,
         "position_tolerance_m": tolerance,
-        "candidate_coverage_threshold": FAST_CHANGE_CANDIDATE_COVERAGE,
-        "minimum_continuous_length_m": minimum_length,
-        "presence_retain_ratio": FAST_CHANGE_RETAIN_RATIO,
-        "width_direction_similarity_threshold": FAST_WIDTH_DIRECTION_SIMILARITY,
-        "width_length_ratio_min": FAST_WIDTH_LENGTH_RATIO_MIN,
-        "width_length_ratio_max": FAST_WIDTH_LENGTH_RATIO_MAX,
+        "paired_width_direction_similarity": FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY,
+        "paired_width_match_coverage": FAST_PAIRED_WIDTH_MATCH_COVERAGE,
+        "paired_width_sample_spacing_m": FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
+        "paired_width_min_samples": FAST_PAIRED_WIDTH_MIN_SAMPLES,
         "width_change_absolute_m": float(width_change_absolute),
         "width_change_ratio": float(width_change_ratio),
-        "fast_width_change_absolute_m": max(
-            float(width_change_absolute), FAST_WIDTH_MIN_ABSOLUTE_CHANGE_M,
-        ),
-        "fast_width_change_ratio": max(
-            float(width_change_ratio), FAST_WIDTH_MIN_RELATIVE_CHANGE,
-        ),
-        "width_retain_ratio": FAST_WIDTH_RETAIN_RATIO,
         "presence_change_seconds": float(presence_change_seconds),
         "width_change_seconds": float(width_change_seconds),
-        "merge_seconds": float(merge_seconds),
         "write_seconds": float(write_seconds),
         "total_seconds": float(total_seconds),
-        **presence_guard,
-        **width_guard,
+        **presence_diagnostics,
+        **width_diagnostics,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
     summary_path = output_dir / "change_summary.json"
@@ -2544,15 +2619,11 @@ def detect_fast_changes(
     print(
         f"[Fast Change] {before_period}->{after_period}: "
         f"presence={presence_change_seconds:.3f}s, "
-        f"width={width_change_seconds:.3f}s, merge={merge_seconds:.3f}s, "
+        f"width={width_change_seconds:.3f}s, "
         f"write={write_seconds:.3f}s, total={total_seconds:.3f}s, "
-        f"guard={presence_guard['presence_guard_mode']}, "
-        f"presence_ratio="
-        f"{presence_guard['raw_presence_change_ratio']:.3f}->"
-        f"{presence_guard['retained_presence_change_ratio']:.3f}, "
-        f"width_guard={width_guard['width_guard_mode']}, "
-        f"width_ratio={width_guard['raw_width_change_ratio']:.3f}->"
-        f"{width_guard['retained_width_change_ratio']:.3f}",
+        f"added={len(record_groups['added'])}, removed={len(record_groups['removed'])}, "
+        f"width_pairs={width_diagnostics['matched_centerline_pair_count']}, "
+        f"width_changes={len(width_records)}",
         flush=True,
     )
     return {

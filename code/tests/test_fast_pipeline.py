@@ -12,6 +12,7 @@ import geopandas as gpd
 import cv2
 import numpy as np
 import rasterio
+from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, box
 
@@ -33,8 +34,6 @@ from engine.fast_pipeline import (
     measure_fast_path_widths,
     measure_fast_widths,
     _build_fast_road_geometry,
-    _apply_fast_presence_guard,
-    _apply_fast_width_guard,
     _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
@@ -42,7 +41,6 @@ from engine.fast_pipeline import (
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
     _trace_skeleton_paths,
-    _fast_width_change_records,
     _jitter_fast_change_geometry,
 )
 from engine.samroad.image_resume import required_image_outputs
@@ -519,178 +517,153 @@ class FastTruthChangeTests(unittest.TestCase):
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
-    def test_added_removed_width_changes_and_small_shift(self) -> None:
+    transform = from_origin(0, 240, 1, 1)
+
+    def _write_period(self, root, name, roads, *, transform=None):
+        directory = root / name
+        directory.mkdir()
+        transform = transform or self.transform
+        lines = [road[0] for road in roads]
+        widths = [road[1] for road in roads]
+        surface_geometries = [
+            line.buffer(width / 2.0, cap_style="flat")
+            for line, width in zip(lines, widths)
+        ]
+        centerline_path = directory / "road_centerlines.shp"
+        surface_path = directory / "road_surfaces.shp"
+        probability_path = directory / "road_probability.tif"
+        gpd.GeoDataFrame(
+            {"source": ["native_toponet"] * len(lines)},
+            geometry=lines,
+            crs="EPSG:3857",
+        ).to_file(centerline_path)
+        gpd.GeoDataFrame(
+            {"source": ["fast"] * len(lines)},
+            geometry=surface_geometries,
+            crs="EPSG:3857",
+        ).to_file(surface_path)
+        road_mask = rasterize(
+            [(geometry, 1) for geometry in surface_geometries],
+            out_shape=(240, 260),
+            transform=transform,
+            fill=0,
+            all_touched=True,
+            dtype="uint8",
+        )
+        probability = np.full((240, 260), 0.03, dtype=np.float32)
+        probability[road_mask > 0] = 0.80
+        with rasterio.open(
+            probability_path,
+            "w",
+            driver="GTiff",
+            width=260,
+            height=240,
+            count=1,
+            dtype="float32",
+            crs="EPSG:3857",
+            transform=transform,
+        ) as dataset:
+            dataset.write(probability, 1)
+        return {
+            "centerlines": str(centerline_path),
+            "surfaces": str(surface_path),
+            "road_probability": str(probability_path),
+        }
+
+    def test_probability_presence_and_shared_position_width_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            before_lines = [
-                LineString([(0, 0), (50, 0)]),
-                LineString([(50, 0), (100, 0)]),
-                LineString([(0, 20), (100, 20)]),
-                LineString([(0, 40), (100, 40)]),
-                LineString([(0, 60), (100, 60)]),
-                LineString([(0, 120), (100, 120)]),
-                *[LineString([(0, y), (100, y)]) for y in range(140, 340, 20)],
+            before_roads = [
+                (LineString([(20, 40), (220, 40)]), 6.0),
+                (LineString([(20, 60), (220, 60)]), 6.0),
+                (LineString([(20, 100), (220, 100)]), 6.0),
+                (LineString([(20, 150), (220, 150)]), 4.0),
+                (LineString([(20, 180), (220, 180)]), 10.0),
+                (LineString([(20, 210), (50, 210)]), 4.0),
             ]
-            after_lines = [
-                LineString([(0, 20), (100, 20)]),
-                LineString([(0, 40), (100, 40)]),
-                LineString([(0, 61), (100, 61)]),
-                LineString([(0, 80), (50, 80)]),
-                LineString([(50, 80), (100, 80)]),
-                LineString([(0, 100), (10, 100)]),
-                LineString([(50, 120), (150, 120)]),
-                *[LineString([(0, y), (100, y)]) for y in range(140, 340, 20)],
+            after_roads = [
+                (LineString([(20, 40), (220, 40)]), 6.0),
+                (LineString([(20, 61), (220, 61)]), 6.0),
+                (LineString([(20, 120), (220, 120)]), 6.0),
+                (LineString([(20, 150), (220, 150)]), 10.0),
+                (LineString([(20, 180), (220, 180)]), 4.0),
+                (LineString([(20, 210), (50, 210)]), 10.0),
             ]
-            before_widths = [4.0, 4.0, 4.0, 8.0, 4.0, 4.0, *([4.0] * 10)]
-            after_widths = [8.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, *([4.0] * 10)]
-
-            def write_period(name, lines, widths):
-                directory = root / name
-                directory.mkdir()
-                centerlines = directory / "road_centerlines.shp"
-                surfaces = directory / "road_surfaces.shp"
-                gpd.GeoDataFrame(
-                    {
-                        "width_m": widths,
-                        "width_src": ["normal_fast"] * len(lines),
-                    },
-                    geometry=lines, crs="EPSG:3857",
-                ).to_file(centerlines)
-                gpd.GeoDataFrame(
-                    {"source": ["fast"] * len(lines)},
-                    geometry=[line.buffer(width / 2.0) for line, width in zip(lines, widths)],
-                    crs="EPSG:3857",
-                ).to_file(surfaces)
-                return {"centerlines": str(centerlines), "surfaces": str(surfaces)}
-
-            before_result = write_period("before", before_lines, before_widths)
-            after_result = write_period("after", after_lines, after_widths)
+            before = self._write_period(root, "before", before_roads)
+            after = self._write_period(root, "after", after_roads)
             result = detect_fast_changes(
-                before_result, after_result,
-                root / "changes", before_period="2021", after_period="2022",
-                position_tolerance=2.0, width_change_absolute=2.0,
+                before,
+                after,
+                root / "changes",
+                before_period="2021",
+                after_period="2022",
+                position_tolerance=2.0,
+                width_change_absolute=2.0,
                 width_change_ratio=0.2,
             )
-            presence_count = sum(
-                len(gpd.read_file(result["layers"][change_type]))
-                for change_type in ("added", "removed")
-            )
-            width_count = sum(
-                len(gpd.read_file(result["layers"][change_type]))
-                for change_type in ("widened", "narrowed")
-            )
-            self.assertGreater(presence_count, 0)
-            self.assertGreater(width_count, 0)
+            for change_type in ("added", "removed", "widened", "narrowed"):
+                self.assertGreater(
+                    len(gpd.read_file(result["layers"][change_type])),
+                    0,
+                    change_type,
+                )
             changes = gpd.read_file(result["road_changes"])
-            shifted_road_area = box(-5, 55, 105, 65)
-            self.assertFalse(changes.geometry.intersects(shifted_road_area).any())
-            short_fragment_area = box(-5, 95, 15, 105)
-            self.assertFalse(changes.geometry.intersects(short_fragment_area).any())
-            ambiguous_coverage_area = box(-5, 115, 155, 125)
-            self.assertFalse(changes.geometry.intersects(ambiguous_coverage_area).any())
-            self.assertTrue(result["automatic_result"])
-            self.assertFalse(result["ground_truth_derived"])
+            self.assertFalse(changes.geometry.intersects(box(10, 56, 230, 65)).any())
+            self.assertFalse(changes.geometry.intersects(box(10, 205, 60, 215)).any())
+            self.assertTrue(Path(result["gpkg"]).is_file())
+            self.assertTrue(Path(result["previews"]["change"]).is_file())
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
-            for timing_key in (
-                "presence_change_seconds", "width_change_seconds",
-                "merge_seconds", "write_seconds", "total_seconds",
-            ):
-                self.assertGreaterEqual(float(summary[timing_key]), 0.0)
-            self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
-            self.assertEqual(summary["width_guard_mode"], "ranked_limited")
-            self.assertGreater(summary["raw_presence_candidate_count"], 0)
-            self.assertGreater(summary["retained_presence_candidate_count"], 0)
-            self.assertGreater(summary["raw_width_candidate_count"], 0)
-            self.assertGreater(summary["retained_width_candidate_count"], 0)
-            stable = detect_fast_changes(
-                after_result, after_result, root / "stable_changes",
-                before_period="2021", after_period="2022",
+            self.assertEqual(
+                summary["presence_change_source"],
+                "enhanced_probability_difference",
+            )
+            self.assertEqual(
+                summary["width_change_source"],
+                "shared_position_sparse_width",
+            )
+            self.assertGreaterEqual(summary["matched_centerline_pair_count"], 4)
+            self.assertNotIn("presence_guard_mode", summary)
+            self.assertNotIn("width_guard_mode", summary)
+            self.assertNotIn("minimum_continuous_length_m", summary)
+
+    def test_unchanged_period_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            roads = [
+                (LineString([(20, 40), (220, 40)]), 6.0),
+                (LineString([(20, 100), (220, 100)]), 10.0),
+            ]
+            period = self._write_period(root, "period", roads)
+            result = detect_fast_changes(
+                period,
+                period,
+                root / "changes",
                 position_tolerance=2.0,
             )
-            self.assertTrue(gpd.read_file(stable["road_changes"]).empty)
+            self.assertTrue(gpd.read_file(result["road_changes"]).empty)
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            self.assertEqual(summary["added_final_pixel_count"], 0)
+            self.assertEqual(summary["removed_final_pixel_count"], 0)
+            self.assertEqual(summary["width_change_feature_count"], 0)
 
-    def test_presence_guard_keeps_best_candidate_instead_of_clearing_all(self) -> None:
-        added, removed, summary = _apply_fast_presence_guard(
-            [{"_line_key": "added:0", "_line_len": 400.0, "_line_score": 300.0}],
-            [{"_line_key": "removed:0", "_line_len": 400.0, "_line_score": 200.0}],
-            before_total_length=500.0, after_total_length=500.0,
-        )
-        self.assertEqual(len(added), 1)
-        self.assertEqual(removed, [])
-        self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
-        self.assertTrue(summary["presence_result_reliable"])
-        self.assertEqual(summary["raw_presence_candidate_count"], 2)
-        self.assertEqual(summary["retained_presence_candidate_count"], 1)
-
-    def test_presence_guard_ranks_and_limits_candidates(self) -> None:
-        added, removed, summary = _apply_fast_presence_guard(
-            [
-                {"_line_key": "added:0", "_line_len": 160.0},
-                {"_line_key": "added:1", "_line_len": 80.0},
-            ],
-            [], before_total_length=500.0, after_total_length=500.0,
-        )
-        self.assertEqual(len(added), 1)
-        self.assertEqual(removed, [])
-        self.assertEqual(summary["presence_guard_mode"], "ranked_limited")
-
-    def test_width_match_rejects_crossing_and_large_length_mismatch(self) -> None:
-        before = gpd.GeoDataFrame(
-            {"width_m": [4.0], "width_src": ["normal_fast"]},
-            geometry=[LineString([(0, 0), (100, 0)])], crs="EPSG:3857",
-        )
-        invalid_after = gpd.GeoDataFrame(
-            {
-                "width_m": [10.0, 10.0],
-                "width_src": ["normal_fast", "normal_fast"],
-            },
-            geometry=[
-                LineString([(50, -50), (50, 50)]),
-                LineString([(0, 0), (30, 0)]),
-            ],
-            crs="EPSG:3857",
-        )
-        common = dict(
-            tolerance=2.0, absolute_threshold=2.0, ratio_threshold=0.2,
-            before_period="2021", after_period="2022", min_area=4.0,
-            min_length=75.0,
-        )
-        invalid_records, invalid_matched = _fast_width_change_records(
-            before, invalid_after, **common,
-        )
-        self.assertEqual(invalid_records, [])
-        self.assertEqual(invalid_matched, 0.0)
-        valid_after = gpd.GeoDataFrame(
-            {"width_m": [10.0], "width_src": ["normal_fast"]},
-            geometry=[LineString([(0, 1), (100, 1)])], crs="EPSG:3857",
-        )
-        valid_records, valid_matched = _fast_width_change_records(
-            before, valid_after, **common,
-        )
-        self.assertGreater(len(valid_records), 0)
-        self.assertEqual(valid_matched, 100.0)
-
-        fallback_after = valid_after.copy()
-        fallback_after["width_src"] = "distance_transform_fallback"
-        fallback_records, fallback_matched = _fast_width_change_records(
-            before, fallback_after, **common,
-        )
-        self.assertEqual(fallback_records, [])
-        self.assertEqual(fallback_matched, 0.0)
-
-    def test_width_change_guard_keeps_best_candidate_instead_of_clearing_all(self) -> None:
-        records, summary = _apply_fast_width_guard(
-            [{
-                "_match_key": "0:0", "_match_len": 200.0,
-                "_width_score": 2.0, "geometry": box(0, 0, 1, 1),
-            }],
-            matched_total_length=1000.0,
-        )
-        self.assertEqual(len(records), 1)
-        self.assertEqual(summary["width_guard_mode"], "ranked_limited")
-        self.assertTrue(summary["width_result_reliable"])
-        self.assertEqual(summary["raw_width_candidate_count"], 1)
-        self.assertEqual(summary["retained_width_candidate_count"], 1)
+    def test_probability_rasters_are_aligned_before_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            roads = [(LineString([(20, 100), (220, 100)]), 8.0)]
+            before = self._write_period(root, "before", roads)
+            after = self._write_period(
+                root,
+                "after",
+                roads,
+                transform=from_origin(0.5, 240.5, 1, 1),
+            )
+            result = detect_fast_changes(
+                before,
+                after,
+                root / "changes",
+                position_tolerance=2.0,
+            )
+            self.assertTrue(gpd.read_file(result["road_changes"]).empty)
 
 
 if __name__ == "__main__":
