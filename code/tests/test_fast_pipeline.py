@@ -423,7 +423,7 @@ class FastTruthChangeTests(unittest.TestCase):
             truth = gpd.GeoDataFrame(
                 {"BHBM": [2, 2, 4]},
                 geometry=[
-                    box(1, 0, 21, 5),
+                    box(1, 0, 35, 5),
                     box(80, 0, 100, 5),
                     box(80, 20, 100, 25),
                 ],
@@ -441,7 +441,7 @@ class FastTruthChangeTests(unittest.TestCase):
             final_added = gpd.read_file(result["layers"]["added"])
             final_removed = gpd.read_file(result["layers"]["removed"])
             final_widened = gpd.read_file(result["layers"]["widened"])
-            self.assertEqual(len(final_added), 3)
+            self.assertEqual(len(final_added), 4)
             self.assertEqual(len(final_removed), 2)
             self.assertEqual(len(final_widened), 1)
             self.assertEqual(
@@ -456,11 +456,21 @@ class FastTruthChangeTests(unittest.TestCase):
             ].geometry.iloc[0]
             assisted = final_added.loc[
                 final_added["change_src"] == "GT_ASSISTED"
-            ].geometry.iloc[0]
+            ]
             self.assertTrue(matched_auto.equals(auto_frames["added"].geometry.iloc[0]))
             self.assertTrue(auto_only.equals(auto_frames["added"].geometry.iloc[1]))
-            self.assertFalse(assisted.equals(truth.geometry.iloc[1]))
-            self.assertTrue(assisted.intersects(truth.geometry.iloc[1]))
+            self.assertEqual(len(assisted), 2)
+            partial_assisted = assisted.loc[
+                assisted.geometry.intersects(box(20, 0, 36, 5))
+            ].geometry.iloc[0]
+            self.assertFalse(partial_assisted.equals(truth.geometry.iloc[0]))
+            self.assertLess(
+                float(partial_assisted.intersection(auto_frames["added"].geometry.iloc[0]).area),
+                8.0,
+            )
+            self.assertTrue(
+                assisted.geometry.union_all().intersects(truth.geometry.iloc[1])
+            )
 
             repeated = augment_fast_changes_with_truth(
                 automatic_result,
@@ -473,8 +483,8 @@ class FastTruthChangeTests(unittest.TestCase):
             repeated_added = gpd.read_file(repeated["layers"]["added"])
             repeated_assisted = repeated_added.loc[
                 repeated_added["change_src"] == "GT_ASSISTED"
-            ].geometry.iloc[0]
-            self.assertTrue(assisted.equals(repeated_assisted))
+            ].geometry.union_all()
+            self.assertTrue(assisted.geometry.union_all().equals(repeated_assisted))
 
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertEqual(
@@ -503,13 +513,15 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertGreaterEqual(
                 final_overall["change_recall"], auto_overall["change_recall"],
             )
+            self.assertIsNotNone(final_overall["road_centerline_completeness"])
+            self.assertIsNotNone(final_overall["centerline_mean_offset_px"])
             self.assertNotEqual(summary["evaluation"], summary["auto_evaluation"])
             self.assertIsNotNone(final_overall["change_precision"])
             self.assertIn("change_type_accuracy", final_overall)
             self.assertEqual(summary["auto_added_count"], 2)
-            self.assertEqual(summary["gt_assisted_added_count"], 1)
+            self.assertEqual(summary["gt_assisted_added_count"], 2)
             self.assertEqual(summary["gt_assisted_removed_count"], 1)
-            self.assertEqual(summary["final_added_count"], 3)
+            self.assertEqual(summary["final_added_count"], 4)
 
             job_root = root / "job"
             job_root.mkdir()
@@ -534,6 +546,8 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertIsNotNone(evaluated["change_recall"])
             self.assertIsNotNone(evaluated["change_precision"])
             self.assertIsNotNone(evaluated["change_type_accuracy"])
+            self.assertIsNotNone(evaluated["road_centerline_completeness"])
+            self.assertIsNotNone(evaluated["centerline_mean_offset_px"])
             updated_summary = json.loads(
                 Path(result["summary"]).read_text(encoding="utf-8")
             )
@@ -557,6 +571,106 @@ class FastTruthChangeTests(unittest.TestCase):
                 updated_final["change_recall"], updated_auto["change_recall"],
             )
             self.assertAlmostEqual(evaluated["change_recall"], updated_final["change_recall"])
+
+    def test_gt_assisted_type_errors_are_sparse_and_reproducible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            auto_root = root / "automatic"
+            auto_root.mkdir()
+            crs = "EPSG:3857"
+
+            empty = gpd.GeoDataFrame(
+                {
+                    "change_typ": [], "before_per": [], "after_per": [],
+                    "source": [], "width_bef": [], "width_aft": [],
+                    "width_diff": [],
+                },
+                geometry=gpd.GeoSeries([], crs=crs),
+                crs=crs,
+            )
+            filenames = {
+                "added": "added_roads.shp", "removed": "removed_roads.shp",
+                "width_changed": "width_changed_road_parts.shp",
+                "widened": "widened_road_parts.shp",
+                "narrowed": "narrowed_road_parts.shp",
+            }
+            layers = {}
+            for name, filename in filenames.items():
+                path = auto_root / filename
+                empty.to_file(path)
+                layers[name] = str(path)
+            changes_path = auto_root / "road_changes.shp"
+            empty.to_file(changes_path)
+            summary_path = auto_root / "change_summary.json"
+            summary_path.write_text(json.dumps({
+                "execution_profile": "fast", "automatic_result": True,
+                "probability_pixel_size": 1.0,
+            }), encoding="utf-8")
+            automatic_result = {
+                "output": str(auto_root), "road_changes": str(changes_path),
+                "summary": str(summary_path), "layers": layers,
+            }
+            truth_path = root / "truth.shp"
+            gpd.GeoDataFrame(
+                {"BHBM": [2] * 20},
+                geometry=[
+                    box(index * 20, 0, index * 20 + 12, 6)
+                    for index in range(20)
+                ],
+                crs=crs,
+            ).to_file(truth_path)
+
+            first = augment_fast_changes_with_truth(
+                automatic_result, truth_path, root / "first",
+                before_period="2021", after_period="2022",
+                position_tolerance=1.0,
+            )
+            second = augment_fast_changes_with_truth(
+                automatic_result, truth_path, root / "second",
+                before_period="2021", after_period="2022",
+                position_tolerance=1.0,
+            )
+            first_changes = gpd.read_file(first["road_changes"])
+            second_changes = gpd.read_file(second["road_changes"])
+            error_count = int(first_changes["type_error"].fillna(0).sum())
+            self.assertGreater(error_count, 0)
+            self.assertLess(error_count, len(first_changes))
+            self.assertEqual(
+                first_changes["change_typ"].tolist(),
+                second_changes["change_typ"].tolist(),
+            )
+            self.assertTrue(
+                first_changes.geometry.union_all().equals(
+                    second_changes.geometry.union_all()
+                )
+            )
+            final_overall = next(
+                row for row in first["evaluation"]["metrics"]
+                if row["class"] == "all"
+            )
+            self.assertLess(final_overall["change_type_accuracy"], 1.0)
+            self.assertGreater(final_overall["change_type_accuracy"], 0.80)
+            job_root = root / "job"
+            job_root.mkdir()
+            manifest_path = job_root / "pipeline_result.json"
+            manifest_path.write_text(json.dumps({
+                "execution_profile": "fast", "job_root": str(job_root),
+                "change_results": [{
+                    "grid": "area", "before_period": "2021",
+                    "after_period": "2022", "truth": str(truth_path),
+                    "truth_type_field": "BHBM", **first,
+                }],
+            }), encoding="utf-8")
+            evaluated = user_pipeline.evaluate_existing_changes(argparse.Namespace(
+                pipeline_manifest=str(manifest_path), grid="area",
+                before_period="2021", after_period="2022",
+                truth=str(truth_path), validation_area="",
+                truth_type_field="BHBM", truth_added_value="",
+                truth_width_changed_value="", truth_removed_value="",
+                evaluation_tolerance=5.0,
+            ))
+            self.assertLess(evaluated["change_type_accuracy"], 1.0)
+            self.assertGreater(evaluated["change_type_accuracy"], 0.80)
 
     def test_truth_codes_generate_three_semantic_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

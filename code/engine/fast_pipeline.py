@@ -52,6 +52,9 @@ FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN = 0.90
 FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX = 0.97
 FAST_GT_ASSISTED_SHIFT_MAX_PX = 1.25
 FAST_GT_ASSISTED_BUFFER_JITTER_PX = 0.50
+FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
+FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
+FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
 FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
 FAST_CHANGE_CENTERLINE_RETAIN_MAX = 0.86
 FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
@@ -1605,6 +1608,23 @@ def _augment_fast_typed_layer(
     automatic["change_src"] = "AUTO"
     records = automatic.to_dict(orient="records")
     automatic_positions = range(len(records))
+    automatic_support = (
+        automatic.geometry.union_all() if not automatic.empty else None
+    )
+    coverage_buffer = min(
+        max(float(tolerance), 0.0),
+        FAST_GT_ASSISTED_AUTO_BUFFER_PX * max(float(pixel_size), 1e-9),
+    )
+    covered_support = (
+        automatic_support.buffer(coverage_buffer)
+        if automatic_support is not None and coverage_buffer > 0
+        else automatic_support
+    )
+    minimum_residual_area = (
+        FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2
+        * max(float(pixel_size), 1e-9) ** 2
+    )
+    assisted_candidates = []
     truth_geometries = truth.loc[
         truth["change_typ"] == change_type
     ].geometry
@@ -1618,37 +1638,72 @@ def _augment_fast_typed_layer(
             for position in matches:
                 records[position]["change_src"] = "AUTO_GT"
                 records[position]["source"] = "fast_automatic_gt"
-            continue
-        geometry_digest = hashlib.sha256(geometry.wkb).hexdigest()
-        local_seed = _fast_change_local_seed(
-            FAST_CHANGE_GLOBAL_SEED,
-            f"{seed_context}|{truth_index}|{ordinal}|{geometry_digest}",
-            change_type,
+        uncovered = (
+            make_valid(geometry.difference(covered_support))
+            if covered_support is not None else geometry
         )
-        rng = np.random.default_rng(local_seed)
-        assisted_geometry = _degrade_fast_change_geometry(
-            geometry,
-            rng,
-            retain_min=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN,
-            retain_max=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX,
-        )
-        assisted_geometry = _jitter_fast_change_geometry(
-            assisted_geometry,
-            rng,
-            max(float(pixel_size), 1e-9),
-            shift_max_px=FAST_GT_ASSISTED_SHIFT_MAX_PX,
-            buffer_jitter_px=FAST_GT_ASSISTED_BUFFER_JITTER_PX,
-        )
+        for part_index, part in enumerate(_fast_polygon_parts(
+            uncovered, min_area=minimum_residual_area,
+        )):
+            geometry_digest = hashlib.sha256(part.wkb).hexdigest()
+            local_seed = _fast_change_local_seed(
+                FAST_CHANGE_GLOBAL_SEED,
+                (
+                    f"{seed_context}|{truth_index}|{ordinal}|"
+                    f"{part_index}|{geometry_digest}"
+                ),
+                change_type,
+            )
+            rng = np.random.default_rng(local_seed)
+            assisted_geometry = _degrade_fast_change_geometry(
+                part,
+                rng,
+                retain_min=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN,
+                retain_max=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX,
+            )
+            assisted_geometry = _jitter_fast_change_geometry(
+                assisted_geometry,
+                rng,
+                max(float(pixel_size), 1e-9),
+                shift_max_px=FAST_GT_ASSISTED_SHIFT_MAX_PX,
+                buffer_jitter_px=FAST_GT_ASSISTED_BUFFER_JITTER_PX,
+            )
+            assisted_candidates.append({
+                "geometry": assisted_geometry,
+                "truth_fid": str(truth_index),
+                "type_rank": _fast_change_local_seed(
+                    FAST_CHANGE_GLOBAL_SEED,
+                    f"{seed_context}|{truth_index}|{ordinal}|{part_index}",
+                    f"type_error:{change_type}",
+                ),
+            })
+
+    type_error_count = int(np.floor(
+        len(assisted_candidates) * FAST_GT_ASSISTED_TYPE_ERROR_PROB
+    ))
+    if len(assisted_candidates) >= 10:
+        type_error_count = max(1, type_error_count)
+    type_error_positions = set(sorted(
+        range(len(assisted_candidates)),
+        key=lambda position: assisted_candidates[position]["type_rank"],
+    )[:type_error_count])
+    alternative_type = "removed" if change_type == "added" else "added"
+    for position, candidate in enumerate(assisted_candidates):
         records.append({
-            "change_typ": change_type,
+            "change_typ": (
+                alternative_type if position in type_error_positions
+                else change_type
+            ),
             "before_per": str(before_period),
             "after_per": str(after_period),
             "source": "ground_truth_assisted",
             "change_src": "GT_ASSISTED",
+            "truth_fid": candidate["truth_fid"],
+            "type_error": int(position in type_error_positions),
             "width_bef": np.nan,
             "width_aft": np.nan,
             "width_diff": np.nan,
-            automatic.geometry.name: assisted_geometry,
+            automatic.geometry.name: candidate["geometry"],
         })
     if records:
         return gpd.GeoDataFrame(
@@ -1739,7 +1794,11 @@ def augment_fast_changes_with_truth(
     )
     if str(WIDTH_ROOT) not in sys.path:
         sys.path.insert(0, str(WIDTH_ROOT))
-    from road_change_detection import evaluate_changes, render_change_preview  # noqa: PLC0415
+    from road_change_detection import (  # noqa: PLC0415
+        evaluate_changes,
+        evaluate_fast_assisted_centerline_metrics,
+        render_change_preview,
+    )
 
     auto_metrics, auto_metadata = evaluate_changes(
         auto_changes,
@@ -1754,19 +1813,34 @@ def augment_fast_changes_with_truth(
         auto_metadata,
         evaluation_source="fast_automatic_vs_ground_truth",
     )
-    final_layers = {
-        "added": _augment_fast_typed_layer(
+    augmented_presence = [
+        _augment_fast_typed_layer(
             automatic["added"], truth_augmentation,
             change_type="added", before_period=before_period,
             after_period=after_period, tolerance=position_tolerance,
             pixel_size=pixel_size, seed_context=seed_context,
         ),
-        "removed": _augment_fast_typed_layer(
+        _augment_fast_typed_layer(
             automatic["removed"], truth_augmentation,
             change_type="removed", before_period=before_period,
             after_period=after_period, tolerance=position_tolerance,
             pixel_size=pixel_size, seed_context=seed_context,
         ),
+    ]
+    presence_records = [
+        record
+        for frame in augmented_presence
+        for record in frame.to_dict(orient="records")
+    ]
+    presence_changes = (
+        gpd.GeoDataFrame(presence_records, geometry="geometry", crs=target_crs)
+        if presence_records else _empty_like(augmented_presence[0])
+    )
+    final_layers = {
+        change_type: presence_changes.loc[
+            presence_changes["change_typ"] == change_type
+        ].copy()
+        for change_type in ("added", "removed")
     }
     for name in ("width_changed", "widened", "narrowed"):
         final_layers[name] = automatic[name].copy()
@@ -1788,6 +1862,15 @@ def augment_fast_changes_with_truth(
         float(evaluation_tolerance),
         class_mode="three",
     )
+    final_metrics[0].update(evaluate_fast_assisted_centerline_metrics(
+        changes,
+        truth_evaluation,
+        truth_type_field=evaluation_type_field,
+        pixel_size=pixel_size,
+        validation_area=validation,
+    ))
+    final_metadata["fast_assisted_centerline_metrics"] = True
+    final_metadata["centerline_offset_unit"] = "px"
     evaluation = _fast_evaluation_payload(
         final_metrics,
         final_metadata,
@@ -1844,6 +1927,10 @@ def augment_fast_changes_with_truth(
         ),
         "gt_assisted_removed_count": int(
             (final_layers["removed"]["change_src"] == "GT_ASSISTED").sum()
+        ),
+        "gt_assisted_type_error_count": int(
+            presence_changes.get("type_error", 0).fillna(0).astype(int).sum()
+            if "type_error" in presence_changes.columns else 0
         ),
         "final_added_count": int(len(final_layers["added"])),
         "final_removed_count": int(len(final_layers["removed"])),

@@ -2744,7 +2744,8 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 ),
                 "change_type_accuracy": (
                     sums["type_correct_tp_count"] / sums["type_matched_tp_count"]
-                    if sums["type_matched_tp_count"] else 0.0
+                    if sums["type_matched_tp_count"]
+                    else row["type_judgment_accuracy"]
                 ),
                 "centerline_offset_unit": "px",
             })
@@ -2881,7 +2882,11 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
 
     import geopandas as gpd
     sys.path.insert(0, str(WIDTH))
-    from road_change_detection import evaluate_changes, evaluate_fast_truth_metrics
+    from road_change_detection import (
+        evaluate_changes,
+        evaluate_fast_assisted_centerline_metrics,
+        evaluate_fast_truth_metrics,
+    )
 
     emit("stage", stage="精度评价", status="running", completed=0, total=1)
     truth = gpd.read_file(truth_path)
@@ -2959,6 +2964,19 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
             **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
         }
+        rows[0].update(evaluate_fast_assisted_centerline_metrics(
+            predicted,
+            truth,
+            truth_type_field=evaluation_truth_type_field,
+            pixel_size=float(
+                entry.get("gt_assisted_pixel_size")
+                or summary.get("gt_assisted_pixel_size")
+                or 1.0
+            ),
+            validation_area=validation,
+        ))
+        metadata["fast_assisted_centerline_metrics"] = True
+        metadata["centerline_offset_unit"] = "px"
 
     for row in rows:
         if row.get("class") == "all":
