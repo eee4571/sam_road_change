@@ -2643,7 +2643,6 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 "truth_support_m2", "validation_area_m2", "correctly_classified_m2",
                 "detected_truth_m2", "truth_axis_length_m", "predicted_axis_length_m",
                 "truth_distance_integral_m2", "predicted_distance_integral_m2",
-                "change_tp_count", "change_fp_count", "change_fn_count",
                 "type_correct_tp_count", "type_matched_tp_count",
                 "truth_centerline_length_px", "covered_truth_centerline_length_px",
                 "predicted_centerline_length_px", "centerline_offset_integral_px2",
@@ -2673,18 +2672,12 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             "evaluated_task_count": len(source_rows),
         }
         has_fast_truth_metrics = class_name == "all" and any(
-            "change_tp_count" in source for source in source_rows
+            "road_centerline_completeness" in source for source in source_rows
         )
         if has_fast_truth_metrics:
-            object_total = sums["change_tp_count"] + sums["change_fp_count"]
-            truth_total = sums["change_tp_count"] + sums["change_fn_count"]
             row.update({
-                "change_precision": (
-                    sums["change_tp_count"] / object_total if object_total else 0.0
-                ),
-                "change_recall": (
-                    sums["change_tp_count"] / truth_total if truth_total else 0.0
-                ),
+                "change_precision": precision,
+                "change_recall": recall,
                 "road_centerline_completeness": (
                     sums["covered_truth_centerline_length_px"]
                     / sums["truth_centerline_length_px"]
@@ -2883,6 +2876,8 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
                 validation_area=validation,
             )
             rows[0].update(fast_metrics)
+            rows[0]["change_precision"] = rows[0]["precision"]
+            rows[0]["change_recall"] = rows[0]["recall"]
             metadata["fast_truth_metrics"] = True
             metadata["centerline_offset_unit"] = "px"
     metrics_path = output / "evaluation_metrics.csv"

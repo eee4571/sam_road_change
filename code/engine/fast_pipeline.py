@@ -32,15 +32,12 @@ FAST_SMALL_LOOP_LENGTH_PX = 24.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
-FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.25
+FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN = 0.25
+FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX = 0.33
 FAST_CHANGE_SHIFT_MAX_PX = 3.0
 FAST_CHANGE_BUFFER_JITTER_PX = 1.5
 FAST_CHANGE_TYPE_ERROR_PROB = 0.15
 FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
-FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN = 2.0
-FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX = 4.0
-FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET = 0.18
-FAST_CHANGE_FALSE_POSITIVE_AREA_MAX = 0.25
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
@@ -1361,7 +1358,7 @@ def build_fast_change_from_truth(
         )
         if nonempty_layers else _empty_like(pseudo_frames[0])
     )
-    stable_false_positives, truth_axes, predicted_axes, pixel_size = (
+    stable_false_positives, truth_axes, predicted_axes, pixel_size, target_fp_area = (
         _build_fast_truth_synthetic_geometry(
             before_result,
             after_result,
@@ -1383,6 +1380,15 @@ def build_fast_change_from_truth(
         )
     synthetic_metrics["false_positive_feature_count"] = int(
         len(stable_false_positives)
+    )
+    predicted_support = changes.geometry.union_all() if not changes.empty else None
+    actual_tp_area = (
+        float(predicted_support.intersection(truth_support).area)
+        if predicted_support is not None else 0.0
+    )
+    actual_fp_area = (
+        max(0.0, float(predicted_support.area) - actual_tp_area)
+        if predicted_support is not None else 0.0
     )
     typed_layers = {
         type_name: changes.loc[changes["change_typ"] == type_name].copy()
@@ -1423,8 +1429,12 @@ def build_fast_change_from_truth(
         "ground_truth_derived": True, "change_output_mode": "fast_synthetic_from_truth",
         "period_key": str(period_key), "global_seed": int(global_seed),
         "miss_probability": FAST_CHANGE_MISS_PROB,
-        "false_positive_ratio": FAST_CHANGE_FALSE_POSITIVE_RATIO,
+        "false_positive_area_ratio_min": FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN,
+        "false_positive_area_ratio_max": FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX,
         "false_positive_source": "stable_unchanged_roads",
+        "false_positive_target_total_area": float(target_fp_area),
+        "false_positive_total_area": float(actual_fp_area),
+        "retained_true_positive_area": float(actual_tp_area),
         "shift_max_px": FAST_CHANGE_SHIFT_MAX_PX,
         "buffer_jitter_px": FAST_CHANGE_BUFFER_JITTER_PX,
         "type_error_probability": FAST_CHANGE_TYPE_ERROR_PROB,
@@ -1607,14 +1617,36 @@ def _stable_road_false_positives(
     before_centerlines: gpd.GeoDataFrame,
     after_centerlines: gpd.GeoDataFrame,
     source_changes: gpd.GeoDataFrame,
+    retained_changes: gpd.GeoDataFrame,
     *,
     truth_support,
     pixel_size: float,
     period_key: str,
     global_seed: int,
-) -> gpd.GeoDataFrame:
+) -> tuple[gpd.GeoDataFrame, float]:
     if before_centerlines.empty or after_centerlines.empty or source_changes.empty:
-        return _empty_like(source_changes)
+        return _empty_like(source_changes), 0.0
+    rng = np.random.default_rng(_fast_change_local_seed(
+        global_seed, period_key, "stable_false_positive",
+    ))
+    retained_truth = retained_changes.loc[
+        retained_changes["synth_kind"] == "truth_derived"
+    ]
+    retained_support = (
+        retained_truth.geometry.union_all() if not retained_truth.empty else None
+    )
+    retained_tp_area = (
+        float(retained_support.intersection(truth_support).area)
+        if retained_support is not None else 0.0
+    )
+    target_ratio = float(rng.uniform(
+        FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN,
+        FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX,
+    ))
+    target_total_fp_area = retained_tp_area * target_ratio
+    stable_fp_area_budget = target_total_fp_area
+    if stable_fp_area_budget <= 1e-9:
+        return _empty_like(source_changes), target_total_fp_area
     tolerance = FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX * pixel_size
     after_support = after_centerlines.geometry.union_all().buffer(tolerance)
     excluded = truth_support.buffer(max(pixel_size, 1e-6))
@@ -1627,25 +1659,47 @@ def _stable_road_false_positives(
         for part in _fast_line_parts(stable_part):
             if float(part.length) >= 12.0 * pixel_size:
                 candidates.append((part, max(_fast_width_value(row), 2.0 * pixel_size)))
-    target_count = int(np.floor(
-        len(source_changes) * FAST_CHANGE_FALSE_POSITIVE_RATIO + 0.5
-    ))
-    if target_count <= 0 or not candidates:
-        return _empty_like(source_changes)
-    rng = np.random.default_rng(_fast_change_local_seed(
-        global_seed, period_key, "stable_false_positive",
-    ))
+    if not candidates:
+        return _empty_like(source_changes), target_total_fp_area
     order = np.asarray(rng.permutation(len(candidates)), dtype=int).tolist()
+    truth_lengths = [
+        max(float(maxx - minx), float(maxy - miny))
+        for minx, miny, maxx, maxy in source_changes.geometry.bounds.to_numpy()
+    ]
+    typical_length = max(
+        12.0 * pixel_size,
+        float(np.median(truth_lengths)) if truth_lengths else 24.0 * pixel_size,
+    )
     records = []
-    for output_index in range(target_count):
+    created_support = None
+    created_area = 0.0
+    max_attempts = max(40, len(candidates) * 12)
+    for output_index in range(max_attempts):
+        if created_area >= 0.98 * stable_fp_area_budget:
+            break
         line, width = candidates[order[output_index % len(order)]]
         length = float(line.length)
-        segment_length = min(length, max(12.0 * pixel_size, min(40.0 * pixel_size, length * 0.40)))
+        remaining_area = max(0.0, stable_fp_area_budget - created_area)
+        scale_length = typical_length * float(rng.uniform(0.75, 1.25))
+        area_length = remaining_area / max(width, 2.0 * pixel_size)
+        minimum_segment_length = min(
+            length,
+            max(3.0 * pixel_size, min(12.0 * pixel_size, typical_length * 0.25)),
+        )
+        if area_length < minimum_segment_length:
+            break
+        segment_length = min(
+            length,
+            max(minimum_segment_length, min(scale_length, area_length)),
+        )
         start = float(rng.uniform(0.0, max(0.0, length - segment_length)))
         segment = substring(line, start, start + segment_length)
-        polygon = make_valid(
-            segment.buffer(max(width / 2.0, pixel_size), cap_style="flat").difference(excluded)
-        )
+        polygon = segment.buffer(
+            max(width / 2.0, pixel_size), cap_style="flat",
+        ).difference(excluded)
+        if created_support is not None:
+            polygon = polygon.difference(created_support)
+        polygon = make_valid(polygon)
         if polygon.is_empty:
             continue
         records.append({
@@ -1662,10 +1716,17 @@ def _stable_road_false_positives(
                 global_seed, period_key, "stable_false_positive",
             )),
         })
+        created_support = (
+            polygon if created_support is None else created_support.union(polygon)
+        )
+        created_area = float(created_support.area)
     if not records:
-        return _empty_like(source_changes)
-    return gpd.GeoDataFrame(
-        records, geometry=source_changes.geometry.name, crs=source_changes.crs,
+        return _empty_like(source_changes), target_total_fp_area
+    return (
+        gpd.GeoDataFrame(
+            records, geometry=source_changes.geometry.name, crs=source_changes.crs,
+        ),
+        target_total_fp_area,
     )
 
 
@@ -1678,10 +1739,10 @@ def _build_fast_truth_synthetic_geometry(
     truth_support,
     period_key: str,
     global_seed: int,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, float]:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
     empty_axes = _empty_fast_change_axes(source_changes.crs)
     if before_result is None or after_result is None:
-        return _empty_like(source_changes), empty_axes, empty_axes.copy(), 1.0
+        return _empty_like(source_changes), empty_axes, empty_axes.copy(), 1.0, 0.0
     before = _load_fast_period_result(before_result)
     after = _load_fast_period_result(after_result)
     before_centerlines = _align_fast_change_frame(
@@ -1706,16 +1767,17 @@ def _build_fast_truth_synthetic_geometry(
         period_key=period_key,
         global_seed=global_seed,
     )
-    false_positives = _stable_road_false_positives(
+    false_positives, target_fp_area = _stable_road_false_positives(
         before_centerlines,
         after_centerlines,
         source_changes,
+        changes,
         truth_support=truth_support,
         pixel_size=pixel_size,
         period_key=period_key,
         global_seed=global_seed,
     )
-    return false_positives, truth_axes, predicted_axes, pixel_size
+    return false_positives, truth_axes, predicted_axes, pixel_size, target_fp_area
 
 
 def _read_fast_change_layer(

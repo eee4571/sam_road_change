@@ -1521,7 +1521,6 @@ def evaluate_fast_truth_metrics(
     truth_types = dict(zip(truth["_fast_truth_fid"], truth["_fast_type"]))
 
     matched: dict[str, str] = {}
-    predicted_count = int(len(predicted))
     if "truth_fid" in predicted.columns and "synth_kind" in predicted.columns:
         for _index, row in predicted.iterrows():
             truth_fid = str(row.get("truth_fid") or "")
@@ -1532,16 +1531,6 @@ def evaluate_fast_truth_metrics(
             ):
                 matched[truth_fid] = str(row.get("change_typ") or "")
     true_positive = len(matched)
-    false_positive = max(0, predicted_count - true_positive)
-    false_negative = max(0, len(truth_types) - true_positive)
-    change_precision = (
-        true_positive / (true_positive + false_positive)
-        if true_positive + false_positive else (1.0 if not truth_types else 0.0)
-    )
-    change_recall = (
-        true_positive / (true_positive + false_negative)
-        if true_positive + false_negative else (1.0 if not predicted_count else 0.0)
-    )
     type_correct = sum(
         _normalized_change_type(predicted_type, "three") == truth_types[truth_fid]
         for truth_fid, predicted_type in matched.items()
@@ -1599,8 +1588,6 @@ def evaluate_fast_truth_metrics(
         offset_integral_px2 / predicted_length_px if predicted_length_px > 0 else None
     )
     return {
-        "change_recall": float(change_recall),
-        "change_precision": float(change_precision),
         "road_centerline_completeness": (
             float(road_centerline_completeness)
             if road_centerline_completeness is not None else None
@@ -1610,9 +1597,6 @@ def evaluate_fast_truth_metrics(
             if centerline_mean_offset_px is not None else None
         ),
         "change_type_accuracy": float(change_type_accuracy),
-        "change_tp_count": int(true_positive),
-        "change_fp_count": int(false_positive),
-        "change_fn_count": int(false_negative),
         "type_correct_tp_count": int(type_correct),
         "type_matched_tp_count": int(true_positive),
         "truth_centerline_length_px": float(truth_length_px),

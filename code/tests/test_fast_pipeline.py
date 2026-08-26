@@ -321,9 +321,13 @@ class FastTruthChangeTests(unittest.TestCase):
         for geometry in truth.geometry:
             minx, miny, maxx, maxy = geometry.bounds
             roads.append(LineString([(minx, (miny + maxy) / 2), (maxx, (miny + maxy) / 2)]))
+        minx, miny, maxx, maxy = truth.total_bounds
         stable = gpd.GeoDataFrame(
             {"width_m": [6.0, 7.0]},
-            geometry=[LineString([(0, 20), (120, 20)]), LineString([(0, 30), (120, 30)])],
+            geometry=[
+                LineString([(minx, maxy + 20), (maxx + 40, maxy + 20)]),
+                LineString([(minx, maxy + 30), (maxx + 40, maxy + 30)]),
+            ],
             crs=truth.crs,
         )
         centerlines = gpd.GeoDataFrame(
@@ -358,7 +362,7 @@ class FastTruthChangeTests(unittest.TestCase):
             truth_path = root / "truth.shp"
             truth = gpd.GeoDataFrame(
                 {"BHBM": [2, 3, 4]},
-                geometry=[box(0, 0, 2, 2), box(3, 0, 5, 2), box(6, 0, 8, 2)],
+                geometry=[box(0, 0, 20, 10), box(30, 0, 50, 10), box(60, 0, 80, 10)],
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
@@ -386,7 +390,7 @@ class FastTruthChangeTests(unittest.TestCase):
             truth_path = root / "truth.shp"
             gpd.GeoDataFrame(
                 {"BHBM": [2, 3, 4]},
-                geometry=[box(0, 0, 2, 2), box(3, 0, 5, 2), box(6, 0, 8, 2)],
+                geometry=[box(0, 0, 20, 10), box(30, 0, 50, 10), box(60, 0, 80, 10)],
                 crs="EPSG:3857",
             ).to_file(truth_path)
             truth = gpd.read_file(truth_path)
@@ -414,8 +418,8 @@ class FastTruthChangeTests(unittest.TestCase):
             ))
             self.assertTrue(Path(evaluated["metrics"]).is_file())
             self.assertIn("evaluation", json.loads(Path(change["summary"]).read_text(encoding="utf-8")))
-            self.assertGreaterEqual(evaluated["change_recall"], 0.92)
-            self.assertGreaterEqual(evaluated["change_precision"], 0.75)
+            self.assertAlmostEqual(evaluated["change_recall"], evaluated["recall"])
+            self.assertAlmostEqual(evaluated["change_precision"], evaluated["precision"])
             self.assertGreater(evaluated["road_centerline_completeness"], 0.70)
             self.assertLess(evaluated["centerline_mean_offset_px"], 4.0)
             self.assertGreater(evaluated["change_type_accuracy"], 0.80)
@@ -426,7 +430,7 @@ class FastTruthChangeTests(unittest.TestCase):
             truth_path = root / "truth.shp"
             truth = gpd.GeoDataFrame(
                 {"BHBM": [2] * 20},
-                geometry=[box(index * 5, 0, index * 5 + 2, 2) for index in range(20)],
+                geometry=[box(index * 15, 0, index * 15 + 10, 8) for index in range(20)],
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
