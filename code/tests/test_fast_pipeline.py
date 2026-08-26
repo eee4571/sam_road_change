@@ -388,6 +388,51 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertTrue(Path(result["truth_change_centerlines"]).is_file())
             self.assertTrue(Path(result["predicted_change_centerlines"]).is_file())
 
+    def test_empty_truth_builds_empty_products_and_evaluates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            truth_path = root / "truth.shp"
+            gpd.GeoDataFrame(
+                {"BHBM": []},
+                geometry=gpd.GeoSeries([], crs="EPSG:3857"),
+                crs="EPSG:3857",
+            ).to_file(truth_path)
+            change = build_fast_change_from_truth(
+                truth_path,
+                root / "change",
+                period_key="area:2021->2022",
+            )
+            self.assertTrue(gpd.read_file(change["road_changes"]).empty)
+            self.assertEqual(change["truth_feature_count"], 0)
+
+            job_root = root / "job"
+            job_root.mkdir()
+            manifest_path = job_root / "pipeline_result.json"
+            manifest_path.write_text(json.dumps({
+                "execution_profile": "fast",
+                "project_root": str(root),
+                "output_root": str(root / "results"),
+                "job_root": str(job_root),
+                "change_results": [{
+                    "grid": "area",
+                    "before_period": "2021",
+                    "after_period": "2022",
+                    "truth": str(truth_path),
+                    "truth_type_field": "BHBM",
+                    **change,
+                }],
+            }), encoding="utf-8")
+            evaluated = user_pipeline.evaluate_existing_changes(argparse.Namespace(
+                pipeline_manifest=str(manifest_path), grid="area",
+                before_period="2021", after_period="2022",
+                truth=str(truth_path), validation_area="",
+                truth_type_field="BHBM", truth_added_value="",
+                truth_width_changed_value="", truth_removed_value="",
+                evaluation_tolerance=5.0,
+            ))
+            self.assertEqual(evaluated["change_precision"], 1.0)
+            self.assertEqual(evaluated["change_recall"], 1.0)
+
     def test_fast_truth_result_uses_existing_evaluation_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

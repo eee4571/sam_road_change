@@ -12,6 +12,28 @@ from dev_tools import generate_mock_change_truth
 
 
 class GridDiscoveryTests(unittest.TestCase):
+    def test_empty_truth_shapefile_with_crs_passes_validation(self) -> None:
+        import geopandas as gpd
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as raw:
+            truth_path = Path(raw) / "empty_truth.shp"
+            gpd.GeoDataFrame(
+                {"BHBM": pd.Series(dtype="int64")},
+                geometry=gpd.GeoSeries([], crs="EPSG:3857"),
+                crs="EPSG:3857",
+            ).to_file(truth_path)
+
+            user_pipeline._validate_truth_shapefile(truth_path)
+            truth = gpd.read_file(truth_path)
+            mapped, field = user_pipeline.apply_truth_value_mapping(
+                truth,
+                "BHBM",
+                {"added": "2", "width_changed": "3", "removed": "4"},
+            )
+            self.assertTrue(mapped.empty)
+            self.assertEqual(field, "__samroad_truth_type")
+
     def test_discovers_txt_direct_raster_and_period_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

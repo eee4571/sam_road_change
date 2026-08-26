@@ -532,7 +532,7 @@ def _validate_truth_shapefile(path: Path) -> None:
         raise ValueError(f"变化真值缺少 CRS：{path}")
     usable = frame.loc[frame.geometry.notna() & ~frame.geometry.is_empty]
     if usable.empty:
-        raise ValueError(f"变化真值没有有效几何：{path}")
+        return
     invalid = sorted({geometry.geom_type for geometry in usable.geometry if geometry.geom_type not in {"LineString", "MultiLineString", "Polygon", "MultiPolygon"}})
     if invalid:
         raise ValueError(f"变化真值必须是线或面：{path}（发现 {', '.join(invalid)}）")
@@ -2750,6 +2750,16 @@ def apply_truth_value_mapping(truth, type_field: str, value_map: dict[str, str])
     configured = {key: str(value or "").strip() for key, value in value_map.items()}
     if any(not configured.get(key) for key in ("added", "width_changed", "removed")):
         raise ValueError("真值类型映射必须同时提供新增、宽度变化和灭失三个字段值。")
+    target_field = "__samroad_truth_type"
+    geometry = getattr(truth, "geometry", None)
+    no_valid_geometry = bool(
+        geometry is not None
+        and not (geometry.notna() & ~geometry.is_empty).any()
+    )
+    if truth.empty or no_valid_geometry:
+        mapped = truth.copy()
+        mapped[target_field] = None
+        return mapped, target_field
     if not type_field:
         raise ValueError("配置真值类型映射时必须指定变化类型字段。")
     field = next(
@@ -2764,7 +2774,6 @@ def apply_truth_value_mapping(truth, type_field: str, value_map: dict[str, str])
     }
     if len(normalized_map) != 3:
         raise ValueError("新增、宽度变化和灭失必须对应三个不同的真值字段值。")
-    target_field = "__samroad_truth_type"
     mapped = truth.copy()
     mapped[target_field] = mapped[field].map(
         lambda value: normalized_map.get(_truth_value_key(value)),

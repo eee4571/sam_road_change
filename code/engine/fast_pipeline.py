@@ -1336,13 +1336,22 @@ def build_fast_change_from_truth(
     truth = gpd.read_file(truth_path)
     if truth.crs is None:
         raise ValueError(f"Change truth lacks CRS: {truth_path}")
-    field = next((column for column in truth.columns if column.casefold() == truth_type_field.casefold()), None)
-    if field is None:
-        raise ValueError(f"Change truth is missing type field {truth_type_field}: {truth_path}")
-    if validation_area is not None and validation_area.is_file():
-        truth = _clip_frame(truth, validation_area)
     truth = truth.loc[truth.geometry.notna() & ~truth.geometry.is_empty].copy()
     truth.geometry = truth.geometry.map(make_valid)
+    truth = truth.loc[~truth.geometry.is_empty].copy()
+    field = next(
+        (
+            column for column in truth.columns
+            if column.casefold() == truth_type_field.casefold()
+        ),
+        None,
+    )
+    if field is None and not truth.empty:
+        raise ValueError(
+            f"Change truth is missing type field {truth_type_field}: {truth_path}"
+        )
+    if validation_area is not None and validation_area.is_file():
+        truth = _clip_frame(truth, validation_area)
     truth["truth_fid"] = truth.index.map(str)
     aliases = {
         "2": "added", "added": "added", "新增": "added",
@@ -1351,7 +1360,12 @@ def build_fast_change_from_truth(
         "widened": "widened", "拓宽": "widened",
         "narrowed": "narrowed", "变窄": "narrowed",
     }
-    truth["change_typ"] = truth[field].map(lambda value: aliases.get(str(value).strip().casefold(), ""))
+    truth["change_typ"] = (
+        truth[field].map(
+            lambda value: aliases.get(str(value).strip().casefold(), "")
+        )
+        if field is not None else ""
+    )
     selected_types = (
         [str(change_type).strip().casefold()]
         if change_type is not None else

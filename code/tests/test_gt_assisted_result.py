@@ -47,6 +47,31 @@ def empty_automatic(crs: str = "EPSG:3857") -> gpd.GeoDataFrame:
 
 
 class GTAssistedConstructionTests(unittest.TestCase):
+    def test_empty_truth_evaluation_completes_and_predictions_are_false_positives(self) -> None:
+        truth = gpd.GeoDataFrame(
+            {"BHBM": []}, geometry=gpd.GeoSeries([], crs="EPSG:3857"),
+            crs="EPSG:3857",
+        )
+        empty_rows, empty_metadata = evaluate_changes(
+            empty_automatic(), truth,
+            truth_type_field="BHBM", class_mode="three",
+        )
+        self.assertEqual(empty_rows[0]["precision"], 1.0)
+        self.assertEqual(empty_rows[0]["recall"], 1.0)
+        self.assertEqual(empty_metadata["total_truth_features"], 0)
+
+        predicted = gpd.GeoDataFrame(
+            {"change_typ": ["added"]},
+            geometry=[box(0, 0, 10, 5)], crs=truth.crs,
+        )
+        predicted_rows, _metadata = evaluate_changes(
+            predicted, truth,
+            truth_type_field="BHBM", class_mode="three",
+        )
+        self.assertEqual(predicted_rows[0]["tp_m2"], 0.0)
+        self.assertGreater(predicted_rows[0]["fp_m2"], 0.0)
+        self.assertEqual(predicted_rows[0]["precision"], 0.0)
+
     def test_bhbm_mapping_and_width_direction_collapse(self) -> None:
         normalized = normalize_truth_changes(truth_frame())
         self.assertEqual(set(normalized["change_typ"]), {"added", "width_changed", "removed"})
@@ -217,6 +242,35 @@ class GTAssistedMainTests(unittest.TestCase):
             self.assertTrue(summary["gt_assisted_applied"])
             self.assertEqual(summary["change_output_mode"], "gt_assisted")
             self.assertTrue(summary["ground_truth_derived"])
+
+    def test_empty_truth_keeps_full_automatic_result_and_evaluates_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            before, after, _truth = self._write_inputs(root)
+            empty_truth = root / "empty_truth.gpkg"
+            gpd.GeoDataFrame(
+                {"BHBM": []},
+                geometry=gpd.GeoSeries([], crs="EPSG:3857"),
+                crs="EPSG:3857",
+            ).to_file(empty_truth, driver="GPKG")
+            output = root / "changes"
+            with mock.patch.object(
+                road_change_detection, "GT_ASSISTED_RESULT_MODE", True,
+            ):
+                self.assertEqual(
+                    road_change_detection.main(
+                        self._argv(before, after, output, empty_truth)
+                    ),
+                    0,
+                )
+
+            summary = json.loads(
+                (output / "change_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(summary["gt_assisted_applied"])
+            self.assertFalse(summary["ground_truth_derived"])
+            self.assertEqual(summary["reason"], "truth_empty_no_change")
+            self.assertEqual(summary["evaluation"]["metrics"][0]["precision"], 0.0)
 
     def test_true_without_truth_falls_back_to_automatic(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

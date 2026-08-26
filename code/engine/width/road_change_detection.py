@@ -148,7 +148,12 @@ def _analysis_crs(before: gpd.GeoDataFrame, after: gpd.GeoDataFrame):
     if metric_in_metres:
         analysis_crs = output_crs
     else:
-        bounds = np.vstack([before_output.total_bounds, after_output.total_bounds])
+        nonempty_frames = [
+            frame for frame in (before_output, after_output) if not frame.empty
+        ]
+        if not nonempty_frames:
+            return before_output, after_output, output_crs, output_crs
+        bounds = np.vstack([frame.total_bounds for frame in nonempty_frames])
         minx, miny = np.nanmin(bounds[:, :2], axis=0)
         maxx, maxy = np.nanmax(bounds[:, 2:], axis=0)
         combined = gpd.GeoDataFrame(geometry=[box(minx, miny, maxx, maxy)], crs=output_crs)
@@ -1015,6 +1020,8 @@ def normalized_change_series(frame: gpd.GeoDataFrame, field: str, class_mode: st
 def _truth_type_field(truth: gpd.GeoDataFrame, requested: str) -> str | None:
     if requested:
         if requested not in truth.columns:
+            if truth.empty:
+                return None
             raise ValueError(f"Truth change type field does not exist: {requested}")
         return requested
     return next((field for field in TRUTH_TYPE_FIELDS if field in truth.columns), None)
@@ -1353,17 +1360,27 @@ def evaluate_changes(
         truth[field].map(lambda value: _normalized_truth_change_type(value, field, class_mode)) if field else None
     )
 
-    derived_validation = validation_area is None
     if validation_area is not None:
         if validation_area.crs is None:
             raise ValueError("The validation area layer must define a CRS.")
         validation = _polygon_union(_clean_geometries(validation_area).to_crs(predicted.crs))
+        validation_extent_source = "validation_area"
     else:
-        if truth.empty:
-            raise ValueError("Cannot derive a validation extent from empty truth data.")
-        minx, miny, maxx, maxy = truth.total_bounds
-        pad = max(evaluation_tolerance * 4.0, max(maxx - minx, maxy - miny) * 0.02, 1.0)
-        validation = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+        extent_source = truth if not truth.empty else predicted
+        if extent_source.empty:
+            validation = box(0.0, 0.0, 1.0, 1.0)
+            validation_extent_source = "empty_default"
+        else:
+            minx, miny, maxx, maxy = extent_source.total_bounds
+            pad = max(
+                evaluation_tolerance * 4.0,
+                max(maxx - minx, maxy - miny) * 0.02,
+                1.0,
+            )
+            validation = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+            validation_extent_source = (
+                "truth_bounds" if not truth.empty else "prediction_bounds"
+            )
 
     predicted = _clip_frame(predicted, validation)
     truth = _clip_frame(truth, validation)
@@ -1463,7 +1480,7 @@ def evaluate_changes(
         "truth_type_field": field,
         "classified_truth_features": classified,
         "total_truth_features": len(truth),
-        "validation_extent_source": "truth_bounds" if derived_validation else "validation_area",
+        "validation_extent_source": validation_extent_source,
         "evaluation_tolerance_m": evaluation_tolerance,
         "class_mode": class_mode,
         "evaluation_classes": list(THREE_CLASS_CHANGE_TYPES if class_mode == "three" else CHANGE_TYPES),
@@ -2112,38 +2129,44 @@ def main(argv: list[str] | None = None) -> int:
         if truth_path is not None and truth_path.is_file():
             try:
                 truth_source = gpd.read_file(truth_path)
-                active_changes, generation_metadata = build_gt_assisted_changes(
-                    truth_source,
-                    automatic_changes,
-                    args.before_period,
-                    args.after_period,
-                    GT_ASSISTED_PROFILE,
-                    args.truth_type_field or "BHBM",
-                )
+                if _clean_geometries(truth_source).empty:
+                    summary["reason"] = "truth_empty_no_change"
+                    active_changes = None
+                    generation_metadata = None
+                else:
+                    active_changes, generation_metadata = build_gt_assisted_changes(
+                        truth_source,
+                        automatic_changes,
+                        args.before_period,
+                        args.after_period,
+                        GT_ASSISTED_PROFILE,
+                        args.truth_type_field or "BHBM",
+                    )
             except (OSError, ValueError) as error:
                 summary["reason"] = "truth_not_usable"
                 summary["gt_assisted_error"] = str(error)
             else:
-                active_positive = active_changes.loc[
-                    active_changes["change_typ"].isin(("added", "width_changed"))
-                ].copy()
-                active_negative = active_changes.loc[
-                    active_changes["change_typ"] == "removed"
-                ].copy()
-                combined = _write_outputs(
-                    output_dir, active_positive, active_negative, unchanged, output_crs, artifacts,
-                    include_width_changed=True,
-                )
-                summary.update(generation_metadata)
-                summary["gt_assisted_applied"] = True
-                summary["ground_truth_derived"] = True
-                summary["change_output_mode"] = "gt_assisted"
-                summary.pop("reason", None)
-                for change_type in (*CHANGE_TYPES, "width_changed"):
-                    selected = combined.loc[combined["change_typ"] == change_type]
-                    summary[f"{change_type}_feature_count"] = int(len(selected))
-                    summary[f"{change_type}_length_m"] = float(selected["length_m"].sum())
-                    summary[f"{change_type}_area_m2"] = float(selected["area_m2"].sum())
+                if active_changes is not None:
+                    active_positive = active_changes.loc[
+                        active_changes["change_typ"].isin(("added", "width_changed"))
+                    ].copy()
+                    active_negative = active_changes.loc[
+                        active_changes["change_typ"] == "removed"
+                    ].copy()
+                    combined = _write_outputs(
+                        output_dir, active_positive, active_negative, unchanged, output_crs, artifacts,
+                        include_width_changed=True,
+                    )
+                    summary.update(generation_metadata)
+                    summary["gt_assisted_applied"] = True
+                    summary["ground_truth_derived"] = True
+                    summary["change_output_mode"] = "gt_assisted"
+                    summary.pop("reason", None)
+                    for change_type in (*CHANGE_TYPES, "width_changed"):
+                        selected = combined.loc[combined["change_typ"] == change_type]
+                        summary[f"{change_type}_feature_count"] = int(len(selected))
+                        summary[f"{change_type}_length_m"] = float(selected["length_m"].sum())
+                        summary[f"{change_type}_area_m2"] = float(selected["area_m2"].sum())
         if not summary["gt_assisted_applied"]:
             combined = _write_outputs(output_dir, added, removed, unchanged, output_crs, artifacts)
     else:
