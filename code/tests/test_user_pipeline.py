@@ -1736,8 +1736,8 @@ class DependencyInvalidationTests(unittest.TestCase):
                     for year in ("2021", "2022", "2024")
                 ],
                 "change_results": [
-                    {"grid": "north", "before_period": "2021", "after_period": "2022"},
-                    {"grid": "north", "before_period": "2022", "after_period": "2024"},
+                    {"grid": "north", "before_period": "2021", "after_period": "2022", "evaluation_metrics": "old.csv"},
+                    {"grid": "north", "before_period": "2022", "after_period": "2024", "evaluation_metrics": "old.csv"},
                 ],
             }
             user_pipeline.write_json(manifest_path, manifest)
@@ -1751,6 +1751,8 @@ class DependencyInvalidationTests(unittest.TestCase):
             self.assertFalse(result["updated_related"])
             change_mock.assert_not_called()
             self.assertEqual([entry["status"] for entry in updated["change_results"]], ["stale", "stale"])
+            self.assertTrue(all(entry["evaluation_stale"] for entry in updated["change_results"]))
+            self.assertTrue(all("evaluation_metrics" not in entry for entry in updated["change_results"]))
             self.assertEqual(updated["temporal_status"], "stale")
 
     def test_period_rerun_with_cascade_is_serial_and_refreshes_downstream_last(self) -> None:

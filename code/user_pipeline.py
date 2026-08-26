@@ -2661,6 +2661,8 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
     for entry in manifest.get("change_results", []) or []:
         if not isinstance(entry, dict):
             continue
+        if entry.get("evaluation_stale") or str(entry.get("evaluation_state") or "") in {"stale", "running"}:
+            continue
         summary_path = Path(str(entry.get("summary") or "")).expanduser()
         if not summary_path.is_file():
             continue
@@ -2838,7 +2840,7 @@ def apply_truth_value_mapping(truth, type_field: str, value_map: dict[str, str])
     return mapped, target_field
 
 
-def evaluate_existing_changes(args: argparse.Namespace) -> dict:
+def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     """Evaluate one saved change result without rerunning extraction or detection."""
     started = time.monotonic()
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
@@ -2888,7 +2890,14 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         evaluate_fast_truth_metrics,
     )
 
-    emit("stage", stage="精度评价", status="running", completed=0, total=1)
+    entry["evaluation_state"] = "running"
+    manifest["updated_at"] = now_text()
+    _persist_existing_pipeline(manifest, manifest_path)
+    emit(
+        "stage", stage="精度评价", status="running", completed=0, total=1,
+        grid=str(args.grid), before_period=str(args.before_period),
+        after_period=str(args.after_period),
+    )
     truth = gpd.read_file(truth_path)
     original_truth_type_field = str(args.truth_type_field or "").strip()
     truth_value_map = {
@@ -3054,6 +3063,11 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
     entry["validation_area"] = validation_value
     entry["evaluation_metrics"] = str(metrics_path)
     entry["evaluated_at"] = now_text()
+    entry["evaluation_state"] = "completed"
+    entry.pop("evaluation_stale", None)
+    entry.pop("evaluation_stale_at", None)
+    entry.pop("evaluation_error", None)
+    entry.pop("evaluation_failed_at", None)
     manifest["evaluation_enabled"] = True
     manifest["truth_type_field"] = original_truth_type_field
     if configured_values:
@@ -3088,9 +3102,44 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         "elapsed_seconds": elapsed_seconds(started),
         "completed_at": now_text(),
     }
-    emit("stage", stage="精度评价", status="complete", completed=1, total=1)
+    emit(
+        "stage", stage="精度评价", status="complete", completed=1, total=1,
+        grid=str(args.grid), before_period=str(args.before_period),
+        after_period=str(args.after_period),
+    )
     emit("complete", stage="evaluate-existing", **result)
     return result
+
+
+def evaluate_existing_changes(args: argparse.Namespace) -> dict:
+    try:
+        return _evaluate_existing_changes_impl(args)
+    except Exception as exc:
+        manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
+        if manifest_path.is_file():
+            try:
+                manifest = read_json(manifest_path)
+                entry = next((
+                    value for value in (manifest.get("change_results", []) or [])
+                    if isinstance(value, dict)
+                    and str(value.get("grid") or "") == str(args.grid)
+                    and str(value.get("before_period") or "") == str(args.before_period)
+                    and str(value.get("after_period") or "") == str(args.after_period)
+                ), None)
+                if entry is not None:
+                    entry["evaluation_state"] = "failed"
+                    entry["evaluation_error"] = str(exc)
+                    entry["evaluation_failed_at"] = now_text()
+                    manifest["updated_at"] = now_text()
+                    _persist_existing_pipeline(manifest, manifest_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                pass
+        emit(
+            "stage", stage="精度评价", status="failed", completed=0, total=1,
+            grid=str(args.grid), before_period=str(args.before_period),
+            after_period=str(args.after_period), error=str(exc),
+        )
+        raise
 
 
 def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
@@ -3313,6 +3362,16 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
                 after_entry = result_by_period.get((changed_grid, after_period))
                 if not before_entry or not after_entry:
                     raise RuntimeError(f"变化对缺少期次结果，无法在编辑后重跑：{before_period} -> {after_period}")
+                _invalidate_change_evaluation(
+                    pipeline, str(changed_grid), str(before_period), str(after_period),
+                )
+                _persist_existing_pipeline(pipeline, pipeline_manifest)
+                emit(
+                    "pipeline", stage="编辑后变化检测重跑", status="running",
+                    grid=str(changed_grid), before_period=str(before_period),
+                    after_period=str(after_period), completed=0, total=1,
+                    area_completed=0, area_total=1,
+                )
                 report_progress(f"重跑相邻变化：{before_period} → {after_period}")
                 output_value = str(change_entry.get("output") or "").strip()
                 if output_value:
@@ -3334,6 +3393,11 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
                 preserved_change = {key: change_entry.get(key) for key in ("grid", "before_period", "after_period", "truth", "validation_area", "truth_type_field")}
                 change_entry.update(rerun)
                 change_entry.update({key: value for key, value in preserved_change.items() if value not in (None, "")})
+                change_entry.pop("evaluation_metrics", None)
+                change_entry.pop("evaluated_at", None)
+                change_entry["evaluation_stale"] = True
+                change_entry["evaluation_state"] = "stale"
+                change_entry["evaluation_stale_at"] = now_text()
                 result["change_reruns"].append({
                     "before_period": before_period,
                     "after_period": after_period,
@@ -3341,6 +3405,13 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
                     "evaluation_metrics": change_entry.get("evaluation_metrics"),
                 })
                 progress_completed += 1
+                _persist_existing_pipeline(pipeline, pipeline_manifest)
+                emit(
+                    "pipeline", stage="编辑后变化检测重跑", status="complete",
+                    grid=str(changed_grid), before_period=str(before_period),
+                    after_period=str(after_period), completed=1, total=1,
+                    area_completed=1, area_total=1,
+                )
 
         result["change_rerun_count"] = len(result["change_reruns"])
         if changed_entry is not None:
@@ -4105,6 +4176,41 @@ def _manifest_change_context(
     return truth, validation, truth_type_field
 
 
+def _invalidate_change_evaluation(
+    manifest: dict, grid: str, before: str, after: str, *, status: str = "running",
+) -> dict | None:
+    """Invalidate metrics before replacing a change result in the active task."""
+    entry = next((
+        value for value in (manifest.get("change_results", []) or [])
+        if isinstance(value, dict)
+        and str(value.get("grid")) == grid
+        and str(value.get("before_period")) == before
+        and str(value.get("after_period")) == after
+    ), None)
+    if entry is None:
+        return None
+    entry.pop("evaluation_metrics", None)
+    entry.pop("evaluated_at", None)
+    entry["evaluation_stale"] = True
+    entry["evaluation_state"] = "stale"
+    entry["evaluation_stale_at"] = now_text()
+    entry["status"] = status
+    manifest.pop("evaluation_summary", None)
+    manifest["updated_at"] = now_text()
+    return entry
+
+
+def _mark_change_rerun_failed(
+    manifest: dict, grid: str, before: str, after: str, error: Exception,
+) -> None:
+    entry = _invalidate_change_evaluation(
+        manifest, grid, before, after, status="failed",
+    )
+    if entry is not None:
+        entry["error"] = str(error)
+        entry["failed_at"] = now_text()
+
+
 def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
     periods = {
         (str(entry.get("grid")), str(entry.get("period"))): entry
@@ -4173,6 +4279,11 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
         "status": "completed", "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
     }
     updated.pop("stale_reason", None)
+    updated.pop("evaluation_metrics", None)
+    updated.pop("evaluated_at", None)
+    updated["evaluation_stale"] = True
+    updated["evaluation_state"] = "stale"
+    updated["evaluation_stale_at"] = now_text()
     if index is None:
         entries.append(updated)
     else:
@@ -4231,14 +4342,34 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     updated = _rerun_period_entry(manifest, grid, period)
     if args.update_related:
         for index, (before, after) in enumerate(pairs, start=1):
-            _rerun_change_entry(manifest, grid, before, after)
-            emit("pipeline", stage="相关变化对更新", status="running", completed=index, total=len(pairs))
+            _invalidate_change_evaluation(manifest, grid, before, after)
+            _persist_existing_pipeline(manifest, manifest_path)
+            emit(
+                "pipeline", stage="相关变化对更新", status="running",
+                completed=index - 1, total=len(pairs), grid=grid,
+                before_period=before, after_period=after,
+                area_completed=index - 1, area_total=len(pairs),
+            )
+            try:
+                _rerun_change_entry(manifest, grid, before, after)
+            except Exception as exc:
+                _mark_change_rerun_failed(manifest, grid, before, after, exc)
+                _persist_existing_pipeline(manifest, manifest_path)
+                raise
+            _persist_existing_pipeline(manifest, manifest_path)
+            emit(
+                "pipeline", stage="相关变化对更新", status="complete",
+                completed=index, total=len(pairs), grid=grid,
+                before_period=before, after_period=after,
+                area_completed=index, area_total=len(pairs),
+            )
         _refresh_manifest_downstream(manifest)
     else:
-        for entry in manifest.get("change_results", []) or []:
-            key = (str(entry.get("before_period")), str(entry.get("after_period")))
-            if str(entry.get("grid")) == grid and key in pairs:
-                entry["status"] = "stale"
+        for before, after in pairs:
+            entry = _invalidate_change_evaluation(
+                manifest, grid, before, after, status="stale",
+            )
+            if entry is not None:
                 entry["stale_reason"] = f"{period} 期道路成果已重跑"
         manifest["temporal_status"] = "stale"
     manifest["status"] = "completed"
@@ -4256,16 +4387,37 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
 def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
-    updated = _rerun_change_entry(manifest, str(args.grid), str(args.before_period), str(args.after_period))
+    grid, before, after = str(args.grid), str(args.before_period), str(args.after_period)
+    _invalidate_change_evaluation(manifest, grid, before, after)
+    _persist_existing_pipeline(manifest, manifest_path)
+    emit(
+        "pipeline", stage="变化检测重跑", status="running", completed=0, total=1,
+        grid=grid, before_period=before, after_period=after,
+        area_completed=0, area_total=1,
+    )
+    try:
+        updated = _rerun_change_entry(manifest, grid, before, after)
+    except Exception as exc:
+        _mark_change_rerun_failed(manifest, grid, before, after, exc)
+        _persist_existing_pipeline(manifest, manifest_path)
+        emit(
+            "pipeline", stage="变化检测重跑", status="failed", completed=0, total=1,
+            grid=grid, before_period=before, after_period=after,
+            area_completed=0, area_total=1, error=str(exc),
+        )
+        raise
     if args.update_temporal:
         _refresh_manifest_downstream(manifest)
     else:
         manifest["temporal_status"] = "stale"
     manifest["status"] = "completed"
     _persist_existing_pipeline(manifest, manifest_path)
-    _evaluate_fast_manifest_pairs(
-        manifest_path, [(str(args.grid), str(args.before_period), str(args.after_period))],
+    emit(
+        "pipeline", stage="变化检测重跑", status="complete", completed=1, total=1,
+        grid=grid, before_period=before, after_period=after,
+        area_completed=1, area_total=1,
     )
+    _evaluate_fast_manifest_pairs(manifest_path, [(grid, before, after)])
     result = {"grid": args.grid, "before_period": args.before_period, "after_period": args.after_period, "updated_temporal": bool(args.update_temporal), "output": updated.get("output")}
     emit("complete", stage="rerun-change", **result)
     return result
@@ -4298,22 +4450,47 @@ def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
         emit("pipeline", stage="批量道路提取重跑", status="running", completed=index, total=len(period_keys))
     change_keys = _all_manifest_change_pairs(manifest)
     completed_changes: list[tuple[str, str, str]] = []
-    for grid, before, after in change_keys:
+    area_totals = {
+        area: sum(1 for key in change_keys if key[0] == area)
+        for area in {key[0] for key in change_keys}
+    }
+    area_completed: dict[str, int] = {area: 0 for area in area_totals}
+    for change_index, (grid, before, after) in enumerate(change_keys, start=1):
+        pair_status = "complete"
+        _invalidate_change_evaluation(manifest, grid, before, after)
+        _persist_existing_pipeline(manifest, manifest_path)
+        emit(
+            "pipeline", stage="道路提取后的变化更新", status="running",
+            completed=change_index - 1, total=len(change_keys), grid=grid,
+            before_period=before, after_period=after,
+            area_completed=area_completed[grid], area_total=area_totals[grid],
+        )
         try:
             _rerun_change_entry(manifest, grid, before, after)
             completed_changes.append((grid, before, after))
+            area_completed[grid] += 1
+            _persist_existing_pipeline(manifest, manifest_path)
         except Exception as exc:
+            pair_status = "failed"
+            _mark_change_rerun_failed(manifest, grid, before, after, exc)
             failure = {
                 "type": "change", "grid": grid, "scope": f"{before} -> {after}",
                 "status": "failed", "error": str(exc), "failed_at": now_text(),
             }
             failures.append(failure)
+            _persist_existing_pipeline(manifest, manifest_path)
             emit("failure", **failure)
             if not continue_on_error:
                 manifest["rerun_all_failures"] = failures
                 manifest["status"] = "failed"
                 _persist_existing_pipeline(manifest, manifest_path)
                 raise
+        emit(
+            "pipeline", stage="道路提取后的变化更新", status=pair_status,
+            completed=change_index, total=len(change_keys), grid=grid,
+            before_period=before, after_period=after,
+            area_completed=area_completed[grid], area_total=area_totals[grid],
+        )
     try:
         _refresh_manifest_downstream(manifest)
     except Exception as exc:
@@ -4359,11 +4536,29 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     failures: list[dict] = []
     completed_keys: list[tuple[str, str, str]] = []
+    area_totals = {
+        area: sum(1 for key in change_keys if key[0] == area)
+        for area in {key[0] for key in change_keys}
+    }
+    area_completed: dict[str, int] = {area: 0 for area in area_totals}
     for index, (grid, before, after) in enumerate(change_keys, start=1):
+        pair_status = "complete"
+        _invalidate_change_evaluation(manifest, grid, before, after)
+        _persist_existing_pipeline(manifest, manifest_path)
+        emit(
+            "pipeline", stage="批量变化检测重跑", status="running",
+            completed=index - 1, total=len(change_keys), grid=grid,
+            before_period=before, after_period=after,
+            area_completed=area_completed[grid], area_total=area_totals[grid],
+        )
         try:
             _rerun_change_entry(manifest, grid, before, after)
             completed_keys.append((grid, before, after))
+            area_completed[grid] += 1
+            _persist_existing_pipeline(manifest, manifest_path)
         except Exception as exc:
+            pair_status = "failed"
+            _mark_change_rerun_failed(manifest, grid, before, after, exc)
             failure = {
                 "type": "change", "grid": grid, "scope": f"{before} -> {after}",
                 "before_period": before, "after_period": after,
@@ -4371,6 +4566,7 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
                 "error": str(exc), "failed_at": now_text(),
             }
             failures.append(failure)
+            _persist_existing_pipeline(manifest, manifest_path)
             emit("failure", **failure)
             if not continue_on_error:
                 manifest["rerun_change_failures"] = failures
@@ -4379,8 +4575,10 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
                 _persist_existing_pipeline(manifest, manifest_path)
                 raise
         emit(
-            "pipeline", stage="批量变化检测重跑", status="running",
-            completed=index, total=len(change_keys),
+            "pipeline", stage="批量变化检测重跑", status=pair_status,
+            completed=index, total=len(change_keys), grid=grid,
+            before_period=before, after_period=after,
+            area_completed=area_completed[grid], area_total=area_totals[grid],
         )
     try:
         _refresh_manifest_downstream(manifest)

@@ -10,9 +10,77 @@ from pathlib import Path
 from unittest import mock
 
 import user_workflow_gui as gui
+from gui.result_page import build_area_evaluation_rows
 
 
 class UserGuiInputCommandTests(unittest.TestCase):
+    def test_area_evaluation_rows_pool_only_current_valid_pair_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            entries = []
+            for index, (before, after, tp, fp, fn) in enumerate((
+                ("2020", "2021", 80, 20, 20),
+                ("2021", "2022", 45, 5, 5),
+            )):
+                summary = root / f"summary_{index}.json"
+                metrics = root / f"metrics_{index}.csv"
+                metrics.touch()
+                summary.write_text(json.dumps({"evaluation": {"metrics": [{
+                    "class": "all", "tp_m2": tp, "fp_m2": fp, "fn_m2": fn,
+                    "truth_centerline_length_px": 100,
+                    "covered_truth_centerline_length_px": 80,
+                    "predicted_centerline_length_px": 50,
+                    "centerline_offset_integral_px2": 125,
+                    "type_correct_tp_count": 8, "type_matched_tp_count": 10,
+                }]}}), encoding="utf-8")
+                entries.append({
+                    "grid": "区域A", "before_period": before, "after_period": after,
+                    "status": "completed", "truth": str(root / "truth.shp"),
+                    "summary": str(summary), "evaluation_metrics": str(metrics),
+                })
+            rows = build_area_evaluation_rows({
+                "period_orders": {"区域A": {"period_order": ["2020", "2021", "2022"]}},
+                "change_results": entries,
+            })
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["change_progress"], "2 / 2")
+            self.assertEqual(rows[0]["evaluation_progress"], "2 / 2")
+            self.assertEqual(rows[0]["status"], "已完成")
+            self.assertAlmostEqual(rows[0]["change_recall"], 125 / 150)
+            self.assertAlmostEqual(rows[0]["change_precision"], 125 / 150)
+            self.assertAlmostEqual(rows[0]["road_centerline_completeness"], 0.8)
+            self.assertAlmostEqual(rows[0]["centerline_mean_offset_px"], 2.5)
+            self.assertAlmostEqual(rows[0]["change_type_accuracy"], 0.8)
+
+            entries[1]["evaluation_stale"] = True
+            entries[1]["evaluation_state"] = "stale"
+            stale = build_area_evaluation_rows({
+                "period_orders": {"区域A": {"period_order": ["2020", "2021", "2022"]}},
+                "change_results": entries,
+            })[0]
+            self.assertEqual(stale["evaluation_progress"], "1 / 2")
+            self.assertEqual(stale["status"], "需重新评价")
+            self.assertNotIn("change_recall", stale)
+
+    def test_evaluation_manifest_reads_exact_active_task_not_merged_results(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "pipeline_result.json"
+            path.write_text(json.dumps({"run_id": "active-run", "change_results": []}), encoding="utf-8")
+            app = object.__new__(gui.UserApp)
+            app.project_root_path = Path(raw)
+            app.vars = {"output_root": mock.Mock(get=mock.Mock(return_value=raw))}
+            app.project_config = {"active_task": {"run_id": "active-run"}}
+            app.task_manager = mock.Mock()
+            app.task_manager.active_pipeline_manifest.return_value = path
+            app.project_manager = mock.Mock()
+
+            manifest, resolved = app._active_evaluation_manifest()
+
+            self.assertEqual(manifest["run_id"], "active-run")
+            self.assertEqual(resolved, path)
+            app.project_manager.result_context.assert_not_called()
+
     def test_tree_selection_helper_is_callable_as_bound_method(self) -> None:
         tree = mock.Mock()
         tree.selection.return_value = ("2021",)

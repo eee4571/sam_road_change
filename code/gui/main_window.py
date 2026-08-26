@@ -1280,6 +1280,8 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                     if event.kind == "complete":
                         self.last_complete_payload = payload
                     self._append_log(event.stage or event.kind, friendly)
+                    if hasattr(self, "handle_evaluation_backend_event"):
+                        self.handle_evaluation_backend_event(payload)
                 elif kind in {"backend_log", "log"}:
                     self._append_log("日志", str(value))
                 elif kind == "backend_protocol_error":
@@ -1340,7 +1342,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                         self.status.set(self._friendly(payload))
                         self.run_status.set("已有变化成果的精度评价已完成。")
                         if hasattr(self, "evaluation_status"):
-                            self.evaluation_status.set(self.status.get())
+                            self.evaluation_status.set("精度评价已完成；区域表已自动刷新。")
                         self._show_step(3, force=True)
                     elif value == "0" and self.active_command in {
                         "extract-project-period", "extract-project-all", "change-project-periods", "change",

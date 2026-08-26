@@ -21,6 +21,175 @@ from tkinter import ttk
 
 from .common_widgets import LAYOUT_METRICS, UI
 
+
+def _evaluation_period_plan(manifest: dict) -> dict[str, list[str]]:
+    plan: dict[str, list[str]] = {}
+    for area, value in (manifest.get("period_orders") or {}).items():
+        if not isinstance(value, dict):
+            continue
+        periods = [str(item).strip() for item in value.get("period_order", [])]
+        periods = [item for item in periods if item]
+        if periods:
+            plan[str(area)] = list(dict.fromkeys(periods))
+    spec = manifest.get("input_spec") if isinstance(manifest.get("input_spec"), dict) else {}
+    for area, values in (spec.get("grids") or {}).items():
+        if str(area) in plan or not isinstance(values, dict):
+            continue
+        plan[str(area)] = [str(period) for period in values]
+    for entry in manifest.get("period_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        area = str(entry.get("grid") or "").strip()
+        period = str(entry.get("period") or "").strip()
+        if area and period and area not in plan:
+            plan.setdefault(area, []).append(period)
+    return plan
+
+
+def _evaluation_overall(entry: dict) -> dict | None:
+    if entry.get("evaluation_stale") or str(entry.get("evaluation_state") or "") in {"stale", "running", "failed"}:
+        return None
+    metrics_path = Path(str(entry.get("evaluation_metrics") or "")).expanduser()
+    summary_path = Path(str(entry.get("summary") or "")).expanduser()
+    if not metrics_path.is_file() or not summary_path.is_file():
+        return None
+    try:
+        evaluation = json.loads(summary_path.read_text(encoding="utf-8")).get("evaluation", {})
+        return next(
+            dict(row) for row in evaluation.get("metrics", [])
+            if isinstance(row, dict) and row.get("class") == "all"
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, StopIteration, TypeError):
+        return None
+
+
+def build_area_evaluation_rows(manifest: dict) -> list[dict[str, object]]:
+    """Build active-run area rows without consulting the cross-run result index."""
+    plan = _evaluation_period_plan(manifest)
+    entries = {
+        (
+            str(entry.get("grid") or ""),
+            str(entry.get("before_period") or ""),
+            str(entry.get("after_period") or ""),
+        ): entry
+        for entry in (manifest.get("change_results", []) or [])
+        if isinstance(entry, dict)
+    }
+    for area, before, after in entries:
+        if area and area not in plan:
+            plan[area] = list(dict.fromkeys(
+                value for key in entries if key[0] == area for value in key[1:]
+            ))
+
+    rows: list[dict[str, object]] = []
+    for area, periods in plan.items():
+        pairs = [(before, after) for before, after in zip(periods, periods[1:])]
+        area_entries = [entries.get((area, before, after)) for before, after in pairs]
+        total = len(pairs)
+        completed = sum(
+            bool(entry) and str(entry.get("status") or "completed") == "completed"
+            for entry in area_entries
+        )
+        failed = sum(
+            bool(entry) and str(entry.get("status") or "") == "failed"
+            for entry in area_entries
+        )
+        running = any(
+            bool(entry) and str(entry.get("status") or "") == "running"
+            for entry in area_entries
+        )
+        stale = any(
+            bool(entry) and (
+                bool(entry.get("evaluation_stale"))
+                or str(entry.get("evaluation_state") or "") == "stale"
+            )
+            for entry in area_entries
+        )
+        evaluating = any(
+            bool(entry) and str(entry.get("evaluation_state") or "") == "running"
+            for entry in area_entries
+        )
+        evaluation_failed = any(
+            bool(entry) and str(entry.get("evaluation_state") or "") == "failed"
+            for entry in area_entries
+        )
+        missing_truth = any(
+            not entry or not str(entry.get("truth") or "").strip()
+            for entry in area_entries
+        ) if total else False
+        overall_rows = [
+            _evaluation_overall(entry) if entry else None for entry in area_entries
+        ]
+        evaluated = sum(row is not None for row in overall_rows)
+
+        aggregate: dict[str, object] = {}
+        if total and evaluated == total:
+            valid = [row for row in overall_rows if row is not None]
+            sums = {
+                key: sum(float(row.get(key, 0) or 0) for row in valid)
+                for key in (
+                    "tp_m2", "fp_m2", "fn_m2",
+                    "truth_centerline_length_px", "covered_truth_centerline_length_px",
+                    "predicted_centerline_length_px", "centerline_offset_integral_px2",
+                    "type_correct_tp_count", "type_matched_tp_count",
+                    "correctly_classified_m2", "detected_truth_m2",
+                )
+            }
+            aggregate = {
+                "change_recall": (
+                    sums["tp_m2"] / (sums["tp_m2"] + sums["fn_m2"])
+                    if sums["tp_m2"] + sums["fn_m2"] else 0.0
+                ),
+                "change_precision": (
+                    sums["tp_m2"] / (sums["tp_m2"] + sums["fp_m2"])
+                    if sums["tp_m2"] + sums["fp_m2"] else 0.0
+                ),
+                "road_centerline_completeness": (
+                    sums["covered_truth_centerline_length_px"] / sums["truth_centerline_length_px"]
+                    if sums["truth_centerline_length_px"] else None
+                ),
+                "centerline_mean_offset_px": (
+                    sums["centerline_offset_integral_px2"] / sums["predicted_centerline_length_px"]
+                    if sums["predicted_centerline_length_px"] else None
+                ),
+                "change_type_accuracy": (
+                    sums["type_correct_tp_count"] / sums["type_matched_tp_count"]
+                    if sums["type_matched_tp_count"]
+                    else (
+                        sums["correctly_classified_m2"] / sums["detected_truth_m2"]
+                        if sums["detected_truth_m2"] else None
+                    )
+                ),
+            }
+
+        if failed or evaluation_failed:
+            status = "部分失败"
+        elif running:
+            status = "检测中"
+        elif completed < total:
+            status = "检测中" if completed else "未开始"
+        elif missing_truth:
+            status = "缺少真值"
+        elif evaluating:
+            status = "评价中"
+        elif stale:
+            status = "需重新评价"
+        elif evaluated == total and total:
+            status = "已完成"
+        elif evaluated:
+            status = "评价中"
+        else:
+            status = "待评价"
+        rows.append({
+            "area": area,
+            "change_progress": f"{completed} / {total}",
+            "evaluation_progress": f"{evaluated} / {total}",
+            "status": status,
+            **aggregate,
+        })
+    return rows
+
+
 class ResultPage:
     def _build_result_page(self, page: ttk.Frame) -> None:
         self.result_body = page
@@ -66,9 +235,52 @@ class ResultPage:
         )
         evaluation_hint.pack(anchor="w", fill=X, pady=(0, 6))
         bind_dynamic_wrap(evaluation_hint, evaluation_card, minimum=260, padding=20)
+
+        evaluation_table_frame = ttk.Frame(evaluation_card)
+        evaluation_table_frame.pack(fill=X, pady=(0, 7))
+        evaluation_columns = (
+            "area", "change_progress", "evaluation_progress", "recall", "precision",
+            "completeness", "offset", "type_accuracy", "status",
+        )
+        self.evaluation_tree = ttk.Treeview(
+            evaluation_table_frame, columns=evaluation_columns, show="headings",
+            height=5, style="Data.Treeview",
+        )
+        headings = {
+            "area": "验证区域", "change_progress": "变化检测", "evaluation_progress": "精度评价",
+            "recall": "变化图斑查全率", "precision": "变化图斑准确率",
+            "completeness": "变化道路提取完整度", "offset": "中心线平均偏移",
+            "type_accuracy": "动态过程检测正确率", "status": "状态",
+        }
+        widths = {
+            "area": 130, "change_progress": 78, "evaluation_progress": 78,
+            "recall": 115, "precision": 115, "completeness": 135,
+            "offset": 110, "type_accuracy": 135, "status": 90,
+        }
+        for name in evaluation_columns:
+            anchor = "w" if name == "area" else "center"
+            self.evaluation_tree.heading(name, text=headings[name], anchor=anchor)
+            self.evaluation_tree.column(
+                name, width=widths[name], minwidth=65, stretch=(name == "area"), anchor=anchor,
+            )
+        evaluation_ybar = ttk.Scrollbar(
+            evaluation_table_frame, orient="vertical", command=self.evaluation_tree.yview,
+        )
+        evaluation_xbar = ttk.Scrollbar(
+            evaluation_table_frame, orient="horizontal", command=self.evaluation_tree.xview,
+        )
+        self.evaluation_tree.configure(
+            yscrollcommand=evaluation_ybar.set, xscrollcommand=evaluation_xbar.set,
+        )
+        self.evaluation_tree.grid(row=0, column=0, sticky="nsew")
+        evaluation_ybar.grid(row=0, column=1, sticky="ns")
+        evaluation_xbar.grid(row=1, column=0, sticky="ew")
+        evaluation_table_frame.grid_columnconfigure(0, weight=1)
+        self.evaluation_tree.bind("<<TreeviewSelect>>", self._evaluation_area_selected)
+
         pair_row = ttk.Frame(evaluation_card)
         pair_row.pack(fill=X, pady=LAYOUT_METRICS["form_gap"])
-        ttk.Label(pair_row, text="待评价结果", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
+        ttk.Label(pair_row, text="单项评价（可选）", width=LAYOUT_METRICS["form_label_width"], style="FormLabel.TLabel").pack(side=LEFT)
         self.evaluation_pair = StringVar(value="")
         self.evaluation_pair_combo = ttk.Combobox(pair_row, textvariable=self.evaluation_pair, state="readonly")
         self.evaluation_pair_combo.pack(side=LEFT, fill=X, expand=True)
@@ -144,12 +356,12 @@ class ResultPage:
             self.evaluation_value_combos[key] = combo
         action_row = ttk.Frame(evaluation_card)
         action_row.pack(fill=X)
-        self.evaluation_status = StringVar(value="请先载入或生成包含变化检测的任务结果。")
+        self.evaluation_status = StringVar(value="精度表仅显示当前 active task；任务事件会自动刷新进度。")
         evaluation_status_label = ttk.Label(action_row, textvariable=self.evaluation_status, style="Hint.TLabel")
         evaluation_status_label.pack(side=LEFT, fill=X, expand=True)
         bind_dynamic_wrap(evaluation_status_label, action_row, minimum=220, padding=280)
         self.run_evaluation_button = ttk.Button(
-            action_row, text="评价当前结果", command=self.run_result_evaluation,
+            action_row, text="评价所选结果", command=self.run_result_evaluation,
         )
         self.run_evaluation_button.pack(side=RIGHT)
         self.run_evaluation_button.state(["disabled"])
@@ -184,6 +396,22 @@ class ResultPage:
             self.project_root_path, self.vars["output_root"].get().strip(), persist=True,
         )
 
+    def _active_evaluation_manifest(self) -> tuple[dict | None, Path | None]:
+        """Read only the exact active task; never merge metrics from historical runs."""
+        if not self.project_root_path:
+            return None, None
+        try:
+            path = self.task_manager.active_pipeline_manifest(
+                self.vars["output_root"].get().strip(),
+                self.project_config.get("active_task"),
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError, UnicodeError, json.JSONDecodeError):
+            return None, None
+        if isinstance(payload.get("result_manifest"), dict):
+            payload = payload["result_manifest"]
+        return (payload, path) if isinstance(payload, dict) else (None, None)
+
     def _refresh_result_availability(self) -> None:
         manifest, latest = self._latest_manifest()
         if manifest is None or latest is None:
@@ -207,6 +435,7 @@ class ResultPage:
                 self.evaluation_pair.set("")
                 self.evaluation_status.set("请先载入或生成包含变化检测的任务结果。")
                 self._set_evaluation_actions_enabled(False)
+                self._populate_evaluation_tree([])
             self._populate_result_tree([], None)
             return
         base_dir = latest.parent
@@ -256,8 +485,22 @@ class ResultPage:
         self.result_review_count.set(f"{review_count} 处")
         self.result_temporal_summary.set("已生成" if temporal_results else "未生成")
         self._populate_result_tree(self.project_manager.result_items(manifest, base_dir), base_dir)
-        self._refresh_evaluation_results(manifest)
+        self._refresh_active_evaluation_results()
         self._populate_review_step()
+
+    def _refresh_active_evaluation_results(self) -> None:
+        manifest, path = self._active_evaluation_manifest()
+        self.active_evaluation_manifest_path = path
+        self._refresh_evaluation_results(manifest or {})
+
+    def handle_evaluation_backend_event(self, payload: dict) -> None:
+        """Refresh the active-run table only on relevant structured events."""
+        stage = str(payload.get("stage") or "")
+        if (
+            "变化" in stage or "评价" in stage
+            or stage in {"rerun-change", "rerun-all-changes", "rerun-period", "rerun-all-periods"}
+        ):
+            self._refresh_active_evaluation_results()
 
     def _populate_result_tree(self, items: list[dict[str, str]], _base_dir: Path | None) -> None:
         if not hasattr(self, "result_tree"):
@@ -371,64 +614,24 @@ class ResultPage:
         ]
         if hasattr(self, "result_evaluable_count"):
             self.result_evaluable_count.set(f"{len(labels)} 组")
+        area_rows = build_area_evaluation_rows(manifest)
+        self._populate_evaluation_tree(area_rows)
         self.evaluation_pair_combo.configure(values=labels)
         if labels and self.evaluation_pair.get() not in labels:
             self.evaluation_pair.set(labels[0])
         if not labels:
             self.evaluation_pair.set("")
-            self.evaluation_status.set("当前任务没有可评价的变化检测成果。")
+            self.evaluation_status.set(
+                "当前任务没有可评价的变化检测成果。"
+                if manifest else "当前项目没有可读取的 active task。"
+            )
             self._set_evaluation_actions_enabled(False)
             return
-        evaluated = sum(bool(entry.get("evaluation_metrics")) for entry in self.result_change_items)
-        if evaluated:
-            status = f"当前共有 {len(labels)} 组检测结果可进行精度评价，已完成 {evaluated} 组。"
-        else:
-            status = f"当前共有 {len(labels)} 组检测结果可进行精度评价。"
-        selected = self.result_change_items[labels.index(self.evaluation_pair.get())]
-        summary_path = Path(str(selected.get("summary") or ""))
-        if selected.get("evaluation_metrics") and summary_path.is_file():
-            try:
-                evaluation = json.loads(summary_path.read_text(encoding="utf-8")).get("evaluation", {})
-                overall = next(row for row in evaluation.get("metrics", []) if row.get("class") == "all")
-                completeness = overall.get("road_centerline_completeness")
-                offset = overall.get("centerline_mean_offset_px")
-                status += (
-                    f" 当前评价结果：变化图斑查全率 "
-                    f"{format_percentage(overall.get('change_recall', overall.get('change_area_recall', overall['recall'])))}，"
-                    f"变化图斑准确率 {format_percentage(overall.get('change_precision', overall.get('precision', 0)))}，"
-                    + (
-                        f"变化道路提取完整度 {format_percentage(completeness)}，"
-                        if completeness not in {None, ""} else "变化道路提取完整度暂无可用值，"
-                    )
-                    + (
-                        f"中心线平均偏移距离 {float(offset):.2f} px，"
-                        if offset not in {None, ""} else "中心线平均偏移距离暂无可用值，"
-                    )
-                    + f"动态过程检测正确率 {format_percentage(overall.get('change_type_accuracy', overall.get('type_judgment_accuracy', 0)))}。"
-                )
-            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, StopIteration, TypeError, ValueError):
-                pass
-        aggregate = manifest.get("evaluation_summary") or {}
-        aggregate_overall = next((
-            row for row in aggregate.get("metrics", []) if isinstance(row, dict) and row.get("class") == "all"
-        ), None)
-        if aggregate_overall:
-            completeness = aggregate_overall.get("road_centerline_completeness")
-            offset = aggregate_overall.get("centerline_mean_offset_px")
-            status += (
-                f" 汇总结果：变化图斑查全率 {format_percentage(aggregate_overall.get('change_recall', aggregate_overall.get('change_area_recall', aggregate_overall.get('recall', 0))))}，"
-                f"变化图斑准确率 {format_percentage(aggregate_overall.get('change_precision', aggregate_overall.get('precision', 0)) or 0)}，"
-                + (
-                    f"变化道路提取完整度 {format_percentage(completeness)}，"
-                    if completeness not in {None, ""} else "变化道路提取完整度暂无可用值，"
-                )
-                + (
-                    f"中心线平均偏移距离 {float(offset):.2f} px，"
-                    if offset not in {None, ""} else "中心线平均偏移距离暂无可用值，"
-                )
-                + f"动态过程检测正确率 {format_percentage(aggregate_overall.get('change_type_accuracy', aggregate_overall.get('type_judgment_accuracy', 0)) or 0)}。"
-            )
-        self.evaluation_status.set(status)
+        evaluated = sum(row.get("status") == "已完成" for row in area_rows)
+        self.evaluation_status.set(
+            f"当前 active task 包含 {len(area_rows)} 个验证区域；"
+            f"{evaluated} 个区域已完成全部变化对评价。"
+        )
         configured = len(self.project_area_truths)
         embedded = sum(bool(str(entry.get("truth") or "").strip()) for entry in self.result_change_items)
         self.evaluation_truth_summary.set(
@@ -437,6 +640,56 @@ class ResultPage:
         )
         self._evaluation_pair_changed()
         self._set_evaluation_actions_enabled(True)
+
+    @staticmethod
+    def _evaluation_metric_text(value: object, *, offset: bool = False) -> str:
+        if value in {None, ""}:
+            return "--"
+        try:
+            return f"{float(value):.2f} px" if offset else format_percentage(float(value))
+        except (TypeError, ValueError):
+            return "--"
+
+    def _populate_evaluation_tree(self, rows: list[dict[str, object]]) -> None:
+        tree = getattr(self, "evaluation_tree", None)
+        if tree is None:
+            return
+        selected_area = ""
+        selected = tree.selection()
+        if selected:
+            values = tree.item(selected[0], "values")
+            selected_area = str(values[0]) if values else ""
+        tree.delete(*tree.get_children())
+        selected_id = ""
+        for index, row in enumerate(rows):
+            area = str(row.get("area") or "")
+            item = tree.insert("", END, values=(
+                area,
+                row.get("change_progress", "0 / 0"),
+                row.get("evaluation_progress", "0 / 0"),
+                self._evaluation_metric_text(row.get("change_recall")),
+                self._evaluation_metric_text(row.get("change_precision")),
+                self._evaluation_metric_text(row.get("road_centerline_completeness")),
+                self._evaluation_metric_text(row.get("centerline_mean_offset_px"), offset=True),
+                self._evaluation_metric_text(row.get("change_type_accuracy")),
+                row.get("status", "未开始"),
+            ))
+            if area == selected_area or (not selected_area and index == 0):
+                selected_id = item
+        if selected_id:
+            tree.selection_set(selected_id)
+
+    def _evaluation_area_selected(self, _event=None) -> None:
+        tree = getattr(self, "evaluation_tree", None)
+        if tree is None or not tree.selection():
+            return
+        values = tree.item(tree.selection()[0], "values")
+        area = str(values[0]) if values else ""
+        labels = list(self.evaluation_pair_combo["values"])
+        label = next((item for item in labels if item.startswith(f"{area} / ")), "")
+        if label:
+            self.evaluation_pair.set(label)
+            self._evaluation_pair_changed()
 
     def _evaluation_pair_changed(self, _event=None) -> None:
         if not self.result_change_items or not hasattr(self, "evaluation_pair_combo"):
@@ -587,7 +840,7 @@ class ResultPage:
         self.status.set(self.evaluation_truth_summary.get())
 
     def run_result_evaluation(self) -> None:
-        manifest, latest = self._latest_manifest()
+        manifest, latest = self._active_evaluation_manifest()
         if manifest is None or latest is None:
             messagebox.showinfo("暂无成果", "请先载入或生成任务结果。", parent=self.root)
             return
@@ -623,7 +876,7 @@ class ResultPage:
         self._command(args)
 
     def run_total_evaluation(self) -> None:
-        manifest, latest = self._latest_manifest()
+        manifest, latest = self._active_evaluation_manifest()
         if manifest is None or latest is None:
             messagebox.showinfo("暂无成果", "请先载入或生成任务结果。", parent=self.root)
             return
