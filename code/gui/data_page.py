@@ -520,6 +520,14 @@ class DataPage:
         active = payload.get("active_task") or {}
         if isinstance(active, dict) and str(active.get("run_id") or "").strip():
             self.vars["run_id"].set(str(active["run_id"]))
+            try:
+                active_manifest = self.task_manager.active_pipeline_manifest(output_root, active)
+            except ValueError:
+                active_manifest = None
+            if active_manifest is not None:
+                profile = self.task_manager.task_execution_profile(active_manifest)
+                if profile:
+                    self.vars["execution_profile"].set(profile)
         self.data_source_display.set("；".join(self.project_data_sources) if self.project_data_sources else "尚未连接外部数据源")
         if self.project_scan_cache:
             cached_files = sum(int(record.get("visited_files", 0) or 0) for record in self.project_scan_cache.values())
@@ -971,7 +979,7 @@ class DataPage:
             notice = self.task_manager.unfinished_message(unfinished)
             self.status.set(notice.replace("\n", " "))
             self.run_status.set(notice)
-            self.preflight_summary.set("检测到同名未完成任务；点击“运行完整流程”将自动续跑。")
+            self.preflight_summary.set("检测到未完成任务；点击“继续当前任务”将从未完成位置续跑。")
         else:
             self.status.set(self.project_scan_summary.get())
         self._save_project_config()

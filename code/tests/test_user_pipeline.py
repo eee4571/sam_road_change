@@ -1658,6 +1658,73 @@ class DependencyInvalidationTests(unittest.TestCase):
             ("north", "2021", "2022"), ("north", "2022", "2024"),
         ])
 
+    def test_resume_rejects_cross_profile_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不能使用不同"):
+            user_pipeline._validate_resume_execution_profile({
+                "execution_profile": "fast",
+            }, "full")
+        user_pipeline._validate_resume_execution_profile({
+            "execution_profile": "fast",
+        }, "fast")
+
+    def test_formal_period_plan_does_not_bridge_failed_middle_period(self) -> None:
+        manifest = {
+            "period_orders": {
+                "north": {"period_order": ["2020", "2021", "2022"]},
+            },
+            "period_results": [
+                {"grid": "north", "period": "2020"},
+                {"grid": "north", "period": "2022"},
+            ],
+        }
+        self.assertEqual(user_pipeline._all_manifest_change_pairs(manifest), [
+            ("north", "2020", "2021"),
+            ("north", "2021", "2022"),
+        ])
+
+    def test_missing_change_entry_recovers_truth_and_validation_from_input_spec(self) -> None:
+        manifest = {
+            "truth_type_field": "BHBM",
+            "validation_areas": {"north": "north.shp"},
+            "input_spec": {"truths": {
+                "north\x002020\x002021": {"path": "truth.shp"},
+            }},
+        }
+        truth, validation, field = user_pipeline._manifest_change_context(
+            manifest, "north", "2020", "2021", {},
+        )
+        self.assertEqual((truth, validation, field), ("truth.shp", "north.shp", "BHBM"))
+
+    def test_missing_change_entry_passes_recovered_truth_to_fast_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            truth = root / "truth.shp"; truth.touch()
+            validation = root / "north.shp"; validation.touch()
+            manifest = {
+                "job_root": str(root / "run"), "execution_profile": "fast",
+                "truth_type_field": "BHBM",
+                "validation_areas": {"north": str(validation)},
+                "input_spec": {
+                    "absolute": "2", "ratio": "0.2", "tolerance": "3",
+                    "truths": {"north\x002020\x002021": {"path": str(truth)}},
+                },
+                "period_results": [
+                    {"grid": "north", "period": "2020", "result": str(root / "before.json")},
+                    {"grid": "north", "period": "2021", "result": str(root / "after.json")},
+                ],
+                "change_results": [],
+            }
+            with patch.object(
+                user_pipeline, "_run_fast_change_result",
+                return_value={"output": str(root / "changes")},
+            ) as runner:
+                updated = user_pipeline._rerun_change_entry(
+                    manifest, "north", "2020", "2021",
+                )
+            self.assertEqual(runner.call_args.kwargs["truth_path"], truth)
+            self.assertEqual(runner.call_args.kwargs["validation_area"], validation)
+            self.assertEqual(updated["truth"], str(truth))
+
     def test_period_rerun_without_cascade_marks_pairs_stale(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw); job = root / "run"; job.mkdir()
@@ -1734,6 +1801,62 @@ class DependencyInvalidationTests(unittest.TestCase):
             ])
             self.assertEqual(result, {"change_count": 3, "failure_count": 0, "total_change_count": 3})
             evaluation_mock.assert_called_once()
+
+    def test_rerun_all_periods_includes_failed_planned_period_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); job = root / "run"; job.mkdir(); manifest_path = root / "pipeline_result.json"
+            user_pipeline.write_json(manifest_path, {
+                "job_root": str(job),
+                "period_orders": {"north": {"period_order": ["2020", "2021", "2022"]}},
+                "period_results": [
+                    {"grid": "north", "period": "2020"},
+                    {"grid": "north", "period": "2022"},
+                ],
+                "change_results": [], "failures": [],
+            })
+            period_calls = []
+            def rerun_period(_manifest, grid, period):
+                period_calls.append((grid, period))
+                if period == "2021":
+                    raise RuntimeError("planned failure")
+                return {}
+            with patch.object(user_pipeline, "_rerun_period_entry", side_effect=rerun_period), \
+                    patch.object(user_pipeline, "_rerun_change_entry", side_effect=RuntimeError("missing dependency")), \
+                    patch.object(user_pipeline, "_refresh_manifest_downstream"), \
+                    patch.object(user_pipeline, "_persist_existing_pipeline"), \
+                    patch.object(user_pipeline, "_evaluate_fast_manifest_pairs"):
+                result = user_pipeline.rerun_all_pipeline_periods(argparse.Namespace(
+                    pipeline_manifest=str(manifest_path), continue_on_error=True,
+                ))
+            self.assertEqual(period_calls, [
+                ("north", "2020"), ("north", "2021"), ("north", "2022"),
+            ])
+            self.assertEqual(result["period_count"], 3)
+            self.assertEqual(result["failure_count"], 3)
+
+    def test_failed_planned_period_can_be_created_without_prior_result_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / "2021.txt"; source.touch()
+            checkpoint = root / "model.ckpt"; checkpoint.touch()
+            config = root / "config.yaml"; config.touch()
+            manifest = {
+                "job_root": str(root / "run"), "execution_profile": "fast",
+                "period_orders": {"north": {"period_order": ["2021"]}},
+                "input_spec": {
+                    "execution_profile": "fast",
+                    "grids": {"north": {"2021": {"path": str(source)}}},
+                    "checkpoint": {"path": str(checkpoint)},
+                    "config": {"path": str(config)},
+                },
+                "period_results": [],
+            }
+            with patch.object(user_pipeline, "prepare") as prepare_mock, \
+                    patch.object(user_pipeline, "extract", return_value={"execution_profile": "fast"}):
+                updated = user_pipeline._rerun_period_entry(manifest, "north", "2021")
+            prepare_mock.assert_called_once()
+            self.assertEqual(updated["grid"], "north")
+            self.assertEqual(updated["period"], "2021")
+            self.assertEqual(manifest["period_results"], [updated])
 
 
 if __name__ == "__main__":

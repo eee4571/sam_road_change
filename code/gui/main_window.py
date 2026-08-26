@@ -1357,11 +1357,12 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                             "rerun-all-changes": "全部相邻变化对已批量重跑完成。",
                         }
                         failure_count = int((self.last_complete_payload or {}).get("failure_count", 0) or 0)
-                        message = (
-                            f"批量变化检测已完成，其中 {failure_count} 个变化对失败；其他结果已更新。"
-                            if self.active_command == "rerun-all-changes" and failure_count
-                            else labels[self.active_command]
-                        )
+                        if self.active_command == "rerun-all-changes" and failure_count:
+                            message = f"批量变化检测已完成，其中 {failure_count} 项失败；其他结果已更新。"
+                        elif self.active_command == "rerun-all-periods" and failure_count:
+                            message = f"批量道路提取及相关更新已完成，其中 {failure_count} 项失败；其他结果已保留。"
+                        else:
+                            message = labels[self.active_command]
                         self.status.set(message)
                         self.run_status.set(message)
                         self._show_step(1, force=True)

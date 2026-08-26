@@ -28,6 +28,11 @@ class RunPage:
             profile_frame, text="快速模式", variable=self.vars["execution_profile"],
             value="fast",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(
+            profile_frame,
+            text="继续任务沿用该任务原模式；分步重跑沿用 active task 的冻结模式和参数。切换模式请从头运行。",
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
         checklist = ttk.Frame(run_card)
         checklist.pack(fill=X, pady=(0, 6))
         self.preflight_check_labels = []
@@ -258,8 +263,18 @@ class RunPage:
             run_id, state_path = self.task_manager.create_new_run(output)
             should_resume = False
         else:
+            active_task = self.project_config.get("active_task")
             run_id, should_resume, state_path = self.task_manager.resolve_run(
-                output, previous_run_id, self.project_config.get("active_task"),
+                output, "" if active_task else previous_run_id, active_task,
+            )
+        selected_profile = self.vars["execution_profile"].get()
+        frozen_profile = self.task_manager.task_execution_profile(state_path) if should_resume else None
+        if frozen_profile and frozen_profile != selected_profile:
+            self.vars["execution_profile"].set(frozen_profile)
+            messagebox.showinfo(
+                "沿用当前任务模式",
+                "继续当前任务必须沿用创建时的处理模式。若要切换快速/标准模式，请使用“从头重新运行完整流程”。",
+                parent=self.root,
             )
         self.vars["run_id"].set(run_id)
         self.vars["resume"].set("1" if should_resume else "0")
@@ -342,10 +357,9 @@ class RunPage:
             self.affected_pairs_summary.set("所选期次没有可识别的相邻变化对。")
 
     def _current_pipeline_manifest_path(self) -> Path:
-        manifest, latest = self._latest_manifest()
-        if manifest is None or latest is None or not latest.is_file():
-            raise ValueError("请先完成或载入一个完整任务，局部重跑需要已有 pipeline_result.json。")
-        return latest.resolve()
+        return self.task_manager.active_pipeline_manifest(
+            self.vars["output_root"].get(), self.project_config.get("active_task"),
+        )
 
     def rerun_selected_period(self, update_related: bool) -> None:
         try:

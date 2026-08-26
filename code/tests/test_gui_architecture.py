@@ -228,6 +228,31 @@ class TaskManagerArchitectureTests(unittest.TestCase):
             self.assertEqual(second_id, "run_fixed_01")
             self.assertNotEqual(first_state.parent, second_state.parent)
 
+    def test_active_manifest_is_exact_task_not_merged_latest_context(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "成果输出"
+            run_id, state = self.manager.create_new_run(
+                output, generated_run_id="run_active",
+            )
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "run_id": run_id, "execution_profile": "fast",
+            }), encoding="utf-8")
+            pipeline = state.parent / "pipeline_result.json"
+            pipeline.write_text(json.dumps({
+                "run_id": run_id, "execution_profile": "fast",
+            }), encoding="utf-8")
+            merged = state.parents[2] / "latest_pipeline.json"
+            merged.parent.mkdir(parents=True, exist_ok=True)
+            merged.write_text(json.dumps({"run_id": "another_run"}), encoding="utf-8")
+
+            resolved = self.manager.active_pipeline_manifest(
+                output, {"run_id": run_id, "state": str(state)},
+            )
+
+            self.assertEqual(resolved, pipeline.resolve())
+            self.assertEqual(self.manager.task_execution_profile(resolved), "fast")
+
     def test_local_rerun_commands_are_built_by_task_manager(self) -> None:
         manifest = Path("pipeline_result.json")
         period = self.manager.build_rerun_period(manifest, "area1", "2021", True)

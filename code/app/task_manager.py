@@ -318,6 +318,53 @@ def create_new_run(
     raise ValueError("无法生成唯一的新任务名称，请稍后重试。")
 
 
+def active_pipeline_manifest(
+    output_root: Path | str, active_task: dict | None,
+) -> Path:
+    """Resolve the exact active task manifest without merging other runs."""
+    active = active_task if isinstance(active_task, dict) else {}
+    run_id = str(active.get("run_id") or "").strip()
+    if not run_id:
+        raise ValueError("当前项目没有 active task，请先继续或创建一个完整任务。")
+    layout = ProjectLayout.from_output(Path(output_root).expanduser())
+    candidates: list[Path] = []
+    current_root = layout.existing_full_run_root(run_id)
+    if current_root is not None:
+        candidates.extend((current_root / "pipeline_result.json", current_root / "job_state.json"))
+    state_value = str(active.get("state") or "").strip()
+    if state_value:
+        state = Path(state_value).expanduser()
+        candidates.extend((state.parent / "pipeline_result.json", state))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("run_id") or run_id) == run_id:
+            return resolved
+    raise ValueError(f"找不到当前 active task 的任务索引：{run_id}")
+
+
+def task_execution_profile(manifest_path: Path | str) -> str | None:
+    """Read the frozen Fast/Full profile from one exact task manifest."""
+    try:
+        payload = json.loads(Path(manifest_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    spec = payload.get("input_spec") if isinstance(payload.get("input_spec"), dict) else {}
+    profile = str(
+        payload.get("execution_profile") or spec.get("execution_profile") or "full"
+    ).strip().casefold()
+    return profile if profile in {"fast", "full"} else None
+
+
 def project_relocation_preview(
     output_root: Path | str, run_id: str, project_root: Path | str,
 ) -> dict | None:
@@ -589,6 +636,14 @@ class TaskManager:
     @staticmethod
     def create_new_run(output_root, *, generated_run_id=None):
         return create_new_run(output_root, generated_run_id=generated_run_id)
+
+    @staticmethod
+    def active_pipeline_manifest(output_root, active_task):
+        return active_pipeline_manifest(output_root, active_task)
+
+    @staticmethod
+    def task_execution_profile(manifest_path):
+        return task_execution_profile(manifest_path)
 
     @staticmethod
     def relocation_preview(output_root, run_id, project_root):

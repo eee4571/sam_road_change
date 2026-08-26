@@ -3602,6 +3602,19 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
     }
 
 
+def _validate_resume_execution_profile(prior: dict, requested_profile: str) -> None:
+    spec = prior.get("input_spec") if isinstance(prior.get("input_spec"), dict) else {}
+    frozen = str(
+        prior.get("execution_profile") or spec.get("execution_profile") or "full"
+    ).strip().casefold()
+    requested = str(requested_profile or "full").strip().casefold()
+    if frozen != requested:
+        raise ValueError(
+            "不能使用不同的快速/标准模式继续同一任务。"
+            "请恢复该任务原模式，或选择“从头重新运行完整流程”创建新任务。"
+        )
+
+
 def _enrich_relocated_input_spec(input_spec: dict, job_root: Path) -> dict:
     """Add stable identities obtainable from a copied task's frozen runtime files."""
     enriched = dict(input_spec)
@@ -3941,23 +3954,94 @@ def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
         write_json(manifest_path, manifest)
 
 
-def _manifest_period_index(manifest: dict, grid: str, period: str) -> int:
-    for index, entry in enumerate(manifest.get("period_results", []) or []):
-        if isinstance(entry, dict) and str(entry.get("grid")) == grid and str(entry.get("period")) == period:
-            return index
-    raise ValueError(f"任务索引中不存在期次：{grid} / {period}")
+def _manifest_period_plan(manifest: dict) -> dict[str, list[str]]:
+    """Return the frozen task plan, never an order inferred across failed periods."""
+    plan: dict[str, list[str]] = {}
+    for raw_grid, raw_order in (manifest.get("period_orders") or {}).items():
+        if not isinstance(raw_order, dict):
+            continue
+        values = [str(value).strip() for value in raw_order.get("period_order", [])]
+        values = [value for value in values if value]
+        if values:
+            plan[str(raw_grid)] = list(dict.fromkeys(values))
+    spec = manifest.get("input_spec") if isinstance(manifest.get("input_spec"), dict) else {}
+    for raw_grid, periods in (spec.get("grids") or {}).items():
+        if str(raw_grid) in plan or not isinstance(periods, dict):
+            continue
+        plan[str(raw_grid)] = sorted(
+            (str(period) for period in periods), key=period_sort_key,
+        )
+    if plan:
+        return plan
+    for entry in manifest.get("period_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        grid = str(entry.get("grid") or "").strip()
+        period = str(entry.get("period") or "").strip()
+        if grid and period:
+            plan.setdefault(grid, []).append(period)
+    return {
+        grid: sorted(set(periods), key=period_sort_key)
+        for grid, periods in plan.items()
+    }
+
+
+def _manifest_identity_path(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("path") or "").strip()
+    return str(value or "").strip()
+
+
+def _manifest_period_source(manifest: dict, grid: str, period: str) -> str:
+    spec = manifest.get("input_spec") if isinstance(manifest.get("input_spec"), dict) else {}
+    grids = spec.get("grids") if isinstance(spec.get("grids"), dict) else {}
+    periods = grids.get(grid) if isinstance(grids.get(grid), dict) else {}
+    return _manifest_identity_path(periods.get(period))
+
+
+def _manifest_analysis_source(
+    manifest: dict, grid: str, period: str, old: dict,
+) -> Path:
+    for value in (old.get("analysis_source"), old.get("source")):
+        source = Path(str(value or "")).expanduser()
+        if str(value or "").strip() and source.exists():
+            return source.resolve()
+    job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
+    marker = job_root / "validation_inputs" / clean_name(grid) / "normalization_complete.json"
+    if marker.is_file():
+        try:
+            stored = str((read_json(marker).get("periods") or {}).get(period) or "").strip()
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            stored = ""
+        if stored:
+            source = Path(stored).expanduser()
+            if not source.is_absolute():
+                source = marker.parent / source
+            if source.exists():
+                return source.resolve()
+    source_value = _manifest_period_source(manifest, grid, period)
+    source = Path(source_value).expanduser()
+    if source_value and source.exists():
+        return source.resolve()
+    raise FileNotFoundError(f"找不到任务计划中的期次输入：{grid} / {period}")
 
 
 def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
-    index = _manifest_period_index(manifest, grid, period)
-    old = manifest["period_results"][index]
-    result_path = Path(str(old.get("result") or "")).expanduser().resolve()
-    if not result_path.parent.is_dir():
-        raise FileNotFoundError(f"期次工作目录不存在：{result_path.parent}")
-    workspace = result_path.parent
-    analysis_source = Path(str(old.get("analysis_source") or old.get("source") or "")).expanduser()
-    if not analysis_source.exists():
-        raise FileNotFoundError(f"期次输入不存在：{analysis_source}")
+    plan = _manifest_period_plan(manifest)
+    if period not in plan.get(grid, []):
+        raise ValueError(f"任务计划中不存在期次：{grid} / {period}")
+    entries = manifest.get("period_results", []) or []
+    index = next((
+        number for number, entry in enumerate(entries)
+        if isinstance(entry, dict) and str(entry.get("grid")) == grid
+        and str(entry.get("period")) == period
+    ), None)
+    old = entries[index] if index is not None else {}
+    job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
+    workspace = Path(str(old.get("result") or (
+        job_root / "grids" / clean_name(grid) / "periods" / clean_name(period) / "latest_result.json"
+    ))).expanduser().resolve().parent
+    analysis_source = _manifest_analysis_source(manifest, grid, period, old)
     input_spec = manifest.get("input_spec") or {}
     checkpoint = str((input_spec.get("checkpoint") or {}).get("path") or "")
     config = str((input_spec.get("config") or {}).get("path") or "")
@@ -3976,11 +4060,49 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
         validation_area=str((manifest.get("validation_areas") or {}).get(grid) or manifest.get("validation_area") or ""),
     )))
     updated = {
-        **old, **result, "result": str(result_path), "status": "completed",
+        **old, **result, "grid": grid, "period": period,
+        "source": _manifest_period_source(manifest, grid, period) or str(old.get("source") or analysis_source),
+        "analysis_source": str(analysis_source),
+        "result": str(workspace / "latest_result.json"), "status": "completed",
         "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
     }
-    manifest["period_results"][index] = updated
+    if index is None:
+        entries.append(updated)
+    else:
+        entries[index] = updated
+    manifest["period_results"] = entries
     return updated
+
+
+def _manifest_change_context(
+    manifest: dict, grid: str, before: str, after: str, old: dict,
+) -> tuple[str, str, str]:
+    spec = manifest.get("input_spec") if isinstance(manifest.get("input_spec"), dict) else {}
+    truths = spec.get("truths") if isinstance(spec.get("truths"), dict) else {}
+    truth = ""
+    for key in (f"{grid}\0{before}\0{after}", f"{before}\0{after}"):
+        if key in truths:
+            truth = _manifest_identity_path(truths[key])
+            break
+    if not truth:
+        truth = str(old.get("truth") or "").strip()
+    validation_areas = manifest.get("validation_areas")
+    validation = str(
+        (validation_areas.get(grid) or "") if isinstance(validation_areas, dict) else ""
+    ).strip()
+    if not validation:
+        configured = spec.get("validation_area")
+        if isinstance(configured, dict) and grid in configured:
+            validation = _manifest_identity_path(configured[grid])
+        elif not isinstance(configured, dict):
+            validation = _manifest_identity_path(configured)
+    if not validation:
+        validation = str(old.get("validation_area") or manifest.get("validation_area") or "").strip()
+    truth_type_field = str(
+        manifest.get("truth_type_field") or spec.get("truth_type_field")
+        or old.get("truth_type_field") or ""
+    ).strip()
+    return truth, validation, truth_type_field
 
 
 def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
@@ -4001,10 +4123,11 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
     output = Path(str(old.get("output") or job_root / "grids" / clean_name(grid) / "changes" / f"{clean_name(before)}_to_{clean_name(after)}"))
     spec = manifest.get("input_spec") or {}
+    truth_value, validation_value, truth_type_field = _manifest_change_context(
+        manifest, grid, before, after, old,
+    )
     started = time.monotonic()
     if str(manifest.get("execution_profile") or "full") == "fast":
-        truth_value = str(old.get("truth") or "").strip()
-        validation_value = str(old.get("validation_area") or "")
         result = _run_fast_change_result(
             Path(str(before_entry["result"])),
             Path(str(after_entry["result"])),
@@ -4025,8 +4148,7 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
                 Path(validation_value) if validation_value else None
             ),
             truth_type_field=str(
-                old.get("truth_type_field")
-                or manifest.get("truth_type_field")
+                truth_type_field
                 or "BHBM"
             ),
         )
@@ -4038,11 +4160,16 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
             absolute=str(spec.get("absolute") or old.get("absolute") or "2.0"),
             ratio=str(spec.get("ratio") or old.get("ratio") or "0.2"),
             tolerance=str(spec.get("tolerance") or old.get("tolerance") or "3.0"),
-            truth=str(old.get("truth") or ""), validation_area=str(old.get("validation_area") or ""),
-            truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or ""),
+            truth=truth_value, validation_area=validation_value,
+            truth_type_field=truth_type_field,
         )), output)
     updated = {
         **old, **result, "grid": grid, "before_period": before, "after_period": after,
+        "truth": truth_value, "validation_area": validation_value,
+        "truth_type_field": truth_type_field,
+        "absolute": str(spec.get("absolute") or old.get("absolute") or "2.0"),
+        "ratio": str(spec.get("ratio") or old.get("ratio") or "0.2"),
+        "tolerance": str(spec.get("tolerance") or old.get("tolerance") or "3.0"),
         "status": "completed", "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
     }
     updated.pop("stale_reason", None)
@@ -4055,10 +4182,7 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
 
 
 def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tuple[str, str]]:
-    names = sorted({
-        str(entry.get("period")) for entry in (manifest.get("period_results", []) or [])
-        if isinstance(entry, dict) and str(entry.get("grid")) == grid
-    }, key=period_sort_key)
+    names = _manifest_period_plan(manifest).get(grid, [])
     return [(before, after) for before, after in zip(names, names[1:]) if period in {before, after}]
 
 
@@ -4150,40 +4274,79 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
 def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    plan = _manifest_period_plan(manifest)
     period_keys = [
-        (str(entry.get("grid")), str(entry.get("period")))
-        for entry in (manifest.get("period_results", []) or []) if isinstance(entry, dict)
+        (grid, period) for grid, periods in plan.items() for period in periods
     ]
+    continue_on_error = bool(getattr(args, "continue_on_error", False))
+    failures: list[dict] = []
     for index, (grid, period) in enumerate(period_keys, start=1):
-        _rerun_period_entry(manifest, grid, period)
+        try:
+            _rerun_period_entry(manifest, grid, period)
+        except Exception as exc:
+            failure = {
+                "type": "period", "grid": grid, "scope": period,
+                "status": "failed", "error": str(exc), "failed_at": now_text(),
+            }
+            failures.append(failure)
+            emit("failure", **failure)
+            if not continue_on_error:
+                manifest["rerun_all_failures"] = failures
+                manifest["status"] = "failed"
+                _persist_existing_pipeline(manifest, manifest_path)
+                raise
         emit("pipeline", stage="批量道路提取重跑", status="running", completed=index, total=len(period_keys))
-    change_keys = [
-        (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))
-        for entry in (manifest.get("change_results", []) or []) if isinstance(entry, dict)
-    ]
+    change_keys = _all_manifest_change_pairs(manifest)
+    completed_changes: list[tuple[str, str, str]] = []
     for grid, before, after in change_keys:
-        _rerun_change_entry(manifest, grid, before, after)
-    _refresh_manifest_downstream(manifest)
-    manifest["status"] = "completed"
+        try:
+            _rerun_change_entry(manifest, grid, before, after)
+            completed_changes.append((grid, before, after))
+        except Exception as exc:
+            failure = {
+                "type": "change", "grid": grid, "scope": f"{before} -> {after}",
+                "status": "failed", "error": str(exc), "failed_at": now_text(),
+            }
+            failures.append(failure)
+            emit("failure", **failure)
+            if not continue_on_error:
+                manifest["rerun_all_failures"] = failures
+                manifest["status"] = "failed"
+                _persist_existing_pipeline(manifest, manifest_path)
+                raise
+    try:
+        _refresh_manifest_downstream(manifest)
+    except Exception as exc:
+        failure = {
+            "type": "downstream", "grid": "", "scope": "长时序/汇总",
+            "status": "failed", "error": str(exc), "failed_at": now_text(),
+        }
+        failures.append(failure)
+        emit("failure", **failure)
+        if not continue_on_error:
+            manifest["rerun_all_failures"] = failures
+            manifest["status"] = "failed"
+            _persist_existing_pipeline(manifest, manifest_path)
+            raise
+    manifest["failure_history"] = list(manifest.get("failure_history", [])) + list(manifest.get("failures", []))
+    manifest["failures"] = failures
+    manifest["rerun_all_failures"] = failures
+    manifest["status"] = "completed_with_errors" if failures else "completed"
+    manifest["period_count"] = len(manifest.get("period_results", []) or [])
+    manifest["change_count"] = len(manifest.get("change_results", []) or [])
     _persist_existing_pipeline(manifest, manifest_path)
-    _evaluate_fast_manifest_pairs(manifest_path, change_keys)
-    result = {"period_count": len(period_keys), "change_count": len(change_keys)}
+    _evaluate_fast_manifest_pairs(manifest_path, completed_changes)
+    result = {
+        "period_count": len(period_keys), "change_count": len(completed_changes),
+        "failure_count": len(failures), "total_change_count": len(change_keys),
+    }
     emit("complete", stage="rerun-all-periods", **result)
     return result
 
 
 def _all_manifest_change_pairs(manifest: dict) -> list[tuple[str, str, str]]:
-    periods_by_grid: dict[str, set[str]] = {}
-    for entry in manifest.get("period_results", []) or []:
-        if not isinstance(entry, dict):
-            continue
-        grid = str(entry.get("grid") or "").strip()
-        period = str(entry.get("period") or "").strip()
-        if grid and period:
-            periods_by_grid.setdefault(grid, set()).add(period)
     pairs: list[tuple[str, str, str]] = []
-    for grid in sorted(periods_by_grid):
-        periods = sorted(periods_by_grid[grid], key=period_sort_key)
+    for grid, periods in _manifest_period_plan(manifest).items():
         pairs.extend((grid, before, after) for before, after in zip(periods, periods[1:]))
     return pairs
 
@@ -4202,8 +4365,10 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
             completed_keys.append((grid, before, after))
         except Exception as exc:
             failure = {
-                "grid": grid, "before_period": before, "after_period": after,
-                "stage": "rerun-change", "message": str(exc), "at": now_text(),
+                "type": "change", "grid": grid, "scope": f"{before} -> {after}",
+                "before_period": before, "after_period": after,
+                "stage": "rerun-change", "status": "failed",
+                "error": str(exc), "failed_at": now_text(),
             }
             failures.append(failure)
             emit("failure", **failure)
@@ -4217,9 +4382,43 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
             "pipeline", stage="批量变化检测重跑", status="running",
             completed=index, total=len(change_keys),
         )
-    _refresh_manifest_downstream(manifest)
+    try:
+        _refresh_manifest_downstream(manifest)
+    except Exception as exc:
+        failure = {
+            "type": "downstream", "grid": "", "scope": "长时序/汇总",
+            "before_period": "", "after_period": "",
+            "stage": "rerun-downstream", "status": "failed",
+            "error": str(exc), "failed_at": now_text(),
+        }
+        failures.append(failure)
+        emit("failure", **failure)
+        if not continue_on_error:
+            manifest["rerun_change_failures"] = failures
+            manifest["status"] = "failed"
+            _persist_existing_pipeline(manifest, manifest_path)
+            raise
+    manifest["failure_history"] = list(manifest.get("failure_history", [])) + list(manifest.get("failures", []))
+    manifest["failures"] = failures
     manifest["rerun_change_failures"] = failures
-    manifest["status"] = "completed_with_errors" if failures else "completed"
+    available_periods = {
+        (str(entry.get("grid")), str(entry.get("period")))
+        for entry in (manifest.get("period_results", []) or [])
+        if isinstance(entry, dict) and _period_result_ready(entry)
+    }
+    missing_dependencies = {
+        (grid, period)
+        for grid, periods in _manifest_period_plan(manifest).items()
+        for period in periods
+        if (grid, period) not in available_periods
+    }
+    manifest["rerun_missing_period_dependencies"] = [
+        {"grid": grid, "period": period}
+        for grid, period in sorted(missing_dependencies)
+    ]
+    manifest["status"] = (
+        "completed_with_errors" if failures or missing_dependencies else "completed"
+    )
     manifest["updated_at"] = now_text()
     _persist_existing_pipeline(manifest, manifest_path)
     _evaluate_fast_manifest_pairs(manifest_path, completed_keys)
@@ -4382,6 +4581,7 @@ def run_all(args: argparse.Namespace) -> dict:
         prior = _read_full_run_resume_state(
             state_path, run_id, job_root, layout=layout, output_root=output_root,
         )
+        _validate_resume_execution_profile(prior, execution_profile)
         batch_repair = repair_task_batch_lists(job_root)
         marker_repair = relocate_task_image_markers(job_root)
         if batch_repair.modified_lists:
