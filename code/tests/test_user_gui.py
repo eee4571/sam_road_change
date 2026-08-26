@@ -89,6 +89,44 @@ class UserGuiInputCommandTests(unittest.TestCase):
 
         self.assertEqual(app._selected_tree_iid(tree), "2021")
 
+    def test_result_tree_double_click_toggles_parent_and_opens_only_png_leaf(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.result_tree = mock.Mock()
+        app.result_tree_paths = {}
+        app.open_selected_result = mock.Mock()
+        app._update_result_tree_height = mock.Mock()
+        app.result_tree.identify_row.return_value = "area:a"
+        app.result_tree.get_children.return_value = ("child",)
+        app.result_tree.item.side_effect = lambda _row, option=None, **_kwargs: False if option == "open" else {}
+
+        result = app._on_result_tree_double_click(mock.Mock(y=10))
+
+        self.assertEqual(result, "break")
+        app.result_tree.item.assert_called_with("area:a", open=True)
+        app.open_selected_result.assert_not_called()
+
+        app.result_tree.reset_mock()
+        app.result_tree.identify_row.return_value = "preview"
+        app.result_tree_paths = {"preview": Path("road.png")}
+        app._on_result_tree_double_click(mock.Mock(y=12))
+        app.open_selected_result.assert_called_once_with()
+
+    def test_result_tree_refreshes_from_result_completion_events_only(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.handle_evaluation_backend_event = mock.Mock()
+        app.refresh_project_results = mock.Mock()
+
+        app.handle_result_backend_event({
+            "kind": "pipeline", "stage": "批量变化检测重跑", "status": "complete",
+        })
+        app.refresh_project_results.assert_called_once_with(automatic=True)
+
+        app.refresh_project_results.reset_mock()
+        app.handle_result_backend_event({
+            "kind": "pipeline", "stage": "批量变化检测重跑", "status": "running",
+        })
+        app.refresh_project_results.assert_not_called()
+
     def test_truth_pair_selection_uses_stable_tree_row_data_not_display_separator(self) -> None:
         tree = mock.Mock()
         tree.selection.return_value = ("truth-row-1",)
@@ -456,12 +494,15 @@ class UserGuiInputCommandTests(unittest.TestCase):
 
     def test_result_browser_represents_missing_products_without_opening_them(self) -> None:
         items = gui.collect_result_tree_items({
-            "period_results": [{"grid": "north", "period": "2022", "centerlines": "missing.shp"}],
+            "period_results": [{
+                "grid": "north", "period": "2022", "centerlines": "ignored.shp",
+                "previews": {"fusion": "missing.png"},
+            }],
             "change_results": [],
         })
-        centerline = next(item for item in items if item["label"] == "中心线")
-        self.assertEqual(centerline["status"], "未生成")
-        self.assertIn("长时序道路", {item["label"] for item in items})
+        preview = next(item for item in items if item["label"] == "道路提取图")
+        self.assertEqual(preview["status"], "未生成")
+        self.assertNotIn("中心线", {item["label"] for item in items})
 
     def test_accuracy_evaluation_is_a_runnable_result_step(self) -> None:
         data_source = inspect.getsource(gui.UserApp._build_data_page)
@@ -824,6 +865,35 @@ class UserGuiArtifactTests(unittest.TestCase):
             }, root)
             self.assertEqual([item["category"] for item in items], ["融合", "重新测宽"])
 
+    def test_result_tree_contains_only_three_final_png_product_types(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            files = {}
+            for name in ("extract.png", "width.png", "change.png", "review.png", "roads.shp", "metrics.csv"):
+                path = root / name
+                path.touch()
+                files[name] = str(path)
+            tree = gui.collect_result_tree_items({
+                "period_results": [{
+                    "grid": "区域A", "period": "2020", "centerlines": files["roads.shp"],
+                    "previews": {"fusion": files["extract.png"], "width": files["width.png"]},
+                }],
+                "change_results": [{
+                    "grid": "区域A", "before_period": "2020", "after_period": "2021",
+                    "layers": {"changes": files["roads.shp"]},
+                    "previews": {"change": files["change.png"], "review_change": files["review.png"]},
+                }],
+                "temporal_results": [{"grid": "区域A", "life_shp": files["roads.shp"]}],
+                "evaluation_summary": {"csv": files["metrics.csv"]},
+            }, root)
+
+            leaves = [item for item in tree if item.get("path")]
+            self.assertEqual(
+                {item["label"] for item in leaves},
+                {"道路提取图", "道路宽度图", "变化结果图"},
+            )
+            self.assertTrue(all(Path(item["path"]).suffix.casefold() == ".png" for item in leaves))
+
     def test_change_and_review_previews_are_separate_gui_items(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -843,8 +913,9 @@ class UserGuiArtifactTests(unittest.TestCase):
                 [item["category"] for item in items],
                 ["最终变化结果", "待复核变化"],
             )
-            self.assertFalse({"最终变化结果", "待复核变化"} & {item["label"] for item in tree})
-            self.assertIn("变化检测", {item["label"] for item in tree})
+            labels = {item["label"] for item in tree}
+            self.assertIn("变化结果图", labels)
+            self.assertNotIn("待复核变化图", labels)
 
     def test_collects_temporal_life_shp_for_attribute_table(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -35,18 +35,33 @@ class _Tree:
         self.rows = {}
         self.insert_calls = 0
         self._selection = ()
-    def get_children(self): return tuple(self.rows)
+        self._yview = 0.0
+        self.height = 0
+    def get_children(self, parent=""):
+        return tuple(iid for iid, row in self.rows.items() if row["parent"] == parent)
     def delete(self, *items):
-        for item in items: self.rows.pop(item, None)
+        for item in items:
+            self.delete(*self.get_children(item))
+            self.rows.pop(item, None)
     def insert(self, parent, _where, iid=None, text="", values=(), **_kwargs):
         iid = iid or f"row:{len(self.rows)}"
-        self.rows[iid] = {"parent": parent, "text": text, "values": tuple(values)}
+        self.rows[iid] = {
+            "parent": parent, "text": text, "values": tuple(values),
+            "open": bool(_kwargs.get("open", False)),
+        }
         self.insert_calls += 1
         return iid
     def selection(self): return self._selection
-    def item(self, iid, option=None):
+    def selection_set(self, values):
+        self._selection = (values,) if isinstance(values, str) else tuple(values)
+    def exists(self, iid): return iid in self.rows
+    def item(self, iid, option=None, **kwargs):
         row = self.rows.get(iid, {})
+        row.update(kwargs)
         return row.get(option, ()) if option else row
+    def yview(self): return (self._yview, min(1.0, self._yview + 0.2))
+    def yview_moveto(self, value): self._yview = float(value)
+    def configure(self, **kwargs): self.height = int(kwargs.get("height", self.height))
 
 
 class _Log:
@@ -218,6 +233,49 @@ class GuiScalePerformanceTests(unittest.TestCase):
             "first_population_seconds": round(first_elapsed, 4),
             "unchanged_second_insertions": app.result_tree.insert_calls - first_calls,
         }))
+
+    def test_result_tree_refresh_preserves_open_selection_and_scroll_state(self) -> None:
+        app = gui.UserApp.__new__(gui.UserApp)
+        app.result_tree, app.result_tree_paths = _Tree(), {}
+        app._result_tree_fingerprint = None
+        initial = [
+            {"id": "area:a", "parent": "", "label": "a", "status": "", "path": ""},
+            {"id": "area:a:periods", "parent": "area:a", "label": "单期结果", "status": "", "path": ""},
+            {"id": "area:a:periods:2020", "parent": "area:a:periods", "label": "2020", "status": "", "path": ""},
+            {"id": "area:a:periods:2020:road_extraction", "parent": "area:a:periods:2020", "label": "道路提取图", "status": "已生成", "path": "road.png"},
+        ]
+        app._populate_result_tree(initial, None)
+        for node in ("area:a", "area:a:periods", "area:a:periods:2020"):
+            app.result_tree.item(node, open=True)
+        selected = "area:a:periods:2020:road_extraction"
+        app.result_tree.selection_set(selected)
+        app.result_tree.yview_moveto(0.4)
+
+        updated = initial + [{
+            "id": "area:a:periods:2020:road_width", "parent": "area:a:periods:2020",
+            "label": "道路宽度图", "status": "已生成", "path": "width.png",
+        }]
+        app._populate_result_tree(updated, None)
+
+        self.assertTrue(all(app.result_tree.item(node, "open") for node in (
+            "area:a", "area:a:periods", "area:a:periods:2020",
+        )))
+        self.assertEqual(app.result_tree.selection(), (selected,))
+        self.assertEqual(app.result_tree.yview()[0], 0.4)
+
+    def test_result_tree_height_counts_only_actually_visible_nodes(self) -> None:
+        app = gui.UserApp.__new__(gui.UserApp)
+        app.result_tree = _Tree()
+        app.result_tree.insert("", "end", iid="area", open=True)
+        app.result_tree.insert("area", "end", iid="group", open=True)
+        for index in range(12):
+            app.result_tree.insert("group", "end", iid=f"leaf:{index}")
+        app._update_result_tree_height()
+        self.assertEqual(app.result_tree.height, 10)
+
+        app.result_tree.item("group", open=False)
+        app._update_result_tree_height()
+        self.assertEqual(app.result_tree.height, 6)
 
     def test_temporal_pager_never_returns_more_than_page_size_for_100k_rows(self) -> None:
         frame = pd.DataFrame({

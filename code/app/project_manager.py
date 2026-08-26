@@ -998,7 +998,7 @@ class TemporalAttributePager:
         return self.frame.iloc[self._filtered_positions[start:stop]]
 
 def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> list[dict[str, str]]:
-    """Build the business-only result tree from the unified index or a legacy manifest."""
+    """Build a compact tree containing only final PNG products."""
     index_path = _manifest_path(manifest.get("result_index"), base_dir)
     index = read_result_index(index_path) if index_path is not None else None
     if index is None:
@@ -1014,71 +1014,62 @@ def collect_result_tree_items(manifest: dict, base_dir: Path | None = None) -> l
             "status": status if status is not None else ("已生成" if exists else "未生成"),
         })
 
-    product_labels = {
-        "centerlines": "中心线", "surfaces": "道路面",
-        "width_segments": "道路宽度", "corridors": "道路走廊",
-        "road_extraction": "道路提取图", "road_width": "道路宽度图",
-    }
-    change_labels = {
-        "changes": "全部变化", "added": "新增道路", "removed": "灭失道路",
-        "widened": "拓宽道路部分", "narrowed": "变窄道路部分",
-        "width_changed": "宽度变化道路部分",
-        "road_change": "变化结果图", "review_change": "待复核变化图",
-    }
-    temporal_labels = {
-        "life_shp": "道路生命史", "observations_shp": "道路观测",
-        "events_shp": "道路事件", "event_parts_shp": "事件范围",
-        "lineage_shp": "道路谱系", "review_shp": "待复核道路",
-    }
-    evaluation_labels = {"csv": "评价汇总表", "json": "评价汇总数据"}
+    def png_value(value: object) -> object | None:
+        path = _manifest_path(value, base_dir)
+        return value if path is not None and path.suffix.casefold() == ".png" else None
+
     for area, area_value in sorted((index.get("areas") or {}).items(), key=lambda row: natural_key(row[0])):
         if not isinstance(area_value, dict):
+            continue
+        periods = area_value.get("periods") if isinstance(area_value.get("periods"), dict) else {}
+        period_rows = []
+        for period, products in sorted(periods.items(), key=lambda row: natural_key(row[0])):
+            if not isinstance(products, dict):
+                continue
+            previews = [
+                (key, label, png_value(products.get(key)))
+                for key, label in (
+                    ("road_extraction", "道路提取图"),
+                    ("road_width", "道路宽度图"),
+                )
+            ]
+            previews = [row for row in previews if row[2] is not None]
+            if previews:
+                period_rows.append((str(period), previews))
+
+        changes = area_value.get("changes") if isinstance(area_value.get("changes"), dict) else {}
+        change_rows = []
+        for pair, products in sorted(changes.items(), key=lambda row: natural_key(row[0])):
+            if not isinstance(products, dict):
+                continue
+            preview = png_value(products.get("road_change"))
+            if preview is None:
+                continue
+            before = str(products.get("before_period") or pair.split("_to_", 1)[0])
+            after = str(products.get("after_period") or (pair.split("_to_", 1)[1] if "_to_" in pair else "后期"))
+            change_rows.append((str(pair), before, after, preview))
+
+        if not period_rows and not change_rows:
             continue
         area_id = f"area:{area}"
         add(area_id, "", str(area), status="")
 
-        period_group = f"{area_id}:periods"
-        add(period_group, area_id, "单期道路", status="")
-        periods = area_value.get("periods") if isinstance(area_value.get("periods"), dict) else {}
-        for period, products in sorted(periods.items(), key=lambda row: natural_key(row[0])):
-            period_id = f"{period_group}:{period}"
-            add(period_id, period_group, str(period), status="")
-            if isinstance(products, dict):
-                for key, label in product_labels.items():
-                    if products.get(key):
-                        add(f"{period_id}:{key}", period_id, label, products.get(key))
+        if period_rows:
+            period_group = f"{area_id}:periods"
+            add(period_group, area_id, "单期结果", status="")
+            for period, previews in period_rows:
+                period_id = f"{period_group}:{period}"
+                add(period_id, period_group, period, status="")
+                for key, label, value in previews:
+                    add(f"{period_id}:{key}", period_id, label, value)
 
-        change_group = f"{area_id}:changes"
-        add(change_group, area_id, "变化检测", status="")
-        changes = area_value.get("changes") if isinstance(area_value.get("changes"), dict) else {}
-        for pair, products in sorted(changes.items(), key=lambda row: natural_key(row[0])):
-            if not isinstance(products, dict):
-                continue
-            before = str(products.get("before_period") or pair.split("_to_", 1)[0])
-            after = str(products.get("after_period") or (pair.split("_to_", 1)[1] if "_to_" in pair else "后期"))
-            pair_id = f"{change_group}:{pair}"
-            add(pair_id, change_group, f"{before} → {after}", status="")
-            for key, label in change_labels.items():
-                if products.get(key):
-                    add(f"{pair_id}:{key}", pair_id, label, products.get(key))
-
-        temporal_group = f"{area_id}:temporal"
-        add(temporal_group, area_id, "长时序道路", status="")
-        temporal = area_value.get("temporal") if isinstance(area_value.get("temporal"), dict) else {}
-        for key, label in temporal_labels.items():
-            if temporal.get(key):
-                add(f"{temporal_group}:{key}", temporal_group, label, temporal.get(key))
-
-        evaluation_group = f"{area_id}:evaluation"
-        add(evaluation_group, area_id, "精度评价", status="")
-        evaluation = area_value.get("evaluation") if isinstance(area_value.get("evaluation"), dict) else {}
-        for key, label in evaluation_labels.items():
-            if evaluation.get(key):
-                add(f"{evaluation_group}:{key}", evaluation_group, label, evaluation.get(key))
-
-    report = index.get("task_report") if isinstance(index.get("task_report"), dict) else {}
-    if report.get("csv"):
-        add("task-report", "", "任务报告", report.get("csv"))
+        if change_rows:
+            change_group = f"{area_id}:changes"
+            add(change_group, area_id, "变化检测", status="")
+            for pair, before, after, preview in change_rows:
+                pair_id = f"{change_group}:{pair}"
+                add(pair_id, change_group, f"{before} → {after}", status="")
+                add(f"{pair_id}:road_change", pair_id, "变化结果图", preview)
     return items
 
 def discover_validation_project(project_dir: Path | str) -> dict:

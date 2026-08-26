@@ -1280,8 +1280,8 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                     if event.kind == "complete":
                         self.last_complete_payload = payload
                     self._append_log(event.stage or event.kind, friendly)
-                    if hasattr(self, "handle_evaluation_backend_event"):
-                        self.handle_evaluation_backend_event(payload)
+                    if hasattr(self, "handle_result_backend_event"):
+                        self.handle_result_backend_event(payload)
                 elif kind in {"backend_log", "log"}:
                     self._append_log("日志", str(value))
                 elif kind == "backend_protocol_error":

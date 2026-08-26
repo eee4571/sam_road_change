@@ -119,23 +119,27 @@ class ResultPublisherTests(unittest.TestCase):
             period = run / "grids" / "区域A" / "periods" / "2021"
             products = period / "runs" / "roads" / "products"
             center = make_shapefile(products, "road_centerlines", "center")
+            extraction = products / "road_extraction.png"; extraction.touch()
             review = period / "runs" / "roads" / "width_review"
             review.mkdir(parents=True)
             result_path = period / "latest_result.json"
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps({
                 "centerlines": str(center),
+                "previews": {"fusion": str(extraction)},
                 "review": {"available": True, "directory": str(review)},
             }, ensure_ascii=False), encoding="utf-8")
             publisher = ResultPublisher(output, project_root=project)
-            publisher.publish_period("区域A", "2021", {"centerlines": str(center)})
+            publisher.publish_period("区域A", "2021", {
+                "centerlines": str(center), "previews": {"fusion": str(extraction)},
+            })
             manifest, path = discover_project_result_context(project, output, persist=True)
             self.assertEqual(path, project / "_work" / "tasks" / "available_results.json")
             self.assertEqual(len(manifest["period_results"]), 1)
             self.assertEqual(manifest["period_results"][0]["result"], str(result_path.resolve()))
             self.assertTrue(manifest["period_results"][0]["review"]["available"])
             labels = {item["label"] for item in collect_result_tree_items(manifest, path.parent)}
-            self.assertTrue({"区域A", "单期道路", "2021", "中心线"}.issubset(labels))
+            self.assertEqual(labels, {"区域A", "单期结果", "2021", "道路提取图"})
 
     def test_old_result_index_remains_readable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -154,10 +158,12 @@ class ResultPublisherTests(unittest.TestCase):
             root = Path(raw)
             legacy = root / "04_成果输出" / "run_old" / "grids" / "区域A" / "periods" / "2021"
             center = make_shapefile(legacy, "road_centerlines", "legacy")
+            extraction = legacy / "road_extraction.png"; extraction.touch()
             manifest = {
                 "job_root": str(root / "04_成果输出" / "run_old"),
                 "period_results": [{
                     "grid": "区域A", "period": "2021", "centerlines": str(center),
+                    "previews": {"fusion": str(extraction)},
                 }],
                 "change_results": [], "temporal_results": [],
             }
@@ -165,7 +171,7 @@ class ResultPublisherTests(unittest.TestCase):
             self.assertIn("区域A", index["areas"])
             items = collect_result_tree_items(manifest, root)
             labels = {item["label"] for item in items}
-            self.assertTrue({"区域A", "单期道路", "2021", "中心线"}.issubset(labels))
+            self.assertEqual(labels, {"区域A", "单期结果", "2021", "道路提取图"})
             self.assertFalse((root / "04_成果输出" / "result_index.json").exists())
 
     def test_opening_legacy_project_only_writes_read_only_available_index(self) -> None:

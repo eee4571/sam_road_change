@@ -218,7 +218,9 @@ class ResultPage:
         self.result_tree.tag_configure("area", font=("Microsoft YaHei UI", 9, "bold"))
         self.result_tree.tag_configure("category", foreground=UI["green"], font=("Microsoft YaHei UI", 9, "bold"))
         self.result_tree_tooltip = Tooltip(self.result_tree, self._result_tree_tooltip_text)
-        self.result_tree.bind("<Double-1>", lambda _event: self.open_selected_result())
+        self.result_tree.bind("<Double-1>", self._on_result_tree_double_click)
+        self.result_tree.bind("<<TreeviewOpen>>", self._schedule_result_tree_height)
+        self.result_tree.bind("<<TreeviewClose>>", self._schedule_result_tree_height)
         result_actions = ttk.Frame(result_card)
         result_actions.pack(fill=X)
         ttk.Button(result_actions, text="打开所选成果", command=self.open_selected_result).pack(side=LEFT)
@@ -502,6 +504,27 @@ class ResultPage:
         ):
             self._refresh_active_evaluation_results()
 
+    def handle_result_backend_event(self, payload: dict) -> None:
+        """Refresh result products on completion events without polling project files."""
+        self.handle_evaluation_backend_event(payload)
+        stage = str(payload.get("stage") or "")
+        status = str(payload.get("status") or "")
+        kind = str(payload.get("kind") or "")
+        completion_stages = {
+            "extract", "change", "extract-project-period", "extract-project-all",
+            "change-project-periods", "rerun-period", "rerun-change",
+            "rerun-all-periods", "rerun-all-changes", "apply-edits", "all",
+        }
+        stage_is_result = (
+            stage in completion_stages
+            or "道路提取" in stage or "变化检测" in stage or "变化成果" in stage
+            or "变化对更新" in stage
+        )
+        if stage_is_result and (
+            kind == "complete" or status in {"complete", "failed", "skipped"}
+        ):
+            self.refresh_project_results(automatic=True)
+
     def _populate_result_tree(self, items: list[dict[str, str]], _base_dir: Path | None) -> None:
         if not hasattr(self, "result_tree"):
             return
@@ -511,8 +534,24 @@ class ResultPage:
         )
         if fingerprint == self._result_tree_fingerprint:
             return
+        existing_roots = self.result_tree.get_children("")
+        had_existing_nodes = bool(existing_roots)
+        open_nodes: set[str] = set()
+
+        def remember_open(nodes) -> None:
+            for node in nodes:
+                if bool(self.result_tree.item(node, "open")):
+                    open_nodes.add(str(node))
+                remember_open(self.result_tree.get_children(node))
+
+        remember_open(existing_roots)
+        selected_nodes = tuple(self.result_tree.selection())
+        try:
+            scroll_position = float(self.result_tree.yview()[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            scroll_position = 0.0
         self._result_tree_fingerprint = fingerprint
-        self.result_tree.delete(*self.result_tree.get_children())
+        self.result_tree.delete(*existing_roots)
         self.result_tree_paths = {}
         pending = list(items)
         inserted = set()
@@ -529,7 +568,8 @@ class ResultPage:
                 status = "" if is_category else item.get("status", "")
                 node = self.result_tree.insert(
                     parent, END, iid=item["id"], text=item["label"], values=(status,),
-                    open=is_area, tags=(tag,) if tag else (),
+                    open=(str(item["id"]) in open_nodes if had_existing_nodes else is_area),
+                    tags=(tag,) if tag else (),
                 )
                 inserted.add(node)
                 path_text = item.get("path", "")
@@ -538,11 +578,46 @@ class ResultPage:
             if len(next_pending) == len(pending):
                 break
             pending = next_pending
-        visible_rows = sum(
-            1 + len(self.result_tree.get_children(root))
-            for root in self.result_tree.get_children("")
-        )
-        self.result_tree.configure(height=max(6, min(visible_rows, 10)))
+        surviving_selection = [node for node in selected_nodes if self.result_tree.exists(node)]
+        if surviving_selection:
+            self.result_tree.selection_set(surviving_selection)
+        self._update_result_tree_height()
+        try:
+            self.result_tree.yview_moveto(scroll_position)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def _schedule_result_tree_height(self, _event=None) -> None:
+        self.root.after_idle(self._update_result_tree_height)
+
+    def _update_result_tree_height(self) -> None:
+        if not hasattr(self, "result_tree"):
+            return
+
+        def visible_count(nodes) -> int:
+            count = 0
+            for node in nodes:
+                count += 1
+                if bool(self.result_tree.item(node, "open")):
+                    count += visible_count(self.result_tree.get_children(node))
+            return count
+
+        rows = visible_count(self.result_tree.get_children(""))
+        self.result_tree.configure(height=max(6, min(rows, 10)))
+
+    def _on_result_tree_double_click(self, event) -> str:
+        row = self.result_tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self.result_tree.selection_set(row)
+        path = self.result_tree_paths.get(row)
+        if path is not None and path.suffix.casefold() == ".png":
+            self.open_selected_result()
+            return "break"
+        if self.result_tree.get_children(row):
+            self.result_tree.item(row, open=not bool(self.result_tree.item(row, "open")))
+            self._update_result_tree_height()
+        return "break"
 
     def _result_tree_tooltip_text(self, _event=None) -> str:
         if not hasattr(self, "result_tree"):
@@ -560,7 +635,10 @@ class ResultPage:
             messagebox.showinfo("请选择成果", "请先在成果树中选择一个已生成成果。", parent=self.root)
             return
         path = self.result_tree_paths.get(selected[0])
-        if path is None or not path.exists():
+        if path is None or path.suffix.casefold() != ".png":
+            messagebox.showinfo("请选择结果图", "请选择道路提取图、道路宽度图或变化结果图。", parent=self.root)
+            return
+        if not path.exists():
             messagebox.showinfo("未生成", "所选成果尚未生成，不能打开。", parent=self.root)
             return
         self._open(path)
@@ -908,7 +986,8 @@ class ResultPage:
 
     def refresh_project_results(self, *, automatic: bool = False) -> None:
         """Reload the current project's index and manifests without a file picker."""
-        self._result_tree_fingerprint = None
+        if not automatic:
+            self._result_tree_fingerprint = None
         self._refresh_result_availability()
         if not automatic:
             self.status.set(

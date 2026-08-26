@@ -180,19 +180,22 @@ class ProjectManagerArchitectureTests(unittest.TestCase):
         manager = ProjectManager()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            center = root / "center.shp"
-            center.touch()
+            extraction = root / "road_extraction.png"
+            width = root / "road_width.png"
+            extraction.touch(); width.touch()
             manifest = {
                 "period_results": [{
                     "grid": "area1", "period": "2021", "status": "completed",
-                    "centerlines": str(center), "surfaces": str(root / "surface.shp"),
+                    "centerlines": str(root / "center.shp"),
+                    "previews": {"fusion": str(extraction), "width": str(width)},
                 }],
                 "change_results": [],
             }
             items = manager.result_items(manifest, root)
-            center_item = next(item for item in items if item["label"] == "中心线")
-            self.assertEqual(center_item["status"], "已生成")
-            self.assertEqual(Path(center_item["path"]), center.resolve())
+            labels = {item["label"] for item in items}
+            self.assertEqual(labels, {"area1", "单期结果", "2021", "道路提取图", "道路宽度图"})
+            extraction_item = next(item for item in items if item["label"] == "道路提取图")
+            self.assertEqual(Path(extraction_item["path"]), extraction.resolve())
 
 
 class TaskManagerArchitectureTests(unittest.TestCase):
