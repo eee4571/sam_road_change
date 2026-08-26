@@ -48,6 +48,10 @@ FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
+FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN = 0.90
+FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX = 0.97
+FAST_GT_ASSISTED_SHIFT_MAX_PX = 1.25
+FAST_GT_ASSISTED_BUFFER_JITTER_PX = 0.50
 FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
 FAST_CHANGE_CENTERLINE_RETAIN_MAX = 0.86
 FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
@@ -1090,6 +1094,9 @@ def _fast_change_local_seed(global_seed: int, period_key: str, change_type: str)
 def _degrade_fast_change_geometry(
     geometry,
     rng: np.random.Generator,
+    *,
+    retain_min: float = FAST_CHANGE_GEOMETRY_RETAIN_MIN,
+    retain_max: float = FAST_CHANGE_GEOMETRY_RETAIN_MAX,
 ):
     """Remove a short end section while keeping the retained polygon coherent."""
     if geometry.geom_type not in {"Polygon", "MultiPolygon"} or geometry.is_empty:
@@ -1099,10 +1106,7 @@ def _degrade_fast_change_geometry(
     height = float(maxy - miny)
     if max(width, height) <= 1e-9:
         return geometry
-    retain_fraction = float(rng.uniform(
-        FAST_CHANGE_GEOMETRY_RETAIN_MIN,
-        FAST_CHANGE_GEOMETRY_RETAIN_MAX,
-    ))
+    retain_fraction = float(rng.uniform(retain_min, retain_max))
     retain_low_end = bool(rng.integers(0, 2))
     if width >= height:
         split = minx + width * retain_fraction
@@ -1126,10 +1130,13 @@ def _jitter_fast_change_geometry(
     geometry,
     rng: np.random.Generator,
     pixel_size: float,
+    *,
+    shift_max_px: float = FAST_CHANGE_SHIFT_MAX_PX,
+    buffer_jitter_px: float = FAST_CHANGE_BUFFER_JITTER_PX,
 ):
     angle = float(rng.uniform(0.0, 2.0 * np.pi))
     distance = float(
-        FAST_CHANGE_SHIFT_MAX_PX * rng.beta(1.0, 4.0) * pixel_size
+        shift_max_px * rng.beta(1.0, 4.0) * pixel_size
     )
     shifted = translate(
         geometry,
@@ -1138,9 +1145,9 @@ def _jitter_fast_change_geometry(
     )
     if shifted.geom_type in {"Polygon", "MultiPolygon"}:
         distance = float(rng.triangular(
-            -FAST_CHANGE_BUFFER_JITTER_PX,
+            -buffer_jitter_px,
             0.0,
-            FAST_CHANGE_BUFFER_JITTER_PX,
+            buffer_jitter_px,
         ) * pixel_size)
         buffered = shifted.buffer(distance)
         if not buffered.is_empty:
@@ -1591,46 +1598,58 @@ def _augment_fast_typed_layer(
     before_period: str,
     after_period: str,
     tolerance: float,
+    pixel_size: float,
+    seed_context: str,
 ) -> gpd.GeoDataFrame:
     automatic = automatic.copy()
     automatic["change_src"] = "AUTO"
     records = automatic.to_dict(orient="records")
-    automatic_positions = set(range(len(records)))
-    for geometry in truth.loc[truth["change_typ"] == change_type].geometry:
+    automatic_positions = range(len(records))
+    truth_geometries = truth.loc[
+        truth["change_typ"] == change_type
+    ].geometry
+    for ordinal, (truth_index, geometry) in enumerate(truth_geometries.items()):
         support = geometry.buffer(max(float(tolerance), 0.0))
         matches = [
             position for position in automatic_positions
-            if records[position] is not None
-            and records[position][automatic.geometry.name].intersects(support)
+            if records[position][automatic.geometry.name].intersects(support)
         ]
         if matches:
-            first = matches[0]
-            merged = gpd.GeoSeries(
-                [geometry, *[
-                    records[position][automatic.geometry.name]
-                    for position in matches
-                ]],
-                crs=automatic.crs,
-            ).union_all()
-            records[first][automatic.geometry.name] = make_valid(merged)
-            records[first]["change_src"] = "AUTO_GT"
-            records[first]["source"] = "fast_automatic_gt"
-            for position in matches[1:]:
-                records[position] = None
-                automatic_positions.discard(position)
+            for position in matches:
+                records[position]["change_src"] = "AUTO_GT"
+                records[position]["source"] = "fast_automatic_gt"
             continue
+        geometry_digest = hashlib.sha256(geometry.wkb).hexdigest()
+        local_seed = _fast_change_local_seed(
+            FAST_CHANGE_GLOBAL_SEED,
+            f"{seed_context}|{truth_index}|{ordinal}|{geometry_digest}",
+            change_type,
+        )
+        rng = np.random.default_rng(local_seed)
+        assisted_geometry = _degrade_fast_change_geometry(
+            geometry,
+            rng,
+            retain_min=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN,
+            retain_max=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX,
+        )
+        assisted_geometry = _jitter_fast_change_geometry(
+            assisted_geometry,
+            rng,
+            max(float(pixel_size), 1e-9),
+            shift_max_px=FAST_GT_ASSISTED_SHIFT_MAX_PX,
+            buffer_jitter_px=FAST_GT_ASSISTED_BUFFER_JITTER_PX,
+        )
         records.append({
             "change_typ": change_type,
             "before_per": str(before_period),
             "after_per": str(after_period),
-            "source": "ground_truth_augmentation",
-            "change_src": "GT",
+            "source": "ground_truth_assisted",
+            "change_src": "GT_ASSISTED",
             "width_bef": np.nan,
             "width_aft": np.nan,
             "width_diff": np.nan,
-            automatic.geometry.name: geometry,
+            automatic.geometry.name: assisted_geometry,
         })
-    records = [record for record in records if record is not None]
     if records:
         return gpd.GeoDataFrame(
             records, geometry=automatic.geometry.name, crs=automatic.crs,
@@ -1642,6 +1661,28 @@ def _augment_fast_typed_layer(
     return gpd.GeoDataFrame(
         columns, geometry=gpd.GeoSeries([], crs=automatic.crs), crs=automatic.crs,
     )
+
+
+def _fast_evaluation_payload(
+    metrics: list[dict],
+    metadata: dict,
+    *,
+    evaluation_source: str,
+) -> dict:
+    normalized_metrics = []
+    for source_row in metrics:
+        row = dict(source_row)
+        if row.get("class") == "all":
+            row["change_recall"] = row.get(
+                "change_area_recall", row.get("recall")
+            )
+            row["change_precision"] = row.get("precision")
+            row["change_type_accuracy"] = row.get("type_judgment_accuracy")
+        normalized_metrics.append(row)
+    return {
+        "metadata": {**dict(metadata), "evaluation_source": evaluation_source},
+        "metrics": normalized_metrics,
+    }
 
 
 def augment_fast_changes_with_truth(
@@ -1656,7 +1697,7 @@ def augment_fast_changes_with_truth(
     position_tolerance: float = 3.0,
     evaluation_tolerance: float = 5.0,
 ) -> dict:
-    """Publish Auto∪GT while retaining Auto-vs-GT evaluation separately."""
+    """Publish Auto plus perturbed GT-only misses and evaluate Auto vs GT."""
     auto_layers = dict(automatic_result.get("layers") or {})
     automatic = {
         name: _read_fast_change_layer(auto_layers, name)
@@ -1669,6 +1710,20 @@ def augment_fast_changes_with_truth(
         {"changes": automatic_result.get("road_changes")}, "changes",
     )
     auto_changes = _align_fast_change_frame(auto_changes, target_crs)
+    auto_summary_path = Path(str(automatic_result.get("summary") or ""))
+    auto_summary = (
+        json.loads(auto_summary_path.read_text(encoding="utf-8"))
+        if auto_summary_path.is_file() else {}
+    )
+    pixel_size = float(
+        automatic_result.get("probability_pixel_size")
+        or auto_summary.get("probability_pixel_size")
+        or 1.0
+    )
+    seed_context = (
+        f"{Path(truth_path).expanduser().resolve()}|"
+        f"{before_period}->{after_period}"
+    )
     truth_evaluation, truth_augmentation, evaluation_type_field = (
         _fast_gt_augmentation_truth(
         Path(truth_path),
@@ -1694,16 +1749,23 @@ def augment_fast_changes_with_truth(
         float(evaluation_tolerance),
         class_mode="three",
     )
+    evaluation = _fast_evaluation_payload(
+        auto_metrics,
+        auto_metadata,
+        evaluation_source="fast_automatic_vs_ground_truth",
+    )
     final_layers = {
         "added": _augment_fast_typed_layer(
             automatic["added"], truth_augmentation,
             change_type="added", before_period=before_period,
             after_period=after_period, tolerance=position_tolerance,
+            pixel_size=pixel_size, seed_context=seed_context,
         ),
         "removed": _augment_fast_typed_layer(
             automatic["removed"], truth_augmentation,
             change_type="removed", before_period=before_period,
             after_period=after_period, tolerance=position_tolerance,
+            pixel_size=pixel_size, seed_context=seed_context,
         ),
     }
     for name in ("width_changed", "widened", "narrowed"):
@@ -1745,28 +1807,31 @@ def augment_fast_changes_with_truth(
         title=f"Fast Auto + Ground Truth: {before_period} to {after_period}",
         empty_message="No Fast road changes detected",
     )
-    auto_summary_path = Path(str(automatic_result.get("summary") or ""))
-    auto_summary = (
-        json.loads(auto_summary_path.read_text(encoding="utf-8"))
-        if auto_summary_path.is_file() else {}
-    )
     summary = {
         **auto_summary,
         "execution_profile": "fast",
         "change_source": "fast_automatic_gt_augmented",
-        "change_output_mode": "fast_auto_plus_ground_truth",
+        "change_output_mode": "fast_auto_plus_gt_assisted",
         "detection_source": "fast_automatic_change_detection",
-        "ground_truth_usage": "augment_missing_reference_changes",
+        "ground_truth_usage": "augment_auto_misses_with_perturbed_geometry",
         "ground_truth_derived": True,
         "automatic_result": False,
         "automatic_output": str(automatic_result.get("output") or ""),
         "automatic_road_changes": str(automatic_result.get("road_changes") or ""),
         "automatic_summary": str(automatic_result.get("summary") or ""),
-        "auto_evaluation": {"metadata": auto_metadata, "metrics": auto_metrics},
+        "evaluation": evaluation,
+        "auto_evaluation": evaluation,
+        "gt_assisted_pixel_size": pixel_size,
         "auto_added_count": int(len(automatic["added"])),
         "auto_removed_count": int(len(automatic["removed"])),
         "gt_added_count": int((truth_augmentation["change_typ"] == "added").sum()),
         "gt_removed_count": int((truth_augmentation["change_typ"] == "removed").sum()),
+        "gt_assisted_added_count": int(
+            (final_layers["added"]["change_src"] == "GT_ASSISTED").sum()
+        ),
+        "gt_assisted_removed_count": int(
+            (final_layers["removed"]["change_src"] == "GT_ASSISTED").sum()
+        ),
         "final_added_count": int(len(final_layers["added"])),
         "final_removed_count": int(len(final_layers["removed"])),
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},

@@ -2716,6 +2716,15 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             "excluded_truth_feature_count": sum(int(row.get("excluded_truth_feature_count", 0) or 0) for row in source_rows),
             "evaluated_task_count": len(source_rows),
         }
+        if (
+            class_name == "all"
+            and str(manifest.get("execution_profile") or "full") == "fast"
+        ):
+            row.update({
+                "change_precision": precision,
+                "change_recall": recall,
+                "change_type_accuracy": row["type_judgment_accuracy"],
+            })
         has_fast_truth_metrics = class_name == "all" and any(
             "road_centerline_completeness" in source for source in source_rows
         )
@@ -2850,6 +2859,22 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
     entry = matches[0]
     output = Path(str(entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
+    summary_path = Path(
+        str(entry.get("summary") or output / "change_summary.json")
+    ).expanduser().resolve()
+    summary = read_json(summary_path) if summary_path.is_file() else {}
+    is_fast_gt_assisted = (
+        str(
+            entry.get("detection_source")
+            or summary.get("detection_source")
+            or ""
+        ) == "fast_automatic_change_detection"
+        and str(
+            entry.get("ground_truth_usage")
+            or summary.get("ground_truth_usage")
+            or ""
+        ) == "augment_auto_misses_with_perturbed_geometry"
+    )
     truth_path = Path(args.truth).expanduser().resolve()
     if not truth_path.is_file():
         raise FileNotFoundError(f"找不到变化真值：{truth_path}")
@@ -2888,7 +2913,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         )
     validation_value = str(args.validation_area or entry.get("validation_area") or manifest.get("validation_area") or "").strip()
     validation = gpd.read_file(validation_value) if validation_value else None
-    rows, metadata = evaluate_changes(
+    assisted_rows, assisted_metadata = evaluate_changes(
         predicted,
         truth,
         validation,
@@ -2896,10 +2921,58 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         float(args.evaluation_tolerance),
         class_mode="three",
     )
-    summary_path = Path(
-        str(entry.get("summary") or output / "change_summary.json")
-    ).expanduser().resolve()
-    summary = read_json(summary_path) if summary_path.is_file() else {}
+    rows, metadata = assisted_rows, assisted_metadata
+    if is_fast_gt_assisted:
+        automatic_path = Path(str(
+            entry.get("automatic_road_changes")
+            or summary.get("automatic_road_changes")
+            or ""
+        )).expanduser()
+        if automatic_path.is_file():
+            automatic_predicted = gpd.read_file(automatic_path)
+            rows, metadata = evaluate_changes(
+                automatic_predicted,
+                truth,
+                validation,
+                evaluation_truth_type_field,
+                float(args.evaluation_tolerance),
+                class_mode="three",
+            )
+        else:
+            stored_evaluation = (
+                summary.get("evaluation") or summary.get("auto_evaluation") or {}
+            )
+            stored_rows = stored_evaluation.get("metrics", [])
+            if not isinstance(stored_rows, list) or not stored_rows:
+                raise FileNotFoundError(
+                    "Fast 自动变化成果不存在，且摘要中没有可复用的 Auto vs GT 评价："
+                    f"{automatic_path}"
+                )
+            rows = [dict(row) for row in stored_rows]
+            metadata = dict(stored_evaluation.get("metadata") or {})
+        metadata = {
+            **metadata,
+            "evaluation_source": "fast_automatic_vs_ground_truth",
+        }
+        assisted_metadata = {
+            **assisted_metadata,
+            "evaluation_source": "gt_assisted_final_vs_ground_truth",
+        }
+
+    for row in rows:
+        if row.get("class") == "all":
+            row["change_recall"] = row.get(
+                "change_area_recall", row.get("recall")
+            )
+            row["change_precision"] = row.get("precision")
+            row["change_type_accuracy"] = row.get("type_judgment_accuracy")
+    for row in assisted_rows:
+        if row.get("class") == "all":
+            row["change_recall"] = row.get(
+                "change_area_recall", row.get("recall")
+            )
+            row["change_precision"] = row.get("precision")
+            row["change_type_accuracy"] = row.get("type_judgment_accuracy")
     is_fast_truth = bool(
         entry.get("ground_truth_derived")
         or summary.get("ground_truth_derived")
@@ -2941,9 +3014,18 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         writer.writerows(rows)
 
     summary["evaluation"] = {"metadata": metadata, "metrics": rows}
+    if is_fast_gt_assisted:
+        summary["auto_evaluation"] = summary["evaluation"]
+        summary["assisted_evaluation"] = {
+            "metadata": assisted_metadata,
+            "metrics": assisted_rows,
+        }
     if configured_values:
         summary["evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
         summary["evaluation"]["metadata"]["truth_value_map"] = truth_value_map
+        if is_fast_gt_assisted:
+            summary["assisted_evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
+            summary["assisted_evaluation"]["metadata"]["truth_value_map"] = truth_value_map
     write_json(summary_path, summary)
 
     entry["truth"] = str(truth_path)

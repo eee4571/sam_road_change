@@ -445,29 +445,92 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertEqual(len(final_removed), 2)
             self.assertEqual(len(final_widened), 1)
             self.assertEqual(
-                set(final_added["change_src"]), {"AUTO", "GT", "AUTO_GT"},
+                set(final_added["change_src"]),
+                {"AUTO", "GT_ASSISTED", "AUTO_GT"},
             )
-            expected_added = gpd.GeoSeries(
-                [*auto_frames["added"].geometry, *truth.iloc[:2].geometry],
-                crs=crs,
-            ).union_all()
-            self.assertLess(
-                final_added.geometry.union_all().symmetric_difference(
-                    expected_added
-                ).area,
-                1e-8,
+            matched_auto = final_added.loc[
+                final_added["change_src"] == "AUTO_GT"
+            ].geometry.iloc[0]
+            auto_only = final_added.loc[
+                final_added["change_src"] == "AUTO"
+            ].geometry.iloc[0]
+            assisted = final_added.loc[
+                final_added["change_src"] == "GT_ASSISTED"
+            ].geometry.iloc[0]
+            self.assertTrue(matched_auto.equals(auto_frames["added"].geometry.iloc[0]))
+            self.assertTrue(auto_only.equals(auto_frames["added"].geometry.iloc[1]))
+            self.assertFalse(assisted.equals(truth.geometry.iloc[1]))
+            self.assertTrue(assisted.intersects(truth.geometry.iloc[1]))
+
+            repeated = augment_fast_changes_with_truth(
+                automatic_result,
+                truth_path,
+                root / "final_repeated",
+                before_period="2021",
+                after_period="2022",
+                position_tolerance=1.0,
             )
+            repeated_added = gpd.read_file(repeated["layers"]["added"])
+            repeated_assisted = repeated_added.loc[
+                repeated_added["change_src"] == "GT_ASSISTED"
+            ].geometry.iloc[0]
+            self.assertTrue(assisted.equals(repeated_assisted))
+
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertEqual(
                 summary["detection_source"], "fast_automatic_change_detection",
             )
             self.assertEqual(
                 summary["ground_truth_usage"],
-                "augment_missing_reference_changes",
+                "augment_auto_misses_with_perturbed_geometry",
             )
-            self.assertIn("auto_evaluation", summary)
+            self.assertEqual(summary["evaluation"], summary["auto_evaluation"])
+            overall = next(
+                row for row in summary["evaluation"]["metrics"]
+                if row["class"] == "all"
+            )
+            self.assertIsNotNone(overall["change_recall"])
+            self.assertIsNotNone(overall["change_precision"])
+            self.assertIn("change_type_accuracy", overall)
             self.assertEqual(summary["auto_added_count"], 2)
+            self.assertEqual(summary["gt_assisted_added_count"], 1)
+            self.assertEqual(summary["gt_assisted_removed_count"], 1)
             self.assertEqual(summary["final_added_count"], 3)
+
+            job_root = root / "job"
+            job_root.mkdir()
+            manifest_path = job_root / "pipeline_result.json"
+            manifest_path.write_text(json.dumps({
+                "execution_profile": "fast",
+                "job_root": str(job_root),
+                "change_results": [{
+                    "grid": "area", "before_period": "2021",
+                    "after_period": "2022", "truth": str(truth_path),
+                    "truth_type_field": "BHBM", **result,
+                }],
+            }), encoding="utf-8")
+            evaluated = user_pipeline.evaluate_existing_changes(argparse.Namespace(
+                pipeline_manifest=str(manifest_path), grid="area",
+                before_period="2021", after_period="2022",
+                truth=str(truth_path), validation_area="",
+                truth_type_field="BHBM", truth_added_value="",
+                truth_width_changed_value="", truth_removed_value="",
+                evaluation_tolerance=5.0,
+            ))
+            self.assertIsNotNone(evaluated["change_recall"])
+            self.assertIsNotNone(evaluated["change_precision"])
+            self.assertIsNotNone(evaluated["change_type_accuracy"])
+            updated_summary = json.loads(
+                Path(result["summary"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                updated_summary["evaluation"]["metadata"]["evaluation_source"],
+                "fast_automatic_vs_ground_truth",
+            )
+            self.assertEqual(
+                updated_summary["assisted_evaluation"]["metadata"]["evaluation_source"],
+                "gt_assisted_final_vs_ground_truth",
+            )
 
     def test_truth_codes_generate_three_semantic_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
