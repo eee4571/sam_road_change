@@ -1704,6 +1704,37 @@ class DependencyInvalidationTests(unittest.TestCase):
                 ))
             self.assertEqual(order, ["period", "change:2021:2022", "change:2022:2024", "downstream"])
 
+    def test_rerun_all_changes_uses_adjacent_period_results_without_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); job = root / "run"; job.mkdir(); manifest_path = root / "latest_pipeline.json"
+            user_pipeline.write_json(manifest_path, {
+                "job_root": str(job),
+                "execution_profile": "fast",
+                "period_results": [
+                    {"grid": grid, "period": year}
+                    for grid, years in (("north", ("2021", "2022", "2024")), ("south", ("2020", "2023")))
+                    for year in years
+                ],
+                "change_results": [],
+            })
+            calls = []
+            with patch.object(user_pipeline, "_rerun_period_entry") as period_mock, \
+                    patch.object(user_pipeline, "_rerun_change_entry", side_effect=lambda _m, g, b, a: calls.append((g, b, a)) or {}), \
+                    patch.object(user_pipeline, "_refresh_manifest_downstream"), \
+                    patch.object(user_pipeline, "_evaluate_fast_manifest_pairs") as evaluation_mock, \
+                    patch.object(user_pipeline, "_write_task_report"):
+                result = user_pipeline.rerun_all_pipeline_changes(argparse.Namespace(
+                    pipeline_manifest=str(manifest_path), continue_on_error=True,
+                ))
+            period_mock.assert_not_called()
+            self.assertEqual(calls, [
+                ("north", "2021", "2022"),
+                ("north", "2022", "2024"),
+                ("south", "2020", "2023"),
+            ])
+            self.assertEqual(result, {"change_count": 3, "failure_count": 0, "total_change_count": 3})
+            evaluation_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

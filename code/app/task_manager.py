@@ -303,6 +303,21 @@ def resolve_automatic_run(
     return run_id, state.is_file(), state
 
 
+def create_new_run(
+    output_root: Path | str, *, generated_run_id: str | None = None,
+) -> tuple[str, Path]:
+    """Reserve a unique run name without reusing any existing task directory."""
+    output = Path(output_root).expanduser()
+    layout = ProjectLayout.from_output(output)
+    base = _safe_task_name(generated_run_id or time.strftime("run_%Y%m%d_%H%M%S"))
+    for suffix in range(10000):
+        run_id = base if suffix == 0 else f"{base}_{suffix:02d}"
+        job_root = layout.full_run_root(run_id)
+        if layout.existing_full_run_root(run_id) is None and not job_root.exists():
+            return run_id, job_root / "job_state.json"
+    raise ValueError("无法生成唯一的新任务名称，请稍后重试。")
+
+
 def project_relocation_preview(
     output_root: Path | str, run_id: str, project_root: Path | str,
 ) -> dict | None:
@@ -572,6 +587,10 @@ class TaskManager:
         )
 
     @staticmethod
+    def create_new_run(output_root, *, generated_run_id=None):
+        return create_new_run(output_root, generated_run_id=generated_run_id)
+
+    @staticmethod
     def relocation_preview(output_root, run_id, project_root):
         return project_relocation_preview(output_root, run_id, project_root)
 
@@ -606,6 +625,20 @@ class TaskManager:
         ]
         if update_temporal:
             args.append("--update-temporal")
+        return args
+
+    @staticmethod
+    def build_rerun_all_periods(manifest, continue_on_error=False) -> list[str]:
+        args = ["rerun-all-periods", "--pipeline-manifest", str(manifest)]
+        if continue_on_error:
+            args.append("--continue-on-error")
+        return args
+
+    @staticmethod
+    def build_rerun_all_changes(manifest, continue_on_error=False) -> list[str]:
+        args = ["rerun-all-changes", "--pipeline-manifest", str(manifest)]
+        if continue_on_error:
+            args.append("--continue-on-error")
         return args
 
     @staticmethod
@@ -743,7 +776,7 @@ class TaskManager:
             return self.backend.run_period(args, **kwargs)
         if command in {"extract-project-all", "rerun-all-periods"}:
             return self.backend.run_all_periods(args, **kwargs)
-        if command in {"change", "change-project-periods", "rerun-change"}:
+        if command in {"change", "change-project-periods", "rerun-change", "rerun-all-changes"}:
             return self.backend.run_change_pair(args, **kwargs)
         if command == "apply-edits":
             return self.backend.apply_edits(args, **kwargs)

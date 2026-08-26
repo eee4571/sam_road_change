@@ -4172,6 +4172,66 @@ def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     return result
 
 
+def _all_manifest_change_pairs(manifest: dict) -> list[tuple[str, str, str]]:
+    periods_by_grid: dict[str, set[str]] = {}
+    for entry in manifest.get("period_results", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        grid = str(entry.get("grid") or "").strip()
+        period = str(entry.get("period") or "").strip()
+        if grid and period:
+            periods_by_grid.setdefault(grid, set()).add(period)
+    pairs: list[tuple[str, str, str]] = []
+    for grid in sorted(periods_by_grid):
+        periods = sorted(periods_by_grid[grid], key=period_sort_key)
+        pairs.extend((grid, before, after) for before, after in zip(periods, periods[1:]))
+    return pairs
+
+
+def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
+    """Rerun every adjacent change pair while reusing completed period results."""
+    manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
+    manifest = read_json(manifest_path)
+    change_keys = _all_manifest_change_pairs(manifest)
+    continue_on_error = bool(getattr(args, "continue_on_error", False))
+    failures: list[dict] = []
+    completed_keys: list[tuple[str, str, str]] = []
+    for index, (grid, before, after) in enumerate(change_keys, start=1):
+        try:
+            _rerun_change_entry(manifest, grid, before, after)
+            completed_keys.append((grid, before, after))
+        except Exception as exc:
+            failure = {
+                "grid": grid, "before_period": before, "after_period": after,
+                "stage": "rerun-change", "message": str(exc), "at": now_text(),
+            }
+            failures.append(failure)
+            emit("failure", **failure)
+            if not continue_on_error:
+                manifest["rerun_change_failures"] = failures
+                manifest["status"] = "failed"
+                manifest["updated_at"] = now_text()
+                _persist_existing_pipeline(manifest, manifest_path)
+                raise
+        emit(
+            "pipeline", stage="批量变化检测重跑", status="running",
+            completed=index, total=len(change_keys),
+        )
+    _refresh_manifest_downstream(manifest)
+    manifest["rerun_change_failures"] = failures
+    manifest["status"] = "completed_with_errors" if failures else "completed"
+    manifest["updated_at"] = now_text()
+    _persist_existing_pipeline(manifest, manifest_path)
+    _evaluate_fast_manifest_pairs(manifest_path, completed_keys)
+    result = {
+        "change_count": len(completed_keys),
+        "failure_count": len(failures),
+        "total_change_count": len(change_keys),
+    }
+    emit("complete", stage="rerun-all-changes", **result)
+    return result
+
+
 def build_temporal_outputs(manifest: dict, job_root: Path | None = None) -> list[dict]:
     """Build the all-Shapefile temporal products without loading GIS at GUI startup."""
     from temporal_road_analysis import build_from_manifest
@@ -4913,6 +4973,10 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--update-temporal", action="store_true")
     a = sub.add_parser("rerun-all-periods", help="批量重跑全部道路提取并按依赖更新下游成果")
     a.add_argument("--pipeline-manifest", required=True)
+    a.add_argument("--continue-on-error", action="store_true")
+    a = sub.add_parser("rerun-all-changes", help="复用道路提取成果并批量重跑全部相邻变化对")
+    a.add_argument("--pipeline-manifest", required=True)
+    a.add_argument("--continue-on-error", action="store_true")
     a = sub.add_parser("evaluate-existing", help="使用真值评价已有变化检测结果，不重跑提取和检测")
     a.add_argument("--pipeline-manifest", required=True)
     a.add_argument("--grid", required=True)
@@ -4981,6 +5045,7 @@ def main() -> int:
     elif args.command == "rerun-period": rerun_pipeline_period(args)
     elif args.command == "rerun-change": rerun_pipeline_change(args)
     elif args.command == "rerun-all-periods": rerun_all_pipeline_periods(args)
+    elif args.command == "rerun-all-changes": rerun_all_pipeline_changes(args)
     elif args.command == "evaluate-existing": evaluate_existing_changes(args)
     elif args.command == "evaluate-all-existing": evaluate_all_existing_changes(args)
     else: run_all(args)

@@ -214,6 +214,20 @@ class TaskManagerArchitectureTests(unittest.TestCase):
             [("2021", "2022"), ("2022", "2024")],
         )
 
+    def test_new_run_never_reuses_an_existing_task_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "成果输出"
+            first_id, first_state = self.manager.create_new_run(
+                output, generated_run_id="run_fixed",
+            )
+            first_state.parent.mkdir(parents=True)
+            second_id, second_state = self.manager.create_new_run(
+                output, generated_run_id="run_fixed",
+            )
+            self.assertEqual(first_id, "run_fixed")
+            self.assertEqual(second_id, "run_fixed_01")
+            self.assertNotEqual(first_state.parent, second_state.parent)
+
     def test_local_rerun_commands_are_built_by_task_manager(self) -> None:
         manifest = Path("pipeline_result.json")
         period = self.manager.build_rerun_period(manifest, "area1", "2021", True)
@@ -224,6 +238,12 @@ class TaskManagerArchitectureTests(unittest.TestCase):
         self.assertIn("--update-related", period)
         self.assertEqual(change[0], "rerun-change")
         self.assertIn("--update-temporal", change)
+        all_periods = self.manager.build_rerun_all_periods(manifest, True)
+        all_changes = self.manager.build_rerun_all_changes(manifest, True)
+        self.assertEqual(all_periods[0], "rerun-all-periods")
+        self.assertEqual(all_changes[0], "rerun-all-changes")
+        self.assertIn("--continue-on-error", all_periods)
+        self.assertIn("--continue-on-error", all_changes)
 
 
 class LayerBoundaryTests(unittest.TestCase):

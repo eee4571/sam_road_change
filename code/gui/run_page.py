@@ -22,11 +22,11 @@ class RunPage:
         profile_frame.pack(fill=X, pady=(0, 7))
         ttk.Radiobutton(
             profile_frame, text="标准模式", variable=self.vars["execution_profile"],
-            value="full", command=self._execution_profile_changed,
+            value="full",
         ).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(
             profile_frame, text="快速模式", variable=self.vars["execution_profile"],
-            value="fast", command=self._execution_profile_changed,
+            value="fast",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
         checklist = ttk.Frame(run_card)
         checklist.pack(fill=X, pady=(0, 6))
@@ -37,16 +37,26 @@ class RunPage:
             state_label.grid(row=row_index, column=1, sticky="e", pady=2)
             self.preflight_check_labels.append(state_label)
         checklist.grid_columnconfigure(0, weight=1)
-        actions = ttk.Frame(run_card)
-        actions.pack(fill=X)
-        self.preflight_button = ttk.Button(actions, text="检查数据", command=self.preflight_inputs)
-        self.preflight_button.pack(side=LEFT)
-        self.run_button = ttk.Button(
-            actions, text="运行快速模式", style="Hero.TButton", command=self.run_all,
+        full_task = ttk.LabelFrame(run_card, text="完整任务", padding=(8, 6))
+        full_task.pack(fill=X)
+        self.continue_task_button = ttk.Button(
+            full_task, text="继续当前任务", style="Hero.TButton", command=self.run_all,
         )
-        self.run_button.pack(side=RIGHT)
-        self.cancel_button = ttk.Button(actions, text="取消任务", command=self.cancel_task)
-        self.cancel_button.pack(side=RIGHT, padx=5)
+        self.continue_task_button.grid(row=0, column=0, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"]))
+        self.fresh_task_button = ttk.Button(
+            full_task, text="从头重新运行完整流程", command=self.run_fresh_all,
+        )
+        self.fresh_task_button.grid(row=0, column=1, sticky="ew")
+        full_task.grid_columnconfigure(0, weight=1, uniform="full_task")
+        full_task.grid_columnconfigure(1, weight=1, uniform="full_task")
+        self.task_start_buttons = [self.continue_task_button, self.fresh_task_button]
+        self.run_button = self.continue_task_button
+        utility_actions = ttk.Frame(run_card)
+        utility_actions.pack(fill=X, pady=(6, 0))
+        self.preflight_button = ttk.Button(utility_actions, text="检查数据", command=self.preflight_inputs)
+        self.preflight_button.pack(side=LEFT)
+        self.cancel_button = ttk.Button(utility_actions, text="取消任务", command=self.cancel_task)
+        self.cancel_button.pack(side=RIGHT)
         self.cancel_button.state(["disabled"])
 
         progress_card = ttk.LabelFrame(page, text="运行进度", padding=LAYOUT_METRICS["card_padding"])
@@ -62,59 +72,59 @@ class RunPage:
         self.progress_text = StringVar(value="0 / 0 · 已用时 00:00:00 · 剩余 --")
         ttk.Label(progress_card, textvariable=self.progress_text).pack(anchor="w", pady=(5, 0))
 
-        stage_card = ttk.LabelFrame(page, text="局部重跑", padding=LAYOUT_METRICS["card_padding"])
+        stage_card = ttk.LabelFrame(page, text="分步重跑", padding=LAYOUT_METRICS["card_padding"])
         stage_card.pack(fill=BOTH, expand=True, pady=(LAYOUT_METRICS["section_gap"], 0))
-        selectors = ttk.Frame(stage_card)
-        selectors.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
-        ttk.Label(selectors, text="区域：", width=LAYOUT_METRICS["form_label_width"]).grid(row=0, column=0, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
-        self.stage_region_combo = ttk.Combobox(selectors, textvariable=self.stage_region, state="readonly", width=14)
+        road_actions = ttk.LabelFrame(stage_card, text="道路提取", padding=LAYOUT_METRICS["card_padding"])
+        road_actions.pack(fill=X)
+        ttk.Label(road_actions, text="区域：", width=LAYOUT_METRICS["form_label_width"]).grid(row=0, column=0, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
+        self.stage_region_combo = ttk.Combobox(road_actions, textvariable=self.stage_region, state="readonly", width=14)
         self.stage_region_combo.grid(row=0, column=1, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"]), pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
-        ttk.Label(selectors, text="期次：", width=6).grid(row=0, column=2, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
-        self.stage_period_combo = ttk.Combobox(selectors, textvariable=self.project_period, state="readonly", width=12)
+        ttk.Label(road_actions, text="期次：", width=6).grid(row=0, column=2, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
+        self.stage_period_combo = ttk.Combobox(road_actions, textvariable=self.project_period, state="readonly", width=12)
         self.stage_period_combo.grid(row=0, column=3, sticky="ew", pady=(0, LAYOUT_METRICS["form_gap"]))
         self.stage_period_combo.bind("<<ComboboxSelected>>", self._stage_period_changed)
-        ttk.Label(selectors, text="相邻变化对：", width=LAYOUT_METRICS["form_label_width"]).grid(row=1, column=0, sticky="w")
-        self.stage_pair_combo = ttk.Combobox(selectors, textvariable=self.project_change_pair, state="readonly", width=16)
-        self.stage_pair_combo.grid(row=1, column=1, columnspan=3, sticky="ew")
-        selectors.grid_columnconfigure(1, weight=1)
-        selectors.grid_columnconfigure(3, weight=1)
+        road_actions.grid_columnconfigure(1, weight=1)
+        road_actions.grid_columnconfigure(3, weight=1)
         self.affected_pairs_summary = StringVar(value="请选择期次以查看受影响的相邻变化对。")
-        affected_row = ttk.Frame(stage_card)
-        affected_row.pack(fill=X, pady=(0, LAYOUT_METRICS["module_gap"]))
-        ttk.Label(affected_row, text="受影响变化对：").pack(side=LEFT)
-        affected_label = ttk.Label(affected_row, textvariable=self.affected_pairs_summary)
-        affected_label.pack(side=LEFT, fill=X, expand=True)
-        bind_dynamic_wrap(affected_label, affected_row, minimum=180, padding=130)
-        stage_actions = ttk.Frame(stage_card)
-        stage_actions.pack(fill=X)
-        road_actions = ttk.LabelFrame(stage_actions, text="道路提取", padding=LAYOUT_METRICS["card_padding"])
-        road_actions.pack(fill=X)
-        change_actions = ttk.LabelFrame(stage_actions, text="变化检测", padding=LAYOUT_METRICS["card_padding"])
-        change_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
+        affected_label = ttk.Label(road_actions, textvariable=self.affected_pairs_summary, style="Hint.TLabel")
+        affected_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, LAYOUT_METRICS["form_gap"]))
+        bind_dynamic_wrap(affected_label, road_actions, minimum=180, padding=20)
         self.stage_buttons = []
-        action_columns = {road_actions: 0, change_actions: 0}
-        for parent, text, command in (
-            (road_actions, "重跑该期", lambda: self.rerun_selected_period(False)),
-            (road_actions, "重跑并更新相关结果", lambda: self.rerun_selected_period(True)),
-            (change_actions, "重跑该变化对", lambda: self.rerun_selected_change(False)),
-            (change_actions, "重跑并更新长时序成果", lambda: self.rerun_selected_change(True)),
-        ):
-            button = ttk.Button(parent, text=text, command=command)
-            column = action_columns[parent]
-            button.grid(
-                row=0, column=column, sticky="ew",
-                padx=(0, LAYOUT_METRICS["module_gap"] if column == 0 else 0),
-            )
-            parent.grid_columnconfigure(column, weight=1, uniform="stage_actions")
-            action_columns[parent] += 1
+        road_button_row = ttk.Frame(road_actions)
+        road_button_row.grid(row=2, column=0, columnspan=4, sticky="ew")
+        for column, (text, command) in enumerate((
+            ("重跑该期", lambda: self.rerun_selected_period(False)),
+            ("重跑并更新相关结果", lambda: self.rerun_selected_period(True)),
+            ("重跑全部道路提取", self.run_extract_all),
+        )):
+            button = ttk.Button(road_button_row, text=text, command=command)
+            button.grid(row=0, column=column, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"] if column < 2 else 0))
+            road_button_row.grid_columnconfigure(column, weight=1, uniform="road_actions")
             self.stage_buttons.append(button)
-        advanced_stage = ttk.Frame(stage_card)
-        advanced_stage.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
-        ttk.Label(advanced_stage, text="高级操作：").pack(side=LEFT)
-        batch_button = ttk.Button(advanced_stage, text="批量重跑全部道路提取", command=self.run_extract_all)
-        batch_button.pack(side=LEFT)
-        self.stage_buttons.append(batch_button)
+
+        change_actions = ttk.LabelFrame(stage_card, text="变化检测", padding=LAYOUT_METRICS["card_padding"])
+        change_actions.pack(fill=X, pady=(LAYOUT_METRICS["module_gap"], 0))
+        ttk.Label(change_actions, text="区域：", width=LAYOUT_METRICS["form_label_width"]).grid(row=0, column=0, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
+        self.stage_change_region_combo = ttk.Combobox(change_actions, textvariable=self.stage_region, state="readonly", width=14)
+        self.stage_change_region_combo.grid(row=0, column=1, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"]), pady=(0, LAYOUT_METRICS["form_gap"]))
+        self.stage_change_region_combo.bind("<<ComboboxSelected>>", self._stage_region_changed)
+        ttk.Label(change_actions, text="变化对：", width=8).grid(row=0, column=2, sticky="w", pady=(0, LAYOUT_METRICS["form_gap"]))
+        self.stage_pair_combo = ttk.Combobox(change_actions, textvariable=self.project_change_pair, state="readonly", width=16)
+        self.stage_pair_combo.grid(row=0, column=3, sticky="ew", pady=(0, LAYOUT_METRICS["form_gap"]))
+        change_actions.grid_columnconfigure(1, weight=1)
+        change_actions.grid_columnconfigure(3, weight=1)
+        change_button_row = ttk.Frame(change_actions)
+        change_button_row.grid(row=1, column=0, columnspan=4, sticky="ew")
+        for column, (text, command) in enumerate((
+            ("重跑该变化对", lambda: self.rerun_selected_change(False)),
+            ("重跑并更新长时序成果", lambda: self.rerun_selected_change(True)),
+            ("重跑全部变化检测", self.run_change_all),
+        )):
+            button = ttk.Button(change_button_row, text=text, command=command)
+            button.grid(row=0, column=column, sticky="ew", padx=(0, LAYOUT_METRICS["module_gap"] if column < 2 else 0))
+            change_button_row.grid_columnconfigure(column, weight=1, uniform="change_actions")
+            self.stage_buttons.append(button)
 
         summary_card = ttk.LabelFrame(self.step_summaries[1], text="任务摘要", padding=LAYOUT_METRICS["card_padding"])
         summary_card.pack(fill=BOTH, expand=True)
@@ -204,10 +214,6 @@ class RunPage:
             execution_profile=self.vars["execution_profile"].get(),
         )
 
-    def _execution_profile_changed(self) -> None:
-        fast = self.vars["execution_profile"].get() == "fast"
-        self.run_button.configure(text="运行快速模式" if fast else "运行完整流程")
-
     def preflight_inputs(self) -> None:
         try:
             args = self._build_current_command(data_check_only=True)
@@ -228,19 +234,40 @@ class RunPage:
         self._command(args)
 
     def run_all(self) -> None:
-        output = Path(self.vars["output_root"].get().strip()).expanduser()
-        run_id, should_resume, state_path = self.task_manager.resolve_run(
-            output, self.vars["run_id"].get(), self.project_config.get("active_task"),
-        )
+        self._run_complete_task(fresh=False)
+
+    def run_fresh_all(self) -> None:
+        if self.project_config.get("active_task"):
+            if not messagebox.askokcancel(
+                "确认从头运行",
+                "将创建新的任务并从头运行，当前已有任务结果不会删除。",
+                parent=self.root,
+            ):
+                return
+        self._run_complete_task(fresh=True)
+
+    def _run_complete_task(self, *, fresh: bool) -> None:
+        output_value = self.vars["output_root"].get().strip()
+        if not output_value:
+            messagebox.showerror("输入不完整", "请选择成果输出根目录。", parent=self.root)
+            return
+        output = Path(output_value).expanduser()
+        previous_run_id = self.vars["run_id"].get()
+        previous_resume = self.vars["resume"].get()
+        if fresh:
+            run_id, state_path = self.task_manager.create_new_run(output)
+            should_resume = False
+        else:
+            run_id, should_resume, state_path = self.task_manager.resolve_run(
+                output, previous_run_id, self.project_config.get("active_task"),
+            )
         self.vars["run_id"].set(run_id)
         self.vars["resume"].set("1" if should_resume else "0")
-        self.project_config["active_task"] = {
-            "run_id": run_id, "state": str(state_path), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        self._save_project_config()
         try:
             args = self._build_current_command()
         except ValueError as exc:
+            self.vars["run_id"].set(previous_run_id)
+            self.vars["resume"].set(previous_resume)
             messagebox.showerror("输入不完整", str(exc), parent=self.root)
             if not self.vars["output_root"].get().strip() or (
                 self.vars["resume"].get() == "1" and not self.vars["run_id"].get().strip()
@@ -272,7 +299,13 @@ class RunPage:
             "程序将按以下顺序提取并检测相邻期次变化：\n\n" + order_text,
             parent=self.root,
         ):
+            self.vars["run_id"].set(previous_run_id)
+            self.vars["resume"].set(previous_resume)
             return
+        self.project_config["active_task"] = {
+            "run_id": run_id, "state": str(state_path), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._save_project_config()
         self._show_step(1, force=True)
         self._command(args)
 
@@ -354,7 +387,20 @@ class RunPage:
             messagebox.showerror("无法批量重跑", str(exc), parent=self.root)
             return
         self._show_step(1, force=True)
-        self._command(["rerun-all-periods", "--pipeline-manifest", str(manifest)])
+        self._command(self.task_manager.build_rerun_all_periods(
+            manifest, self.vars["continue_on_error"].get() == "1",
+        ))
+
+    def run_change_all(self) -> None:
+        try:
+            manifest = self._current_pipeline_manifest_path()
+        except ValueError as exc:
+            messagebox.showerror("无法批量重跑", str(exc), parent=self.root)
+            return
+        self._show_step(1, force=True)
+        self._command(self.task_manager.build_rerun_all_changes(
+            manifest, self.vars["continue_on_error"].get() == "1",
+        ))
 
     def run_extract_all_legacy(self) -> None:
         """Retained for callers of the historical standalone stage commands."""

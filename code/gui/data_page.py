@@ -390,6 +390,8 @@ class DataPage:
             return
         names = [name for name, _path in self.project_validation_areas]
         self.stage_region_combo.configure(values=names)
+        if hasattr(self, "stage_change_region_combo"):
+            self.stage_change_region_combo.configure(values=names)
         if self.stage_region.get() not in names:
             self.stage_region.set(names[0] if names else "")
         region = self._selected_project_region("stage")

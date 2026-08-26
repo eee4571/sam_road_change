@@ -985,7 +985,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.recent_log_lines = []
         self.status.set("任务启动中…")
         self.run_status.set("任务启动中，请稍候…")
-        self.run_button.state(["disabled"])
+        self._set_task_start_buttons_enabled(False)
         self.preflight_button.state(["disabled"])
         self._set_stage_buttons_enabled(False)
         self._set_cancel_enabled(True)
@@ -1130,6 +1130,10 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
 
     def _set_stage_buttons_enabled(self, enabled: bool) -> None:
         for button in getattr(self, "stage_buttons", []):
+            button.state(["!disabled"] if enabled else ["disabled"])
+
+    def _set_task_start_buttons_enabled(self, enabled: bool) -> None:
+        for button in getattr(self, "task_start_buttons", [self.run_button]):
             button.state(["!disabled"] if enabled else ["disabled"])
 
     @staticmethod
@@ -1308,13 +1312,13 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                             self.run_status.set("增量重建已停止；查看上方日志后可再次点击“应用编辑并重新生成结果”。")
                         else:
                             self.status.set("任务已取消；已完成结果和当前位置已保留。")
-                            self.run_status.set("任务已取消；再次点击“运行完整流程”将自动从未完成步骤继续。")
+                            self.run_status.set("任务已取消；再次点击“继续当前任务”将自动从未完成步骤继续。")
                     elif value == "0" and self.active_command in {"preflight", "data-check"}:
                         payload = self.last_complete_payload or {"kind": "complete", "stage": self.active_command}
                         self.preflight_passed = True
                         pending_candidates = sum(len(values) for values in self.project_candidates.values())
                         self.data_status.set("已扫描，存在待确认项" if pending_candidates else "数据已就绪")
-                        self.run_button.state(["!disabled"])
+                        self._set_task_start_buttons_enabled(True)
                         self.status.set(self._friendly(payload))
                         self.run_status.set(self._friendly(payload))
                         self.preflight_summary.set("所有阻断性检查均已通过，可以开始处理。")
@@ -1340,7 +1344,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                         self._show_step(3, force=True)
                     elif value == "0" and self.active_command in {
                         "extract-project-period", "extract-project-all", "change-project-periods", "change",
-                        "rerun-period", "rerun-change", "rerun-all-periods",
+                        "rerun-period", "rerun-change", "rerun-all-periods", "rerun-all-changes",
                     }:
                         labels = {
                             "extract-project-period": "所选期次道路提取已完成。",
@@ -1350,9 +1354,16 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                             "rerun-period": "所选期次已按指定范围重跑完成。",
                             "rerun-change": "所选变化对已重跑完成。",
                             "rerun-all-periods": "全部道路提取已按依赖顺序批量重跑完成。",
+                            "rerun-all-changes": "全部相邻变化对已批量重跑完成。",
                         }
-                        self.status.set(labels[self.active_command])
-                        self.run_status.set(labels[self.active_command])
+                        failure_count = int((self.last_complete_payload or {}).get("failure_count", 0) or 0)
+                        message = (
+                            f"批量变化检测已完成，其中 {failure_count} 个变化对失败；其他结果已更新。"
+                            if self.active_command == "rerun-all-changes" and failure_count
+                            else labels[self.active_command]
+                        )
+                        self.status.set(message)
+                        self.run_status.set(message)
                         self._show_step(1, force=True)
                     elif value == "0":
                         failure_count = int((self.last_complete_payload or {}).get("failure_count", 0) or 0)
@@ -1374,7 +1385,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                     self.process = None
                     self.task_started_monotonic = None
                     self.active_command = ""
-                    self.run_button.state(["!disabled"])
+                    self._set_task_start_buttons_enabled(True)
                     self.preflight_button.state(["!disabled"])
                     self._set_stage_buttons_enabled(True)
                     if hasattr(self, "apply_review_button"):
@@ -1389,7 +1400,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
                     self.process = None
                     self.task_started_monotonic = None
                     self.active_command = ""
-                    self.run_button.state(["!disabled"])
+                    self._set_task_start_buttons_enabled(True)
                     self.preflight_button.state(["!disabled"])
                     self._set_stage_buttons_enabled(True)
                     if hasattr(self, "apply_review_button"):
