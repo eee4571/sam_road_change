@@ -1,11 +1,13 @@
 ---
-name: samroadchange-incremental
-description: Use for routine SamRoadChange code changes, Tkinter GUI adjustments, debugging, and focused refactors that should preserve the existing architecture and build on the current working-tree context without rescanning the whole repository.
+name: samroadchange-development
+description: Use for SamRoadChange code changes, debugging, refactors, module rewrites, and architecture adjustments that should acquire only the necessary repository context while choosing an implementation strategy based on the requested outcome rather than preserving legacy code by default.
 ---
 
-# SamRoadChange Incremental Development
+# SamRoadChange Development Context
 
-Work incrementally from the repository's current state. Keep the task boundary narrow, preserve local edits, and avoid rebuilding repository context that is already documented or visible in the diff.
+Use the smallest necessary repository context to understand the task, then choose the implementation strategy that best fits the requested outcome and the quality of the current design.
+
+Minimize context acquisition, not implementation quality. The current codebase is context, not a constraint. Do not assume that preserving the existing implementation is desirable.
 
 ## Start with repository context
 
@@ -33,7 +35,45 @@ For GUI-only layout, wording, styling, or widget changes, default to the relevan
 
 Before changing anything under `code/gui/`, follow the applicable `code/gui/AGENTS.md` instructions, loading that file only when they are not already available. If it is absent, follow the applicable root instructions.
 
-## Preserve project boundaries
+Do not recursively scan `runtime/`, `project/`, model directories, output directories, or unrelated engine modules merely to build general context.
+
+## Choose the modification strategy
+
+After locating the relevant implementation and necessary call chain, select the strategy according to the problem rather than defaulting to a local patch.
+
+### Local patch
+
+Use a local patch when the current design is sound, the problem is genuinely local, and the change does not introduce extra branches or duplicated responsibilities.
+
+### Focused refactor
+
+Use a focused refactor when the relevant code has clear duplication, excessive conditionals, misplaced responsibilities, or an internal interface that obstructs the requested behavior. Update direct callers together when that produces a clearer result.
+
+### Module rewrite
+
+Rewrite a module when its core approach no longer fits the requirement, when fallback or heuristic layers have made it harder to change than replace, or when the old implementation is itself the source of recurring complexity. It is acceptable to remove the obsolete implementation and replace it with a clearer one.
+
+### Architectural change
+
+Make an architectural change when the user requests redesign, the current data flow materially blocks the outcome, or preserving it would require adapters, bridges, duplicate pipelines, or parallel execution paths. Keep changes scoped to the affected architecture and preserve genuine project responsibility boundaries.
+
+## Prevent compatibility-layer accumulation
+
+Historical implementation is not a requirement. Unless the user explicitly requires backward compatibility or the behavior belongs to a stable external interface, do not preserve legacy internal behavior by adding:
+
+- compatibility branches or legacy fallbacks;
+- wrappers, adapters, or bridges around an obsolete design;
+- parallel or duplicated processing pipelines;
+- special-mode patches;
+- additional heuristic layers.
+
+Prefer removing, simplifying, merging, refactoring, or replacing obsolete logic over stacking another compatibility layer. If an existing internal interface or implementation causes unnecessary complexity, refactor it and its direct callers instead of building another abstraction around it.
+
+Preserve backward compatibility for stable external interfaces and user-requested contracts. Internal interfaces may change when they obstruct a clear implementation, provided their affected callers and tests are updated consistently.
+
+When the user says “重新设计”, “重新实现”, “重构”, “推翻当前实现”, “不要兼容旧逻辑”, “重新考虑这个模块”, “现在的方案不合理”, “不要继续打补丁”, or an equivalent phrase, treat it as explicit authorization to delete or replace the relevant internal implementation. Do not respond by retaining it behind another fallback or compatibility path.
+
+## Preserve responsibility boundaries
 
 Keep the existing dependency direction:
 
@@ -46,15 +86,7 @@ GUI → app → backend → user_pipeline → engine
 - Backend and pipeline code orchestrate processing.
 - Engine modules contain algorithm implementations.
 
-Reuse existing interfaces and managers before introducing new paths between layers. Do not add `GUI → user_pipeline` or `GUI → engine` coupling. Avoid unrelated refactors, interface changes, file moves, or formatting churn.
-
-## Make focused changes
-
-- Base edits on the current diff and nearby code conventions.
-- Change only what is required for the requested outcome.
-- Preserve backward compatibility, task recovery, and existing behavior outside the task boundary.
-- When debugging, establish a focused reproduction or evidence trail before editing.
-- If the necessary fix expands into another layer, explain why and inspect only the relevant entry point in that layer.
+Do not add `GUI → user_pipeline` or `GUI → engine` coupling. Within these layers, files, functions, internal interfaces, and implementations may be reorganized, consolidated, split, or rewritten when justified by the selected strategy.
 
 ## Verify proportionally
 
@@ -62,10 +94,10 @@ After editing:
 
 1. Run syntax or import checks for the changed modules when applicable.
 2. Run the smallest relevant test file or focused test cases.
-3. Expand testing only when the observed impact justifies it.
+3. Expand testing according to the actual impact of a refactor, rewrite, or interface change.
 4. Inspect `git diff --stat` and the final diff for unintended edits, formatting churn, and overlap with user changes.
 
-Do not default to the full test suite, model inference, or end-to-end remote-sensing workflows for a local GUI or narrowly scoped code change.
+Do not default to the full test suite, model inference, or end-to-end remote-sensing workflows when they are unrelated to the affected behavior.
 
 ## Report the result
 
