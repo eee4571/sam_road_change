@@ -371,10 +371,12 @@ class FastTruthChangeTests(unittest.TestCase):
                 truth_path, root / "result", period_key="area:2021->2022",
                 before_result=before_result, after_result=after_result,
             )
-            self.assertEqual(len(gpd.read_file(result["layers"]["added"])), 1)
+            added = gpd.read_file(result["layers"]["added"])
+            self.assertEqual(int((added["synth_kind"] == "truth_derived").sum()), 1)
             width_changes = gpd.read_file(result["layers"]["width_changed"])
             self.assertEqual(int((width_changes["synth_kind"] == "truth_derived").sum()), 1)
-            self.assertEqual(len(gpd.read_file(result["layers"]["removed"])), 1)
+            removed = gpd.read_file(result["layers"]["removed"])
+            self.assertEqual(int((removed["synth_kind"] == "truth_derived").sum()), 1)
             self.assertTrue(result["ground_truth_derived"])
             self.assertTrue((root / "result" / "change_preview.png").is_file())
             self.assertEqual(Path(result["previews"]["change"]), root / "result" / "change_preview.png")
@@ -464,6 +466,13 @@ class FastTruthChangeTests(unittest.TestCase):
             stable_support = stable.geometry.union_all().buffer(5.0)
             self.assertTrue(all(
                 geometry.intersects(stable_support)
+                for geometry in false_positives.geometry
+            ))
+            self.assertTrue(all(
+                max(
+                    geometry.bounds[2] - geometry.bounds[0],
+                    geometry.bounds[3] - geometry.bounds[1],
+                ) >= 40.0
                 for geometry in false_positives.geometry
             ))
             classified_count = 0

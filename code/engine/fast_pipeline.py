@@ -34,6 +34,8 @@ FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
 FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN = 0.25
 FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MAX = 0.33
+FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M = 40.0
+FAST_CHANGE_FALSE_POSITIVE_MAX_COUNT = 8
 FAST_CHANGE_SHIFT_MAX_PX = 3.0
 FAST_CHANGE_BUFFER_JITTER_PX = 1.5
 FAST_CHANGE_TYPE_ERROR_PROB = 0.15
@@ -1618,6 +1620,7 @@ def _stable_road_false_positives(
     after_centerlines: gpd.GeoDataFrame,
     source_changes: gpd.GeoDataFrame,
     retained_changes: gpd.GeoDataFrame,
+    truth_axes: gpd.GeoDataFrame,
     *,
     truth_support,
     pixel_size: float,
@@ -1647,61 +1650,114 @@ def _stable_road_false_positives(
     stable_fp_area_budget = target_total_fp_area
     if stable_fp_area_budget <= 1e-9:
         return _empty_like(source_changes), target_total_fp_area
-    tolerance = FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX * pixel_size
+    tolerance = max(
+        3.0,
+        FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX * pixel_size,
+    )
     after_support = after_centerlines.geometry.union_all().buffer(tolerance)
-    excluded = truth_support.buffer(max(pixel_size, 1e-6))
+    before_network = before_centerlines.geometry.union_all()
+    merged_before = (
+        before_network
+        if before_network.geom_type in {"LineString", "LinearRing"}
+        else linemerge(before_network)
+    )
+    reliable_widths = [
+        _fast_width_value(row)
+        for _index, row in before_centerlines.iterrows()
+        if _fast_width_value(row) > 0
+    ]
+    representative_width = max(
+        float(np.median(reliable_widths)) if reliable_widths else 0.0,
+        2.0 * pixel_size,
+    )
+    truth_widths = []
+    if not truth_axes.empty:
+        axis_lengths = {
+            str(truth_fid): float(group.geometry.union_all().length)
+            for truth_fid, group in truth_axes.groupby("truth_fid")
+        }
+        truth_widths = [
+            float(row.geometry.area) / axis_lengths[str(row["truth_fid"])]
+            for _index, row in source_changes.iterrows()
+            if axis_lengths.get(str(row["truth_fid"]), 0.0) > 0
+        ]
+    if truth_widths:
+        representative_width = max(
+            representative_width,
+            float(np.median(truth_widths)),
+        )
     candidates = []
-    for _index, row in before_centerlines.iterrows():
-        geometry = row.geometry
+    for geometry in _fast_line_parts(merged_before):
         if _fast_line_coverage(geometry, after_support) < FAST_CHANGE_STABLE_ROAD_COVERAGE:
             continue
-        stable_part = geometry.intersection(after_support).difference(excluded)
-        for part in _fast_line_parts(stable_part):
-            if float(part.length) >= 12.0 * pixel_size:
-                candidates.append((part, max(_fast_width_value(row), 2.0 * pixel_size)))
+        if float(geometry.length) >= FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M:
+            candidates.append((geometry, representative_width))
     if not candidates:
         return _empty_like(source_changes), target_total_fp_area
     order = np.asarray(rng.permutation(len(candidates)), dtype=int).tolist()
-    truth_lengths = [
-        max(float(maxx - minx), float(maxy - miny))
-        for minx, miny, maxx, maxy in source_changes.geometry.bounds.to_numpy()
-    ]
+    order.sort(key=lambda index: float(candidates[index][0].length), reverse=True)
+    truth_lengths = []
+    if not truth_axes.empty:
+        truth_lengths = [
+            float(group.geometry.union_all().length)
+            for _truth_fid, group in truth_axes.groupby("truth_fid")
+            if float(group.geometry.union_all().length) > 0
+        ]
+    if not truth_lengths:
+        truth_lengths = [
+            max(float(maxx - minx), float(maxy - miny))
+            for minx, miny, maxx, maxy in source_changes.geometry.bounds.to_numpy()
+        ]
     typical_length = max(
-        12.0 * pixel_size,
-        float(np.median(truth_lengths)) if truth_lengths else 24.0 * pixel_size,
+        FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+        float(np.median(truth_lengths))
+        if truth_lengths else FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
     )
     records = []
     created_support = None
     created_area = 0.0
-    max_attempts = max(40, len(candidates) * 12)
-    for output_index in range(max_attempts):
-        if created_area >= 0.98 * stable_fp_area_budget:
+    median_width = float(np.median([width for _line, width in candidates]))
+    expected_segment_area = max(typical_length * median_width, 1e-9)
+    max_output_count = min(
+        FAST_CHANGE_FALSE_POSITIVE_MAX_COUNT,
+        max(1, int(np.ceil(stable_fp_area_budget / expected_segment_area)) + 1),
+    )
+    for candidate_index in order:
+        if len(records) >= max_output_count or created_area >= 0.90 * stable_fp_area_budget:
             break
-        line, width = candidates[order[output_index % len(order)]]
+        line, width = candidates[candidate_index]
         length = float(line.length)
         remaining_area = max(0.0, stable_fp_area_budget - created_area)
-        scale_length = typical_length * float(rng.uniform(0.75, 1.25))
-        area_length = remaining_area / max(width, 2.0 * pixel_size)
-        minimum_segment_length = min(
-            length,
-            max(3.0 * pixel_size, min(12.0 * pixel_size, typical_length * 0.25)),
+        reference_length = max(
+            FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+            float(rng.choice(truth_lengths)) * float(rng.uniform(0.85, 1.15)),
         )
-        if area_length < minimum_segment_length:
-            break
+        budget_length = remaining_area / max(width, 2.0 * pixel_size)
         segment_length = min(
             length,
-            max(minimum_segment_length, min(scale_length, area_length)),
+            max(
+                FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_M,
+                min(reference_length * 1.5, max(reference_length, budget_length)),
+            ),
         )
         start = float(rng.uniform(0.0, max(0.0, length - segment_length)))
         segment = substring(line, start, start + segment_length)
         polygon = segment.buffer(
             max(width / 2.0, pixel_size), cap_style="flat",
-        ).difference(excluded)
-        if created_support is not None:
-            polygon = polygon.difference(created_support)
-        polygon = make_valid(polygon)
+        )
         if polygon.is_empty:
             continue
+        polygon_area = float(polygon.area)
+        truth_overlap_ratio = float(polygon.intersection(truth_support).area) / polygon_area
+        existing_overlap_ratio = (
+            float(polygon.intersection(created_support).area) / polygon_area
+            if created_support is not None else 0.0
+        )
+        if truth_overlap_ratio > 0.05 or existing_overlap_ratio > 0.10:
+            continue
+        if records and created_area + polygon_area > 1.20 * stable_fp_area_budget:
+            continue
+        polygon = make_valid(polygon)
         records.append({
             source_changes.geometry.name: polygon,
             "change_typ": ("added", "width_changed", "removed")[
@@ -1772,6 +1828,7 @@ def _build_fast_truth_synthetic_geometry(
         after_centerlines,
         source_changes,
         changes,
+        truth_axes,
         truth_support=truth_support,
         pixel_size=pixel_size,
         period_key=period_key,
