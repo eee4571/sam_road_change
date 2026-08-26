@@ -17,7 +17,7 @@ import rasterio
 from rasterio.features import shapes
 from shapely import make_valid
 from shapely.affinity import translate
-from shapely.geometry import LineString, shape
+from shapely.geometry import LineString, box, shape
 from shapely.ops import linemerge
 
 
@@ -32,10 +32,18 @@ FAST_SMALL_LOOP_LENGTH_PX = 24.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
-FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.02
-FAST_CHANGE_SHIFT_MAX_PX = 1.5
-FAST_CHANGE_BUFFER_JITTER_PX = 1.0
-FAST_CHANGE_TYPE_ERROR_PROB = 0.03
+FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.20
+FAST_CHANGE_SHIFT_MAX_PX = 3.0
+FAST_CHANGE_BUFFER_JITTER_PX = 1.5
+FAST_CHANGE_TYPE_ERROR_PROB = 0.15
+FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
+FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN = 2.0
+FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX = 4.0
+FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET = 0.18
+FAST_CHANGE_FALSE_POSITIVE_AREA_MAX = 0.25
+FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
+FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
+FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
 FAST_CHANGE_MIN_AREA_M2 = 4.0
 FAST_CHANGE_MIN_LENGTH_M = 50.0
 FAST_CHANGE_CANDIDATE_COVERAGE = 0.12
@@ -1047,17 +1055,55 @@ def _fast_change_local_seed(global_seed: int, period_key: str, change_type: str)
     return int.from_bytes(digest[:8], "big", signed=False) % (2**31 - 1)
 
 
+def _degrade_fast_change_geometry(
+    geometry,
+    rng: np.random.Generator,
+):
+    """Remove a short end section while keeping the retained polygon coherent."""
+    if geometry.geom_type not in {"Polygon", "MultiPolygon"} or geometry.is_empty:
+        return geometry
+    minx, miny, maxx, maxy = geometry.bounds
+    width = float(maxx - minx)
+    height = float(maxy - miny)
+    if max(width, height) <= 1e-9:
+        return geometry
+    retain_fraction = float(rng.uniform(
+        FAST_CHANGE_GEOMETRY_RETAIN_MIN,
+        FAST_CHANGE_GEOMETRY_RETAIN_MAX,
+    ))
+    retain_low_end = bool(rng.integers(0, 2))
+    if width >= height:
+        split = minx + width * retain_fraction
+        clip = (
+            box(minx, miny, split, maxy)
+            if retain_low_end else
+            box(maxx - width * retain_fraction, miny, maxx, maxy)
+        )
+    else:
+        split = miny + height * retain_fraction
+        clip = (
+            box(minx, miny, maxx, split)
+            if retain_low_end else
+            box(minx, maxy - height * retain_fraction, maxx, maxy)
+        )
+    degraded = make_valid(geometry.intersection(clip))
+    return geometry if degraded.is_empty else degraded
+
+
 def _jitter_fast_change_geometry(geometry, rng: np.random.Generator):
     angle = float(rng.uniform(0.0, 2.0 * np.pi))
-    distance = float(rng.uniform(0.0, FAST_CHANGE_SHIFT_MAX_PX))
+    distance = float(
+        FAST_CHANGE_SHIFT_MAX_PX * rng.beta(1.0, 4.0)
+    )
     shifted = translate(
         geometry,
         xoff=float(np.cos(angle) * distance),
         yoff=float(np.sin(angle) * distance),
     )
     if shifted.geom_type in {"Polygon", "MultiPolygon"}:
-        distance = float(rng.uniform(
+        distance = float(rng.triangular(
             -FAST_CHANGE_BUFFER_JITTER_PX,
+            0.0,
             FAST_CHANGE_BUFFER_JITTER_PX,
         ))
         buffered = shifted.buffer(distance)
@@ -1066,42 +1112,145 @@ def _jitter_fast_change_geometry(geometry, rng: np.random.Generator):
     return make_valid(shifted)
 
 
+def _select_fast_change_positions(
+    positions: list[int],
+    geometries: gpd.GeoSeries,
+    *,
+    target_count: int,
+    measure_budget_ratio: float,
+    measure_scale: float,
+    rng: np.random.Generator,
+    target_measure_ratio: float | None = None,
+) -> set[int]:
+    """Randomly select objects without letting a few large polygons dominate."""
+    if target_count <= 0 or not positions:
+        return set()
+    measures = {
+        position: _fast_change_geometry_measure(geometries.iloc[position])
+        for position in positions
+    }
+    total_measure = float(sum(measures.values()))
+    if total_measure <= 1e-9:
+        chosen = rng.choice(
+            positions, size=min(target_count, len(positions)), replace=False,
+        )
+        return set(np.asarray(chosen, dtype=int).reshape(-1).tolist())
+    budget = total_measure * max(0.0, float(measure_budget_ratio))
+    if target_measure_ratio is not None:
+        best_positions: set[int] = set()
+        best_distance = float("inf")
+        sample_size = min(target_count, len(positions))
+        target_measure = total_measure * max(0.0, float(target_measure_ratio))
+        for _attempt in range(64):
+            sample = set(np.asarray(
+                rng.choice(positions, size=sample_size, replace=False),
+                dtype=int,
+            ).reshape(-1).tolist())
+            sample_measure = sum(
+                measures[position] * max(0.0, float(measure_scale))
+                for position in sample
+            )
+            if sample_measure <= budget + 1e-9:
+                distance = abs(sample_measure - target_measure)
+                if distance < best_distance:
+                    best_positions = sample
+                    best_distance = distance
+        if best_positions:
+            return best_positions
+    selected: set[int] = set()
+    used_measure = 0.0
+    for position in np.asarray(rng.permutation(positions), dtype=int).tolist():
+        cost = measures[position] * max(0.0, float(measure_scale))
+        if used_measure + cost <= budget + 1e-9:
+            selected.add(position)
+            used_measure += cost
+            if len(selected) >= target_count:
+                break
+    return selected
+
+
+def _fast_change_geometry_measure(geometry) -> float:
+    """Use polygon area, falling back to line length for completeness accounting."""
+    area = max(float(geometry.area), 0.0)
+    return area if area > 1e-9 else max(float(geometry.length), 0.0)
+
+
 def _pseudo_fast_change_type(
     source: gpd.GeoDataFrame,
     *,
     period_key: str,
     change_type: str,
     global_seed: int,
+    truth_support,
 ) -> gpd.GeoDataFrame:
     local_seed = _fast_change_local_seed(global_seed, period_key, change_type)
     rng = np.random.default_rng(local_seed)
+    source_measure = float(sum(
+        _fast_change_geometry_measure(geometry) for geometry in source.geometry
+    ))
+    retained_measure = 0.0
+    retained_truth_count = 0
+    false_positive_output_count = 0
     if source.empty:
         result = _empty_like(source)
     else:
-        keep = rng.random(len(source)) >= FAST_CHANGE_MISS_PROB
-        if not np.any(keep):
-            keep[int(rng.integers(0, len(source)))] = True
-        kept_positions = np.flatnonzero(keep).tolist()
+        all_positions = list(range(len(source)))
+        miss_count = int(np.floor(
+            len(source) * FAST_CHANGE_MISS_PROB + 0.5
+        ))
+        missed_positions = _select_fast_change_positions(
+            all_positions,
+            source.geometry,
+            target_count=miss_count,
+            measure_budget_ratio=FAST_CHANGE_MISS_PROB,
+            measure_scale=1.0,
+            rng=rng,
+        )
+        kept_positions = [
+            position for position in all_positions
+            if position not in missed_positions
+        ]
         type_error_positions: set[int] = set()
         if change_type in {"added", "width_changed", "removed"}:
-            type_error_count = int(np.floor(
-                len(kept_positions) * FAST_CHANGE_TYPE_ERROR_PROB + 0.5
+            type_error_count = int(np.ceil(
+                len(kept_positions) * FAST_CHANGE_TYPE_ERROR_PROB
             ))
             if len(source) >= 10 and kept_positions:
                 type_error_count = max(1, type_error_count)
             if type_error_count:
-                type_error_positions = set(np.asarray(
-                    rng.choice(
-                        kept_positions,
-                        size=min(type_error_count, len(kept_positions)),
-                        replace=False,
-                    ),
-                ).reshape(-1).tolist())
+                type_error_positions = _select_fast_change_positions(
+                    kept_positions,
+                    source.geometry,
+                    target_count=type_error_count,
+                    measure_budget_ratio=FAST_CHANGE_TYPE_ERROR_AREA_MAX,
+                    measure_scale=1.0,
+                    rng=rng,
+                    target_measure_ratio=FAST_CHANGE_TYPE_ERROR_PROB,
+                )
+        geometry_degrade_count = int(np.floor(
+            len(kept_positions) * FAST_CHANGE_GEOMETRY_DEGRADE_PROB + 0.5
+        ))
+        geometry_degrade_positions = _select_fast_change_positions(
+            kept_positions,
+            source.geometry,
+            target_count=geometry_degrade_count,
+            measure_budget_ratio=(
+                FAST_CHANGE_GEOMETRY_DEGRADE_PROB
+                * (1.0 - FAST_CHANGE_GEOMETRY_RETAIN_MIN)
+            ),
+            measure_scale=1.0 - FAST_CHANGE_GEOMETRY_RETAIN_MIN,
+            rng=rng,
+        )
         records = []
         for position in kept_positions:
             row = source.iloc[position].to_dict()
+            degraded = source.geometry.iloc[position]
+            if position in geometry_degrade_positions:
+                degraded = _degrade_fast_change_geometry(degraded, rng)
+            retained_measure += _fast_change_geometry_measure(degraded)
+            retained_truth_count += 1
             row[source.geometry.name] = _jitter_fast_change_geometry(
-                source.geometry.iloc[position], rng,
+                degraded, rng,
             )
             predicted_type = str(change_type)
             if position in type_error_positions:
@@ -1111,28 +1260,60 @@ def _pseudo_fast_change_type(
                 ]
                 predicted_type = alternatives[int(rng.integers(0, len(alternatives)))]
             row["change_typ"] = predicted_type
+            row["synth_kind"] = "truth_derived"
             records.append(row)
 
         false_positive_count = int(np.floor(
             len(source) * FAST_CHANGE_FALSE_POSITIVE_RATIO + 0.5
         ))
-        for _ in range(false_positive_count):
-            position = int(rng.integers(0, len(source)))
+        false_positive_positions = _select_fast_change_positions(
+            all_positions,
+            source.geometry,
+            target_count=false_positive_count,
+            measure_budget_ratio=FAST_CHANGE_FALSE_POSITIVE_AREA_MAX,
+            measure_scale=1.0,
+            rng=rng,
+            target_measure_ratio=FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET,
+        )
+        for position in sorted(false_positive_positions):
             row = source.iloc[position].to_dict()
             geometry = source.geometry.iloc[position]
             angle = float(rng.uniform(0.0, 2.0 * np.pi))
             distance = float(rng.uniform(
-                FAST_CHANGE_SHIFT_MAX_PX,
-                2.0 * FAST_CHANGE_SHIFT_MAX_PX,
+                FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN * FAST_CHANGE_SHIFT_MAX_PX,
+                FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX * FAST_CHANGE_SHIFT_MAX_PX,
             ))
-            nearby = translate(
-                geometry,
-                xoff=float(np.cos(angle) * distance),
-                yoff=float(np.sin(angle) * distance),
+            minx, miny, maxx, maxy = geometry.bounds
+            clearance_step = max(
+                0.5 * float(max(maxx - minx, maxy - miny)),
+                FAST_CHANGE_SHIFT_MAX_PX,
             )
-            row[source.geometry.name] = _jitter_fast_change_geometry(nearby, rng)
-            row["change_typ"] = str(change_type)
+            nearby = geometry
+            for _attempt in range(6):
+                nearby = translate(
+                    geometry,
+                    xoff=float(np.cos(angle) * distance),
+                    yoff=float(np.sin(angle) * distance),
+                )
+                nearby_measure = _fast_change_geometry_measure(nearby)
+                outside_measure = _fast_change_geometry_measure(
+                    nearby.difference(truth_support)
+                )
+                if outside_measure >= 0.80 * nearby_measure:
+                    break
+                distance += clearance_step
+            false_positive = make_valid(
+                _jitter_fast_change_geometry(nearby, rng).difference(truth_support)
+            )
+            if false_positive.is_empty:
+                continue
+            row[source.geometry.name] = false_positive
+            row["change_typ"] = (
+                "added", "width_changed", "removed",
+            )[int(rng.integers(0, 3))]
+            row["synth_kind"] = "false_positive"
             records.append(row)
+            false_positive_output_count += 1
         result = gpd.GeoDataFrame(
             records,
             geometry=source.geometry.name,
@@ -1145,6 +1326,13 @@ def _pseudo_fast_change_type(
     result["source"] = "synthetic_from_truth"
     result["seed"] = int(local_seed)
     result["change_src"] = "synthetic_from_truth"
+    result.attrs["synthetic_metrics"] = {
+        "truth_feature_count": int(len(source)),
+        "retained_truth_feature_count": int(retained_truth_count),
+        "false_positive_feature_count": int(false_positive_output_count),
+        "truth_geometry_measure": source_measure,
+        "retained_truth_geometry_measure": retained_measure,
+    }
     return result
 
 
@@ -1189,6 +1377,14 @@ def build_fast_change_from_truth(
     source_changes = truth.loc[truth["change_typ"].isin(selected_types)].copy()
     output_dir.mkdir(parents=True, exist_ok=True)
     pseudo_frames = []
+    truth_support = source_changes.geometry.union_all()
+    synthetic_metrics = {
+        "truth_feature_count": 0,
+        "retained_truth_feature_count": 0,
+        "false_positive_feature_count": 0,
+        "truth_geometry_measure": 0.0,
+        "retained_truth_geometry_measure": 0.0,
+    }
     for type_name in ("added", "removed", "width_changed", "widened", "narrowed"):
         typed_source = source_changes.loc[source_changes["change_typ"] == type_name].copy()
         pseudo = _pseudo_fast_change_type(
@@ -1196,7 +1392,10 @@ def build_fast_change_from_truth(
             period_key=period_key,
             change_type=type_name,
             global_seed=global_seed,
+            truth_support=truth_support,
         )
+        for metric, value in pseudo.attrs.get("synthetic_metrics", {}).items():
+            synthetic_metrics[metric] += value
         pseudo["before_per"] = str(before_period)
         pseudo["after_per"] = str(after_period)
         pseudo_frames.append(pseudo)
@@ -1227,11 +1426,42 @@ def build_fast_change_from_truth(
         frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
         frame.to_file(gpkg, layer="road_changes" if name == "changes" else name, driver="GPKG", mode="w" if index == 0 else "a")
         output_layers[name] = str(target.resolve())
+    truth_geometry_measure = float(synthetic_metrics["truth_geometry_measure"])
+    retained_geometry_measure = float(
+        synthetic_metrics["retained_truth_geometry_measure"]
+    )
+    extraction_completeness = (
+        retained_geometry_measure / truth_geometry_measure
+        if truth_geometry_measure > 0 else 1.0
+    )
     summary = {
         "execution_profile": "fast", "change_source": "synthetic_from_truth",
         "ground_truth_derived": True, "change_output_mode": "fast_synthetic_from_truth",
         "period_key": str(period_key), "global_seed": int(global_seed),
+        "miss_probability": FAST_CHANGE_MISS_PROB,
+        "false_positive_ratio": FAST_CHANGE_FALSE_POSITIVE_RATIO,
+        "false_positive_distance_min_px": (
+            FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN * FAST_CHANGE_SHIFT_MAX_PX
+        ),
+        "false_positive_distance_max_px": (
+            FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX * FAST_CHANGE_SHIFT_MAX_PX
+        ),
+        "false_positive_area_target": FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET,
+        "false_positive_area_max": FAST_CHANGE_FALSE_POSITIVE_AREA_MAX,
+        "shift_max_px": FAST_CHANGE_SHIFT_MAX_PX,
+        "buffer_jitter_px": FAST_CHANGE_BUFFER_JITTER_PX,
         "type_error_probability": FAST_CHANGE_TYPE_ERROR_PROB,
+        "type_error_area_max": FAST_CHANGE_TYPE_ERROR_AREA_MAX,
+        "geometry_degrade_probability": FAST_CHANGE_GEOMETRY_DEGRADE_PROB,
+        "geometry_retain_min": FAST_CHANGE_GEOMETRY_RETAIN_MIN,
+        "geometry_retain_max": FAST_CHANGE_GEOMETRY_RETAIN_MAX,
+        "change_road_extraction_completeness": float(extraction_completeness),
+        "change_road_extraction_completeness_definition": (
+            "retained truth-derived geometry area (line length fallback) / "
+            "source truth geometry area (line length fallback)"
+        ),
+        "synthetic_offset_unit": "pixel",
+        **synthetic_metrics,
         "automatic_result": False,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }

@@ -37,6 +37,7 @@ from engine.fast_pipeline import (
     _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
+    _degrade_fast_change_geometry,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
     _trace_skeleton_paths,
@@ -330,6 +331,9 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertTrue(result["ground_truth_derived"])
             self.assertTrue((root / "result" / "change_preview.png").is_file())
             self.assertEqual(Path(result["previews"]["change"]), root / "result" / "change_preview.png")
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            self.assertGreater(summary["change_road_extraction_completeness"], 0.70)
+            self.assertEqual(summary["synthetic_offset_unit"], "pixel")
 
     def test_fast_truth_result_uses_existing_evaluation_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -389,13 +393,31 @@ class FastTruthChangeTests(unittest.TestCase):
                 second_frame.geometry.to_wkb().tolist(),
             )
             combined = first_frame
-            self.assertEqual(int((combined["change_typ"] != "added").sum()), 1)
+            self.assertGreaterEqual(int((combined["change_typ"] != "added").sum()), 3)
+            false_positives = combined.loc[combined["synth_kind"] == "false_positive"]
+            self.assertGreater(len(false_positives), 0)
+            truth_support = truth.geometry.union_all()
+            self.assertTrue(all(
+                geometry.intersection(truth_support).area <= 1e-8
+                for geometry in false_positives.geometry
+            ))
             classified_count = 0
             for type_name in ("added", "width_changed", "removed"):
                 classified = gpd.read_file(first["layers"][type_name])
                 self.assertTrue(classified.empty or (classified["change_typ"] == type_name).all())
                 classified_count += len(classified)
             self.assertEqual(classified_count, len(combined))
+
+    def test_synthetic_geometry_degradation_keeps_one_coherent_partial_shape(self) -> None:
+        source = box(0, 0, 100, 10)
+        degraded = _degrade_fast_change_geometry(
+            source, np.random.default_rng(20260826),
+        )
+        retained_ratio = float(degraded.area / source.area)
+        self.assertGreaterEqual(retained_ratio, 0.75)
+        self.assertLessEqual(retained_ratio, 0.90)
+        self.assertEqual(degraded.geom_type, "Polygon")
+        self.assertTrue(source.covers(degraded))
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
