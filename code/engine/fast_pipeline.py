@@ -18,7 +18,7 @@ from rasterio.features import shapes
 from shapely import make_valid
 from shapely.affinity import translate
 from shapely.geometry import LineString, box, shape
-from shapely.ops import linemerge
+from shapely.ops import linemerge, substring
 
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
@@ -32,7 +32,7 @@ FAST_SMALL_LOOP_LENGTH_PX = 24.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
-FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.20
+FAST_CHANGE_FALSE_POSITIVE_RATIO = 0.25
 FAST_CHANGE_SHIFT_MAX_PX = 3.0
 FAST_CHANGE_BUFFER_JITTER_PX = 1.5
 FAST_CHANGE_TYPE_ERROR_PROB = 0.15
@@ -44,6 +44,11 @@ FAST_CHANGE_FALSE_POSITIVE_AREA_MAX = 0.25
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
+FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
+FAST_CHANGE_CENTERLINE_RETAIN_MAX = 0.86
+FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
+FAST_CHANGE_STABLE_ROAD_COVERAGE = 0.80
+FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX = 4.0
 FAST_CHANGE_MIN_AREA_M2 = 4.0
 FAST_CHANGE_MIN_LENGTH_M = 50.0
 FAST_CHANGE_CANDIDATE_COVERAGE = 0.12
@@ -1181,7 +1186,6 @@ def _pseudo_fast_change_type(
     period_key: str,
     change_type: str,
     global_seed: int,
-    truth_support,
 ) -> gpd.GeoDataFrame:
     local_seed = _fast_change_local_seed(global_seed, period_key, change_type)
     rng = np.random.default_rng(local_seed)
@@ -1195,9 +1199,7 @@ def _pseudo_fast_change_type(
         result = _empty_like(source)
     else:
         all_positions = list(range(len(source)))
-        miss_count = int(np.floor(
-            len(source) * FAST_CHANGE_MISS_PROB + 0.5
-        ))
+        miss_count = int(np.floor(len(source) * FAST_CHANGE_MISS_PROB))
         missed_positions = _select_fast_change_positions(
             all_positions,
             source.geometry,
@@ -1212,7 +1214,7 @@ def _pseudo_fast_change_type(
         ]
         type_error_positions: set[int] = set()
         if change_type in {"added", "width_changed", "removed"}:
-            type_error_count = int(np.ceil(
+            type_error_count = int(np.floor(
                 len(kept_positions) * FAST_CHANGE_TYPE_ERROR_PROB
             ))
             if len(source) >= 10 and kept_positions:
@@ -1261,59 +1263,8 @@ def _pseudo_fast_change_type(
                 predicted_type = alternatives[int(rng.integers(0, len(alternatives)))]
             row["change_typ"] = predicted_type
             row["synth_kind"] = "truth_derived"
+            row["truth_fid"] = str(source.iloc[position]["truth_fid"])
             records.append(row)
-
-        false_positive_count = int(np.floor(
-            len(source) * FAST_CHANGE_FALSE_POSITIVE_RATIO + 0.5
-        ))
-        false_positive_positions = _select_fast_change_positions(
-            all_positions,
-            source.geometry,
-            target_count=false_positive_count,
-            measure_budget_ratio=FAST_CHANGE_FALSE_POSITIVE_AREA_MAX,
-            measure_scale=1.0,
-            rng=rng,
-            target_measure_ratio=FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET,
-        )
-        for position in sorted(false_positive_positions):
-            row = source.iloc[position].to_dict()
-            geometry = source.geometry.iloc[position]
-            angle = float(rng.uniform(0.0, 2.0 * np.pi))
-            distance = float(rng.uniform(
-                FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN * FAST_CHANGE_SHIFT_MAX_PX,
-                FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX * FAST_CHANGE_SHIFT_MAX_PX,
-            ))
-            minx, miny, maxx, maxy = geometry.bounds
-            clearance_step = max(
-                0.5 * float(max(maxx - minx, maxy - miny)),
-                FAST_CHANGE_SHIFT_MAX_PX,
-            )
-            nearby = geometry
-            for _attempt in range(6):
-                nearby = translate(
-                    geometry,
-                    xoff=float(np.cos(angle) * distance),
-                    yoff=float(np.sin(angle) * distance),
-                )
-                nearby_measure = _fast_change_geometry_measure(nearby)
-                outside_measure = _fast_change_geometry_measure(
-                    nearby.difference(truth_support)
-                )
-                if outside_measure >= 0.80 * nearby_measure:
-                    break
-                distance += clearance_step
-            false_positive = make_valid(
-                _jitter_fast_change_geometry(nearby, rng).difference(truth_support)
-            )
-            if false_positive.is_empty:
-                continue
-            row[source.geometry.name] = false_positive
-            row["change_typ"] = (
-                "added", "width_changed", "removed",
-            )[int(rng.integers(0, 3))]
-            row["synth_kind"] = "false_positive"
-            records.append(row)
-            false_positive_output_count += 1
         result = gpd.GeoDataFrame(
             records,
             geometry=source.geometry.name,
@@ -1341,6 +1292,8 @@ def build_fast_change_from_truth(
     output_dir: Path,
     *,
     period_key: str,
+    before_result: Path | dict | None = None,
+    after_result: Path | dict | None = None,
     change_type: str | None = None,
     global_seed: int = FAST_CHANGE_GLOBAL_SEED,
     validation_area: Path | None = None,
@@ -1358,6 +1311,7 @@ def build_fast_change_from_truth(
         truth = _clip_frame(truth, validation_area)
     truth = truth.loc[truth.geometry.notna() & ~truth.geometry.is_empty].copy()
     truth.geometry = truth.geometry.map(make_valid)
+    truth["truth_fid"] = truth.index.map(str)
     aliases = {
         "2": "added", "added": "added", "新增": "added",
         "3": "width_changed", "width_changed": "width_changed", "变化": "width_changed",
@@ -1377,7 +1331,7 @@ def build_fast_change_from_truth(
     source_changes = truth.loc[truth["change_typ"].isin(selected_types)].copy()
     output_dir.mkdir(parents=True, exist_ok=True)
     pseudo_frames = []
-    truth_support = source_changes.geometry.union_all()
+    truth_support = truth.geometry.union_all()
     synthetic_metrics = {
         "truth_feature_count": 0,
         "retained_truth_feature_count": 0,
@@ -1392,7 +1346,6 @@ def build_fast_change_from_truth(
             period_key=period_key,
             change_type=type_name,
             global_seed=global_seed,
-            truth_support=truth_support,
         )
         for metric, value in pseudo.attrs.get("synthetic_metrics", {}).items():
             synthetic_metrics[metric] += value
@@ -1407,6 +1360,29 @@ def build_fast_change_from_truth(
             crs=truth.crs,
         )
         if nonempty_layers else _empty_like(pseudo_frames[0])
+    )
+    stable_false_positives, truth_axes, predicted_axes, pixel_size = (
+        _build_fast_truth_synthetic_geometry(
+            before_result,
+            after_result,
+            source_changes,
+            changes,
+            truth_support=truth_support,
+            period_key=period_key,
+            global_seed=global_seed,
+        )
+    )
+    if not stable_false_positives.empty:
+        changes = gpd.GeoDataFrame(
+            [
+                *changes.to_dict(orient="records"),
+                *stable_false_positives.to_dict(orient="records"),
+            ],
+            geometry=truth.geometry.name,
+            crs=truth.crs,
+        )
+    synthetic_metrics["false_positive_feature_count"] = int(
+        len(stable_false_positives)
     )
     typed_layers = {
         type_name: changes.loc[changes["change_typ"] == type_name].copy()
@@ -1426,13 +1402,21 @@ def build_fast_change_from_truth(
         frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
         frame.to_file(gpkg, layer="road_changes" if name == "changes" else name, driver="GPKG", mode="w" if index == 0 else "a")
         output_layers[name] = str(target.resolve())
-    truth_geometry_measure = float(synthetic_metrics["truth_geometry_measure"])
-    retained_geometry_measure = float(
-        synthetic_metrics["retained_truth_geometry_measure"]
+    truth_axes_path = output_dir / "truth_change_centerlines.shp"
+    predicted_axes_path = output_dir / "predicted_change_centerlines.shp"
+    truth_axes.to_file(truth_axes_path, driver="ESRI Shapefile", encoding="UTF-8")
+    predicted_axes.to_file(
+        predicted_axes_path, driver="ESRI Shapefile", encoding="UTF-8",
     )
+    truth_axes.to_file(gpkg, layer="truth_change_centerlines", driver="GPKG", mode="a")
+    predicted_axes.to_file(
+        gpkg, layer="predicted_change_centerlines", driver="GPKG", mode="a",
+    )
+    truth_axis_length = float(truth_axes.geometry.length.sum())
+    predicted_axis_length = float(predicted_axes.geometry.length.sum())
     extraction_completeness = (
-        retained_geometry_measure / truth_geometry_measure
-        if truth_geometry_measure > 0 else 1.0
+        predicted_axis_length / truth_axis_length
+        if truth_axis_length > 0 else None
     )
     summary = {
         "execution_profile": "fast", "change_source": "synthetic_from_truth",
@@ -1440,14 +1424,7 @@ def build_fast_change_from_truth(
         "period_key": str(period_key), "global_seed": int(global_seed),
         "miss_probability": FAST_CHANGE_MISS_PROB,
         "false_positive_ratio": FAST_CHANGE_FALSE_POSITIVE_RATIO,
-        "false_positive_distance_min_px": (
-            FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MIN * FAST_CHANGE_SHIFT_MAX_PX
-        ),
-        "false_positive_distance_max_px": (
-            FAST_CHANGE_FALSE_POSITIVE_DISTANCE_MAX * FAST_CHANGE_SHIFT_MAX_PX
-        ),
-        "false_positive_area_target": FAST_CHANGE_FALSE_POSITIVE_AREA_TARGET,
-        "false_positive_area_max": FAST_CHANGE_FALSE_POSITIVE_AREA_MAX,
+        "false_positive_source": "stable_unchanged_roads",
         "shift_max_px": FAST_CHANGE_SHIFT_MAX_PX,
         "buffer_jitter_px": FAST_CHANGE_BUFFER_JITTER_PX,
         "type_error_probability": FAST_CHANGE_TYPE_ERROR_PROB,
@@ -1455,11 +1432,13 @@ def build_fast_change_from_truth(
         "geometry_degrade_probability": FAST_CHANGE_GEOMETRY_DEGRADE_PROB,
         "geometry_retain_min": FAST_CHANGE_GEOMETRY_RETAIN_MIN,
         "geometry_retain_max": FAST_CHANGE_GEOMETRY_RETAIN_MAX,
-        "change_road_extraction_completeness": float(extraction_completeness),
+        "change_road_extraction_completeness": extraction_completeness,
         "change_road_extraction_completeness_definition": (
-            "retained truth-derived geometry area (line length fallback) / "
-            "source truth geometry area (line length fallback)"
+            "synthetic predicted change-centerline length / truth change-centerline length"
         ),
+        "road_centerline_pixel_size": pixel_size,
+        "truth_change_centerline_length": truth_axis_length,
+        "predicted_change_centerline_length": predicted_axis_length,
         "synthetic_offset_unit": "pixel",
         **synthetic_metrics,
         "automatic_result": False,
@@ -1482,6 +1461,9 @@ def build_fast_change_from_truth(
     return {
         "output": str(output_dir.resolve()), "summary": str(summary_path.resolve()),
         "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
+        "truth_change_centerlines": str(truth_axes_path.resolve()),
+        "predicted_change_centerlines": str(predicted_axes_path.resolve()),
+        "road_centerline_pixel_size": pixel_size,
         "layers": output_layers,
         "previews": {"change": str(preview_path.resolve())},
         "road_change": str(preview_path.resolve()),
@@ -1496,6 +1478,244 @@ def _load_fast_period_result(result: Path | dict) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Fast period result is missing: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _fast_period_pixel_size(result: dict) -> float:
+    probability_path = Path(str(result.get("road_probability") or "")).expanduser()
+    if not probability_path.is_file():
+        return 1.0
+    with rasterio.open(probability_path) as dataset:
+        x_size = abs(float(dataset.transform.a))
+        y_size = abs(float(dataset.transform.e))
+    valid = [value for value in (x_size, y_size) if value > 1e-9]
+    return float(sum(valid) / len(valid)) if valid else 1.0
+
+
+def _empty_fast_change_axes(crs) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        {"truth_fid": [], "change_typ": []},
+        geometry=gpd.GeoSeries([], crs=crs),
+        crs=crs,
+    )
+
+
+def _truth_change_axes_from_period_roads(
+    source_changes: gpd.GeoDataFrame,
+    before_centerlines: gpd.GeoDataFrame,
+    after_centerlines: gpd.GeoDataFrame,
+    *,
+    pixel_size: float,
+) -> gpd.GeoDataFrame:
+    records = []
+    before_index = before_centerlines.sindex if not before_centerlines.empty else None
+    after_index = after_centerlines.sindex if not after_centerlines.empty else None
+    for _index, change in source_changes.iterrows():
+        change_type = str(change["change_typ"])
+        if change_type == "removed":
+            road_frame, road_index = before_centerlines, before_index
+        else:
+            road_frame, road_index = after_centerlines, after_index
+            if road_frame.empty:
+                road_frame, road_index = before_centerlines, before_index
+        if road_index is None:
+            continue
+        support = change.geometry.buffer(max(0.25 * pixel_size, 1e-6))
+        positions = np.asarray(
+            road_index.query(support, predicate="intersects"), dtype=int,
+        ).reshape(-1)
+        for position in positions.tolist():
+            clipped = road_frame.geometry.iloc[position].intersection(change.geometry)
+            for part in _fast_line_parts(clipped):
+                if float(part.length) <= max(0.25 * pixel_size, 1e-6):
+                    continue
+                records.append({
+                    "truth_fid": str(change["truth_fid"]),
+                    "change_typ": change_type,
+                    "geometry": part,
+                })
+    if not records:
+        return _empty_fast_change_axes(source_changes.crs)
+    return gpd.GeoDataFrame(records, geometry="geometry", crs=source_changes.crs)
+
+
+def _synthetic_predicted_change_axes(
+    truth_axes: gpd.GeoDataFrame,
+    changes: gpd.GeoDataFrame,
+    *,
+    pixel_size: float,
+    period_key: str,
+    global_seed: int,
+) -> gpd.GeoDataFrame:
+    if truth_axes.empty or changes.empty:
+        return _empty_fast_change_axes(truth_axes.crs)
+    truth_predictions = changes.loc[
+        changes.get("synth_kind", "") == "truth_derived"
+    ].copy()
+    predicted_types = {
+        str(row["truth_fid"]): str(row["change_typ"])
+        for _index, row in truth_predictions.iterrows()
+    }
+    records = []
+    for truth_fid, group in truth_axes.groupby("truth_fid", sort=True):
+        truth_fid = str(truth_fid)
+        if truth_fid not in predicted_types:
+            continue
+        rng = np.random.default_rng(_fast_change_local_seed(
+            global_seed, period_key, f"centerline:{truth_fid}",
+        ))
+        retain_fraction = float(rng.uniform(
+            FAST_CHANGE_CENTERLINE_RETAIN_MIN,
+            FAST_CHANGE_CENTERLINE_RETAIN_MAX,
+        ))
+        shift_px = float(rng.uniform(
+            FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX,
+            FAST_CHANGE_SHIFT_MAX_PX,
+        ))
+        representative = max(group.geometry, key=lambda geometry: float(geometry.length))
+        coordinates = np.asarray(representative.coords, dtype=np.float64)
+        direction = coordinates[-1] - coordinates[0]
+        direction_norm = float(np.linalg.norm(direction))
+        if direction_norm > 1e-9:
+            normal = np.asarray([-direction[1], direction[0]]) / direction_norm
+        else:
+            angle = float(rng.uniform(0.0, 2.0 * np.pi))
+            normal = np.asarray([np.cos(angle), np.sin(angle)])
+        normal *= -1.0 if bool(rng.integers(0, 2)) else 1.0
+        xoff = float(normal[0] * shift_px * pixel_size)
+        yoff = float(normal[1] * shift_px * pixel_size)
+        keep_low_end = bool(rng.integers(0, 2))
+        for geometry in group.geometry:
+            length = float(geometry.length)
+            if length <= 1e-9:
+                continue
+            retained_length = length * retain_fraction
+            start = 0.0 if keep_low_end else length - retained_length
+            retained = substring(geometry, start, start + retained_length)
+            if retained.is_empty or retained.geom_type != "LineString":
+                continue
+            records.append({
+                "truth_fid": truth_fid,
+                "change_typ": predicted_types[truth_fid],
+                "geometry": translate(retained, xoff=xoff, yoff=yoff),
+            })
+    if not records:
+        return _empty_fast_change_axes(truth_axes.crs)
+    return gpd.GeoDataFrame(records, geometry="geometry", crs=truth_axes.crs)
+
+
+def _stable_road_false_positives(
+    before_centerlines: gpd.GeoDataFrame,
+    after_centerlines: gpd.GeoDataFrame,
+    source_changes: gpd.GeoDataFrame,
+    *,
+    truth_support,
+    pixel_size: float,
+    period_key: str,
+    global_seed: int,
+) -> gpd.GeoDataFrame:
+    if before_centerlines.empty or after_centerlines.empty or source_changes.empty:
+        return _empty_like(source_changes)
+    tolerance = FAST_CHANGE_CENTERLINE_MATCH_TOLERANCE_PX * pixel_size
+    after_support = after_centerlines.geometry.union_all().buffer(tolerance)
+    excluded = truth_support.buffer(max(pixel_size, 1e-6))
+    candidates = []
+    for _index, row in before_centerlines.iterrows():
+        geometry = row.geometry
+        if _fast_line_coverage(geometry, after_support) < FAST_CHANGE_STABLE_ROAD_COVERAGE:
+            continue
+        stable_part = geometry.intersection(after_support).difference(excluded)
+        for part in _fast_line_parts(stable_part):
+            if float(part.length) >= 12.0 * pixel_size:
+                candidates.append((part, max(_fast_width_value(row), 2.0 * pixel_size)))
+    target_count = int(np.floor(
+        len(source_changes) * FAST_CHANGE_FALSE_POSITIVE_RATIO + 0.5
+    ))
+    if target_count <= 0 or not candidates:
+        return _empty_like(source_changes)
+    rng = np.random.default_rng(_fast_change_local_seed(
+        global_seed, period_key, "stable_false_positive",
+    ))
+    order = np.asarray(rng.permutation(len(candidates)), dtype=int).tolist()
+    records = []
+    for output_index in range(target_count):
+        line, width = candidates[order[output_index % len(order)]]
+        length = float(line.length)
+        segment_length = min(length, max(12.0 * pixel_size, min(40.0 * pixel_size, length * 0.40)))
+        start = float(rng.uniform(0.0, max(0.0, length - segment_length)))
+        segment = substring(line, start, start + segment_length)
+        polygon = make_valid(
+            segment.buffer(max(width / 2.0, pixel_size), cap_style="flat").difference(excluded)
+        )
+        if polygon.is_empty:
+            continue
+        records.append({
+            source_changes.geometry.name: polygon,
+            "change_typ": ("added", "width_changed", "removed")[
+                int(rng.integers(0, 3))
+            ],
+            "truth_fid": "",
+            "synth_kind": "false_positive",
+            "source": "synthetic_from_truth",
+            "change_src": "synthetic_from_truth",
+            "period_key": str(period_key),
+            "seed": int(_fast_change_local_seed(
+                global_seed, period_key, "stable_false_positive",
+            )),
+        })
+    if not records:
+        return _empty_like(source_changes)
+    return gpd.GeoDataFrame(
+        records, geometry=source_changes.geometry.name, crs=source_changes.crs,
+    )
+
+
+def _build_fast_truth_synthetic_geometry(
+    before_result: Path | dict | None,
+    after_result: Path | dict | None,
+    source_changes: gpd.GeoDataFrame,
+    changes: gpd.GeoDataFrame,
+    *,
+    truth_support,
+    period_key: str,
+    global_seed: int,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, float]:
+    empty_axes = _empty_fast_change_axes(source_changes.crs)
+    if before_result is None or after_result is None:
+        return _empty_like(source_changes), empty_axes, empty_axes.copy(), 1.0
+    before = _load_fast_period_result(before_result)
+    after = _load_fast_period_result(after_result)
+    before_centerlines = _align_fast_change_frame(
+        _read_fast_change_layer(before, "centerlines"), source_changes.crs,
+    )
+    after_centerlines = _align_fast_change_frame(
+        _read_fast_change_layer(after, "centerlines"), source_changes.crs,
+    )
+    pixel_size = float(np.mean([
+        _fast_period_pixel_size(before), _fast_period_pixel_size(after),
+    ]))
+    truth_axes = _truth_change_axes_from_period_roads(
+        source_changes,
+        before_centerlines,
+        after_centerlines,
+        pixel_size=pixel_size,
+    )
+    predicted_axes = _synthetic_predicted_change_axes(
+        truth_axes,
+        changes,
+        pixel_size=pixel_size,
+        period_key=period_key,
+        global_seed=global_seed,
+    )
+    false_positives = _stable_road_false_positives(
+        before_centerlines,
+        after_centerlines,
+        source_changes,
+        truth_support=truth_support,
+        pixel_size=pixel_size,
+        period_key=period_key,
+        global_seed=global_seed,
+    )
+    return false_positives, truth_axes, predicted_axes, pixel_size
 
 
 def _read_fast_change_layer(

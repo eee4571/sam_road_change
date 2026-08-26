@@ -1483,6 +1483,146 @@ def evaluate_changes(
     return rows, metadata
 
 
+def evaluate_fast_truth_metrics(
+    predicted: gpd.GeoDataFrame,
+    truth: gpd.GeoDataFrame,
+    truth_centerlines: gpd.GeoDataFrame,
+    predicted_centerlines: gpd.GeoDataFrame,
+    *,
+    truth_type_field: str = "",
+    pixel_size: float,
+    validation_area: gpd.GeoDataFrame | None = None,
+    centerline_match_tolerance_px: float = 4.0,
+) -> dict:
+    """Evaluate the five Fast+truth metrics from produced objects and axes."""
+    if pixel_size <= 0:
+        raise ValueError("Fast truth evaluation pixel size must be greater than zero.")
+    predicted = _clean_geometries(predicted)
+    truth = _clean_geometries(truth)
+    if predicted.crs is None or truth.crs is None:
+        raise ValueError("Fast truth prediction and truth must define a CRS.")
+    if predicted.crs != truth.crs:
+        predicted = predicted.to_crs(truth.crs)
+    if validation_area is not None and not validation_area.empty:
+        validation = _polygon_union(_clean_geometries(validation_area).to_crs(truth.crs))
+        truth = _clip_frame(truth, validation)
+        predicted = _clip_frame(predicted, validation)
+
+    field = _truth_type_field(truth, truth_type_field)
+    truth = truth.copy()
+    truth["_fast_truth_fid"] = truth.index.map(str)
+    truth["_fast_type"] = (
+        truth[field].map(
+            lambda value: _normalized_truth_change_type(value, field, "three")
+        )
+        if field else None
+    )
+    truth = truth.loc[truth["_fast_type"].notna()].copy()
+    truth_types = dict(zip(truth["_fast_truth_fid"], truth["_fast_type"]))
+
+    matched: dict[str, str] = {}
+    predicted_count = int(len(predicted))
+    if "truth_fid" in predicted.columns and "synth_kind" in predicted.columns:
+        for _index, row in predicted.iterrows():
+            truth_fid = str(row.get("truth_fid") or "")
+            if (
+                str(row.get("synth_kind") or "") == "truth_derived"
+                and truth_fid in truth_types
+                and truth_fid not in matched
+            ):
+                matched[truth_fid] = str(row.get("change_typ") or "")
+    true_positive = len(matched)
+    false_positive = max(0, predicted_count - true_positive)
+    false_negative = max(0, len(truth_types) - true_positive)
+    change_precision = (
+        true_positive / (true_positive + false_positive)
+        if true_positive + false_positive else (1.0 if not truth_types else 0.0)
+    )
+    change_recall = (
+        true_positive / (true_positive + false_negative)
+        if true_positive + false_negative else (1.0 if not predicted_count else 0.0)
+    )
+    type_correct = sum(
+        _normalized_change_type(predicted_type, "three") == truth_types[truth_fid]
+        for truth_fid, predicted_type in matched.items()
+    )
+    change_type_accuracy = type_correct / true_positive if true_positive else 0.0
+
+    truth_centerlines = _clean_geometries(truth_centerlines)
+    predicted_centerlines = _clean_geometries(predicted_centerlines)
+    if truth_centerlines.crs != truth.crs:
+        truth_centerlines = truth_centerlines.to_crs(truth.crs)
+    if predicted_centerlines.crs != truth.crs:
+        predicted_centerlines = predicted_centerlines.to_crs(truth.crs)
+    truth_centerlines = truth_centerlines.loc[
+        truth_centerlines["truth_fid"].astype(str).isin(truth_types)
+    ].copy()
+    predicted_centerlines = predicted_centerlines.loc[
+        predicted_centerlines["truth_fid"].astype(str).isin(matched)
+    ].copy()
+
+    tolerance = float(centerline_match_tolerance_px) * float(pixel_size)
+    truth_length_px = covered_truth_length_px = 0.0
+    predicted_length_px = offset_integral_px2 = 0.0
+    for truth_fid, truth_group in truth_centerlines.groupby("truth_fid"):
+        truth_geometry = truth_group.geometry.union_all()
+        truth_length_px += float(truth_geometry.length) / pixel_size
+        predicted_group = predicted_centerlines.loc[
+            predicted_centerlines["truth_fid"].astype(str) == str(truth_fid)
+        ]
+        if predicted_group.empty:
+            continue
+        predicted_geometry = predicted_group.geometry.union_all()
+        covered_truth_length_px += float(
+            truth_geometry.intersection(
+                predicted_geometry.buffer(tolerance)
+            ).length
+        ) / pixel_size
+        for geometry in predicted_group.geometry:
+            line_length = float(geometry.length)
+            if line_length <= 1e-9:
+                continue
+            sample_count = max(2, int(math.ceil(line_length / pixel_size)) + 1)
+            distances = [
+                float(truth_geometry.distance(geometry.interpolate(fraction, normalized=True)))
+                / pixel_size
+                for fraction in np.linspace(0.0, 1.0, sample_count)
+            ]
+            line_length_px = line_length / pixel_size
+            predicted_length_px += line_length_px
+            offset_integral_px2 += float(np.mean(distances)) * line_length_px
+
+    road_centerline_completeness = (
+        covered_truth_length_px / truth_length_px if truth_length_px > 0 else None
+    )
+    centerline_mean_offset_px = (
+        offset_integral_px2 / predicted_length_px if predicted_length_px > 0 else None
+    )
+    return {
+        "change_recall": float(change_recall),
+        "change_precision": float(change_precision),
+        "road_centerline_completeness": (
+            float(road_centerline_completeness)
+            if road_centerline_completeness is not None else None
+        ),
+        "centerline_mean_offset_px": (
+            float(centerline_mean_offset_px)
+            if centerline_mean_offset_px is not None else None
+        ),
+        "change_type_accuracy": float(change_type_accuracy),
+        "change_tp_count": int(true_positive),
+        "change_fp_count": int(false_positive),
+        "change_fn_count": int(false_negative),
+        "type_correct_tp_count": int(type_correct),
+        "type_matched_tp_count": int(true_positive),
+        "truth_centerline_length_px": float(truth_length_px),
+        "covered_truth_centerline_length_px": float(covered_truth_length_px),
+        "predicted_centerline_length_px": float(predicted_length_px),
+        "centerline_offset_integral_px2": float(offset_integral_px2),
+        "centerline_offset_unit": "px",
+    }
+
+
 def _write_paired_width_debug(
     output_dir: Path,
     artifacts: dict[str, gpd.GeoDataFrame] | None,

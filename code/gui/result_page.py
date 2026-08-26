@@ -390,14 +390,21 @@ class ResultPage:
             try:
                 evaluation = json.loads(summary_path.read_text(encoding="utf-8")).get("evaluation", {})
                 overall = next(row for row in evaluation.get("metrics", []) if row.get("class") == "all")
-                offset = overall.get("centerline_avg_offset_m")
+                completeness = overall.get("road_centerline_completeness")
+                offset = overall.get("centerline_mean_offset_px")
                 status += (
-                    f" 当前评价结果：变化区域查全率 "
-                    f"{format_percentage(overall.get('change_area_recall', overall['recall']))}，"
-                    f"变化检测正确率 {format_percentage(overall.get('precision', 0))}，"
-                    f"变化类型判断准确率 "
-                    f"{format_percentage(overall.get('type_judgment_accuracy', 0))}"
-                    + (f"，中心线平均偏差 {float(offset):.2f} 米。" if offset not in {None, ""} else "；中心线平均偏差暂无可用值。")
+                    f" 当前评价结果：变化图斑查全率 "
+                    f"{format_percentage(overall.get('change_recall', overall.get('change_area_recall', overall['recall'])))}，"
+                    f"变化图斑准确率 {format_percentage(overall.get('change_precision', overall.get('precision', 0)))}，"
+                    + (
+                        f"变化道路提取完整度 {format_percentage(completeness)}，"
+                        if completeness not in {None, ""} else "变化道路提取完整度暂无可用值，"
+                    )
+                    + (
+                        f"中心线平均偏移距离 {float(offset):.2f} px，"
+                        if offset not in {None, ""} else "中心线平均偏移距离暂无可用值，"
+                    )
+                    + f"动态过程检测正确率 {format_percentage(overall.get('change_type_accuracy', overall.get('type_judgment_accuracy', 0)))}。"
                 )
             except (OSError, UnicodeError, json.JSONDecodeError, KeyError, StopIteration, TypeError, ValueError):
                 pass
@@ -406,12 +413,20 @@ class ResultPage:
             row for row in aggregate.get("metrics", []) if isinstance(row, dict) and row.get("class") == "all"
         ), None)
         if aggregate_overall:
-            offset = aggregate_overall.get("centerline_avg_offset_m")
+            completeness = aggregate_overall.get("road_centerline_completeness")
+            offset = aggregate_overall.get("centerline_mean_offset_px")
             status += (
-                f" 汇总结果：变化区域查全率 {format_percentage(aggregate_overall.get('change_area_recall', aggregate_overall.get('recall', 0)))}，"
-                f"变化检测正确率 {format_percentage(aggregate_overall.get('precision', 0) or 0)}，"
-                f"变化类型判断准确率 {format_percentage(aggregate_overall.get('type_judgment_accuracy', 0) or 0)}"
-                + (f"，中心线平均偏差 {float(offset):.2f} 米。" if offset not in {None, ""} else "；中心线平均偏差暂无可用值。")
+                f" 汇总结果：变化图斑查全率 {format_percentage(aggregate_overall.get('change_recall', aggregate_overall.get('change_area_recall', aggregate_overall.get('recall', 0))))}，"
+                f"变化图斑准确率 {format_percentage(aggregate_overall.get('change_precision', aggregate_overall.get('precision', 0)) or 0)}，"
+                + (
+                    f"变化道路提取完整度 {format_percentage(completeness)}，"
+                    if completeness not in {None, ""} else "变化道路提取完整度暂无可用值，"
+                )
+                + (
+                    f"中心线平均偏移距离 {float(offset):.2f} px，"
+                    if offset not in {None, ""} else "中心线平均偏移距离暂无可用值，"
+                )
+                + f"动态过程检测正确率 {format_percentage(aggregate_overall.get('change_type_accuracy', aggregate_overall.get('type_judgment_accuracy', 0)) or 0)}。"
             )
         self.evaluation_status.set(status)
         configured = len(self.project_area_truths)

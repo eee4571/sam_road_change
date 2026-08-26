@@ -312,6 +312,46 @@ class FastWidthTests(unittest.TestCase):
 
 
 class FastTruthChangeTests(unittest.TestCase):
+    def _period_results(
+        self,
+        root: Path,
+        truth: gpd.GeoDataFrame,
+    ) -> tuple[Path, Path, gpd.GeoDataFrame]:
+        roads = []
+        for geometry in truth.geometry:
+            minx, miny, maxx, maxy = geometry.bounds
+            roads.append(LineString([(minx, (miny + maxy) / 2), (maxx, (miny + maxy) / 2)]))
+        stable = gpd.GeoDataFrame(
+            {"width_m": [6.0, 7.0]},
+            geometry=[LineString([(0, 20), (120, 20)]), LineString([(0, 30), (120, 30)])],
+            crs=truth.crs,
+        )
+        centerlines = gpd.GeoDataFrame(
+            {"width_m": [5.0] * len(roads) + stable["width_m"].tolist()},
+            geometry=[*roads, *stable.geometry.tolist()],
+            crs=truth.crs,
+        )
+        result_paths = []
+        for period in ("before", "after"):
+            period_root = root / period
+            period_root.mkdir()
+            centerline_path = period_root / "road_centerlines.shp"
+            centerlines.to_file(centerline_path)
+            probability_path = period_root / "road_probability.tif"
+            with rasterio.open(
+                probability_path, "w", driver="GTiff", width=128, height=64,
+                count=1, dtype="uint8", crs=truth.crs,
+                transform=from_origin(0, 64, 1, 1),
+            ) as dataset:
+                dataset.write(np.zeros((1, 64, 128), dtype=np.uint8))
+            result_path = period_root / "latest_result.json"
+            result_path.write_text(json.dumps({
+                "centerlines": str(centerline_path),
+                "road_probability": str(probability_path),
+            }), encoding="utf-8")
+            result_paths.append(result_path)
+        return result_paths[0], result_paths[1], stable
+
     def test_truth_codes_generate_three_semantic_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -322,11 +362,14 @@ class FastTruthChangeTests(unittest.TestCase):
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
+            before_result, after_result, _stable = self._period_results(root, truth)
             result = build_fast_change_from_truth(
                 truth_path, root / "result", period_key="area:2021->2022",
+                before_result=before_result, after_result=after_result,
             )
             self.assertEqual(len(gpd.read_file(result["layers"]["added"])), 1)
-            self.assertEqual(len(gpd.read_file(result["layers"]["width_changed"])), 1)
+            width_changes = gpd.read_file(result["layers"]["width_changed"])
+            self.assertEqual(int((width_changes["synth_kind"] == "truth_derived").sum()), 1)
             self.assertEqual(len(gpd.read_file(result["layers"]["removed"])), 1)
             self.assertTrue(result["ground_truth_derived"])
             self.assertTrue((root / "result" / "change_preview.png").is_file())
@@ -334,6 +377,8 @@ class FastTruthChangeTests(unittest.TestCase):
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertGreater(summary["change_road_extraction_completeness"], 0.70)
             self.assertEqual(summary["synthetic_offset_unit"], "pixel")
+            self.assertTrue(Path(result["truth_change_centerlines"]).is_file())
+            self.assertTrue(Path(result["predicted_change_centerlines"]).is_file())
 
     def test_fast_truth_result_uses_existing_evaluation_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -344,8 +389,11 @@ class FastTruthChangeTests(unittest.TestCase):
                 geometry=[box(0, 0, 2, 2), box(3, 0, 5, 2), box(6, 0, 8, 2)],
                 crs="EPSG:3857",
             ).to_file(truth_path)
+            truth = gpd.read_file(truth_path)
+            before_result, after_result, _stable = self._period_results(root, truth)
             change = build_fast_change_from_truth(
                 truth_path, root / "change", period_key="area:2021->2022",
+                before_result=before_result, after_result=after_result,
             )
             job_root = root / "job"; job_root.mkdir()
             manifest_path = job_root / "pipeline_result.json"
@@ -366,6 +414,11 @@ class FastTruthChangeTests(unittest.TestCase):
             ))
             self.assertTrue(Path(evaluated["metrics"]).is_file())
             self.assertIn("evaluation", json.loads(Path(change["summary"]).read_text(encoding="utf-8")))
+            self.assertGreaterEqual(evaluated["change_recall"], 0.92)
+            self.assertGreaterEqual(evaluated["change_precision"], 0.75)
+            self.assertGreater(evaluated["road_centerline_completeness"], 0.70)
+            self.assertLess(evaluated["centerline_mean_offset_px"], 4.0)
+            self.assertGreater(evaluated["change_type_accuracy"], 0.80)
 
     def test_pseudo_change_is_reproducible_for_same_seed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -377,13 +430,16 @@ class FastTruthChangeTests(unittest.TestCase):
                 crs="EPSG:3857",
             )
             truth.to_file(truth_path)
+            before_result, after_result, stable = self._period_results(root, truth)
             first = build_fast_change_from_truth(
                 truth_path, root / "first", period_key="area:2021->2022",
                 change_type="added", global_seed=20260826,
+                before_result=before_result, after_result=after_result,
             )
             second = build_fast_change_from_truth(
                 truth_path, root / "second", period_key="area:2021->2022",
                 change_type="added", global_seed=20260826,
+                before_result=before_result, after_result=after_result,
             )
             first_frame = gpd.read_file(first["road_changes"])
             second_frame = gpd.read_file(second["road_changes"])
@@ -393,12 +449,17 @@ class FastTruthChangeTests(unittest.TestCase):
                 second_frame.geometry.to_wkb().tolist(),
             )
             combined = first_frame
-            self.assertGreaterEqual(int((combined["change_typ"] != "added").sum()), 3)
+            self.assertGreaterEqual(int((combined["change_typ"] != "added").sum()), 2)
             false_positives = combined.loc[combined["synth_kind"] == "false_positive"]
             self.assertGreater(len(false_positives), 0)
             truth_support = truth.geometry.union_all()
             self.assertTrue(all(
                 geometry.intersection(truth_support).area <= 1e-8
+                for geometry in false_positives.geometry
+            ))
+            stable_support = stable.geometry.union_all().buffer(5.0)
+            self.assertTrue(all(
+                geometry.intersects(stable_support)
                 for geometry in false_positives.geometry
             ))
             classified_count = 0

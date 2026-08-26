@@ -1468,23 +1468,33 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             reruns = payload.get("change_rerun_count", len(payload.get("change_reruns", []) or []))
             return f"人工编辑成果已重建并重新测宽；已重跑 {reruns} 个受影响的相邻期变化对。"
         if kind == "complete" and payload.get("stage") == "evaluate-existing":
-            offset = payload.get("centerline_avg_offset_m")
-            offset_text = f"，中心线平均偏差 {float(offset):.2f} 米" if offset not in {None, ""} else ""
+            completeness = payload.get("road_centerline_completeness")
+            completeness_text = (
+                f"，变化道路提取完整度 {format_percentage(completeness)}"
+                if completeness not in {None, ""} else ""
+            )
+            offset = payload.get("centerline_mean_offset_px")
+            offset_text = f"，中心线平均偏移距离 {float(offset):.2f} px" if offset not in {None, ""} else ""
             return (
-                f"精度评价完成：变化区域查全率 {format_percentage(payload.get('change_area_recall', 0))}，"
-                f"变化检测正确率 {format_percentage(payload.get('precision', 0))}，"
-                f"变化类型判断准确率 {format_percentage(payload.get('type_judgment_accuracy', 0))}"
-                f"{offset_text}。"
+                f"精度评价完成：变化图斑查全率 {format_percentage(payload.get('change_recall', payload.get('change_area_recall', 0)))}，"
+                f"变化图斑准确率 {format_percentage(payload.get('change_precision', payload.get('precision', 0)))}"
+                f"{completeness_text}{offset_text}，动态过程检测正确率 "
+                f"{format_percentage(payload.get('change_type_accuracy', payload.get('type_judgment_accuracy', 0)))}。"
             )
         if kind == "complete" and payload.get("stage") == "evaluate-all-existing":
-            offset = payload.get("centerline_avg_offset_m")
-            offset_text = f"，中心线平均偏差 {float(offset):.2f} 米" if offset not in {None, ""} else ""
+            completeness = payload.get("road_centerline_completeness")
+            completeness_text = (
+                f"，变化道路提取完整度 {format_percentage(completeness)}"
+                if completeness not in {None, ""} else ""
+            )
+            offset = payload.get("centerline_mean_offset_px")
+            offset_text = f"，中心线平均偏移距离 {float(offset):.2f} px" if offset not in {None, ""} else ""
             return (
                 f"总精度评价完成：{payload.get('evaluated_task_count', 0)} 个区域/变化对，"
-                f"变化区域查全率 {format_percentage(payload.get('change_area_recall', 0))}，"
-                f"变化检测正确率 {format_percentage(payload.get('precision', 0))}，"
-                f"变化类型判断准确率 {format_percentage(payload.get('type_judgment_accuracy', 0))}"
-                f"{offset_text}。"
+                f"变化图斑查全率 {format_percentage(payload.get('change_recall', payload.get('change_area_recall', 0)))}，"
+                f"变化图斑准确率 {format_percentage(payload.get('change_precision', payload.get('precision', 0)))}"
+                f"{completeness_text}{offset_text}，动态过程检测正确率 "
+                f"{format_percentage(payload.get('change_type_accuracy', payload.get('type_judgment_accuracy', 0)))}。"
             )
         if kind == "stage" and status == "complete":
             return f"{payload.get('stage', '阶段')}完成{elapsed_text}。"

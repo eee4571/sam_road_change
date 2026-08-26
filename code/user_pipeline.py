@@ -1361,6 +1361,8 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 result = build_fast_change_from_truth(
                     Path(truth_entry["source"]), products,
                     period_key=f"{args.area_id}:{args.before_period}->{args.after_period}",
+                    before_result=before_result_path,
+                    after_result=after_result_path,
                     validation_area=Path(area["validation_area"]),
                     truth_type_field="BHBM",
                     before_period=args.before_period, after_period=args.after_period,
@@ -2641,6 +2643,10 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 "truth_support_m2", "validation_area_m2", "correctly_classified_m2",
                 "detected_truth_m2", "truth_axis_length_m", "predicted_axis_length_m",
                 "truth_distance_integral_m2", "predicted_distance_integral_m2",
+                "change_tp_count", "change_fp_count", "change_fn_count",
+                "type_correct_tp_count", "type_matched_tp_count",
+                "truth_centerline_length_px", "covered_truth_centerline_length_px",
+                "predicted_centerline_length_px", "centerline_offset_integral_px2",
             )
         }
         precision = sums["tp_m2"] / (sums["tp_m2"] + sums["fp_m2"]) if sums["tp_m2"] + sums["fp_m2"] else 0.0
@@ -2666,6 +2672,35 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             "excluded_truth_feature_count": sum(int(row.get("excluded_truth_feature_count", 0) or 0) for row in source_rows),
             "evaluated_task_count": len(source_rows),
         }
+        has_fast_truth_metrics = class_name == "all" and any(
+            "change_tp_count" in source for source in source_rows
+        )
+        if has_fast_truth_metrics:
+            object_total = sums["change_tp_count"] + sums["change_fp_count"]
+            truth_total = sums["change_tp_count"] + sums["change_fn_count"]
+            row.update({
+                "change_precision": (
+                    sums["change_tp_count"] / object_total if object_total else 0.0
+                ),
+                "change_recall": (
+                    sums["change_tp_count"] / truth_total if truth_total else 0.0
+                ),
+                "road_centerline_completeness": (
+                    sums["covered_truth_centerline_length_px"]
+                    / sums["truth_centerline_length_px"]
+                    if sums["truth_centerline_length_px"] else None
+                ),
+                "centerline_mean_offset_px": (
+                    sums["centerline_offset_integral_px2"]
+                    / sums["predicted_centerline_length_px"]
+                    if sums["predicted_centerline_length_px"] else None
+                ),
+                "change_type_accuracy": (
+                    sums["type_correct_tp_count"] / sums["type_matched_tp_count"]
+                    if sums["type_matched_tp_count"] else 0.0
+                ),
+                "centerline_offset_unit": "px",
+            })
         truth_length = sums["truth_axis_length_m"]
         predicted_length = sums["predicted_axis_length_m"]
         if truth_length > 0 and predicted_length > 0:
@@ -2774,7 +2809,7 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
 
     import geopandas as gpd
     sys.path.insert(0, str(WIDTH))
-    from road_change_detection import evaluate_changes
+    from road_change_detection import evaluate_changes, evaluate_fast_truth_metrics
 
     emit("stage", stage="精度评价", status="running", completed=0, total=1)
     truth = gpd.read_file(truth_path)
@@ -2814,14 +2849,48 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         float(args.evaluation_tolerance),
         class_mode="three",
     )
+    summary_path = Path(
+        str(entry.get("summary") or output / "change_summary.json")
+    ).expanduser().resolve()
+    summary = read_json(summary_path) if summary_path.is_file() else {}
+    is_fast_truth = bool(
+        entry.get("ground_truth_derived")
+        or summary.get("ground_truth_derived")
+    ) and str(
+        entry.get("change_source") or summary.get("change_source") or ""
+    ) == "synthetic_from_truth"
+    if is_fast_truth:
+        truth_axes_path = Path(str(
+            entry.get("truth_change_centerlines")
+            or output / "truth_change_centerlines.shp"
+        )).expanduser()
+        predicted_axes_path = Path(str(
+            entry.get("predicted_change_centerlines")
+            or output / "predicted_change_centerlines.shp"
+        )).expanduser()
+        if truth_axes_path.is_file() and predicted_axes_path.is_file():
+            fast_metrics = evaluate_fast_truth_metrics(
+                predicted,
+                truth,
+                gpd.read_file(truth_axes_path),
+                gpd.read_file(predicted_axes_path),
+                truth_type_field=evaluation_truth_type_field,
+                pixel_size=float(
+                    entry.get("road_centerline_pixel_size")
+                    or summary.get("road_centerline_pixel_size")
+                    or 1.0
+                ),
+                validation_area=validation,
+            )
+            rows[0].update(fast_metrics)
+            metadata["fast_truth_metrics"] = True
+            metadata["centerline_offset_unit"] = "px"
     metrics_path = output / "evaluation_metrics.csv"
     with metrics_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
-    summary_path = Path(str(entry.get("summary") or output / "change_summary.json")).expanduser().resolve()
-    summary = read_json(summary_path) if summary_path.is_file() else {}
     summary["evaluation"] = {"metadata": metadata, "metrics": rows}
     if configured_values:
         summary["evaluation"]["metadata"]["truth_type_field"] = original_truth_type_field
@@ -2860,6 +2929,11 @@ def evaluate_existing_changes(args: argparse.Namespace) -> dict:
         "f1": overall["f1"],
         "iou": overall["iou"],
         "centerline_avg_offset_m": overall.get("centerline_avg_offset_m"),
+        "change_recall": overall.get("change_recall"),
+        "change_precision": overall.get("change_precision"),
+        "road_centerline_completeness": overall.get("road_centerline_completeness"),
+        "centerline_mean_offset_px": overall.get("centerline_mean_offset_px"),
+        "change_type_accuracy": overall.get("change_type_accuracy"),
         "aggregate_metrics": aggregate.get("json"),
         "elapsed_seconds": elapsed_seconds(started),
         "completed_at": now_text(),
@@ -2920,6 +2994,11 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
         "precision": overall.get("precision", 0),
         "type_judgment_accuracy": overall.get("type_judgment_accuracy", 0),
         "centerline_avg_offset_m": overall.get("centerline_avg_offset_m"),
+        "change_recall": overall.get("change_recall"),
+        "change_precision": overall.get("change_precision"),
+        "road_centerline_completeness": overall.get("road_centerline_completeness"),
+        "centerline_mean_offset_px": overall.get("centerline_mean_offset_px"),
+        "change_type_accuracy": overall.get("change_type_accuracy"),
     }
     emit("stage", stage="批量精度评价", status="complete", completed=completed, total=completed)
     emit("complete", stage="evaluate-all-existing", **result)
@@ -3784,6 +3863,8 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
                 raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
             result = build_fast_change_from_truth(
                 truth_path, output, period_key=f"{grid}:{before}->{after}",
+                before_result=Path(str(before_entry["result"])),
+                after_result=Path(str(after_entry["result"])),
                 validation_area=Path(validation_value) if validation_value else None,
                 truth_type_field=str(old.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
                 before_period=before, after_period=after,
@@ -4480,6 +4561,8 @@ def run_all(args: argparse.Namespace) -> dict:
                             result = build_fast_change_from_truth(
                                 Path(truth_value), change_output,
                                 period_key=f"{grid_name}:{before_period}->{after_period}",
+                                before_result=Path(str(before_entry["result"])),
+                                after_result=Path(str(after_entry["result"])),
                                 validation_area=Path(validation_value) if validation_value else None,
                                 truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
                                 before_period=before_period, after_period=after_period,
