@@ -3154,6 +3154,17 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
             raise ValueError("--truth 必须使用：验证区 前期 后期 真值SHP")
         area, before, after, source = (str(value).strip() for value in values)
         truths[(area, before, after)] = source
+    area_field_configs: dict[str, dict[str, str]] = {}
+    for values in getattr(args, "truth_field_config", []) or []:
+        if len(values) != 5:
+            raise ValueError("--truth-field-config 必须使用：验证区 字段 新增值 宽度变化值 灭失值")
+        area, field, added, width_changed, removed = (str(value).strip() for value in values)
+        area_field_configs[area] = {
+            "truth_type_field": field,
+            "added": added,
+            "width_changed": width_changed,
+            "removed": removed,
+        }
     change_entries = [entry for entry in manifest.get("change_results", []) or [] if isinstance(entry, dict)]
     missing = [
         f"{entry.get('grid')} / {entry.get('before_period')} → {entry.get('after_period')}"
@@ -3165,6 +3176,7 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
     completed = 0
     for entry in change_entries:
         key = (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))
+        field_config = area_field_configs.get(key[0], {})
         emit(
             "stage", stage="批量精度评价", status="running",
             completed=completed, total=len(change_entries), grid=key[0],
@@ -3174,10 +3186,15 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
             pipeline_manifest=str(manifest_path), grid=key[0],
             before_period=key[1], after_period=key[2], truth=truths[key],
             validation_area=str(entry.get("validation_area") or ""),
-            truth_type_field=str(args.truth_type_field or entry.get("truth_type_field") or ""),
-            truth_added_value=str(getattr(args, "truth_added_value", "") or ""),
-            truth_width_changed_value=str(getattr(args, "truth_width_changed_value", "") or ""),
-            truth_removed_value=str(getattr(args, "truth_removed_value", "") or ""),
+            truth_type_field=str(
+                field_config.get("truth_type_field")
+                or args.truth_type_field or entry.get("truth_type_field") or ""
+            ),
+            truth_added_value=str(field_config.get("added") or getattr(args, "truth_added_value", "") or ""),
+            truth_width_changed_value=str(
+                field_config.get("width_changed") or getattr(args, "truth_width_changed_value", "") or ""
+            ),
+            truth_removed_value=str(field_config.get("removed") or getattr(args, "truth_removed_value", "") or ""),
             evaluation_tolerance=float(args.evaluation_tolerance),
         ))
         completed += 1
@@ -5390,6 +5407,10 @@ def parser() -> argparse.ArgumentParser:
     a = sub.add_parser("evaluate-all-existing", help="评价已有任务的全部验证区和相邻期变化，并汇总总精度")
     a.add_argument("--pipeline-manifest", required=True)
     a.add_argument("--truth", action="append", nargs=4, metavar=("AREA", "BEFORE", "AFTER", "SHP"), default=[])
+    a.add_argument(
+        "--truth-field-config", action="append", nargs=5,
+        metavar=("AREA", "FIELD", "ADDED", "WIDTH_CHANGED", "REMOVED"), default=[],
+    )
     a.add_argument("--truth-type-field", default="BHBM")
     a.add_argument("--truth-added-value", default="")
     a.add_argument("--truth-width-changed-value", default="")

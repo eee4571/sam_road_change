@@ -226,6 +226,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.project_txt_encodings: dict[str, str] = {}
         self.project_path_relocations: dict[str, str] = {}
         self.project_candidates: dict[str, list[str]] = {"shp": [], "txt": []}
+        self.project_area_truth_field_configs: dict[str, dict[str, object]] = {}
         self.project_config: dict = {}
         self.project_root_path = ""
         self.data_region = StringVar(value="")
@@ -236,6 +237,16 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.data_status = StringVar(value="未连接数据源")
         self.data_source_display = StringVar(value="尚未连接外部数据源")
         self.project_validation_path = StringVar(value="尚未选择验证区。")
+        self.evaluation_type_field = StringVar(value="BHBM")
+        self.evaluation_added_value = StringVar(value="2")
+        self.evaluation_width_changed_value = StringVar(value="3")
+        self.evaluation_removed_value = StringVar(value="4")
+        self.evaluation_type_field_status = StringVar(
+            value="选择当前区域的变化真值后，可检查 SHP 中实际存在的字段和样例值。",
+        )
+        self.evaluation_value_combos: dict[str, ttk.Combobox] = {}
+        self._evaluation_truth_field_summary: dict[str, object] = {}
+        self._truth_field_config_area = ""
         self.review_edit_directory = StringVar(value="")
         self.grid_options_visible = False
         self.manual_inputs_visible = False

@@ -571,6 +571,7 @@ def build_evaluate_all_command(
     manifest: dict, pipeline_manifest: Path | str,
     truths: list[tuple[str, str, str, str]], *, truth_type_field: str = "BHBM",
     evaluation_tolerance: str = "5.0", truth_value_map: dict[str, str] | None = None,
+    area_truth_field_configs: dict[str, dict] | None = None,
 ) -> list[str]:
     """Build one result-stage command covering every area and adjacent pair."""
     truth_map = {
@@ -591,6 +592,17 @@ def build_evaluate_all_command(
         value = str((truth_value_map or {}).get(key) or "").strip()
         if value:
             args.extend((option, value))
+    for area, config in sorted((area_truth_field_configs or {}).items()):
+        if not isinstance(config, dict):
+            continue
+        area_map = config.get("truth_value_map") if isinstance(config.get("truth_value_map"), dict) else {}
+        args.extend((
+            "--truth-field-config", str(area),
+            str(config.get("truth_type_field") or "BHBM"),
+            str(area_map.get("added") or "2"),
+            str(area_map.get("width_changed") or "3"),
+            str(area_map.get("removed") or "4"),
+        ))
     missing = []
     for entry in changes:
         key = (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))

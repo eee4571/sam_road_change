@@ -17,6 +17,12 @@ from .common_widgets import (
 )
 
 
+DEFAULT_TRUTH_FIELD_CONFIG = {
+    "truth_type_field": "BHBM",
+    "truth_value_map": {"added": "2", "width_changed": "3", "removed": "4"},
+}
+
+
 def _fit_tree_height(tree: ttk.Treeview, item_count: int, minimum: int, maximum: int) -> None:
     tree.configure(height=max(minimum, min(item_count, maximum)))
 
@@ -132,14 +138,12 @@ class DataPage:
         self.data_summary_areas = StringVar(value="0 个")
         self.data_summary_periods = StringVar(value="0 个")
         self.data_summary_truths = StringVar(value="0 组")
-        self.data_summary_candidates = StringVar(value="0 项")
         self.data_summary_encoding = StringVar(value="自动检测")
         for index, (label, variable) in enumerate((
             ("已连接数据源：", self.data_summary_sources),
             ("验证区：", self.data_summary_areas),
             ("影像期次：", self.data_summary_periods),
             ("变化真值：", self.data_summary_truths),
-            ("待确认候选：", self.data_summary_candidates),
             ("TXT 编码：", self.data_summary_encoding),
         )):
             row, column = index % 3, (index // 3) * 2
@@ -166,8 +170,6 @@ class DataPage:
             f"{sum(len(rows) for rows in self.project_area_periods.values())} 个"
         )
         self.data_summary_truths.set(f"{len(self.project_area_truths)} 组")
-        candidate_count = sum(len(rows) for rows in self.project_candidates.values())
-        self.data_summary_candidates.set(f"{candidate_count} 项")
         encodings = sorted({value for value in self.project_txt_encodings.values() if value})
         self.data_summary_encoding.set("、".join(encodings) if encodings else "自动检测")
 
@@ -178,6 +180,82 @@ class DataPage:
         if selected in names:
             return selected
         return names[0] if names else ""
+
+    @staticmethod
+    def _normalize_truth_field_config(config: object) -> dict[str, object]:
+        source = config if isinstance(config, dict) else {}
+        raw_map = source.get("truth_value_map") if isinstance(source.get("truth_value_map"), dict) else {}
+        defaults = DEFAULT_TRUTH_FIELD_CONFIG["truth_value_map"]
+        return {
+            "truth_type_field": str(source.get("truth_type_field") or "BHBM").strip() or "BHBM",
+            "truth_value_map": {
+                key: str(raw_map.get(key) or defaults[key]).strip()
+                for key in ("added", "width_changed", "removed")
+            },
+        }
+
+    def _truth_field_config_for_area(self, area: str) -> dict[str, object]:
+        return self._normalize_truth_field_config(
+            self.project_area_truth_field_configs.get(str(area), {}),
+        )
+
+    def _store_truth_field_controls(self, *, save: bool = False) -> None:
+        area = str(getattr(self, "_truth_field_config_area", "") or "").strip()
+        if not area:
+            return
+        self.project_area_truth_field_configs[area] = {
+            "truth_type_field": self.evaluation_type_field.get().strip() or "BHBM",
+            "truth_value_map": {
+                "added": self.evaluation_added_value.get().strip(),
+                "width_changed": self.evaluation_width_changed_value.get().strip(),
+                "removed": self.evaluation_removed_value.get().strip(),
+            },
+        }
+        if save:
+            self._save_project_config()
+
+    def _load_truth_field_controls(self, area: str) -> None:
+        config = self._truth_field_config_for_area(area)
+        value_map = config["truth_value_map"]
+        self._truth_field_config_area = area
+        self.evaluation_type_field.set(str(config["truth_type_field"]))
+        self.evaluation_added_value.set(str(value_map["added"]))
+        self.evaluation_width_changed_value.set(str(value_map["width_changed"]))
+        self.evaluation_removed_value.set(str(value_map["removed"]))
+        self._evaluation_truth_field_summary = {}
+        if hasattr(self, "evaluation_type_field_combo"):
+            self.evaluation_type_field_combo.configure(values=())
+        for combo in getattr(self, "evaluation_value_combos", {}).values():
+            combo.configure(values=())
+        self.evaluation_type_field_status.set(
+            f"区域“{area}”使用字段“{config['truth_type_field']}”；"
+            f"新增={value_map['added']}，宽度变化={value_map['width_changed']}，灭失={value_map['removed']}。"
+            if area else "请选择区域后配置真值字段。"
+        )
+
+    def _project_truth_type_field_changed(self, event=None) -> None:
+        self._evaluation_type_field_changed(event)
+        self._store_truth_field_controls(save=True)
+
+    def _project_truth_value_mapping_changed(self, _event=None) -> None:
+        self._store_truth_field_controls(save=True)
+
+    def _current_region_truth_path(self) -> str:
+        area = self._selected_project_region()
+        pair = self._selected_truth_pair() if hasattr(self, "project_truth_tree") else None
+        if pair is not None:
+            selected = next((
+                path for region, before, after, path in self.project_area_truths
+                if (region, before, after) == (area, pair[0], pair[1])
+            ), "")
+            if selected:
+                return selected
+        return next((path for region, _before, _after, path in self.project_area_truths if region == area), "")
+
+    def _inspect_current_region_truth_fields(self) -> None:
+        truth = self._current_region_truth_path()
+        self._refresh_evaluation_truth_fields(show_error=True, truth_path=truth)
+        self._store_truth_field_controls(save=True)
 
     def _ensure_project_config_tables(self) -> None:
         if hasattr(self, "project_period_tree"):
@@ -241,25 +319,47 @@ class DataPage:
         ttk.Button(truth_actions, text="选择真值", style="Compact.TButton", command=self.set_selected_project_truth).pack(side=LEFT)
         ttk.Button(truth_actions, text="移除真值", style="Compact.TButton", command=self.remove_selected_project_truth).pack(side=LEFT, padx=(4, 0))
 
-        ttk.Label(self.project_config_container, text="待确认候选").grid(row=6, column=0, sticky="w", pady=(0, 3))
-        candidate_frame = ttk.Frame(self.project_config_container)
-        candidate_frame.grid(row=7, column=0, sticky="ew")
-        self.project_candidate_tree = ttk.Treeview(
-            candidate_frame, columns=("kind", "path"), show="headings",
-            height=2, style="Data.Treeview",
+        ttk.Label(self.project_config_container, text="真值字段配置（当前区域）").grid(
+            row=6, column=0, sticky="w", pady=(0, 3),
         )
-        self.project_candidate_tree.heading("kind", text="类型", anchor="w")
-        self.project_candidate_tree.heading("path", text="路径", anchor="w")
-        self.project_candidate_tree.column("kind", width=70, stretch=False, anchor="w")
-        self.project_candidate_tree.column("path", width=760, stretch=True, anchor="w")
-        candidate_scroll = ttk.Scrollbar(candidate_frame, orient="vertical", command=self.project_candidate_tree.yview)
-        candidate_xscroll = ttk.Scrollbar(candidate_frame, orient="horizontal", command=self.project_candidate_tree.xview)
-        self.project_candidate_tree.configure(yscrollcommand=candidate_scroll.set, xscrollcommand=candidate_xscroll.set)
-        self.project_candidate_tree.grid(row=0, column=0, sticky="nsew")
-        candidate_scroll.grid(row=0, column=1, sticky="ns")
-        candidate_xscroll.grid(row=1, column=0, sticky="ew")
-        candidate_frame.grid_columnconfigure(0, weight=1)
-        attach_treeview_tooltip(self.project_candidate_tree)
+        field_row = ttk.Frame(self.project_config_container)
+        field_row.grid(row=7, column=0, sticky="ew")
+        ttk.Label(field_row, text="变化类型字段", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
+        self.evaluation_type_field_combo = ttk.Combobox(
+            field_row, textvariable=self.evaluation_type_field, width=18, state="normal",
+        )
+        self.evaluation_type_field_combo.pack(side=LEFT)
+        self.evaluation_type_field_combo.bind(
+            "<<ComboboxSelected>>", self._project_truth_type_field_changed,
+        )
+        self.evaluation_type_field_combo.bind(
+            "<FocusOut>", self._project_truth_type_field_changed,
+        )
+        ttk.Button(
+            field_row, text="检查当前真值字段", style="Compact.TButton",
+            command=self._inspect_current_region_truth_fields,
+        ).pack(side=LEFT, padx=(6, 0))
+        status_label = ttk.Label(
+            self.project_config_container, textvariable=self.evaluation_type_field_status,
+            style="CardMuted.TLabel",
+        )
+        status_label.grid(row=8, column=0, sticky="ew", pady=(4, 0))
+        bind_dynamic_wrap(status_label, self.project_config_container, minimum=260, padding=20)
+        value_row = ttk.Frame(self.project_config_container)
+        value_row.grid(row=9, column=0, sticky="ew", pady=(5, 0))
+        ttk.Label(value_row, text="字段值对应关系", width=LAYOUT_METRICS["form_label_width"]).pack(side=LEFT)
+        self.evaluation_value_combos = {}
+        for key, label, variable in (
+            ("added", "新增", self.evaluation_added_value),
+            ("width_changed", "宽度变化", self.evaluation_width_changed_value),
+            ("removed", "灭失", self.evaluation_removed_value),
+        ):
+            ttk.Label(value_row, text=f"{label}=").pack(side=LEFT, padx=((8 if key != "added" else 0), 3))
+            combo = ttk.Combobox(value_row, textvariable=variable, width=9, state="normal")
+            combo.pack(side=LEFT)
+            combo.bind("<<ComboboxSelected>>", self._project_truth_value_mapping_changed)
+            combo.bind("<FocusOut>", self._project_truth_value_mapping_changed)
+            self.evaluation_value_combos[key] = combo
 
     @staticmethod
     def _selected_tree_iid(tree) -> str:
@@ -340,7 +440,7 @@ class DataPage:
         region = self._selected_project_region()
         area_path = next((path for name, path in self.project_validation_areas if name == region), "")
         self.project_validation_path.set(area_path or "尚未选择验证区。")
-        for tree in (self.project_period_tree, self.project_truth_tree, self.project_candidate_tree):
+        for tree in (self.project_period_tree, self.project_truth_tree):
             children = tree.get_children()
             if children:
                 tree.delete(*children)
@@ -350,7 +450,7 @@ class DataPage:
                 self.add_project_period_button.state(["disabled"])
             _fit_tree_height(self.project_period_tree, 0, 2, 5)
             _fit_tree_height(self.project_truth_tree, 0, 2, 4)
-            _fit_tree_height(self.project_candidate_tree, 0, 2, 4)
+            self._load_truth_field_controls("")
             self._refresh_stage_selectors()
             self._refresh_data_summary()
             self._schedule_content_layout()
@@ -375,12 +475,9 @@ class DataPage:
             self.project_truth_tree.insert(
                 "", END, iid=iid, values=(f"{before} - {after}", truth or "", "已配置" if truth else "未配置"),
             )
-        pending = [(kind.upper(), path) for kind, paths in self.project_candidates.items() for path in paths]
-        for index, (kind, path) in enumerate(pending[:10]):
-            self.project_candidate_tree.insert("", END, iid=f"candidate:{index}", values=(kind, path))
         _fit_tree_height(self.project_period_tree, len(rows), 2, 5)
         _fit_tree_height(self.project_truth_tree, len(pairs), 2, 4)
-        _fit_tree_height(self.project_candidate_tree, min(len(pending), 10), 2, 4)
+        self._load_truth_field_controls(region)
         self._refresh_stage_selectors()
         self._refresh_data_summary()
         self._schedule_content_layout()
@@ -407,12 +504,14 @@ class DataPage:
         self._stage_period_changed()
 
     def _project_region_changed(self, _event=None) -> None:
+        self._store_truth_field_controls(save=True)
         self._refresh_project_config_panel()
 
     def _stage_region_changed(self, _event=None) -> None:
         self._refresh_stage_selectors()
 
     def _project_payload(self) -> dict:
+        self._store_truth_field_controls()
         payload = dict(self.project_config)
         payload.update({
             "version": 3,
@@ -427,6 +526,7 @@ class DataPage:
                 for area, rows in self.project_area_periods.items()
             },
             "area_truths": [list(row) for row in self.project_area_truths],
+            "area_truth_field_configs": self.project_area_truth_field_configs,
             "unmapped_candidates": self.project_candidates,
             "output_root": self.vars["output_root"].get().strip(),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -479,6 +579,7 @@ class DataPage:
         self.project_area_truths = [(*key, path) for key, path in truths.items()]
 
     def _apply_project_config(self, payload: dict) -> None:
+        self._truth_field_config_area = ""
         self.project_config = dict(payload)
         self.project_data_sources = [str(Path(value).expanduser().resolve()) for value in payload.get("external_data_sources", []) if str(value).strip()]
         self.project_scan_cache = {
@@ -507,6 +608,10 @@ class DataPage:
             (str(area), str(before), str(after), str(path))
             for area, before, after, path in payload.get("area_truths", [])
         ]
+        self.project_area_truth_field_configs = {
+            str(area): self._normalize_truth_field_config(config)
+            for area, config in (payload.get("area_truth_field_configs") or {}).items()
+        }
         candidates = payload.get("unmapped_candidates") or {}
         self.project_candidates = {
             "shp": [str(value) for value in candidates.get("shp", [])],
@@ -702,11 +807,10 @@ class DataPage:
                 path for path in paths
                 if path not in mapped and not (path in seen or seen.add(path))
             ]
-        pending = sum(len(values) for values in self.project_candidates.values())
-        self.data_status.set("已扫描，存在待确认项" if pending else "已扫描，等待数据检查")
+        self.data_status.set("已扫描，等待数据检查")
         self.project_scan_summary.set(
             f"已索引 {len(self.project_scan_cache)} 个外部目录；自动识别 {len(self.project_validation_areas)} 个区域、"
-            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个期次；待确认候选 {pending} 项；"
+            f"{sum(len(rows) for rows in self.project_area_periods.values())} 个期次；"
             f"本轮用时 {float(payload.get('elapsed_seconds', 0.0)):.2f} 秒。"
         )
         self._refresh_project_config_panel()
@@ -767,6 +871,7 @@ class DataPage:
         self.project_validation_areas = [row for row in self.project_validation_areas if row[0] != region]
         self.project_area_periods.pop(region, None)
         self.project_area_truths = [row for row in self.project_area_truths if row[0] != region]
+        self.project_area_truth_field_configs.pop(region, None)
         self.data_region.set("")
         self._refresh_project_config_panel()
         self._refresh_input_summary()
@@ -878,6 +983,8 @@ class DataPage:
         self.project_validation_areas = []
         self.project_area_periods = {}
         self.project_area_truths = []
+        self.project_area_truth_field_configs = {}
+        self._truth_field_config_area = ""
         self.project_data_sources = []
         self.project_scan_cache = {}
         self.project_txt_encodings = {}
@@ -931,6 +1038,8 @@ class DataPage:
             self._apply_project_config(payload)
         elif legacy_project:
             self.project_data_sources = [str(root)]
+            self.project_area_truth_field_configs = {}
+            self._truth_field_config_area = ""
             self._apply_discovered_project(legacy_project)
             self.vars["output_root"].set(str(legacy_project["output_root"]))
             self.data_source_display.set(str(root))
@@ -943,6 +1052,8 @@ class DataPage:
             self.project_validation_areas = []
             self.project_area_truths = []
             self.project_area_periods = {}
+            self.project_area_truth_field_configs = {}
+            self._truth_field_config_area = ""
             self.project_candidates = {"shp": [], "txt": []}
             output = root / RESULT_DIRECTORY_NAME
             self.vars["output_root"].set(str(output))
@@ -961,15 +1072,11 @@ class DataPage:
         self.run_button.state(["!disabled"])
         self._refresh_input_summary()
         self._refresh_project_config_panel()
-        pending = sum(len(values) for values in self.project_candidates.values())
-        self.data_status.set(
-            "未连接数据源" if not self.project_data_sources else
-            ("已扫描，存在待确认项" if pending else "已扫描，等待数据检查")
-        )
+        self.data_status.set("未连接数据源" if not self.project_data_sources else "已扫描，等待数据检查")
         self.project_scan_summary.set(
             f"项目已打开：{len(self.project_validation_areas)} 个验证区、"
             f"{sum(len(rows) for rows in self.project_area_periods.values())} 个影像期次、"
-            f"{len(self.project_area_truths)} 个变化真值、{pending} 个待确认候选；"
+            f"{len(self.project_area_truths)} 个变化真值；"
             f"已恢复 {len(self.project_scan_cache)} 个数据源扫描索引，未递归重扫。"
         )
         unfinished = self.task_manager.unfinished_state(

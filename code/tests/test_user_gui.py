@@ -347,13 +347,43 @@ class UserGuiInputCommandTests(unittest.TestCase):
 
     def test_result_copy_is_user_facing_and_keeps_internal_codes_out_of_intro(self) -> None:
         source = inspect.getsource(gui.UserApp._build_result_page)
+        data_source = inspect.getsource(gui.UserApp._ensure_project_config_tables)
         self.assertIn("根据真值数据中的变化类型", source)
         self.assertNotIn("BHBM=2", source)
-        self.assertIn('text="待评价结果"', source)
-        self.assertIn('text="项目真值"', source)
-        self.assertIn('text="变化类型字段"', source)
+        self.assertNotIn('text="项目真值"', source)
+        self.assertNotIn('text="补充真值"', source)
+        self.assertNotIn('text="变化类型字段"', source)
+        self.assertIn('text="变化类型字段"', data_source)
+        self.assertIn('text="检查当前真值字段"', data_source)
+        self.assertIn('text="字段值对应关系"', data_source)
         self.assertIn('text="中心线匹配容差（米）"', source)
         self.assertIn("self.result_review_count", source)
+
+    def test_truth_field_config_is_scoped_by_area(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app.project_area_truth_field_configs = {
+            "区域A": {
+                "truth_type_field": "kind_a",
+                "truth_value_map": {"added": "A", "width_changed": "W", "removed": "R"},
+            },
+            "区域B": {
+                "truth_type_field": "kind_b",
+                "truth_value_map": {"added": "1", "width_changed": "2", "removed": "3"},
+            },
+        }
+
+        self.assertEqual(app._truth_field_config_for_area("区域A")["truth_type_field"], "kind_a")
+        self.assertEqual(
+            app._truth_field_config_for_area("区域B")["truth_value_map"],
+            {"added": "1", "width_changed": "2", "removed": "3"},
+        )
+        self.assertEqual(app._truth_field_config_for_area("未配置区域")["truth_type_field"], "BHBM")
+
+    def test_area_data_config_has_no_candidate_table(self) -> None:
+        source = inspect.getsource(gui.UserApp._ensure_project_config_tables)
+        summary_source = inspect.getsource(gui.UserApp._build_data_page)
+        self.assertNotIn("project_candidate_tree", source)
+        self.assertNotIn("待确认候选", summary_source)
 
     def test_layout_metrics_cover_page_card_form_and_wrap_spacing(self) -> None:
         self.assertEqual(
@@ -530,6 +560,34 @@ class UserGuiInputCommandTests(unittest.TestCase):
             self.assertEqual(command[command.index("--truth-added-value") + 1], "A")
             self.assertEqual(command[command.index("--truth-width-changed-value") + 1], "W")
             self.assertEqual(command[command.index("--truth-removed-value") + 1], "R")
+
+    def test_builds_area_specific_truth_field_configs_for_total_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            truth_a = root / "a.shp"; truth_a.touch()
+            truth_b = root / "b.shp"; truth_b.touch()
+            manifest = {"change_results": [
+                {"grid": "区域A", "before_period": "2020", "after_period": "2021"},
+                {"grid": "区域B", "before_period": "2020", "after_period": "2021"},
+            ]}
+            command = gui.build_evaluate_all_command(
+                manifest, root / "pipeline_result.json",
+                [("区域A", "2020", "2021", str(truth_a)), ("区域B", "2020", "2021", str(truth_b))],
+                area_truth_field_configs={
+                    "区域A": {"truth_type_field": "kind_a", "truth_value_map": {
+                        "added": "A", "width_changed": "W", "removed": "R",
+                    }},
+                    "区域B": {"truth_type_field": "kind_b", "truth_value_map": {
+                        "added": "1", "width_changed": "2", "removed": "3",
+                    }},
+                },
+            )
+
+        configs = [command[index + 1:index + 6] for index, value in enumerate(command) if value == "--truth-field-config"]
+        self.assertEqual(configs, [
+            ["区域A", "kind_a", "A", "W", "R"],
+            ["区域B", "kind_b", "1", "2", "3"],
+        ])
 
     def test_entering_run_step_does_not_auto_start_preflight(self) -> None:
         source = inspect.getsource(gui.UserApp._show_step)
