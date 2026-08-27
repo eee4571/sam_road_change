@@ -65,8 +65,8 @@ FAST_PRESENCE_HIGH_THRESHOLD = 0.45
 FAST_PRESENCE_LOW_THRESHOLD = 0.20
 FAST_PRESENCE_DELTA_THRESHOLD = 0.25
 FAST_PRESENCE_ALIGNMENT_RADIUS_PX = 2
-FAST_PRESENCE_MORPH_KERNEL_PX = 3
 FAST_PRESENCE_MIN_BLOB_AREA_PX2 = 12
+FAST_PRESENCE_MIN_PATH_SEED_PIXELS = 2
 FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY = 0.90
 FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
@@ -2483,14 +2483,38 @@ def _fast_period_road_masks(
     surfaces: gpd.GeoDataFrame,
     centerlines: gpd.GeoDataFrame,
     grid: FastProbabilityGrid,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     surface_mask = _fast_rasterize_frame(surfaces, grid)
-    line_mask = _fast_rasterize_frame(
+    line_anchor = _fast_rasterize_frame(
         centerlines,
         grid,
         buffer_distance=0.75 * grid.pixel_size,
     )
-    return surface_mask, line_mask
+    path_labels = _fast_centerline_path_labels(centerlines, grid)
+    return surface_mask, line_anchor, path_labels
+
+
+def _fast_centerline_path_labels(
+    centerlines: gpd.GeoDataFrame,
+    grid: FastProbabilityGrid,
+) -> np.ndarray:
+    """Rasterize noded centerline paths without turning them into road surfaces."""
+    if centerlines.empty:
+        return np.zeros(grid.before.shape, dtype=np.int32)
+    parts = _fast_line_parts(centerlines.geometry.union_all())
+    if len(parts) > 1:
+        parts = _fast_line_parts(linemerge(parts))
+    paths = [part for part in parts if not part.is_empty and float(part.length) > 0]
+    if not paths:
+        return np.zeros(grid.before.shape, dtype=np.int32)
+    return rasterize(
+        [(path, path_id) for path_id, path in enumerate(paths, start=1)],
+        out_shape=grid.before.shape,
+        transform=grid.transform,
+        fill=0,
+        all_touched=True,
+        dtype="int32",
+    )
 
 
 def _clean_fast_presence_mask(
@@ -2498,13 +2522,8 @@ def _clean_fast_presence_mask(
     centerline_anchor: np.ndarray,
 ) -> np.ndarray:
     binary = np.asarray(mask, dtype=np.uint8)
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (FAST_PRESENCE_MORPH_KERNEL_PX, FAST_PRESENCE_MORPH_KERNEL_PX),
-    )
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-        closed, connectivity=8,
+        binary, connectivity=8,
     )
     anchor_counts = np.bincount(
         labels[np.asarray(centerline_anchor) > 0], minlength=count,
@@ -2517,8 +2536,63 @@ def _clean_fast_presence_mask(
     return keep_labels[labels].astype(np.uint8)
 
 
-def _fast_presence_records(
+def _partition_fast_presence_components(
     mask: np.ndarray,
+    path_labels: np.ndarray,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Assign every retained change pixel to its nearest centerline path seed."""
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    component_count, components, stats, _centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8,
+    )
+    regions = np.zeros(binary.shape, dtype=np.int32)
+    next_region = 1
+    split_component_count = 0
+    split_region_count = 0
+    for component_id in range(1, component_count):
+        x = int(stats[component_id, cv2.CC_STAT_LEFT])
+        y = int(stats[component_id, cv2.CC_STAT_TOP])
+        width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+        component = components[y:y + height, x:x + width] == component_id
+        seeds = np.where(component, path_labels[y:y + height, x:x + width], 0)
+        seed_paths, seed_counts = np.unique(seeds[seeds > 0], return_counts=True)
+        valid_paths = seed_paths[seed_counts >= FAST_PRESENCE_MIN_PATH_SEED_PIXELS]
+        if valid_paths.size <= 1:
+            region_crop = regions[y:y + height, x:x + width]
+            region_crop[component] = next_region
+            next_region += 1
+            continue
+
+        valid_seed_mask = component & np.isin(seeds, valid_paths)
+        distance_source = np.ones(component.shape, dtype=np.uint8)
+        distance_source[valid_seed_mask] = 0
+        _distance, nearest_seed = cv2.distanceTransformWithLabels(
+            distance_source,
+            cv2.DIST_L2,
+            cv2.DIST_MASK_5,
+            labelType=cv2.DIST_LABEL_PIXEL,
+        )
+        seed_owners = seeds[valid_seed_mask]
+        owner_by_label = np.zeros(seed_owners.size + 1, dtype=np.int32)
+        owner_by_label[1:] = seed_owners
+        nearest_path = owner_by_label[nearest_seed]
+        region_crop = regions[y:y + height, x:x + width]
+        for path_id in valid_paths:
+            owned = component & (nearest_path == path_id)
+            if owned.any():
+                region_crop[owned] = next_region
+                next_region += 1
+                split_region_count += 1
+        split_component_count += 1
+    return regions, {
+        "split_component_count": int(split_component_count),
+        "split_region_count": int(split_region_count),
+    }
+
+
+def _fast_presence_records(
+    regions: np.ndarray,
     source_surfaces: gpd.GeoDataFrame,
     grid: FastProbabilityGrid,
     *,
@@ -2530,9 +2604,9 @@ def _fast_presence_records(
     surface_union = source_surfaces.geometry.union_all()
     records = []
     for mapping, value in shapes(
-        mask.astype(np.uint8), mask=mask.astype(bool), transform=grid.transform,
+        regions.astype(np.int32), mask=regions.astype(bool), transform=grid.transform,
     ):
-        if int(value) != 1:
+        if int(value) <= 0:
             continue
         change_geometry = make_valid(shape(mapping)).intersection(surface_union)
         for part in _fast_polygon_parts(change_geometry, min_area=min_area):
@@ -2574,10 +2648,10 @@ def _detect_probability_presence_changes(
         & (after_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
         & ((grid.before - after_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
     )
-    before_surface_mask, before_line_anchor = _fast_period_road_masks(
+    before_surface_mask, before_line_anchor, before_path_labels = _fast_period_road_masks(
         before_surfaces, before_centerlines, grid,
     )
-    after_surface_mask, after_line_anchor = _fast_period_road_masks(
+    after_surface_mask, after_line_anchor, after_path_labels = _fast_period_road_masks(
         after_surfaces, after_centerlines, grid,
     )
     added_mask = _clean_fast_presence_mask(
@@ -2586,14 +2660,20 @@ def _detect_probability_presence_changes(
     removed_mask = _clean_fast_presence_mask(
         removed_raw & (before_surface_mask > 0), before_line_anchor,
     )
+    added_regions, added_split = _partition_fast_presence_components(
+        added_mask, after_path_labels,
+    )
+    removed_regions, removed_split = _partition_fast_presence_components(
+        removed_mask, before_path_labels,
+    )
     records = {
         "added": _fast_presence_records(
-            added_mask, after_surfaces, grid, change_type="added",
+            added_regions, after_surfaces, grid, change_type="added",
             before_period=before_period, after_period=after_period,
             min_area=min_area,
         ),
         "removed": _fast_presence_records(
-            removed_mask, before_surfaces, grid, change_type="removed",
+            removed_regions, before_surfaces, grid, change_type="removed",
             before_period=before_period, after_period=after_period,
             min_area=min_area,
         ),
@@ -2605,6 +2685,10 @@ def _detect_probability_presence_changes(
         "removed_final_pixel_count": int(removed_mask.sum()),
         "added_feature_count": int(len(records["added"])),
         "removed_feature_count": int(len(records["removed"])),
+        "added_split_component_count": added_split["split_component_count"],
+        "added_split_region_count": added_split["split_region_count"],
+        "removed_split_component_count": removed_split["split_component_count"],
+        "removed_split_region_count": removed_split["split_region_count"],
     }
     return records, diagnostics, before_surface_mask, after_surface_mask
 

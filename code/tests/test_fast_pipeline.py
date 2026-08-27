@@ -43,12 +43,26 @@ from engine.fast_pipeline import (
     _relative_hysteresis_mask,
     _trace_skeleton_paths,
     _jitter_fast_change_geometry,
+    _partition_fast_presence_components,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
 
 
 class FastCommandTests(unittest.TestCase):
+    def test_presence_component_is_partitioned_without_changing_mask_pixels(self) -> None:
+        mask = np.zeros((24, 24), dtype=np.uint8)
+        mask[4:20, 4:20] = 1
+        path_labels = np.zeros_like(mask, dtype=np.int32)
+        path_labels[8, 4:20] = 1
+        path_labels[4:20, 15] = 2
+
+        regions, diagnostics = _partition_fast_presence_components(mask, path_labels)
+
+        self.assertTrue(np.array_equal(regions > 0, mask > 0))
+        self.assertEqual(len(np.unique(regions[regions > 0])), 2)
+        self.assertEqual(diagnostics["split_component_count"], 1)
+
     def test_full_keeps_legacy_cli_and_fast_adds_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
