@@ -43,7 +43,7 @@ class UserGuiInputCommandTests(unittest.TestCase):
                 "change_results": entries,
             })
 
-            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["change_progress"], "2 / 2")
             self.assertEqual(rows[0]["evaluation_progress"], "2 / 2")
             self.assertEqual(rows[0]["status"], "已完成")
@@ -52,16 +52,71 @@ class UserGuiInputCommandTests(unittest.TestCase):
             self.assertAlmostEqual(rows[0]["road_centerline_completeness"], 0.8)
             self.assertAlmostEqual(rows[0]["centerline_mean_offset_px"], 2.5)
             self.assertAlmostEqual(rows[0]["change_type_accuracy"], 0.8)
+            self.assertEqual(rows[1]["area"], "项目总计")
+            self.assertEqual(rows[1]["evaluation_progress"], "2 / 2")
+            self.assertAlmostEqual(rows[1]["change_recall"], 125 / 150)
 
             entries[1]["evaluation_stale"] = True
             entries[1]["evaluation_state"] = "stale"
-            stale = build_area_evaluation_rows({
+            stale_rows = build_area_evaluation_rows({
                 "period_orders": {"区域A": {"period_order": ["2020", "2021", "2022"]}},
                 "change_results": entries,
-            })[0]
+            })
+            stale = stale_rows[0]
             self.assertEqual(stale["evaluation_progress"], "1 / 2")
             self.assertEqual(stale["status"], "需重新评价")
             self.assertNotIn("change_recall", stale)
+            self.assertEqual(stale_rows[-1]["status"], "需重新评价")
+            self.assertNotIn("change_recall", stale_rows[-1])
+
+    def test_eight_periods_require_seven_pair_evaluations_before_metrics_show(self) -> None:
+        periods = [str(year) for year in range(2010, 2018)]
+        changes = [{
+            "grid": "区域A", "before_period": before, "after_period": after,
+            "status": "completed", "truth": "truth.shp",
+        } for before, after in zip(periods, periods[1:])]
+
+        rows = build_area_evaluation_rows({
+            "period_orders": {"区域A": {"period_order": periods}},
+            "change_results": changes,
+        })
+
+        self.assertEqual(rows[0]["change_progress"], "7 / 7")
+        self.assertEqual(rows[0]["evaluation_progress"], "0 / 7")
+        self.assertEqual(rows[0]["status"], "待评价")
+        self.assertNotIn("change_recall", rows[0])
+        self.assertEqual(rows[-1]["area"], "项目总计")
+        self.assertEqual(rows[-1]["evaluation_progress"], "0 / 7")
+
+    def test_project_total_pools_supports_instead_of_averaging_area_percentages(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            changes = []
+            for area, tp, fp, fn in (("区域A", 90, 10, 10), ("区域B", 1, 9, 9)):
+                summary = root / f"{area}.json"
+                metrics = root / f"{area}.csv"; metrics.touch()
+                summary.write_text(json.dumps({"evaluation": {"metrics": [{
+                    "class": "all", "tp_m2": tp, "fp_m2": fp, "fn_m2": fn,
+                }]}}), encoding="utf-8")
+                changes.append({
+                    "grid": area, "before_period": "2020", "after_period": "2021",
+                    "status": "completed", "truth": "truth.shp",
+                    "summary": str(summary), "evaluation_metrics": str(metrics),
+                })
+
+            rows = build_area_evaluation_rows({
+                "period_orders": {
+                    "区域A": {"period_order": ["2020", "2021"]},
+                    "区域B": {"period_order": ["2020", "2021"]},
+                },
+                "change_results": changes,
+            })
+
+        total = rows[-1]
+        self.assertEqual(total["area"], "项目总计")
+        self.assertAlmostEqual(total["change_recall"], 91 / 110)
+        self.assertAlmostEqual(total["change_precision"], 91 / 110)
+        self.assertNotAlmostEqual(total["change_recall"], (0.9 + 0.1) / 2)
 
     def test_evaluation_manifest_reads_exact_active_task_not_merged_results(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -126,6 +181,53 @@ class UserGuiInputCommandTests(unittest.TestCase):
             "kind": "pipeline", "stage": "批量变化检测重跑", "status": "running",
         })
         app.refresh_project_results.assert_not_called()
+
+    def test_evaluation_table_ignores_ordinary_change_stage_events(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app._refresh_active_evaluation_results = mock.Mock()
+
+        app.handle_evaluation_backend_event({
+            "kind": "pipeline", "stage": "变化检测", "status": "running",
+        })
+        app.handle_evaluation_backend_event({
+            "kind": "pipeline", "stage": "变化检测", "status": "complete",
+        })
+        app._refresh_active_evaluation_results.assert_not_called()
+
+        app.handle_evaluation_backend_event({
+            "kind": "stage", "stage": "批量精度评价", "status": "running",
+        })
+        app._refresh_active_evaluation_results.assert_called_once_with()
+
+    def test_evaluation_tree_fingerprint_avoids_unchanged_rebuild(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app._evaluation_tree_fingerprint = None
+        app.evaluation_tree = mock.Mock()
+        app.evaluation_tree.selection.return_value = ()
+        app.evaluation_tree.get_children.return_value = ()
+        app.evaluation_tree.yview.return_value = (0.0, 1.0)
+        app.evaluation_tree.insert.side_effect = ("area", "total")
+        rows = [
+            {"area": "区域A", "change_progress": "1 / 1", "evaluation_progress": "0 / 1", "status": "待评价"},
+            {"area": "项目总计", "change_progress": "1 / 1", "evaluation_progress": "0 / 1", "status": "待评价"},
+        ]
+
+        app._populate_evaluation_tree(rows)
+        app._populate_evaluation_tree(rows)
+
+        self.assertEqual(app.evaluation_tree.delete.call_count, 1)
+        self.assertEqual(app.evaluation_tree.insert.call_count, 2)
+
+    def test_manual_result_refresh_does_not_refresh_evaluation_table(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app._result_tree_fingerprint = ("old",)
+        app.results_available = True
+        app.status = mock.Mock()
+        app._refresh_result_availability = mock.Mock()
+
+        app.refresh_project_results()
+
+        app._refresh_result_availability.assert_called_once_with(refresh_evaluation=False)
 
     def test_truth_pair_selection_uses_stable_tree_row_data_not_display_separator(self) -> None:
         tree = mock.Mock()
@@ -832,7 +934,9 @@ class UserGuiInputCommandTests(unittest.TestCase):
         self.assertNotIn("载入已有任务结果", main_source)
         self.assertNotIn("选择已有任务结果索引", result_source)
         self.assertIn("text=\"刷新成果\"", result_source)
-        self.assertIn("self.refresh_project_results(automatic=True)", data_source)
+        self.assertIn(
+            "self.refresh_project_results(automatic=True, refresh_evaluation=True)", data_source,
+        )
 
     def test_validation_command_rejects_non_shp_or_non_txt_user_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

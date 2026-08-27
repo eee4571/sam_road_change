@@ -3095,7 +3095,12 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     manifest["updated_at"] = now_text()
 
     job_root = Path(str(manifest.get("job_root") or manifest_path.parent)).expanduser().resolve()
-    aggregate = aggregate_change_evaluations(manifest, job_root)
+    defer_aggregate = bool(getattr(args, "defer_aggregate", False))
+    aggregate = (
+        {"json": None}
+        if defer_aggregate
+        else aggregate_change_evaluations(manifest, job_root)
+    )
     _persist_existing_pipeline(manifest, manifest_path)
 
     overall = rows[0]
@@ -3216,6 +3221,7 @@ def evaluate_all_existing_changes(args: argparse.Namespace) -> dict:
             ),
             truth_removed_value=str(field_config.get("removed") or getattr(args, "truth_removed_value", "") or ""),
             evaluation_tolerance=float(args.evaluation_tolerance),
+            defer_aggregate=True,
         ))
         completed += 1
     manifest = read_json(manifest_path)

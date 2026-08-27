@@ -108,6 +108,55 @@ class GridDiscoveryTests(unittest.TestCase):
                 user_pipeline.discover_grid_periods(Path(raw))
 
 
+class EvaluationBatchTests(unittest.TestCase):
+    def test_batch_evaluation_defers_pair_aggregates_and_aggregates_once_at_end(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest_path = root / "pipeline_result.json"
+            changes = [{
+                "grid": "区域A", "before_period": before, "after_period": after,
+                "status": "completed", "validation_area": "",
+            } for before, after in (("2020", "2021"), ("2021", "2022"))]
+            user_pipeline.write_json(manifest_path, {
+                "job_root": str(root), "output_root": str(root / "out"),
+                "project_root": str(root), "change_results": changes,
+            })
+
+            def fake_evaluate(namespace):
+                self.assertTrue(namespace.defer_aggregate)
+                manifest = user_pipeline.read_json(manifest_path)
+                entry = next(
+                    item for item in manifest["change_results"]
+                    if item["before_period"] == namespace.before_period
+                )
+                entry["evaluation_state"] = "completed"
+                user_pipeline.write_json(manifest_path, manifest)
+                return {}
+
+            aggregate_result = {"json": str(root / "evaluation_summary.json"), "metrics": [{
+                "class": "all", "change_area_recall": 0.9, "precision": 0.8,
+                "type_judgment_accuracy": 0.85,
+            }]}
+            args = argparse.Namespace(
+                pipeline_manifest=str(manifest_path),
+                truth=[
+                    ["区域A", "2020", "2021", "truth_1.shp"],
+                    ["区域A", "2021", "2022", "truth_2.shp"],
+                ],
+                truth_field_config=[], truth_type_field="BHBM",
+                truth_added_value="2", truth_width_changed_value="3",
+                truth_removed_value="4", evaluation_tolerance=5.0,
+            )
+            with patch.object(user_pipeline, "evaluate_existing_changes", side_effect=fake_evaluate) as evaluate_mock, \
+                    patch.object(user_pipeline, "aggregate_change_evaluations", return_value=aggregate_result) as aggregate_mock, \
+                    patch.object(user_pipeline, "_persist_existing_pipeline"):
+                result = user_pipeline.evaluate_all_existing_changes(args)
+
+        self.assertEqual(evaluate_mock.call_count, 2)
+        aggregate_mock.assert_called_once()
+        self.assertEqual(result["evaluated_task_count"], 2)
+
+
 class ProjectPeriodExtractionTests(unittest.TestCase):
     @staticmethod
     def _checkpoint_workspace(root: Path) -> tuple[Path, argparse.Namespace]:

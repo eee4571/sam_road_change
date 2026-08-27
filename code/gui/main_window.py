@@ -276,6 +276,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.scan_thread: threading.Thread | None = None
         self.scan_cancel_event: threading.Event | None = None
         self._result_tree_fingerprint: tuple | None = None
+        self._evaluation_tree_fingerprint: tuple | None = None
         self.result_tree_paths: dict[str, Path] = {}
         self.vars = {
             key: StringVar(value=value)
@@ -759,7 +760,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         if index == 2:
             self._populate_review_step()
         elif index == 3:
-            self._refresh_result_availability()
+            self._refresh_result_availability(refresh_evaluation=True)
 
     def _go_back(self) -> None:
         if self.current_step > 0:

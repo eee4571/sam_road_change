@@ -1090,7 +1090,7 @@ class DataPage:
         else:
             self.status.set(self.project_scan_summary.get())
         self._save_project_config()
-        self.refresh_project_results(automatic=True)
+        self.refresh_project_results(automatic=True, refresh_evaluation=True)
 
     def save_task_config(self) -> None:
         path = filedialog.asksaveasfilename(
