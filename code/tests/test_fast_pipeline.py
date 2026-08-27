@@ -645,6 +645,14 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertGreaterEqual(summary["auto_overlap_clipping_seconds"], 0.0)
             self.assertEqual(summary["gt_assisted_truth_count"], 4)
             self.assertEqual(summary["gt_assisted_auto_count"], 4)
+            self.assertTrue(summary["gt_assisted_geometry_structure_types"])
+            self.assertGreater(summary["gt_assisted_skeleton_branch_count"], 0)
+            self.assertGreater(summary["gt_assisted_boundary_erosion_pixel_count"], 0)
+            self.assertGreater(summary["gt_assisted_boundary_expansion_pixel_count"], 0)
+            self.assertGreater(summary["gt_assisted_boundary_erosion_pixel_count"], 0)
+            self.assertGreater(summary["gt_assisted_boundary_expansion_pixel_count"], 0)
+            self.assertGreater(summary["gt_assisted_overdetect_pixel_count"], 0)
+            self.assertGreaterEqual(summary["gt_assisted_mean_retained_ratio"], 0.85)
             final_overall = next(
                 row for row in summary["evaluation"]["metrics"]
                 if row["class"] == "all"
@@ -1052,12 +1060,17 @@ class FastTruthChangeTests(unittest.TestCase):
         area_ratio = float(final.area / rasterized_geometry.area)
         self.assertTrue(final.is_valid)
         self.assertFalse(final.is_empty)
-        self.assertGreaterEqual(area_ratio, 0.88)
-        self.assertLessEqual(area_ratio, 0.95)
+        self.assertGreaterEqual(diagnostics["retained_ratio"], 0.85)
+        self.assertLessEqual(diagnostics["retained_ratio"], 0.98)
         self.assertTrue(dropout_geometry.equals(final))
         self.assertGreater(diagnostics["dropout_pixel_count"], 0)
-        self.assertGreaterEqual(diagnostics["dropout_blob_count"], 1)
-        self.assertLessEqual(diagnostics["dropout_blob_count"], 3)
+        self.assertEqual(diagnostics["geometry_structure_type"], "corridor")
+        self.assertGreaterEqual(diagnostics["skeleton_branch_count"], 1)
+        self.assertGreater(diagnostics["boundary_erosion_pixel_count"], 0)
+        self.assertGreater(diagnostics["boundary_expansion_pixel_count"], 0)
+        self.assertGreater(diagnostics["overdetect_pixel_count"], 0)
+        self.assertGreater(final.difference(rasterized_geometry).area, 0)
+        self.assertTrue(rasterized_geometry.buffer(8.1).covers(final))
         self.assertLess(
             diagnostics["raster_window_pixel_count"], grid.before.size,
         )
@@ -1141,11 +1154,21 @@ class FastTruthChangeTests(unittest.TestCase):
         self.assertTrue(final.is_valid)
         self.assertFalse(final.is_empty)
         self.assertTrue(dropout_geometry.equals(final))
-        self.assertGreaterEqual(area_ratio, 0.88)
-        self.assertLessEqual(area_ratio, 0.95)
+        self.assertGreaterEqual(diagnostics["retained_ratio"], 0.85)
+        self.assertLessEqual(diagnostics["retained_ratio"], 0.98)
         self.assertFalse(final.equals(rasterized_geometry))
         self.assertLessEqual(final_holes, source_holes)
         self.assertGreater(diagnostics["dropout_pixel_count"], 20)
+        self.assertEqual(diagnostics["geometry_structure_type"], "network")
+        self.assertGreaterEqual(diagnostics["skeleton_branch_count"], 4)
+        self.assertGreater(
+            diagnostics["removed_branch_count"]
+            + diagnostics["transverse_cut_count"],
+            0,
+        )
+        self.assertGreater(diagnostics["overdetect_pixel_count"], 0)
+        self.assertGreater(final.difference(rasterized_geometry).area, 0)
+        self.assertTrue(rasterized_geometry.buffer(8.1).covers(final))
 
         source_mask = rasterize(
             [(rasterized_geometry, 1)], out_shape=grid.before.shape,
@@ -1160,10 +1183,8 @@ class FastTruthChangeTests(unittest.TestCase):
             cv2.connectedComponentsWithStats(removed_mask, connectivity=8)
         )
         self.assertGreater(removed_count, 1)
-        self.assertLessEqual(removed_count - 1, 8)
         self.assertGreater(int(removed_stats[1:, cv2.CC_STAT_AREA].max()), 20)
-        minimum_part_area = max(6.0, rasterized_geometry.area * 0.005)
-        self.assertTrue(all(part.area >= minimum_part_area for part in final_parts))
+        self.assertGreaterEqual(len(final_parts), 1)
 
         debug_path = (
             Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_grid.png"
@@ -1178,6 +1199,116 @@ class FastTruthChangeTests(unittest.TestCase):
             "final_holes": final_holes,
             **diagnostics,
         })
+
+    def test_gt_assisted_structure_aware_dropout_splits_loop_arcs(self) -> None:
+        source = box(15.35, 15.45, 140.65, 140.55).difference(
+            box(30.35, 30.45, 125.65, 125.55)
+        )
+        grid = self._dropout_test_grid()
+        rasterized, dropout, final, diagnostics = _perturb_fast_gt_geometry_stages(
+            source, np.random.default_rng(20260828), grid,
+        )
+        ratio = float(final.area / rasterized.area)
+        rasterized_parts = [rasterized] if rasterized.geom_type == "Polygon" else list(rasterized.geoms)
+        final_parts = [final] if final.geom_type == "Polygon" else list(final.geoms)
+        self.assertEqual(diagnostics["geometry_structure_type"], "network")
+        self.assertGreaterEqual(diagnostics["skeleton_branch_count"], 3)
+        self.assertGreater(diagnostics["boundary_erosion_pixel_count"], 0)
+        self.assertGreater(diagnostics["boundary_expansion_pixel_count"], 0)
+        self.assertGreaterEqual(diagnostics["retained_ratio"], 0.85)
+        self.assertLessEqual(diagnostics["retained_ratio"], 0.98)
+        self.assertLessEqual(
+            sum(len(part.interiors) for part in final_parts),
+            sum(len(part.interiors) for part in rasterized_parts),
+        )
+        self.assertGreater(diagnostics["overdetect_pixel_count"], 0)
+        self.assertTrue(rasterized.buffer(8.1).covers(final))
+        debug_path = Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_loop.png"
+        self._write_gt_dropout_preview(
+            source, rasterized, dropout, final, grid, debug_path,
+        )
+        print("GT loop dropout debug:", str(debug_path), diagnostics)
+
+    def test_gt_assisted_local_overdetections_are_sparse_across_features(self) -> None:
+        strip = box(0.35, 40.45, 120.65, 60.55)
+        roads = [
+            *(box(x + 0.35, 0.45, x + 7.35, 120.55) for x in (10, 45, 80, 115)),
+            *(box(10.35, y + 0.45, 122.35, y + 7.45) for y in (10, 45, 80, 113)),
+        ]
+        network = unary_union(roads)
+        grid = self._dropout_test_grid()
+        strip_diagnostics = [
+            _perturb_fast_gt_geometry_stages(
+                strip, np.random.default_rng(20260900 + index), grid,
+            )[3]
+            for index in range(20)
+        ]
+        network_diagnostics = [
+            _perturb_fast_gt_geometry_stages(
+                network, np.random.default_rng(20261000 + index), grid,
+            )[3]
+            for index in range(20)
+        ]
+        endpoint_count = sum(
+            row["endpoint_extension_count"] for row in strip_diagnostics
+        )
+        junction_count = sum(
+            row["junction_deformation_count"] for row in network_diagnostics
+        )
+        fragment_count = sum(
+            row["overdetect_fragment_count"]
+            for row in (*strip_diagnostics, *network_diagnostics)
+        )
+        self.assertGreater(endpoint_count, 0)
+        self.assertLess(endpoint_count, 15)
+        self.assertGreater(junction_count, 0)
+        self.assertLess(junction_count, 15)
+        self.assertLess(fragment_count, 12)
+
+    def test_gt_assisted_structure_aware_dropout_degrades_areal_blob(self) -> None:
+        source = box(20.35, 25.45, 135.65, 135.55)
+        grid = self._dropout_test_grid()
+        rasterized, dropout, final, diagnostics = _perturb_fast_gt_geometry_stages(
+            source, np.random.default_rng(20260829), grid,
+        )
+        ratio = float(final.area / rasterized.area)
+        final_parts = [final] if final.geom_type == "Polygon" else list(final.geoms)
+        self.assertEqual(diagnostics["geometry_structure_type"], "areal")
+        self.assertGreaterEqual(diagnostics["transverse_cut_count"], 0)
+        self.assertGreater(diagnostics["boundary_erosion_pixel_count"], 0)
+        self.assertGreaterEqual(diagnostics["retained_ratio"], 0.85)
+        self.assertLessEqual(diagnostics["retained_ratio"], 0.98)
+        self.assertEqual(sum(len(part.interiors) for part in final_parts), 0)
+        self.assertGreater(diagnostics["overdetect_pixel_count"], 0)
+        self.assertTrue(rasterized.buffer(8.1).covers(final))
+        debug_path = Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_areal.png"
+        self._write_gt_dropout_preview(
+            source, rasterized, dropout, final, grid, debug_path,
+        )
+        print("GT areal dropout debug:", str(debug_path), diagnostics)
+
+    def test_gt_assisted_structure_aware_dropout_preserves_width_change_shape(self) -> None:
+        source = unary_union((
+            box(5.35, 65.45, 85.65, 75.55),
+            box(70.35, 60.45, 145.65, 81.55),
+        ))
+        grid = self._dropout_test_grid()
+        rasterized, dropout, final, diagnostics = _perturb_fast_gt_geometry_stages(
+            source, np.random.default_rng(20260830), grid,
+        )
+        ratio = float(final.area / rasterized.area)
+        self.assertEqual(diagnostics["geometry_structure_type"], "corridor")
+        self.assertGreaterEqual(diagnostics["retained_ratio"], 0.85)
+        self.assertLessEqual(diagnostics["retained_ratio"], 0.98)
+        self.assertGreater(diagnostics["overdetect_pixel_count"], 0)
+        self.assertTrue(rasterized.buffer(8.1).covers(final))
+        self.assertFalse(final.equals(rasterized))
+        self.assertGreater(final.intersection(box(80, 58, 140, 84)).area, 0)
+        debug_path = Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_width.png"
+        self._write_gt_dropout_preview(
+            source, rasterized, dropout, final, grid, debug_path,
+        )
+        print("GT width-change dropout debug:", str(debug_path), diagnostics)
 
     def test_gt_assisted_priority_clips_only_overlapping_auto_parts(self) -> None:
         automatic = gpd.GeoDataFrame(

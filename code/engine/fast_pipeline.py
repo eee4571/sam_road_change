@@ -50,13 +50,13 @@ FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
-FAST_GT_ASSISTED_DROPOUT_RETAIN_MIN = 0.88
+FAST_GT_ASSISTED_DROPOUT_RETAIN_MIN = 0.85
 FAST_GT_ASSISTED_DROPOUT_RETAIN_MAX = 0.95
-FAST_GT_ASSISTED_DROPOUT_BLOB_MIN_COUNT = 1
-FAST_GT_ASSISTED_DROPOUT_BLOB_MAX_COUNT = 3
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
-FAST_GT_ASSISTED_WINDOW_PADDING_PX = 2
+FAST_GT_ASSISTED_WINDOW_PADDING_PX = 8
+FAST_GT_ASSISTED_LOCAL_DEFORMATION_RADIUS_PX = 6
+FAST_GT_ASSISTED_OVERDETECTION_MAX_RATIO = 0.06
 FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
 FAST_CHANGE_CENTERLINE_RETAIN_MAX = 0.86
 FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
@@ -82,6 +82,11 @@ FAST_PUBLIC_CHANGE_FIELDS = (
 )
 FAST_PRIVATE_CHANGE_FIELDS = {
     "change_src", "source", "truth_fid", "synth_kind", "seed", "type_error",
+    "geometry_structure_type", "skeleton_branch_count", "removed_branch_count",
+    "transverse_cut_count", "boundary_erosion_pixel_count", "retained_ratio",
+    "boundary_expansion_pixel_count", "endpoint_extension_count",
+    "junction_deformation_count", "overdetect_fragment_count",
+    "overdetect_pixel_count", "final_area_ratio",
 }
 
 
@@ -1252,132 +1257,641 @@ def _fill_fast_gt_new_internal_holes(
     return result
 
 
-def _fast_gt_low_frequency_dropout(
+def _fast_gt_structure_branches(skeleton: np.ndarray) -> list[dict]:
+    """Trace GT structure and split closed loops into degradable arc branches."""
+    branches = []
+    for path in _trace_skeleton_paths(skeleton):
+        pixels = np.asarray(path.pixels, dtype=np.float32)
+        closed = bool(
+            path.start_degree == 2
+            and path.end_degree == 2
+            and np.linalg.norm(pixels[0] - pixels[-1]) <= 1.5
+        )
+        if not closed or pixels.shape[0] < 12:
+            branches.append({
+                "pixels": pixels,
+                "length_px": float(path.length_px),
+                "start_degree": int(path.start_degree),
+                "end_degree": int(path.end_degree),
+                "loop_segment": False,
+            })
+            continue
+        split_count = int(np.clip(np.ceil(path.length_px / 30.0), 3, 6))
+        split_indices = np.linspace(
+            0, pixels.shape[0] - 1, split_count + 1,
+        ).round().astype(int)
+        for start, stop in zip(split_indices[:-1], split_indices[1:]):
+            segment = pixels[start:stop + 1]
+            if segment.shape[0] < 2:
+                continue
+            length = float(np.linalg.norm(
+                np.diff(segment, axis=0), axis=1,
+            ).sum())
+            branches.append({
+                "pixels": segment,
+                "length_px": length,
+                "start_degree": 2,
+                "end_degree": 2,
+                "loop_segment": True,
+            })
+    return branches
+
+
+def _fast_gt_structure_type(
+    source: np.ndarray,
+    skeleton: np.ndarray,
+    branches: list[dict],
+    distance: np.ndarray,
+) -> str:
+    rows, columns = np.nonzero(source)
+    height = int(rows.max() - rows.min() + 1)
+    width = int(columns.max() - columns.min() + 1)
+    aspect = max(height, width) / max(1.0, min(height, width))
+    adjacency = _pixel_adjacency(skeleton)
+    junction_count = sum(len(neighbors) >= 3 for neighbors in adjacency.values())
+    skeleton_distance = distance[skeleton > 0]
+    median_radius = (
+        float(np.median(skeleton_distance)) if skeleton_distance.size else 0.0
+    )
+    if aspect >= 2.5:
+        return "corridor"
+    if median_radius >= max(6.0, 0.18 * min(height, width)):
+        return "areal"
+    if junction_count > 0 or len(branches) >= 4:
+        return "network"
+    if median_radius <= 4.0:
+        return "corridor"
+    return "areal"
+
+
+def _fast_gt_transverse_cut(
+    shape_2d: tuple[int, int],
+    branch: dict,
+    distance: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw a narrow cut across the complete local GT width at one branch point."""
+    points = np.asarray(branch["pixels"], dtype=np.float32)
+    if points.shape[0] < 5:
+        return np.zeros(shape_2d, dtype=np.uint8)
+    center_index = int(rng.integers(
+        max(2, points.shape[0] // 4),
+        max(3, points.shape[0] - max(2, points.shape[0] // 4)),
+    ))
+    low = max(0, center_index - 2)
+    high = min(points.shape[0] - 1, center_index + 2)
+    tangent = points[high] - points[low]
+    norm = float(np.linalg.norm(tangent))
+    if norm <= 1e-9:
+        return np.zeros(shape_2d, dtype=np.uint8)
+    normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32) / norm
+    center = points[center_index]
+    row = int(np.clip(round(float(center[0])), 0, shape_2d[0] - 1))
+    column = int(np.clip(round(float(center[1])), 0, shape_2d[1] - 1))
+    half_length = max(5.0, float(distance[row, column]) * 2.2 + 3.0)
+    start = center - normal * half_length
+    stop = center + normal * half_length
+    cut = np.zeros(shape_2d, dtype=np.uint8)
+    cv2.line(
+        cut,
+        (int(round(start[1])), int(round(start[0]))),
+        (int(round(stop[1])), int(round(stop[0]))),
+        1,
+        int(rng.integers(1, 3)),
+    )
+    return cut
+
+
+def _fast_gt_branch_interval_removal(
+    shape_2d: tuple[int, int],
+    branch: dict,
+    distance: np.ndarray,
+    *,
+    from_start: bool,
+    fraction: float,
+) -> np.ndarray:
+    """Remove one continuous endpoint interval while retaining original GT widths."""
+    points = np.asarray(branch["pixels"], dtype=np.float32)
+    count = max(2, int(round(points.shape[0] * float(fraction))))
+    if float(fraction) >= 0.99:
+        endpoint_index = 0 if from_start else -1
+        endpoint = np.rint(points[endpoint_index]).astype(np.int32)
+        endpoint[0] = np.clip(endpoint[0], 0, shape_2d[0] - 1)
+        endpoint[1] = np.clip(endpoint[1], 0, shape_2d[1] - 1)
+        local_radius = float(distance[endpoint[0], endpoint[1]])
+        junction_guard = max(2, int(np.ceil(2.0 * local_radius + 3.0)))
+        count = max(2, points.shape[0] - junction_guard)
+    selected = points[:count] if from_start else points[-count:]
+    indices = np.rint(selected).astype(np.int32)
+    indices[:, 0] = np.clip(indices[:, 0], 0, shape_2d[0] - 1)
+    indices[:, 1] = np.clip(indices[:, 1], 0, shape_2d[1] - 1)
+    radius = float(np.median(distance[indices[:, 0], indices[:, 1]]))
+    removal = np.zeros(shape_2d, dtype=np.uint8)
+    coordinates = np.column_stack((selected[:, 1], selected[:, 0])).round().astype(np.int32)
+    cv2.polylines(
+        removal,
+        [coordinates.reshape(-1, 1, 2)],
+        False,
+        1,
+        max(3, int(np.ceil(2.0 * radius + 3.0))),
+    )
+    return removal
+
+
+def _fast_gt_areal_through_cut(
+    source: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Create a slightly bent background-connected channel through a thick area."""
+    rows, columns = np.nonzero(source)
+    row0, row1 = int(rows.min()), int(rows.max())
+    column0, column1 = int(columns.min()), int(columns.max())
+    cut = np.zeros_like(source, dtype=np.uint8)
+    if (column1 - column0) >= (row1 - row0):
+        center_column = int(rng.integers(
+            column0 + max(1, (column1 - column0) // 4),
+            column1 - max(1, (column1 - column0) // 4) + 1,
+        ))
+        bend = int(rng.integers(-3, 4))
+        points = np.asarray([
+            (center_column, row0 - 3),
+            (center_column + bend, (row0 + row1) // 2),
+            (center_column - bend, row1 + 3),
+        ], dtype=np.int32)
+    else:
+        center_row = int(rng.integers(
+            row0 + max(1, (row1 - row0) // 4),
+            row1 - max(1, (row1 - row0) // 4) + 1,
+        ))
+        bend = int(rng.integers(-3, 4))
+        points = np.asarray([
+            (column0 - 3, center_row),
+            ((column0 + column1) // 2, center_row + bend),
+            (column1 + 3, center_row - bend),
+        ], dtype=np.int32)
+    cv2.polylines(
+        cut, [points.reshape(-1, 1, 2)], False, 1, int(rng.integers(1, 3)),
+    )
+    return cut
+
+
+def _fast_gt_low_frequency_field(
+    shape_2d: tuple[int, int],
+    rng: np.random.Generator,
+    *,
+    spatial_scale_px: float = 24.0,
+) -> np.ndarray:
+    """Create a smooth field whose variations span several road-width samples."""
+    coarse_shape = (
+        max(3, int(np.ceil(shape_2d[0] / spatial_scale_px)) + 1),
+        max(3, int(np.ceil(shape_2d[1] / spatial_scale_px)) + 1),
+    )
+    coarse = rng.standard_normal(coarse_shape, dtype=np.float32)
+    field = cv2.resize(
+        coarse, (shape_2d[1], shape_2d[0]), interpolation=cv2.INTER_CUBIC,
+    )
+    return cv2.GaussianBlur(field, (0, 0), sigmaX=4.0, sigmaY=4.0)
+
+
+def _fast_gt_irregular_boundary(
+    current: np.ndarray,
+    source: np.ndarray,
+    distance: np.ndarray,
+    structure_type: str,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict]:
+    """Move the raster boundary in coherent, geometry-scaled patches.
+
+    Unlike the former one-pixel boundary sampling, this applies one smooth signed
+    displacement field to the full boundary band.  Positive patches expand the
+    result and negative patches shrink it, producing visible local width changes
+    without vector buffering or isolated salt-and-pepper teeth.
+    """
+    current = (np.asarray(current) > 0).astype(np.uint8)
+    source = (np.asarray(source) > 0).astype(np.uint8)
+    if not current.any():
+        return current, {
+            "boundary_erosion_pixel_count": 0,
+            "boundary_expansion_pixel_count": 0,
+        }
+
+    inside_distance = cv2.distanceTransform(current, cv2.DIST_L2, 5)
+    outside_distance = cv2.distanceTransform(1 - current, cv2.DIST_L2, 5)
+    signed_distance = inside_distance - outside_distance
+    original_radius = distance[source > 0]
+    median_radius = (
+        float(np.median(original_radius)) if original_radius.size else 2.0
+    )
+    base_amplitude = {
+        "corridor": 3.25,
+        "network": 2.75,
+        "areal": 4.25,
+    }.get(structure_type, 2.5)
+    area_scale = float(np.sqrt(max(1, int(source.sum()))))
+    amplitude_px = (
+        base_amplitude
+        + 0.018 * area_scale
+        + 0.08 * median_radius
+    )
+    if structure_type in {"corridor", "network"}:
+        # Long geometries may have a very large area merely because of length;
+        # cap their deformation by the actual local road half-width.
+        amplitude_cap = max(3.5, 2.0 + 0.75 * median_radius)
+    else:
+        amplitude_cap = 24.0
+    amplitude_px = float(np.clip(amplitude_px, 2.5, amplitude_cap))
+    spatial_scale = float(np.clip(
+        max(6.0 * amplitude_px, 0.07 * area_scale), 18.0, 144.0,
+    ))
+    field = _fast_gt_low_frequency_field(
+        current.shape, rng, spatial_scale_px=spatial_scale,
+    )
+
+    boundary_band = cv2.dilate(
+        current,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+    ) - cv2.erode(
+        current,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+    )
+    boundary_values = field[boundary_band > 0]
+    if boundary_values.size:
+        center = float(np.median(boundary_values))
+        scale = float(np.percentile(np.abs(boundary_values - center), 80))
+    else:
+        center, scale = float(field.mean()), float(field.std())
+    normalized = np.clip((field - center) / max(scale, 1e-6), -1.0, 1.0)
+
+    # A second, still-smooth field prevents every road side from moving in exact
+    # lockstep while retaining a low-frequency segmentation-like outline.
+    secondary = _fast_gt_low_frequency_field(
+        current.shape, rng, spatial_scale_px=max(14.0, spatial_scale * 0.55),
+    )
+    secondary -= float(np.median(secondary[boundary_band > 0]))
+    secondary_scale = float(np.percentile(
+        np.abs(secondary[boundary_band > 0]), 80,
+    )) if np.any(boundary_band) else float(secondary.std())
+    secondary = np.clip(secondary / max(secondary_scale, 1e-6), -1.0, 1.0)
+    displacement = amplitude_px * np.clip(
+        0.78 * normalized + 0.22 * secondary, -1.0, 1.0,
+    )
+
+    boundary_score = signed_distance + displacement
+    minimum_inside_retain = 0.92 if structure_type == "areal" else 0.94
+    inside_scores = boundary_score[current > 0]
+    threshold = 0.0
+    if inside_scores.size:
+        raw_inside_retain = float((inside_scores >= 0.0).mean())
+        if raw_inside_retain < minimum_inside_retain:
+            threshold = min(
+                0.0,
+                float(np.quantile(inside_scores, 1.0 - minimum_inside_retain)),
+            )
+    deformed = (boundary_score >= threshold).astype(np.uint8)
+    maximum_reach = int(np.ceil(amplitude_px)) + 1
+    allowed = cv2.dilate(
+        current,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * maximum_reach + 1, 2 * maximum_reach + 1),
+        ),
+    )
+    deformed &= allowed
+    deformed = _fill_fast_gt_new_internal_holes(current, deformed)
+
+    minimum_component = max(4, int(round(int(current.sum()) * 0.0015)))
+    cleaned = _remove_small_components(
+        deformed, min_area_px2=minimum_component,
+    )
+    if cleaned.any():
+        deformed = cleaned
+    erosion_count = int(((current > 0) & (deformed == 0)).sum())
+    expansion_count = int(((deformed > 0) & (source == 0)).sum())
+    return deformed, {
+        "boundary_erosion_pixel_count": erosion_count,
+        "boundary_expansion_pixel_count": expansion_count,
+    }
+
+
+def _fast_gt_local_overdetection(
+    source: np.ndarray,
+    skeleton: np.ndarray,
+    branches: list[dict],
+    distance: np.ndarray,
+    structure_type: str,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict]:
+    """Add small raster-like boundary, endpoint, junction and fragment errors."""
+    source = (np.asarray(source) > 0).astype(np.uint8)
+    addition = np.zeros_like(source, dtype=np.uint8)
+    source_area = int(source.sum())
+    maximum_pixels = max(
+        4,
+        int(round(source_area * FAST_GT_ASSISTED_OVERDETECTION_MAX_RATIO)),
+    )
+    diagnostics = {
+        "boundary_expansion_pixel_count": 0,
+        "endpoint_extension_count": 0,
+        "junction_deformation_count": 0,
+        "overdetect_fragment_count": 0,
+        "overdetect_pixel_count": 0,
+    }
+
+    endpoint_options = []
+    for branch in branches:
+        if float(branch["length_px"]) < 8.0:
+            continue
+        if int(branch["start_degree"]) <= 1:
+            endpoint_options.append((branch, True))
+        if int(branch["end_degree"]) <= 1:
+            endpoint_options.append((branch, False))
+    if endpoint_options and float(rng.random()) < 0.38:
+        endpoint_target = 1
+        selected = rng.choice(
+            len(endpoint_options), size=endpoint_target, replace=False,
+        )
+        for option_index in np.asarray(selected, dtype=int).reshape(-1):
+            branch, at_start = endpoint_options[int(option_index)]
+            points = np.asarray(branch["pixels"], dtype=np.float32)
+            step = min(4, points.shape[0] - 1)
+            center = points[0] if at_start else points[-1]
+            inward = points[step] if at_start else points[-1 - step]
+            outward = center - inward
+            norm = float(np.linalg.norm(outward))
+            if norm <= 1e-9:
+                continue
+            outward /= norm
+            row = int(np.clip(round(float(center[0])), 0, source.shape[0] - 1))
+            column = int(np.clip(round(float(center[1])), 0, source.shape[1] - 1))
+            radius = max(1.0, float(distance[row, column]))
+            length = radius + float(rng.integers(2, 5))
+            stop = center + outward * length
+            proposal = np.zeros_like(source, dtype=np.uint8)
+            cv2.line(
+                proposal,
+                (int(round(center[1])), int(round(center[0]))),
+                (int(round(stop[1])), int(round(stop[0]))),
+                1,
+                max(2, int(round(1.5 * radius))),
+            )
+            new_pixels = (proposal > 0) & (source == 0) & (addition == 0)
+            if 0 < int(new_pixels.sum()) <= maximum_pixels - int(addition.sum()):
+                addition[new_pixels] = 1
+                diagnostics["endpoint_extension_count"] += 1
+
+    adjacency = _pixel_adjacency(skeleton)
+    junctions = [point for point, neighbors in adjacency.items() if len(neighbors) >= 3]
+    if (
+        junctions
+        and float(rng.random()) < 0.30
+        and int(addition.sum()) < maximum_pixels
+    ):
+        center = junctions[int(rng.integers(0, len(junctions)))]
+        radius = max(2, int(np.ceil(float(distance[center]) + 2.0)))
+        zone = np.zeros_like(source, dtype=np.uint8)
+        cv2.circle(zone, (int(center[1]), int(center[0])), radius, 1, -1)
+        expanded = cv2.dilate(
+            source, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        candidates = (zone > 0) & (expanded > 0) & (source == 0) & (addition == 0)
+        remaining = maximum_pixels - int(addition.sum())
+        if 0 < int(candidates.sum()) <= remaining:
+            addition[candidates] = 1
+            diagnostics["junction_deformation_count"] = 1
+
+    if (
+        branches
+        and float(rng.random()) < 0.25
+        and int(addition.sum()) < maximum_pixels
+    ):
+        branch = max(branches, key=lambda item: float(item["length_px"]))
+        points = np.asarray(branch["pixels"], dtype=np.float32)
+        if points.shape[0] >= 8:
+            index = int(rng.integers(points.shape[0] // 3, max(points.shape[0] // 3 + 1, 2 * points.shape[0] // 3)))
+            low, high = max(0, index - 2), min(points.shape[0] - 1, index + 2)
+            tangent = points[high] - points[low]
+            norm = float(np.linalg.norm(tangent))
+            if norm > 1e-9:
+                normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32) / norm
+                normal *= -1.0 if int(rng.integers(0, 2)) else 1.0
+                center = points[index]
+                row = int(np.clip(round(float(center[0])), 0, source.shape[0] - 1))
+                column = int(np.clip(round(float(center[1])), 0, source.shape[1] - 1))
+                radius = max(1.0, float(distance[row, column]))
+                start = center + normal * max(0.0, radius - 1.0)
+                stop = center + normal * (radius + float(rng.integers(3, 7)))
+                proposal = np.zeros_like(source, dtype=np.uint8)
+                cv2.line(
+                    proposal,
+                    (int(round(start[1])), int(round(start[0]))),
+                    (int(round(stop[1])), int(round(stop[0]))),
+                    1,
+                    int(rng.integers(1, 3)),
+                )
+                new_pixels = (proposal > 0) & (source == 0) & (addition == 0)
+                if 0 < int(new_pixels.sum()) <= maximum_pixels - int(addition.sum()):
+                    addition[new_pixels] = 1
+
+    addition[source > 0] = 0
+    diagnostics["overdetect_pixel_count"] = int(addition.sum())
+    return addition, diagnostics
+
+
+def _fast_gt_structure_aware_dropout_crop(
     mask: np.ndarray,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, dict]:
-    """Remove a few continuous low-frequency spatial regions from a GT raster."""
+    """Degrade one tightly cropped GT mask without reconstructing road widths."""
     source = (np.asarray(mask) > 0).astype(np.uint8)
     source_area = int(source.sum())
     diagnostics = {
-        "dropout_blob_count": 0,
+        "geometry_structure_type": "small",
+        "skeleton_branch_count": 0,
+        "removed_branch_count": 0,
+        "transverse_cut_count": 0,
+        "boundary_erosion_pixel_count": 0,
+        "boundary_expansion_pixel_count": 0,
+        "endpoint_extension_count": 0,
+        "junction_deformation_count": 0,
+        "overdetect_fragment_count": 0,
+        "overdetect_pixel_count": 0,
         "dropout_pixel_count": 0,
         "retained_ratio": 1.0,
+        "final_area_ratio": 1.0,
     }
     if source_area < 24:
         return source, diagnostics
 
-    source_rows, source_cols = np.nonzero(source)
-    row0, row1 = int(source_rows.min()), int(source_rows.max()) + 1
-    col0, col1 = int(source_cols.min()), int(source_cols.max()) + 1
-    crop = source[row0:row1, col0:col1]
-    crop_height, crop_width = crop.shape
-    boundary = cv2.morphologyEx(
-        crop,
-        cv2.MORPH_GRADIENT,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    skeleton = _skeletonize_mask(source)
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    branches = _fast_gt_structure_branches(skeleton)
+    structure_type = _fast_gt_structure_type(
+        source, skeleton, branches, distance,
     )
-    center_candidates = np.argwhere((boundary > 0) & (crop > 0))
-    if not center_candidates.size:
-        center_candidates = np.argwhere(crop > 0)
-
-    target_retain = float(rng.uniform(
-        FAST_GT_ASSISTED_DROPOUT_RETAIN_MIN,
-        FAST_GT_ASSISTED_DROPOUT_RETAIN_MAX,
-    ))
-    target_loss = max(1, int(round(source_area * (1.0 - target_retain))))
-    blob_count = int(rng.integers(
-        FAST_GT_ASSISTED_DROPOUT_BLOB_MIN_COUNT,
-        FAST_GT_ASSISTED_DROPOUT_BLOB_MAX_COUNT + 1,
-    ))
-    yy, xx = np.mgrid[:crop_height, :crop_width].astype(np.float32)
-    dropout = np.zeros_like(crop, dtype=bool)
-    for blob_index in range(blob_count):
-        available = center_candidates[
-            ~dropout[
-                center_candidates[:, 0], center_candidates[:, 1]
-            ]
-        ]
-        if not available.size:
-            break
-        center_y, center_x = available[int(rng.integers(0, len(available)))]
-        span = max(crop_height, crop_width)
-        major_sigma = float(rng.uniform(
-            max(7.0, span * 0.10), max(10.0, span * 0.24),
-        ))
-        minor_sigma = float(major_sigma * rng.uniform(0.25, 0.55))
-        angle = float(rng.uniform(0.0, np.pi))
-        cosine, sine = float(np.cos(angle)), float(np.sin(angle))
-        dx, dy = xx - float(center_x), yy - float(center_y)
-        along = cosine * dx + sine * dy
-        across = -sine * dx + cosine * dy
-        envelope = np.exp(-0.5 * (
-            (along / major_sigma) ** 2 + (across / minor_sigma) ** 2
-        )).astype(np.float32)
-        coarse_height = max(3, int(np.ceil(crop_height / 8.0)) + 1)
-        coarse_width = max(3, int(np.ceil(crop_width / 8.0)) + 1)
-        coarse_noise = rng.standard_normal(
-            (coarse_height, coarse_width), dtype=np.float32,
-        )
-        smooth_noise = cv2.resize(
-            coarse_noise,
-            (crop_width, crop_height),
-            interpolation=cv2.INTER_CUBIC,
-        )
-        smooth_noise = cv2.GaussianBlur(
-            smooth_noise, (0, 0), sigmaX=2.0, sigmaY=2.0,
-        )
-        smooth_noise -= float(smooth_noise.min())
-        noise_range = float(smooth_noise.max())
-        if noise_range > 1e-9:
-            smooth_noise /= noise_range
-        score = envelope * (0.40 + 0.60 * smooth_noise)
-        remaining_budget = target_loss - int(dropout.sum())
-        remaining_blobs = blob_count - blob_index
-        blob_budget = max(1, int(np.ceil(remaining_budget / remaining_blobs)))
-        candidates = np.argwhere((crop > 0) & ~dropout)
-        if not candidates.size:
-            break
-        candidate_scores = score[candidates[:, 0], candidates[:, 1]]
-        selected_count = min(blob_budget, candidates.shape[0])
-        selected = np.argpartition(
-            candidate_scores, -selected_count,
-        )[-selected_count:]
-        selected_pixels = candidates[selected]
-        blob = np.zeros_like(crop, dtype=np.uint8)
-        blob[selected_pixels[:, 0], selected_pixels[:, 1]] = 1
-        component_count, component_labels = cv2.connectedComponents(
-            blob, connectivity=8,
-        )
-        if component_count > 2:
-            component_scores = np.bincount(
-                component_labels.ravel(),
-                weights=score.ravel(),
-                minlength=component_count,
-            )
-            component_scores[0] = 0.0
-            blob = (
-                component_labels == int(np.argmax(component_scores))
-            ).astype(np.uint8)
-        dropout |= blob.astype(bool)
-
-    dropout &= crop.astype(bool)
-    perturbed_crop = crop.copy()
-    perturbed_crop[dropout] = 0
-    perturbed_crop = _fill_fast_gt_new_internal_holes(crop, perturbed_crop)
-    minimum_fragment_area = max(6, int(round(source_area * 0.005)))
-    perturbed_crop = _remove_small_components(
-        perturbed_crop, min_area_px2=minimum_fragment_area,
-    )
-    result = np.zeros_like(source)
-    result[row0:row1, col0:col1] = perturbed_crop
-    removed = max(0, source_area - int(result.sum()))
     diagnostics.update({
-        "dropout_blob_count": int(blob_count),
-        "dropout_pixel_count": int(removed),
-        "retained_ratio": float(result.sum() / source_area),
+        "geometry_structure_type": structure_type,
+        "skeleton_branch_count": int(len(branches)),
     })
-    return result, diagnostics
+    # Structural loss is deliberately secondary.  The visible degradation now
+    # comes mainly from a coherent boundary displacement below.
+    target_retain = float(rng.uniform(0.92, 0.97))
+    loss_budget = max(1, int(round(source_area * (1.0 - target_retain))))
+    removal = np.zeros_like(source, dtype=np.uint8)
+
+    def accept(candidate: np.ndarray) -> bool:
+        new_pixels = (candidate > 0) & (source > 0) & (removal == 0)
+        count = int(new_pixels.sum())
+        if count <= 0 or int(removal.sum()) + count > loss_budget:
+            return False
+        removal[new_pixels] = 1
+        return True
+
+    ordered_branches = sorted(
+        branches, key=lambda branch: float(branch["length_px"]),
+    )
+    if structure_type == "corridor" and ordered_branches:
+        main_branch = max(
+            ordered_branches, key=lambda branch: float(branch["length_px"]),
+        )
+        endpoint_choices = []
+        if int(main_branch["start_degree"]) <= 1:
+            endpoint_choices.append(True)
+        if int(main_branch["end_degree"]) <= 1:
+            endpoint_choices.append(False)
+        if endpoint_choices:
+            accept(_fast_gt_branch_interval_removal(
+                source.shape,
+                main_branch,
+                distance,
+                from_start=bool(endpoint_choices[int(rng.integers(0, len(endpoint_choices)))]),
+                fraction=float(rng.uniform(0.04, 0.10)),
+            ))
+        cut_target = int(rng.integers(0, 2))
+        for _index in range(cut_target):
+            if accept(_fast_gt_transverse_cut(
+                source.shape, main_branch, distance, rng,
+            )):
+                diagnostics["transverse_cut_count"] += 1
+    elif structure_type == "network" and ordered_branches:
+        endpoint_branches = [
+            branch for branch in ordered_branches
+            if min(int(branch["start_degree"]), int(branch["end_degree"])) <= 1
+        ]
+        remove_target = min(
+            len(endpoint_branches),
+            1 if len(endpoint_branches) >= 3 and float(rng.random()) < 0.55 else 0,
+        )
+        for branch in endpoint_branches[:remove_target]:
+            from_start = int(branch["start_degree"]) <= 1
+            if accept(_fast_gt_branch_interval_removal(
+                source.shape,
+                branch,
+                distance,
+                from_start=from_start,
+                fraction=1.0,
+            )):
+                diagnostics["removed_branch_count"] += 1
+        long_branches = sorted(
+            branches, key=lambda branch: float(branch["length_px"]), reverse=True,
+        )
+        cut_target = min(2, max(0, int(np.ceil(len(long_branches) / 14.0))))
+        for branch in long_branches[:cut_target]:
+            if accept(_fast_gt_transverse_cut(
+                source.shape, branch, distance, rng,
+            )):
+                diagnostics["transverse_cut_count"] += 1
+    else:
+        cut_target = int(rng.integers(0, 2))
+        for _index in range(cut_target):
+            if accept(_fast_gt_areal_through_cut(source, rng)):
+                diagnostics["transverse_cut_count"] += 1
+
+    perturbed = source.copy()
+    perturbed[removal > 0] = 0
+    perturbed = _fill_fast_gt_new_internal_holes(source, perturbed)
+    perturbed, boundary_diagnostics = _fast_gt_irregular_boundary(
+        perturbed, source, distance, structure_type, rng,
+    )
+    diagnostics.update(boundary_diagnostics)
+    minimum_fragment_area = max(6, int(round(source_area * 0.005)))
+    cleaned = _remove_small_components(
+        perturbed, min_area_px2=minimum_fragment_area,
+    )
+    if float(cleaned.sum() / source_area) >= FAST_GT_ASSISTED_DROPOUT_RETAIN_MIN:
+        perturbed = cleaned
+    retained_inside = int(perturbed.sum())
+    addition, overdetect_diagnostics = _fast_gt_local_overdetection(
+        source, skeleton, branches, distance, structure_type, rng,
+    )
+    perturbed = ((perturbed > 0) | (addition > 0)).astype(np.uint8)
+    # Do not let local endpoint/junction over-detection heal an intentional gap.
+    perturbed[removal > 0] = 0
+    perturbed = _fill_fast_gt_new_internal_holes(source, perturbed)
+    retained_inside = int(((perturbed > 0) & (source > 0)).sum())
+    removed = max(0, source_area - retained_inside)
+    diagnostics.update({
+        **overdetect_diagnostics,
+        "boundary_erosion_pixel_count": int(
+            boundary_diagnostics["boundary_erosion_pixel_count"]
+        ),
+        "boundary_expansion_pixel_count": int(
+            boundary_diagnostics["boundary_expansion_pixel_count"]
+        ),
+        "overdetect_pixel_count": int(((perturbed > 0) & (source == 0)).sum()),
+        "dropout_pixel_count": int(removed),
+        "retained_ratio": float(retained_inside / source_area),
+        "final_area_ratio": float(perturbed.sum() / source_area),
+    })
+    return perturbed, diagnostics
+
+
+def _fast_gt_low_frequency_dropout(
+    mask: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict]:
+    """Apply structure-aware degradation independently of outer raster padding."""
+    source = (np.asarray(mask) > 0).astype(np.uint8)
+    diagnostics = {
+        "geometry_structure_type": "small",
+        "skeleton_branch_count": 0,
+        "removed_branch_count": 0,
+        "transverse_cut_count": 0,
+        "boundary_erosion_pixel_count": 0,
+        "boundary_expansion_pixel_count": 0,
+        "endpoint_extension_count": 0,
+        "junction_deformation_count": 0,
+        "overdetect_fragment_count": 0,
+        "overdetect_pixel_count": 0,
+        "dropout_pixel_count": 0,
+        "retained_ratio": 1.0,
+        "final_area_ratio": 1.0,
+    }
+    if not source.any():
+        return source, diagnostics
+    rows, columns = np.nonzero(source)
+    # A fixed six-pixel crop silently clipped visible deformation on large GT
+    # blocks.  Scale the working margin with area while retaining a firm cap.
+    margin = max(
+        FAST_GT_ASSISTED_LOCAL_DEFORMATION_RADIUS_PX,
+        int(np.ceil(min(28.0, 4.0 + 0.022 * np.sqrt(float(source.sum()))))),
+    )
+    row0 = max(0, int(rows.min()) - margin)
+    row1 = min(source.shape[0], int(rows.max()) + margin + 1)
+    column0 = max(0, int(columns.min()) - margin)
+    column1 = min(source.shape[1], int(columns.max()) + margin + 1)
+    crop = source[row0:row1, column0:column1]
+    padding = 2
+    padded_crop = np.pad(crop, padding, mode="constant")
+    perturbed_padded, diagnostics = _fast_gt_structure_aware_dropout_crop(
+        padded_crop, rng,
+    )
+    perturbed_crop = perturbed_padded[
+        padding:padding + crop.shape[0],
+        padding:padding + crop.shape[1],
+    ]
+    perturbed = np.zeros_like(source, dtype=np.uint8)
+    perturbed[row0:row1, column0:column1] = perturbed_crop
+    return perturbed, diagnostics
 
 
 def _fast_gt_mask_geometry(mask: np.ndarray, transform):
@@ -1442,7 +1956,14 @@ def _perturb_fast_gt_geometry_stages(
     geometry = make_valid(geometry)
     if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
         return geometry, geometry, geometry, {}
-    window = _fast_gt_geometry_window(geometry, grid)
+    area_px = float(geometry.area) / max(float(grid.pixel_size) ** 2, 1e-9)
+    deformation_padding = max(
+        FAST_GT_ASSISTED_WINDOW_PADDING_PX,
+        int(np.ceil(min(30.0, 6.0 + 0.022 * np.sqrt(max(area_px, 1.0))))),
+    )
+    window = _fast_gt_geometry_window(
+        geometry, grid, padding_px=deformation_padding,
+    )
     if window is None:
         return geometry, geometry, geometry, {}
     local_shape = (int(window.height), int(window.width))
@@ -1474,12 +1995,14 @@ def _dropout_fast_gt_geometry(
     geometry,
     rng: np.random.Generator,
     grid: FastProbabilityGrid,
+    *,
+    return_diagnostics: bool = False,
 ):
-    """Apply only low-frequency raster dropout on the aligned Fast grid."""
-    _rasterized, _dropout, final, _diagnostics = _perturb_fast_gt_geometry_stages(
+    """Apply structure-aware raster degradation on the aligned Fast grid."""
+    _rasterized, _dropout, final, diagnostics = _perturb_fast_gt_geometry_stages(
         geometry, rng, grid,
     )
-    return final
+    return (final, diagnostics) if return_diagnostics else final
 
 
 def _select_fast_change_positions(
@@ -1941,10 +2464,11 @@ def _augment_fast_typed_layer(
             change_type,
         )
         rng = np.random.default_rng(local_seed)
-        assisted_geometry = _dropout_fast_gt_geometry(
+        assisted_geometry, degradation_diagnostics = _dropout_fast_gt_geometry(
             geometry,
             rng,
             probability_grid,
+            return_diagnostics=True,
         )
         if (
             assisted_geometry is None
@@ -1955,6 +2479,7 @@ def _augment_fast_typed_layer(
         assisted_candidates.append({
             "geometry": assisted_geometry,
             "truth_fid": str(truth_index),
+            **degradation_diagnostics,
             "type_rank": _fast_change_local_seed(
                 FAST_CHANGE_GLOBAL_SEED,
                 f"{seed_context}|{truth_index}|{ordinal}",
@@ -1988,6 +2513,26 @@ def _augment_fast_typed_layer(
             "change_src": "GT_ASSISTED",
             "truth_fid": candidate["truth_fid"],
             "type_error": int(position in type_error_positions),
+            "geometry_structure_type": candidate.get(
+                "geometry_structure_type", "unknown",
+            ),
+            "skeleton_branch_count": int(candidate.get("skeleton_branch_count", 0)),
+            "removed_branch_count": int(candidate.get("removed_branch_count", 0)),
+            "transverse_cut_count": int(candidate.get("transverse_cut_count", 0)),
+            "boundary_erosion_pixel_count": int(candidate.get(
+                "boundary_erosion_pixel_count", 0,
+            )),
+            "boundary_expansion_pixel_count": int(candidate.get(
+                "boundary_expansion_pixel_count", 0,
+            )),
+            "endpoint_extension_count": int(candidate.get("endpoint_extension_count", 0)),
+            "junction_deformation_count": int(candidate.get(
+                "junction_deformation_count", 0,
+            )),
+            "overdetect_fragment_count": int(candidate.get("overdetect_fragment_count", 0)),
+            "overdetect_pixel_count": int(candidate.get("overdetect_pixel_count", 0)),
+            "retained_ratio": float(candidate.get("retained_ratio", 1.0)),
+            "final_area_ratio": float(candidate.get("final_area_ratio", 1.0)),
             "width_bef": np.nan,
             "width_aft": np.nan,
             "width_diff": np.nan,
@@ -2000,6 +2545,12 @@ def _augment_fast_typed_layer(
     columns = {
         "change_typ": [], "before_per": [], "after_per": [], "source": [],
         "change_src": [], "width_bef": [], "width_aft": [], "width_diff": [],
+        "geometry_structure_type": [], "skeleton_branch_count": [],
+        "removed_branch_count": [], "transverse_cut_count": [],
+        "boundary_erosion_pixel_count": [], "retained_ratio": [],
+        "boundary_expansion_pixel_count": [], "endpoint_extension_count": [],
+        "junction_deformation_count": [], "overdetect_fragment_count": [],
+        "overdetect_pixel_count": [], "final_area_ratio": [],
     }
     return gpd.GeoDataFrame(
         columns, geometry=gpd.GeoSeries([], crs=automatic.crs), crs=automatic.crs,
@@ -2287,6 +2838,31 @@ def augment_fast_changes_with_truth(
         title=_fast_change_preview_title(before_period, after_period),
         empty_message="No Fast road changes detected",
     )
+    structure_counts = (
+        assisted_changes["geometry_structure_type"].value_counts().to_dict()
+        if "geometry_structure_type" in assisted_changes.columns else {}
+    )
+    degradation_totals = {
+        field: int(assisted_changes[field].fillna(0).sum())
+        if field in assisted_changes.columns else 0
+        for field in (
+            "skeleton_branch_count", "removed_branch_count",
+            "transverse_cut_count", "boundary_erosion_pixel_count",
+            "boundary_expansion_pixel_count", "endpoint_extension_count",
+            "junction_deformation_count", "overdetect_fragment_count",
+            "overdetect_pixel_count",
+        )
+    }
+    retained_ratios = (
+        assisted_changes["retained_ratio"].dropna().astype(float).to_numpy()
+        if "retained_ratio" in assisted_changes.columns
+        else np.asarray([], dtype=np.float64)
+    )
+    final_area_ratios = (
+        assisted_changes["final_area_ratio"].dropna().astype(float).to_numpy()
+        if "final_area_ratio" in assisted_changes.columns
+        else np.asarray([], dtype=np.float64)
+    )
     summary = {
         **auto_summary,
         "execution_profile": "fast",
@@ -2331,6 +2907,42 @@ def augment_fast_changes_with_truth(
         "gt_assisted_type_error_count": int(
             augmented_changes.get("type_error", 0).fillna(0).astype(int).sum()
             if "type_error" in augmented_changes.columns else 0
+        ),
+        "gt_assisted_geometry_structure_types": {
+            str(name): int(count) for name, count in structure_counts.items()
+        },
+        "gt_assisted_skeleton_branch_count": degradation_totals[
+            "skeleton_branch_count"
+        ],
+        "gt_assisted_removed_branch_count": degradation_totals[
+            "removed_branch_count"
+        ],
+        "gt_assisted_transverse_cut_count": degradation_totals[
+            "transverse_cut_count"
+        ],
+        "gt_assisted_boundary_erosion_pixel_count": degradation_totals[
+            "boundary_erosion_pixel_count"
+        ],
+        "gt_assisted_boundary_expansion_pixel_count": degradation_totals[
+            "boundary_expansion_pixel_count"
+        ],
+        "gt_assisted_endpoint_extension_count": degradation_totals[
+            "endpoint_extension_count"
+        ],
+        "gt_assisted_junction_deformation_count": degradation_totals[
+            "junction_deformation_count"
+        ],
+        "gt_assisted_overdetect_fragment_count": degradation_totals[
+            "overdetect_fragment_count"
+        ],
+        "gt_assisted_overdetect_pixel_count": degradation_totals[
+            "overdetect_pixel_count"
+        ],
+        "gt_assisted_mean_retained_ratio": (
+            float(retained_ratios.mean()) if retained_ratios.size else 1.0
+        ),
+        "gt_assisted_mean_final_area_ratio": (
+            float(final_area_ratios.mean()) if final_area_ratios.size else 1.0
         ),
         "final_added_count": int(len(final_layers["added"])),
         "final_removed_count": int(len(final_layers["removed"])),
