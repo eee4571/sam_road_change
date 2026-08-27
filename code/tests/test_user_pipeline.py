@@ -489,6 +489,12 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             self.assertEqual(detect_mock.call_args.args[2], output / "_automatic")
             augment_mock.assert_called_once()
             self.assertEqual(augment_mock.call_args.args[:3], (automatic, truth, output))
+            self.assertEqual(
+                augment_mock.call_args.kwargs["before_result"], before_result,
+            )
+            self.assertEqual(
+                augment_mock.call_args.kwargs["after_result"], after_result,
+            )
             legacy_mock.assert_not_called()
 
     def test_accepts_completed_historical_latest_result_as_period_state(self) -> None:

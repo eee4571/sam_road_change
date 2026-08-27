@@ -27,6 +27,7 @@ from app.task_manager import build_pipeline_command
 import user_pipeline
 from engine.fast_pipeline import (
     FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX,
+    FastProbabilityGrid,
     augment_fast_changes_with_truth,
     build_fast_change_from_truth,
     build_fast_surface_mask,
@@ -48,7 +49,6 @@ from engine.fast_pipeline import (
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
     _fast_change_preview_title,
-    _perturb_fast_gt_boundary,
     _perturb_fast_gt_geometry_stages,
 )
 from engine.samroad.image_resume import required_image_outputs
@@ -388,6 +388,52 @@ class FastWidthTests(unittest.TestCase):
 
 
 class FastTruthChangeTests(unittest.TestCase):
+    @staticmethod
+    def _dropout_test_grid() -> FastProbabilityGrid:
+        transform = from_origin(-16.5, 160.5, 1.0, 1.0)
+        values = np.zeros((192, 192), dtype=np.float32)
+        return FastProbabilityGrid(
+            before=values.copy(), after=values.copy(), transform=transform,
+            crs="EPSG:3857", pixel_size=1.0,
+        )
+
+    @staticmethod
+    def _write_gt_dropout_preview(
+        source,
+        rasterized_geometry,
+        dropout_geometry,
+        final_geometry,
+        grid: FastProbabilityGrid,
+        target: Path,
+    ) -> None:
+        geometries = (source, rasterized_geometry, dropout_geometry, final_geometry)
+        masks = [
+            rasterize(
+                [(geometry, 1)], out_shape=grid.before.shape,
+                transform=grid.transform, fill=0, dtype=np.uint8,
+            )
+            for geometry in geometries
+        ]
+        rows, cols = np.nonzero(masks[0])
+        row0, row1 = max(0, int(rows.min()) - 4), min(
+            masks[0].shape[0], int(rows.max()) + 5,
+        )
+        col0, col1 = max(0, int(cols.min()) - 4), min(
+            masks[0].shape[1], int(cols.max()) + 5,
+        )
+        height, width = row1 - row0, col1 - col0
+        comparison = np.full((height, width * 4, 3), 255, dtype=np.uint8)
+        colors = ((220, 80, 110), (75, 125, 215), (235, 150, 45), (40, 165, 95))
+        for panel, (mask, color) in enumerate(zip(masks, colors)):
+            crop = mask[row0:row1, col0:col1]
+            comparison[:, panel * width:(panel + 1) * width][crop > 0] = color
+        preview = Image.new("RGB", (width * 4, height + 22), "white")
+        preview.paste(Image.fromarray(comparison), (0, 22))
+        draw = ImageDraw.Draw(preview)
+        for panel, label in enumerate(("Original GT", "Rasterized", "Dropout", "Polygonized")):
+            draw.text((panel * width + 3, 4), label, fill=(25, 25, 25))
+        preview.save(target)
+
     def _period_results(
         self,
         root: Path,
@@ -414,6 +460,13 @@ class FastTruthChangeTests(unittest.TestCase):
             crs=truth.crs,
         )
         result_paths = []
+        left = float(minx - 16 * pixel_size)
+        top = float(maxy + 56 * pixel_size)
+        raster_width = max(64, int(np.ceil((maxx - left) / pixel_size)) + 16)
+        raster_height = max(64, int(np.ceil((top - miny) / pixel_size)) + 16)
+        probability_transform = from_origin(
+            left, top, pixel_size, pixel_size,
+        )
         for period in ("before", "after"):
             period_root = root / period
             period_root.mkdir()
@@ -421,11 +474,14 @@ class FastTruthChangeTests(unittest.TestCase):
             centerlines.to_file(centerline_path)
             probability_path = period_root / "road_probability.tif"
             with rasterio.open(
-                probability_path, "w", driver="GTiff", width=128, height=64,
+                probability_path, "w", driver="GTiff",
+                width=raster_width, height=raster_height,
                 count=1, dtype="uint8", crs=truth.crs,
-                transform=from_origin(0, 64 * pixel_size, pixel_size, pixel_size),
+                transform=probability_transform,
             ) as dataset:
-                dataset.write(np.zeros((1, 64, 128), dtype=np.uint8))
+                dataset.write(np.zeros(
+                    (1, raster_height, raster_width), dtype=np.uint8,
+                ))
             result_path = period_root / "latest_result.json"
             result_path.write_text(json.dumps({
                 "centerlines": str(centerline_path),
@@ -506,10 +562,13 @@ class FastTruthChangeTests(unittest.TestCase):
                 crs=crs,
             )
             truth.to_file(truth_path)
+            before_result, after_result, _stable = self._period_results(root, truth)
             result = augment_fast_changes_with_truth(
                 automatic_result,
                 truth_path,
                 root / "final",
+                before_result=before_result,
+                after_result=after_result,
                 before_period="2021",
                 after_period="2022",
                 position_tolerance=1.0,
@@ -568,6 +627,8 @@ class FastTruthChangeTests(unittest.TestCase):
                 automatic_result,
                 truth_path,
                 root / "final_repeated",
+                before_result=before_result,
+                after_result=after_result,
                 before_period="2021",
                 after_period="2022",
                 position_tolerance=1.0,
@@ -721,14 +782,18 @@ class FastTruthChangeTests(unittest.TestCase):
                 ],
                 crs=crs,
             ).to_file(truth_path)
+            truth = gpd.read_file(truth_path)
+            before_result, after_result, _stable = self._period_results(root, truth)
 
             first = augment_fast_changes_with_truth(
                 automatic_result, truth_path, root / "first",
+                before_result=before_result, after_result=after_result,
                 before_period="2021", after_period="2022",
                 position_tolerance=1.0,
             )
             second = augment_fast_changes_with_truth(
                 automatic_result, truth_path, root / "second",
+                before_result=before_result, after_result=after_result,
                 before_period="2021", after_period="2022",
                 position_tolerance=1.0,
             )
@@ -984,118 +1049,107 @@ class FastTruthChangeTests(unittest.TestCase):
         large_buffer = abs((large.bounds[2] - large.bounds[0]) - 100.0) / 2.0
         self.assertAlmostEqual(large_buffer, 4.0 * small_buffer, places=6)
 
-    def test_gt_assisted_boundary_uses_local_nonrigid_noise(self) -> None:
-        source = box(0, 0, 120, 20)
-        perturbed = _perturb_fast_gt_boundary(
-            source, np.random.default_rng(20260826), pixel_size=1.0,
-        )
-        area_ratio = float(perturbed.area / source.area)
-        source_vertices = len(source.exterior.coords)
-        perturbed_vertices = sum(
-            len(part.exterior.coords)
-            for part in (
-                [perturbed] if perturbed.geom_type == "Polygon"
-                else list(perturbed.geoms)
+    def test_gt_assisted_dropout_keeps_long_strip_on_probability_grid(self) -> None:
+        source = box(0.35, 40.45, 120.65, 60.55)
+        grid = self._dropout_test_grid()
+        rasterized_geometry, dropout_geometry, final, diagnostics = (
+            _perturb_fast_gt_geometry_stages(
+                source, np.random.default_rng(20260826), grid,
             )
         )
-        print(
-            "GT boundary perturbation debug:",
-            {
-                "original_vertices": source_vertices,
-                "perturbed_vertices": perturbed_vertices,
-                "area_ratio": round(area_ratio, 4),
-                "original_wkt": source.wkt,
-                "perturbed_wkt": perturbed.wkt,
-            },
+        area_ratio = float(final.area / rasterized_geometry.area)
+        self.assertTrue(final.is_valid)
+        self.assertFalse(final.is_empty)
+        self.assertGreaterEqual(area_ratio, 0.88)
+        self.assertLessEqual(area_ratio, 0.95)
+        self.assertTrue(dropout_geometry.equals(final))
+        self.assertGreater(diagnostics["dropout_pixel_count"], 0)
+        self.assertGreaterEqual(diagnostics["dropout_blob_count"], 1)
+        self.assertLessEqual(diagnostics["dropout_blob_count"], 3)
+        self.assertEqual(
+            sum(len(part.interiors) for part in (
+                [final] if final.geom_type == "Polygon" else list(final.geoms)
+            )),
+            0,
         )
-        self.assertTrue(perturbed.is_valid)
-        self.assertFalse(perturbed.is_empty)
-        self.assertGreaterEqual(area_ratio, 0.85)
-        self.assertLessEqual(area_ratio, 1.15)
-        self.assertFalse(perturbed.equals(source))
-        self.assertGreater(perturbed_vertices, source_vertices)
-        for original_bound, perturbed_bound in zip(source.bounds, perturbed.bounds):
-            self.assertLessEqual(abs(perturbed_bound - original_bound), 3.0)
+        for part in ([final] if final.geom_type == "Polygon" else list(final.geoms)):
+            for x, y in part.exterior.coords:
+                column, row = (~grid.transform) * (x, y)
+                self.assertAlmostEqual(column, round(column), places=6)
+                self.assertAlmostEqual(row, round(row), places=6)
+        debug_path = (
+            Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_strip.png"
+        )
+        self._write_gt_dropout_preview(
+            source, rasterized_geometry, dropout_geometry, final, grid, debug_path,
+        )
+        print("GT strip dropout debug:", {
+            "comparison": str(debug_path),
+            "area_ratio": round(area_ratio, 4),
+            **diagnostics,
+        })
 
-    def test_gt_assisted_boundary_keeps_complex_grid_natural(self) -> None:
+    def test_gt_assisted_dropout_keeps_complex_grid_natural(self) -> None:
         roads = [
-            *(box(x, 0, x + 7, 120) for x in (10, 45, 80, 115)),
-            *(box(10, y, 122, y + 7) for y in (10, 45, 80, 113)),
+            *(box(x + 0.35, 0.45, x + 7.35, 120.55) for x in (10, 45, 80, 115)),
+            *(box(10.35, y + 0.45, 122.35, y + 7.45) for y in (10, 45, 80, 113)),
         ]
         source = unary_union(roads)
-        structural, perturbed, diagnostics = _perturb_fast_gt_geometry_stages(
-            source, np.random.default_rng(20260827), pixel_size=1.0,
+        grid = self._dropout_test_grid()
+        rasterized_geometry, dropout_geometry, final, diagnostics = (
+            _perturb_fast_gt_geometry_stages(
+                source, np.random.default_rng(20260827), grid,
+            )
         )
-        structural_area_ratio = float(structural.area / source.area)
-        area_ratio = float(perturbed.area / source.area)
-        source_holes = sum(len(part.interiors) for part in [source])
-        perturbed_parts = (
-            [perturbed] if perturbed.geom_type == "Polygon" else list(perturbed.geoms)
+        area_ratio = float(final.area / rasterized_geometry.area)
+        rasterized_parts = (
+            [rasterized_geometry]
+            if rasterized_geometry.geom_type == "Polygon"
+            else list(rasterized_geometry.geoms)
         )
-        perturbed_holes = sum(len(part.interiors) for part in perturbed_parts)
-        self.assertTrue(perturbed.is_valid)
-        self.assertFalse(perturbed.is_empty)
-        self.assertFalse(structural.equals(source))
-        self.assertGreaterEqual(structural_area_ratio, 0.75)
-        self.assertLessEqual(structural_area_ratio, 0.93)
-        self.assertGreaterEqual(area_ratio, 0.75)
-        self.assertLessEqual(area_ratio, 1.00)
-        self.assertFalse(perturbed.equals(source))
-        self.assertGreater(sum(item["removed_operation_count"] for item in diagnostics), 0)
-        self.assertLessEqual(abs(perturbed_holes - source_holes), 4)
+        final_parts = [final] if final.geom_type == "Polygon" else list(final.geoms)
+        source_holes = sum(len(part.interiors) for part in rasterized_parts)
+        final_holes = sum(len(part.interiors) for part in final_parts)
+        self.assertTrue(final.is_valid)
+        self.assertFalse(final.is_empty)
+        self.assertTrue(dropout_geometry.equals(final))
+        self.assertGreaterEqual(area_ratio, 0.88)
+        self.assertLessEqual(area_ratio, 0.95)
+        self.assertFalse(final.equals(rasterized_geometry))
+        self.assertLessEqual(final_holes, source_holes)
+        self.assertGreater(diagnostics["dropout_pixel_count"], 20)
 
-        minx, miny, maxx, maxy = unary_union([source, structural, perturbed]).bounds
-        transform = from_origin(minx - 3, maxy + 3, 1, 1)
-        width = int(np.ceil(maxx - minx)) + 6
-        height = int(np.ceil(maxy - miny)) + 6
         source_mask = rasterize(
-            [(source, 1)], out_shape=(height, width), transform=transform,
-            fill=0, dtype=np.uint8,
+            [(rasterized_geometry, 1)], out_shape=grid.before.shape,
+            transform=grid.transform, fill=0, dtype=np.uint8,
         )
-        structural_mask = rasterize(
-            [(structural, 1)], out_shape=(height, width), transform=transform,
-            fill=0, dtype=np.uint8,
+        final_mask = rasterize(
+            [(final, 1)], out_shape=grid.before.shape,
+            transform=grid.transform, fill=0, dtype=np.uint8,
         )
-        removed_mask = ((source_mask > 0) & (structural_mask == 0)).astype(np.uint8)
+        removed_mask = ((source_mask > 0) & (final_mask == 0)).astype(np.uint8)
         removed_count, _removed_labels, removed_stats, _ = (
             cv2.connectedComponentsWithStats(removed_mask, connectivity=8)
         )
         self.assertGreater(removed_count, 1)
-        self.assertLessEqual(removed_count - 1, 4)
-        self.assertGreater(
-            int(removed_stats[1:, cv2.CC_STAT_AREA].max()), 20,
-        )
-        perturbed_mask = rasterize(
-            [(perturbed, 1)], out_shape=(height, width), transform=transform,
-            fill=0, dtype=np.uint8,
-        )
-        comparison = np.full((height, width * 3, 3), 255, dtype=np.uint8)
-        comparison[:, :width][source_mask > 0] = (220, 80, 110)
-        comparison[:, width:2 * width][structural_mask > 0] = (235, 150, 45)
-        comparison[:, 2 * width:][perturbed_mask > 0] = (40, 165, 95)
+        self.assertLessEqual(removed_count - 1, 8)
+        self.assertGreater(int(removed_stats[1:, cv2.CC_STAT_AREA].max()), 20)
+        minimum_part_area = max(6.0, rasterized_geometry.area * 0.005)
+        self.assertTrue(all(part.area >= minimum_part_area for part in final_parts))
+
         debug_path = (
-            Path(tempfile.gettempdir())
-            / "samroad_fast_gt_boundary_grid_comparison.png"
+            Path(tempfile.gettempdir()) / "samroad_fast_gt_dropout_grid.png"
         )
-        preview = Image.new("RGB", (width * 3, height + 22), "white")
-        preview.paste(Image.fromarray(comparison), (0, 22))
-        draw = ImageDraw.Draw(preview)
-        for panel, label in enumerate((
-            "Original GT", "Structure gaps", "Final result",
-        )):
-            draw.text((panel * width + 3, 4), label, fill=(25, 25, 25))
-        preview.save(debug_path)
-        print(
-            "GT complex boundary perturbation debug:",
-            {
-                "comparison": str(debug_path),
-                "structural_area_ratio": round(structural_area_ratio, 4),
-                "area_ratio": round(area_ratio, 4),
-                "original_holes": source_holes,
-                "perturbed_holes": perturbed_holes,
-                "diagnostics": diagnostics,
-            },
+        self._write_gt_dropout_preview(
+            source, rasterized_geometry, dropout_geometry, final, grid, debug_path,
         )
+        print("GT complex dropout debug:", {
+            "comparison": str(debug_path),
+            "area_ratio": round(area_ratio, 4),
+            "original_holes": source_holes,
+            "final_holes": final_holes,
+            **diagnostics,
+        })
 
 
 class FastAutomaticChangeTests(unittest.TestCase):

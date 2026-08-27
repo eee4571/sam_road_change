@@ -419,6 +419,8 @@ def _run_fast_change_result(
         automatic,
         truth_path,
         output,
+        before_result=before_result,
+        after_result=after_result,
         before_period=before_period,
         after_period=after_period,
         truth_type_field=truth_type_field,
