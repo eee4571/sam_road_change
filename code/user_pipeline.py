@@ -72,6 +72,9 @@ FAST_PERIOD_STAGE_DEFINITIONS = (
     ("width", "快速道路宽度"),
     ("export", "道路产品导出"),
 )
+ATOMIC_REPLACE_ATTEMPTS = 12
+ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.05
+ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.5
 
 
 def project_root() -> Path:
@@ -105,15 +108,32 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Replace a file atomically while tolerating brief Windows reader locks."""
+    delay = ATOMIC_REPLACE_INITIAL_DELAY_SECONDS
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay = min(ATOMIC_REPLACE_MAX_DELAY_SECONDS, delay * 1.8)
+
+
 def write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary.exists():
-            temporary.unlink()
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def now_text() -> str:

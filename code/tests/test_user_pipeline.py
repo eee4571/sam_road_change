@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,28 @@ from dev_tools import generate_mock_change_truth
 
 
 class GridDiscoveryTests(unittest.TestCase):
+    def test_write_json_retries_a_brief_windows_file_lock(self) -> None:
+        real_replace = os.replace
+        attempts = 0
+
+        def flaky_replace(source, target):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError(5, "拒绝访问", str(target))
+            return real_replace(source, target)
+
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "pipeline_result.json"
+            with patch.object(user_pipeline.os, "replace", side_effect=flaky_replace), \
+                    patch.object(user_pipeline.time, "sleep") as sleep:
+                user_pipeline.write_json(target, {"status": "completed"})
+
+            self.assertEqual(user_pipeline.read_json(target), {"status": "completed"})
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(list(Path(raw).glob(".*.tmp")), [])
+
     def test_empty_truth_shapefile_with_crs_passes_validation(self) -> None:
         import geopandas as gpd
         import pandas as pd
