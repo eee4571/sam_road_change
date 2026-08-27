@@ -2517,6 +2517,9 @@ def extract(args: argparse.Namespace) -> dict:
                 "--surface-dir", str(surface_mask_dir),
                 "--probability-dir", str(probability_dir), "--output-dir", str(width_dir),
                 "--pixel-size", str(args.pixel_size),
+                "--molra-sam", str(MODELS / "sam_molra" / "sam_vit_b_01ec64.pth"),
+                "--molra-weight", str(MODELS / "sam_molra" / "adapter.th"),
+                "--device", device,
             ], ROOT),
             "export": ([
                 str(PYTHON), str(fast_script), "export", "--width-dir", str(width_dir),

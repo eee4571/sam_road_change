@@ -909,6 +909,73 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
+class MolraSurfacePredictor:
+    """Reusable SAM-MLoRA road-surface predictor for tile-level Fast width work.
+
+    The regular ``infer_molra_mask`` helper constructs a model for one call.  Fast
+    width processes several source tiles in one process, so keeping the loaded
+    model here avoids paying that cost once per tile.
+    """
+
+    def __init__(
+        self,
+        sam_pretrained_path: Path,
+        weight_path: Path,
+        *,
+        device: str | torch.device = "auto",
+        tile: int = 1024,
+        overlap: int = 256,
+        threshold: float = 0.5,
+        image_size: int = 512,
+    ) -> None:
+        add_sam_molra_path()
+        from infer_img import get_model_holder, infer_tile, load_checkpoint, read_image
+        from networks.sam_multi_lora import build_sam_vit_b_adapter_linknet_multi_lora, resize_model_pos_embed
+
+        self.sam_pretrained_path = Path(sam_pretrained_path)
+        self.weight_path = Path(weight_path)
+        if not self.sam_pretrained_path.is_file():
+            raise FileNotFoundError(f"SAM pretrained weight not found: {self.sam_pretrained_path}")
+        if not self.weight_path.is_file():
+            raise FileNotFoundError(f"SAM_MLoRA weight not found: {self.weight_path}")
+        self.device = device if isinstance(device, torch.device) else resolve_device(str(device))
+        self.tile = int(tile)
+        self.overlap = int(overlap)
+        self.threshold = float(threshold)
+        self._infer_tile = infer_tile
+        self._read_image = read_image
+
+        model, encoder_global_attn_indexes = build_sam_vit_b_adapter_linknet_multi_lora(
+            str(self.sam_pretrained_path), image_size=int(image_size),
+        )
+        model = model.to(self.device)
+        load_checkpoint(model, str(self.weight_path))
+        holder = get_model_holder(model)
+        holder.enc = resize_model_pos_embed(
+            holder.enc,
+            img_size=self.tile,
+            encoder_global_attn_indexes=encoder_global_attn_indexes,
+        )
+        model.eval()
+        self.model = model
+
+    def predict_probability(self, image_path: Path) -> np.ndarray:
+        image, _profile = self._read_image(Path(image_path))
+        probability = self._infer_tile(
+            image,
+            self.model,
+            self.device,
+            tile=self.tile,
+            overlap=self.overlap,
+            threshold=self.threshold,
+            return_probability=True,
+        )
+        return np.asarray(probability, dtype=np.float32)
+
+    def predict_mask(self, image_path: Path) -> np.ndarray:
+        return (self.predict_probability(image_path) >= self.threshold).astype(np.uint8)
+
+
 def infer_molra_mask(
     image_path: Path,
     sam_pretrained_path: Path,

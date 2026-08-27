@@ -788,40 +788,227 @@ def _distance_width(distance: np.ndarray, point: np.ndarray, pixel_size: float) 
     return float(2.0 * np.max(distance[row0:row1, col0:col1]) * pixel_size)
 
 
+def _normal_width_evidence(
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    binary: np.ndarray,
+    pixel_size: float,
+    *,
+    sample_function,
+    max_asymmetry_ratio: float,
+) -> tuple[dict[int, list[float]], dict[int, int]]:
+    sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
+    samples = sample_function(
+        nodes, edges, binary, sample_step_px=sample_step_px,
+        normal_step_px=1.0, max_search_px=max(20.0, 80.0 / max(pixel_size, 1e-6)),
+        pixel_size=pixel_size, snap_radius_px=6,
+        junction_buffer_px=max(4.0, min(12.0, sample_step_px)),
+        border_margin_px=1, max_snap_distance_px=6.0,
+        max_asymmetry_ratio=max_asymmetry_ratio,
+    )
+    by_edge: dict[int, list[float]] = {}
+    sample_counts: dict[int, int] = {}
+    for sample in samples:
+        edge_id = int(sample.get("edge_id", -1))
+        if edge_id < 0:
+            continue
+        sample_counts[edge_id] = sample_counts.get(edge_id, 0) + 1
+        width = float(sample.get("width_units", 0.0))
+        if (
+            sample.get("valid_width")
+            and width > 0
+            and float(sample.get("asymmetry_ratio", 1.0)) <= max_asymmetry_ratio
+        ):
+            by_edge.setdefault(edge_id, []).append(width)
+    return by_edge, sample_counts
+
+
+def _ordered_edge_chains(edges: np.ndarray, node_count: int) -> list[list[int]]:
+    """Return degree-2 edge chains without crossing a junction."""
+    node_edges: list[list[int]] = [[] for _ in range(node_count)]
+    for edge_id, (src, dst) in enumerate(edges.tolist()):
+        node_edges[int(src)].append(edge_id)
+        node_edges[int(dst)].append(edge_id)
+    visited: set[int] = set()
+    chains: list[list[int]] = []
+
+    def trace(start_node: int, start_edge: int) -> list[int]:
+        chain: list[int] = []
+        node = int(start_node)
+        edge_id = int(start_edge)
+        while edge_id not in visited:
+            visited.add(edge_id)
+            chain.append(edge_id)
+            src, dst = (int(value) for value in edges[edge_id])
+            next_node = dst if src == node else src
+            if len(node_edges[next_node]) != 2:
+                break
+            candidates = [candidate for candidate in node_edges[next_node] if candidate not in visited]
+            if not candidates:
+                break
+            node, edge_id = next_node, candidates[0]
+        return chain
+
+    for node, incident in enumerate(node_edges):
+        if len(incident) == 2:
+            continue
+        for edge_id in incident:
+            if edge_id not in visited:
+                chain = trace(node, edge_id)
+                if chain:
+                    chains.append(chain)
+    for edge_id, (src, _dst) in enumerate(edges.tolist()):
+        if edge_id not in visited:
+            chain = trace(int(src), edge_id)
+            if chain:
+                chains.append(chain)
+    return chains
+
+
+def _stabilize_fast_width_rows(
+    rows: list[dict],
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    *,
+    short_edge_px: float,
+) -> list[dict]:
+    """Replace isolated spikes and unresolved short edges within road chains."""
+    stabilized = [dict(row) for row in rows]
+    lengths = [float(np.linalg.norm(nodes[int(src)] - nodes[int(dst)])) for src, dst in edges.tolist()]
+    reliable_sources = {"molra", "molra_assisted", "neighbor_fallback"}
+
+    for chain in _ordered_edge_chains(edges, int(nodes.shape[0])):
+        original_widths = [float(stabilized[edge_id].get("width_units", 0.0)) for edge_id in chain]
+        original_sources = [str(stabilized[edge_id].get("width_source", "")) for edge_id in chain]
+        for index, edge_id in enumerate(chain):
+            neighbor_indexes = [candidate for candidate in range(max(0, index - 2), min(len(chain), index + 3)) if candidate != index]
+            reliable_neighbors = [
+                original_widths[candidate]
+                for candidate in neighbor_indexes
+                if original_widths[candidate] > 0 and original_sources[candidate] in reliable_sources
+            ]
+            if not reliable_neighbors:
+                continue
+            neighbor_median = _robust_median(reliable_neighbors)
+            if neighbor_median <= 0:
+                continue
+            width = original_widths[index]
+            source = original_sources[index]
+            should_fill = width <= 0
+            if source in {"molra_assisted", "fast_mask_fallback"}:
+                ratio = width / neighbor_median if width > 0 else 0.0
+                should_fill = (
+                    lengths[edge_id] <= short_edge_px
+                    or ratio < (0.75 if source == "molra_assisted" else 0.65)
+                    or ratio > 1.55
+                )
+            if should_fill:
+                stabilized[edge_id]["width_units"] = neighbor_median
+                stabilized[edge_id]["width_source"] = "neighbor_fallback"
+
+        # Only replace an isolated spike when its immediate neighbours agree.
+        for index in range(1, len(chain) - 1):
+            edge_id = chain[index]
+            left = float(stabilized[chain[index - 1]].get("width_units", 0.0))
+            value = float(stabilized[edge_id].get("width_units", 0.0))
+            right = float(stabilized[chain[index + 1]].get("width_units", 0.0))
+            if min(left, value, right) <= 0:
+                continue
+            neighbor_median = float(np.median((left, right)))
+            neighbor_spread = abs(left - right) / max(neighbor_median, 1e-6)
+            ratio = value / max(neighbor_median, 1e-6)
+            if neighbor_spread <= 0.30 and (ratio < 0.60 or ratio > 1.65):
+                stabilized[edge_id]["width_units"] = neighbor_median
+                stabilized[edge_id]["width_source"] = "neighbor_fallback"
+
+    # A very short junction edge may form a one-edge chain.  Fill it only when
+    # widths on all adjoining branches are mutually consistent.
+    node_edges: list[list[int]] = [[] for _ in range(nodes.shape[0])]
+    for edge_id, (src, dst) in enumerate(edges.tolist()):
+        node_edges[int(src)].append(edge_id)
+        node_edges[int(dst)].append(edge_id)
+    for edge_id, (src, dst) in enumerate(edges.tolist()):
+        row = stabilized[edge_id]
+        if float(row.get("width_units", 0.0)) > 0 or lengths[edge_id] > short_edge_px:
+            continue
+        neighbor_ids = set(node_edges[int(src)] + node_edges[int(dst)]) - {edge_id}
+        neighbor_widths = [
+            float(stabilized[candidate].get("width_units", 0.0))
+            for candidate in neighbor_ids
+            if str(stabilized[candidate].get("width_source", "")) in reliable_sources
+            and float(stabilized[candidate].get("width_units", 0.0)) > 0
+        ]
+        if not neighbor_widths:
+            continue
+        median = float(np.median(neighbor_widths))
+        if max(neighbor_widths) / max(min(neighbor_widths), 1e-6) <= 1.35:
+            row["width_units"] = median
+            row["width_source"] = "neighbor_fallback"
+    return stabilized
+
+
 def measure_fast_edge_widths(
     nodes: np.ndarray,
     edges: np.ndarray,
     binary: np.ndarray,
     pixel_size: float,
     *,
+    molra_binary: np.ndarray | None = None,
     sample_function=None,
 ) -> list[dict]:
-    """Sparse normal measurement with a real distance-transform fallback."""
+    """Measure TopoNet edges from MLoRA surface evidence with Fast fallbacks."""
     if sample_function is None:
         if str(WIDTH_ROOT) not in sys.path:
             sys.path.insert(0, str(WIDTH_ROOT))
         from molra_centerline_width import sample_widths_by_normal as sample_function
-    sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
-    samples = sample_function(
-        nodes, edges, binary, sample_step_px=sample_step_px,
-        normal_step_px=1.0, max_search_px=max(20.0, 80.0 / max(pixel_size, 1e-6)),
-        pixel_size=pixel_size, snap_radius_px=6, junction_buffer_px=0.0,
-        border_margin_px=1, max_snap_distance_px=6.0, max_asymmetry_ratio=1.0,
+    fast_binary = (np.asarray(binary) > 0).astype(np.uint8)
+    molra = None if molra_binary is None else (np.asarray(molra_binary) > 0).astype(np.uint8)
+    if molra is not None and molra.shape != fast_binary.shape:
+        raise ValueError(f"MLoRA/Fast mask shape mismatch: {molra.shape} != {fast_binary.shape}")
+
+    molra_widths: dict[int, list[float]] = {}
+    assisted_widths: dict[int, list[float]] = {}
+    if molra is not None and np.any(molra):
+        molra_widths, _counts = _normal_width_evidence(
+            nodes, edges, molra, pixel_size, sample_function=sample_function,
+            max_asymmetry_ratio=0.65,
+        )
+        assisted = np.maximum(molra, fast_binary)
+        assisted_widths, _counts = _normal_width_evidence(
+            nodes, edges, assisted, pixel_size, sample_function=sample_function,
+            max_asymmetry_ratio=0.90,
+        )
+    fast_widths, _counts = _normal_width_evidence(
+        nodes, edges, fast_binary, pixel_size, sample_function=sample_function,
+        max_asymmetry_ratio=1.0,
     )
-    by_edge: dict[int, list[float]] = {}
-    for sample in samples:
-        if sample.get("valid_width") and float(sample.get("width_units", 0.0)) > 0:
-            by_edge.setdefault(int(sample["edge_id"]), []).append(float(sample["width_units"]))
-    distance = cv2.distanceTransform((binary > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    fast_distance = cv2.distanceTransform(fast_binary, cv2.DIST_L2, 5)
     rows = []
     for edge_id, (src, dst) in enumerate(edges.tolist()):
-        width = _robust_median(by_edge.get(edge_id, []))
-        source = "normal_fast"
+        width = _robust_median(molra_widths.get(edge_id, []))
+        source = "molra" if width > 0 else ""
         if width <= 0:
-            width = _distance_width(distance, (nodes[src] + nodes[dst]) * 0.5, pixel_size)
-            source = "distance_transform_fallback"
-        rows.append({"edge_id": edge_id, "width_units": width, "width_source": source})
-    return rows
+            width = _robust_median(assisted_widths.get(edge_id, []))
+            source = "molra_assisted" if width > 0 else ""
+        if width <= 0:
+            width = _robust_median(fast_widths.get(edge_id, []))
+            if width <= 0:
+                width = _distance_width(fast_distance, (nodes[src] + nodes[dst]) * 0.5, pixel_size)
+            source = "fast_mask_fallback" if width > 0 else ""
+        rows.append({
+            "edge_id": edge_id,
+            "width_units": float(width),
+            "width_px": float(width / max(pixel_size, 1e-9)) if width > 0 else 0.0,
+            "width_source": source,
+            "molra_valid_sample_count": len(molra_widths.get(edge_id, [])),
+        })
+    sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
+    stabilized = _stabilize_fast_width_rows(
+        rows, nodes, edges, short_edge_px=1.5 * sample_step_px,
+    )
+    for row in stabilized:
+        row["width_px"] = float(row["width_units"] / max(pixel_size, 1e-9)) if row["width_units"] > 0 else 0.0
+    return stabilized
 
 
 def _simplify_path_pixels(path: FastRoadPath, epsilon_px: float = 0.75) -> np.ndarray:
@@ -847,9 +1034,10 @@ def measure_fast_path_widths(
     binary: np.ndarray,
     pixel_size: float,
     *,
+    molra_binary: np.ndarray | None = None,
     sample_function=None,
 ) -> list[dict]:
-    """Reuse Fast normal probing while aggregating sparse samples by complete path."""
+    """Aggregate the same MLoRA-first edge measurements by complete path."""
     if not paths:
         return []
     if sample_function is None:
@@ -870,32 +1058,41 @@ def measure_fast_path_widths(
             path_by_edge.append(path_id)
     nodes_array = np.asarray(nodes, dtype=np.float32).reshape(-1, 2)
     edges_array = np.asarray(edges, dtype=np.int32).reshape(-1, 2)
-    sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
-    samples = sample_function(
-        nodes_array, edges_array, binary, sample_step_px=sample_step_px,
-        normal_step_px=1.0, max_search_px=max(20.0, 80.0 / max(pixel_size, 1e-6)),
-        pixel_size=pixel_size, snap_radius_px=6, junction_buffer_px=0.0,
-        border_margin_px=1, max_snap_distance_px=6.0, max_asymmetry_ratio=1.0,
+    edge_rows = measure_fast_edge_widths(
+        nodes_array, edges_array, binary, pixel_size,
+        molra_binary=molra_binary,
+        sample_function=sample_function,
     ) if edges else []
-    by_path: dict[int, list[float]] = {}
-    for sample in samples:
-        edge_id = int(sample.get("edge_id", -1))
-        if (
-            0 <= edge_id < len(path_by_edge)
-            and sample.get("valid_width")
-            and float(sample.get("width_units", 0.0)) > 0
-        ):
-            by_path.setdefault(path_by_edge[edge_id], []).append(float(sample["width_units"]))
-    distance = cv2.distanceTransform((binary > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    by_path: dict[int, list[dict]] = {}
+    for edge_id, row in enumerate(edge_rows):
+        if 0 <= edge_id < len(path_by_edge) and float(row.get("width_units", 0.0)) > 0:
+            by_path.setdefault(path_by_edge[edge_id], []).append(row)
     rows = []
     for path_id, path in enumerate(paths):
-        width = _robust_median(by_path.get(path_id, []))
-        source = "normal_fast"
-        if width <= 0:
-            width = _distance_width(distance, path.pixels[path.pixels.shape[0] // 2], pixel_size)
-            source = "distance_transform_fallback"
+        path_rows = by_path.get(path_id, [])
+        width = _robust_median([float(row["width_units"]) for row in path_rows])
+        source_priority = ("molra", "molra_assisted", "neighbor_fallback", "fast_mask_fallback")
+        source = next(
+            (candidate for candidate in source_priority if any(row["width_source"] == candidate for row in path_rows)),
+            "",
+        )
         rows.append({"path_id": path_id, "width_units": width, "width_source": source})
     return rows
+
+
+def _cached_fast_molra_surface(cache_path: Path, expected_shape: tuple[int, int]) -> np.ndarray | None:
+    if not cache_path.is_file():
+        return None
+    cached = cv2.imread(str(cache_path), cv2.IMREAD_GRAYSCALE)
+    if cached is None or cached.shape != expected_shape:
+        return None
+    return (cached > 0).astype(np.uint8)
+
+
+def _write_fast_molra_surface(cache_path: Path, mask: np.ndarray) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(cache_path), (np.asarray(mask) > 0).astype(np.uint8) * 255):
+        raise OSError(f"Could not cache Fast MLoRA surface: {cache_path}")
 
 
 def measure_fast_widths(
@@ -905,6 +1102,13 @@ def measure_fast_widths(
     output_dir: Path,
     *,
     requested_pixel_size: float = 0.0,
+    sam_pretrained_path: Path | None = None,
+    molra_weight_path: Path | None = None,
+    device: str = "auto",
+    molra_tile: int = 1024,
+    molra_overlap: int = 256,
+    molra_threshold: float = 0.5,
+    molra_surface_provider=None,
 ) -> dict:
     if str(WIDTH_ROOT) not in sys.path:
         sys.path.insert(0, str(WIDTH_ROOT))
@@ -915,6 +1119,9 @@ def measure_fast_widths(
     layer_records: dict[str, list[dict]] = {key: [] for key in ("centerlines", "surfaces", "width_segments", "corridors")}
     target_crs = None
     image_rows = []
+    molra_predictor = None
+    molra_disabled_reason = ""
+    molra_cache_dir = output_dir / "molra_surface_cache"
     for image_path in _raster_paths(image_dir):
         tile_started = time.perf_counter()
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
@@ -938,13 +1145,60 @@ def measure_fast_widths(
             if dataset.crs != target_crs:
                 raise ValueError("Fast products currently require normalized period tiles in one CRS")
             transform = dataset.transform
-            pixel_size = requested_pixel_size if requested_pixel_size > 0 else float(np.mean((abs(transform.a), abs(transform.e))))
+            map_pixel_size = float(np.mean((
+                float(np.hypot(transform.a, transform.d)),
+                float(np.hypot(transform.b, transform.e)),
+            )))
+            pixel_size = _fast_tile_physical_pixel_size(
+                transform, dataset.crs, binary.shape, requested_pixel_size,
+            )
+            molra_started = time.perf_counter()
+            molra_cache_path = molra_cache_dir / f"{image_path.stem}_mask.png"
+            molra_binary = _cached_fast_molra_surface(molra_cache_path, binary.shape)
+            molra_cache_hit = molra_binary is not None
+            molra_error = ""
+            if len(edges) and molra_binary is None:
+                try:
+                    if molra_surface_provider is not None:
+                        molra_binary = (np.asarray(molra_surface_provider(image_path)) > 0).astype(np.uint8)
+                    elif not molra_disabled_reason:
+                        if sam_pretrained_path is None or molra_weight_path is None:
+                            raise FileNotFoundError("Fast MLoRA model paths were not configured")
+                        if molra_predictor is None:
+                            from molra_centerline_width import MolraSurfacePredictor
+                            molra_predictor = MolraSurfacePredictor(
+                                Path(sam_pretrained_path), Path(molra_weight_path),
+                                device=device, tile=molra_tile, overlap=molra_overlap,
+                                threshold=molra_threshold,
+                            )
+                        molra_binary = molra_predictor.predict_mask(image_path)
+                    if molra_binary is not None and molra_binary.shape != binary.shape:
+                        raise ValueError(
+                            f"MLoRA/image shape mismatch for {image_path.stem}: "
+                            f"{molra_binary.shape} != {binary.shape}"
+                        )
+                    if molra_binary is not None:
+                        _write_fast_molra_surface(molra_cache_path, molra_binary)
+                except Exception as exc:  # model absence must retain the documented Fast fallback
+                    molra_error = f"{type(exc).__name__}: {exc}"
+                    if molra_surface_provider is None and molra_predictor is None:
+                        molra_disabled_reason = molra_error
+                    warnings.warn(
+                        f"Fast MLoRA surface unavailable for {image_path.stem}; "
+                        f"using Fast mask fallback. {molra_error}",
+                        RuntimeWarning,
+                    )
+                    molra_binary = None
+            molra_seconds = time.perf_counter() - molra_started
             width_rows = measure_fast_edge_widths(
-                nodes, edges, binary, pixel_size, sample_function=sample_widths_by_normal,
+                nodes, edges, binary, pixel_size,
+                molra_binary=molra_binary,
+                sample_function=sample_widths_by_normal,
             )
             for edge_id, (src, dst) in enumerate(edges.tolist()):
                 line = _world_line(transform, nodes[src], nodes[dst])
                 width = float(width_rows[edge_id]["width_units"])
+                width_px = float(width_rows[edge_id]["width_px"])
                 width_source = str(width_rows[edge_id]["width_source"])
                 if width <= 0:
                     continue
@@ -955,7 +1209,10 @@ def measure_fast_widths(
                 }
                 layer_records["centerlines"].append({**common, "source": "native_toponet"})
                 layer_records["width_segments"].append(common)
-                layer_records["corridors"].append({**common, "geometry": line.buffer(width / 2.0)})
+                layer_records["corridors"].append({
+                    **common,
+                    "geometry": line.buffer(width_px * map_pixel_size / 2.0),
+                })
             valid = dataset.dataset_mask() > 0
             for mapping, value in shapes(binary, mask=(binary > 0) & valid, transform=transform):
                 if int(value) != 1:
@@ -987,6 +1244,15 @@ def measure_fast_widths(
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,
+            "molra_surface_mask": str(molra_cache_path) if molra_binary is not None else "",
+            "molra_surface_available": bool(molra_binary is not None),
+            "molra_surface_cache_hit": bool(molra_cache_hit),
+            "molra_surface_seconds": float(molra_seconds),
+            "molra_surface_error": molra_error or molra_disabled_reason,
+            "width_source_counts": {
+                source: sum(str(row.get("width_source", "")) == source for row in width_rows)
+                for source in ("molra", "molra_assisted", "fast_mask_fallback", "neighbor_fallback")
+            },
             "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
             "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
             "final_mask_pixel_count": int(surface_diagnostics.get("final_mask_pixel_count", np.count_nonzero(binary))),
@@ -1010,6 +1276,8 @@ def measure_fast_widths(
             f"[Fast Centerline] {image_path.stem}: "
             f"paths={tile_summary['final_centerline_path_count']}, "
             f"length={tile_summary['final_centerline_length']:.3f}, "
+            f"width_sources={tile_summary['width_source_counts']}, "
+            f"molra={molra_seconds:.3f}s, "
             f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
         )
         image_rows.append(tile_summary)
@@ -1025,7 +1293,7 @@ def measure_fast_widths(
         )
         frame.to_file(working, layer=layer, driver="GPKG", mode="w" if index == 0 else "a")
     summary = {
-        "execution_profile": "fast", "width_source": "fast_measured",
+        "execution_profile": "fast", "width_source": "molra_surface_normal",
         "working_gpkg": str(working), "images": image_rows,
         "fast_width_elapsed_seconds": float(time.perf_counter() - batch_started),
     }
@@ -4772,6 +5040,13 @@ def parser() -> argparse.ArgumentParser:
     command = sub.add_parser("width", parents=[common])
     command.add_argument("--surface-dir", required=True)
     command.add_argument("--output-dir", required=True); command.add_argument("--pixel-size", type=float, default=0.0)
+    runtime_models = Path(__file__).resolve().parents[2] / "runtime" / "models" / "sam_molra"
+    command.add_argument("--molra-sam", default=str(runtime_models / "sam_vit_b_01ec64.pth"))
+    command.add_argument("--molra-weight", default=str(runtime_models / "adapter.th"))
+    command.add_argument("--device", default="auto")
+    command.add_argument("--molra-tile", type=int, default=1024)
+    command.add_argument("--molra-overlap", type=int, default=256)
+    command.add_argument("--molra-threshold", type=float, default=0.5)
     command = sub.add_parser("export")
     command.add_argument("--width-dir", required=True); command.add_argument("--output-dir", required=True)
     command.add_argument("--image-dir", default="")
@@ -4787,6 +5062,12 @@ def main() -> int:
         measure_fast_widths(
             Path(args.image_dir), Path(args.surface_dir), Path(args.probability_dir),
             Path(args.output_dir), requested_pixel_size=float(args.pixel_size),
+            sam_pretrained_path=Path(args.molra_sam),
+            molra_weight_path=Path(args.molra_weight),
+            device=str(args.device),
+            molra_tile=int(args.molra_tile),
+            molra_overlap=int(args.molra_overlap),
+            molra_threshold=float(args.molra_threshold),
         )
     else:
         validation = Path(args.validation_area) if str(args.validation_area).strip() else None

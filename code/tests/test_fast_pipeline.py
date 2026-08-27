@@ -328,10 +328,61 @@ class FastWidthTests(unittest.TestCase):
         self.nodes = np.asarray([[10.0, 35.0], [70.0, 35.0]], dtype=np.float32)
         self.edges = np.asarray([[0, 1]], dtype=np.int32)
 
-    def test_sparse_normal_width_is_measured_from_surface(self) -> None:
+    def test_fast_mask_is_used_only_as_fallback(self) -> None:
         rows = measure_fast_edge_widths(self.nodes, self.edges, self.mask, 1.0)
-        self.assertEqual(rows[0]["width_source"], "normal_fast")
+        self.assertEqual(rows[0]["width_source"], "fast_mask_fallback")
         self.assertAlmostEqual(rows[0]["width_units"], 10.0, delta=2.0)
+
+    def test_molra_surface_controls_width_instead_of_thin_fast_mask(self) -> None:
+        fast_mask = np.zeros((80, 80), dtype=np.uint8)
+        fast_mask[:, 39:42] = 1
+        molra_mask = np.zeros((80, 80), dtype=np.uint8)
+        molra_mask[:, 34:46] = 1
+        nodes = np.asarray([[10.0, 40.0], [70.0, 40.0]], dtype=np.float32)
+
+        rows = measure_fast_edge_widths(
+            nodes, self.edges, fast_mask, 1.0, molra_binary=molra_mask,
+        )
+
+        self.assertEqual(rows[0]["width_source"], "molra")
+        self.assertAlmostEqual(rows[0]["width_units"], 12.0, delta=1.0)
+
+    def test_local_molra_gap_uses_neighbor_width_instead_of_shrinking(self) -> None:
+        nodes = np.asarray(
+            [[8.0, 35.0], [35.0, 35.0], [45.0, 35.0], [72.0, 35.0]],
+            dtype=np.float32,
+        )
+        edges = np.asarray([[0, 1], [1, 2], [2, 3]], dtype=np.int32)
+        fast_mask = np.zeros((80, 80), dtype=np.uint8)
+        fast_mask[:, 34:37] = 1
+        molra_mask = np.zeros((80, 80), dtype=np.uint8)
+        molra_mask[:33, 30:41] = 1
+        molra_mask[48:, 30:41] = 1
+
+        rows = measure_fast_edge_widths(
+            nodes, edges, fast_mask, 1.0, molra_binary=molra_mask,
+        )
+
+        self.assertEqual(rows[1]["width_source"], "neighbor_fallback")
+        self.assertAlmostEqual(rows[1]["width_units"], 11.0, delta=2.0)
+
+    def test_junction_samples_do_not_inflate_road_width(self) -> None:
+        nodes = np.asarray(
+            [[40.0, 40.0], [10.0, 40.0], [70.0, 40.0], [40.0, 10.0], [40.0, 70.0]],
+            dtype=np.float32,
+        )
+        edges = np.asarray([[0, 1], [0, 2], [0, 3], [0, 4]], dtype=np.int32)
+        surface = np.zeros((80, 80), dtype=np.uint8)
+        surface[:, 36:45] = 1
+        surface[36:45, :] = 1
+
+        rows = measure_fast_edge_widths(
+            nodes, edges, surface, 1.0, molra_binary=surface,
+        )
+
+        widths = [row["width_units"] for row in rows if row["width_units"] > 0]
+        self.assertEqual(len(widths), 4)
+        self.assertLess(max(widths), 14.0)
 
     def test_lightweight_period_phases_export_compatible_products(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -360,7 +411,12 @@ class FastWidthTests(unittest.TestCase):
                 scores=np.asarray([0.9, 0.9], dtype=np.float32),
             )
             build_fast_surfaces(images, probabilities, surfaces)
-            summary = measure_fast_widths(images, surfaces, probabilities, widths)
+            molra_mask = np.zeros((80, 80), dtype=np.uint8)
+            molra_mask[:, 29:41] = 1
+            summary = measure_fast_widths(
+                images, surfaces, probabilities, widths,
+                molra_surface_provider=lambda _path: molra_mask,
+            )
             exported = export_fast_products(widths, products, image_dir=images)
             for key in ("centerlines", "surfaces", "width_segments", "corridors", "gpkg"):
                 self.assertTrue(Path(exported[key]).is_file(), key)
@@ -370,6 +426,7 @@ class FastWidthTests(unittest.TestCase):
             self.assertEqual(Path(exported["previews"]["width"]), products / "road_width_overview.png")
             self.assertGreater(summary["images"][0]["final_centerline_length"], 0)
             self.assertGreater(summary["images"][0]["measured_edge_count"], 0)
+            self.assertEqual(summary["images"][0]["width_source_counts"]["molra"], 1)
             centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
             self.assertEqual(len(centerlines), 1)
             self.assertEqual(centerlines.iloc[0]["source"], "native_toponet")
@@ -379,7 +436,7 @@ class FastWidthTests(unittest.TestCase):
             self.nodes, self.edges, self.mask, 1.0,
             sample_function=lambda *_args, **_kwargs: [],
         )
-        self.assertEqual(rows[0]["width_source"], "distance_transform_fallback")
+        self.assertEqual(rows[0]["width_source"], "fast_mask_fallback")
         self.assertAlmostEqual(rows[0]["width_units"], 10.0, delta=2.0)
 
     def test_path_width_is_aggregated_for_one_complete_polyline(self) -> None:
