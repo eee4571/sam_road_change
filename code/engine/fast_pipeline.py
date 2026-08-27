@@ -7,6 +7,7 @@ import hashlib
 import json
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import cv2
 import geopandas as gpd
 import numpy as np
 import rasterio
+from pyproj import CRS, Geod
 from rasterio.enums import Resampling
 from rasterio.features import rasterize, shapes
 from rasterio.warp import reproject
@@ -73,6 +75,7 @@ FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
 FAST_PAIRED_WIDTH_MIN_SAMPLES = 3
 FAST_PAIRED_WIDTH_MAX_SEARCH_M = 80.0
+FAST_CHANGE_TILE_HALO_MIN_PX = 8
 FAST_PUBLIC_CHANGE_FIELDS = (
     "change_typ", "before_per", "after_per",
     "width_bef", "width_aft", "width_diff",
@@ -104,6 +107,23 @@ class FastProbabilityGrid:
     after: np.ndarray
     transform: object
     crs: object
+    pixel_size: float
+
+
+@dataclass(frozen=True)
+class FastTileArtifacts:
+    """Existing Fast extraction intermediates for one normalized source tile."""
+
+    stem: str
+    image: Path
+    probability: Path
+    surface_mask: Path
+    centerline_mask: Path
+    topology: Path
+    transform: object
+    crs: object
+    shape: tuple[int, int]
+    bounds: tuple[float, float, float, float]
     pixel_size: float
 
 
@@ -2838,66 +2858,344 @@ def _fast_probability_grid(
     return FastProbabilityGrid(before, after, transform, crs, pixel_size)
 
 
-def _fast_rasterize_frame(
-    frame: gpd.GeoDataFrame,
-    grid: FastProbabilityGrid,
+def _fast_tile_physical_pixel_size(
+    transform,
+    crs,
+    shape_2d: tuple[int, int],
+    configured_value,
+) -> float:
+    """Resolve meters per pixel even when the raster CRS uses angular units."""
+    try:
+        configured = float(configured_value)
+    except (TypeError, ValueError):
+        configured = 0.0
+    projected_crs = CRS.from_user_input(crs)
+    if configured > 0 and not (
+        projected_crs.is_geographic and configured < 0.01
+    ):
+        return configured
+    center_row = float(shape_2d[0]) / 2.0
+    center_column = float(shape_2d[1]) / 2.0
+    center_x, center_y = transform * (center_column, center_row)
+    next_x, next_y = transform * (center_column + 1.0, center_row)
+    down_x, down_y = transform * (center_column, center_row + 1.0)
+    if projected_crs.is_geographic:
+        geod = Geod(ellps="WGS84")
+        _azimuth, _back_azimuth, x_distance = geod.inv(
+            center_x, center_y, next_x, next_y,
+        )
+        _azimuth, _back_azimuth, y_distance = geod.inv(
+            center_x, center_y, down_x, down_y,
+        )
+        distances = [
+            abs(float(value))
+            for value in (x_distance, y_distance)
+            if np.isfinite(value) and abs(float(value)) > 1e-9
+        ]
+    else:
+        unit_factor = float(
+            projected_crs.axis_info[0].unit_conversion_factor
+            if projected_crs.axis_info else 1.0
+        )
+        distances = [
+            float(np.hypot(next_x - center_x, next_y - center_y)) * unit_factor,
+            float(np.hypot(down_x - center_x, down_y - center_y)) * unit_factor,
+        ]
+    return float(np.mean(distances)) if distances else 1.0
+
+
+def _fast_tile_catalog(period_result: dict) -> dict[str, FastTileArtifacts]:
+    """Resolve per-tile Fast intermediates without opening regional products."""
+    width_dir = Path(str(period_result.get("width_review") or "")).expanduser()
+    summary_path = width_dir / "batch_width_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            f"Fast tile summary is missing: {summary_path}"
+        )
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    catalog: dict[str, FastTileArtifacts] = {}
+    for row in payload.get("images", []):
+        stem = str(row.get("stem") or Path(str(row.get("image") or "")).stem)
+        image_path = Path(str(row.get("image") or "")).expanduser()
+        surface_path = Path(str(row.get("surface_mask") or "")).expanduser()
+        centerline_path = Path(str(row.get("centerline_mask") or "")).expanduser()
+        batch_name = surface_path.parent.name
+        run_root = width_dir.parent
+        inference_root = run_root / "inference" / "road_graphs" / batch_name
+        probability_path = inference_root / "mask" / f"{stem}_road.png"
+        if not probability_path.is_file():
+            probability_path = width_dir / f"{stem}_centerline_probability.png"
+        topology_path = inference_root / "graph" / f"{stem}_fast_topology.npz"
+        required = {
+            "image": image_path,
+            "probability": probability_path,
+            "surface mask": surface_path,
+            "centerline mask": centerline_path,
+            "topology": topology_path,
+        }
+        missing = [label for label, path in required.items() if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"Fast tile {stem} is missing intermediates: {', '.join(missing)}"
+            )
+        with rasterio.open(image_path) as dataset:
+            if dataset.crs is None:
+                raise ValueError(f"Fast tile lacks CRS: {image_path}")
+            catalog[stem] = FastTileArtifacts(
+                stem=stem,
+                image=image_path,
+                probability=probability_path,
+                surface_mask=surface_path,
+                centerline_mask=centerline_path,
+                topology=topology_path,
+                transform=dataset.transform,
+                crs=dataset.crs,
+                shape=(int(dataset.height), int(dataset.width)),
+                bounds=tuple(dataset.bounds),
+                pixel_size=_fast_tile_physical_pixel_size(
+                    dataset.transform,
+                    dataset.crs,
+                    (int(dataset.height), int(dataset.width)),
+                    row.get("pixel_size"),
+                ),
+            )
+    if not catalog:
+        raise RuntimeError(f"Fast tile summary contains no images: {summary_path}")
+    return catalog
+
+
+def _fast_change_halo_pixels(pixel_size: float, tolerance: float) -> int:
+    map_halo = max(float(tolerance), FAST_PAIRED_WIDTH_MAX_SEARCH_M)
+    return max(
+        FAST_CHANGE_TILE_HALO_MIN_PX,
+        int(np.ceil(map_halo / max(float(pixel_size), 1e-9)))
+        + FAST_PRESENCE_ALIGNMENT_RADIUS_PX + 2,
+    )
+
+
+def _fast_place_tile_array(
+    destination: np.ndarray,
+    source: np.ndarray,
     *,
-    buffer_distance: float = 0.0,
-) -> np.ndarray:
-    geometries = []
-    for geometry in frame.geometry:
-        if geometry is None or geometry.is_empty:
-            continue
-        candidate = geometry.buffer(buffer_distance) if buffer_distance > 0 else geometry
-        if not candidate.is_empty:
-            geometries.append((candidate, 1))
-    if not geometries:
-        return np.zeros(grid.before.shape, dtype=np.uint8)
-    return rasterize(
-        geometries,
-        out_shape=grid.before.shape,
-        transform=grid.transform,
-        fill=0,
-        all_touched=True,
-        dtype="uint8",
+    source_transform,
+    source_crs,
+    target_transform,
+    target_crs,
+    resampling: Resampling,
+) -> None:
+    """Place an aligned tile directly, with reprojection only as a safeguard."""
+    placement = _fast_aligned_tile_slices(
+        source.shape,
+        source_transform=source_transform,
+        source_crs=source_crs,
+        target_shape=destination.shape,
+        target_transform=target_transform,
+        target_crs=target_crs,
+    )
+    if placement is not None:
+        source_rows, source_columns, target_rows, target_columns = placement
+        destination[target_rows, target_columns] = source[
+            source_rows, source_columns,
+        ]
+        return
+    reproject(
+        source=source,
+        destination=destination,
+        src_transform=source_transform,
+        src_crs=source_crs,
+        dst_transform=target_transform,
+        dst_crs=target_crs,
+        resampling=resampling,
+        init_dest_nodata=False,
     )
 
 
-def _fast_period_road_masks(
-    surfaces: gpd.GeoDataFrame,
-    centerlines: gpd.GeoDataFrame,
-    grid: FastProbabilityGrid,
+def _fast_aligned_tile_slices(
+    source_shape: tuple[int, int],
+    *,
+    source_transform,
+    source_crs,
+    target_shape: tuple[int, int],
+    target_transform,
+    target_crs,
+):
+    """Map aligned source/target overlap to source and destination slices."""
+    source_coefficients = np.asarray(
+        [source_transform.a, source_transform.b, source_transform.d, source_transform.e],
+        dtype=np.float64,
+    )
+    target_coefficients = np.asarray(
+        [target_transform.a, target_transform.b, target_transform.d, target_transform.e],
+        dtype=np.float64,
+    )
+    column_offset, row_offset = (~target_transform) * (
+        source_transform.c, source_transform.f,
+    )
+    rounded_column = int(round(column_offset))
+    rounded_row = int(round(row_offset))
+    aligned = (
+        source_crs == target_crs
+        and np.allclose(
+            source_coefficients, target_coefficients, rtol=0.0, atol=1e-9,
+        )
+        and np.isclose(column_offset, rounded_column, rtol=0.0, atol=1e-7)
+        and np.isclose(row_offset, rounded_row, rtol=0.0, atol=1e-7)
+    )
+    if not aligned:
+        return None
+
+    source_height, source_width = source_shape
+    target_height, target_width = target_shape
+    destination_row0 = max(0, rounded_row)
+    destination_col0 = max(0, rounded_column)
+    destination_row1 = min(target_height, rounded_row + source_height)
+    destination_col1 = min(target_width, rounded_column + source_width)
+    if destination_row0 >= destination_row1 or destination_col0 >= destination_col1:
+        return None
+    source_row0 = destination_row0 - rounded_row
+    source_col0 = destination_col0 - rounded_column
+    source_row1 = source_row0 + destination_row1 - destination_row0
+    source_col1 = source_col0 + destination_col1 - destination_col0
+    return (
+        slice(source_row0, source_row1),
+        slice(source_col0, source_col1),
+        slice(destination_row0, destination_row1),
+        slice(destination_col0, destination_col1),
+    )
+
+
+def _fast_tile_halo_layers(
+    catalog: dict[str, FastTileArtifacts],
+    *,
+    target_transform,
+    target_shape: tuple[int, int],
+    target_crs,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    surface_mask = _fast_rasterize_frame(surfaces, grid)
-    line_anchor = _fast_rasterize_frame(
-        centerlines,
-        grid,
-        buffer_distance=0.75 * grid.pixel_size,
+    """Read only tiles intersecting one halo and release each source immediately."""
+    probability = np.zeros(target_shape, dtype=np.uint8)
+    surface = np.zeros(target_shape, dtype=np.uint8)
+    centerline = np.zeros(target_shape, dtype=np.uint8)
+    target_bounds = rasterio.windows.bounds(
+        rasterio.windows.Window(0, 0, target_shape[1], target_shape[0]),
+        target_transform,
     )
-    path_labels = _fast_centerline_path_labels(centerlines, grid)
-    return surface_mask, line_anchor, path_labels
+    target_geometry = box(*target_bounds)
+    for artifact in catalog.values():
+        if not target_geometry.intersects(box(*artifact.bounds)):
+            continue
+        placement = _fast_aligned_tile_slices(
+            artifact.shape,
+            source_transform=artifact.transform,
+            source_crs=artifact.crs,
+            target_shape=target_shape,
+            target_transform=target_transform,
+            target_crs=target_crs,
+        )
+        if placement is not None:
+            source_rows, source_columns, target_rows, target_columns = placement
+            source_window = rasterio.windows.Window.from_slices(
+                source_rows, source_columns,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter(
+                    "ignore", rasterio.errors.NotGeoreferencedWarning,
+                )
+                with rasterio.open(artifact.probability) as dataset:
+                    source_probability = dataset.read(1, window=source_window)
+                with rasterio.open(artifact.surface_mask) as dataset:
+                    source_surface = dataset.read(1, window=source_window)
+                with rasterio.open(artifact.centerline_mask) as dataset:
+                    source_centerline = dataset.read(1, window=source_window)
+            with rasterio.open(artifact.image) as dataset:
+                valid = dataset.dataset_mask(window=source_window) > 0
+            probability[target_rows, target_columns] = np.where(
+                valid, source_probability, 0,
+            )
+            surface[target_rows, target_columns] = np.where(
+                valid, source_surface, 0,
+            )
+            centerline[target_rows, target_columns] = np.where(
+                valid, source_centerline, 0,
+            )
+            del source_probability, source_surface, source_centerline, valid
+            continue
+        source_probability = cv2.imread(
+            str(artifact.probability), cv2.IMREAD_GRAYSCALE,
+        )
+        source_surface = cv2.imread(
+            str(artifact.surface_mask), cv2.IMREAD_GRAYSCALE,
+        )
+        source_centerline = cv2.imread(
+            str(artifact.centerline_mask), cv2.IMREAD_GRAYSCALE,
+        )
+        if any(item is None for item in (
+            source_probability, source_surface, source_centerline,
+        )):
+            raise FileNotFoundError(f"Cannot read Fast tile intermediates: {artifact.stem}")
+        if any(item.shape != artifact.shape for item in (
+            source_probability, source_surface, source_centerline,
+        )):
+            raise ValueError(f"Fast tile intermediate shape mismatch: {artifact.stem}")
+        with rasterio.open(artifact.image) as dataset:
+            valid = dataset.dataset_mask() > 0
+        source_probability[~valid] = 0
+        source_surface[~valid] = 0
+        source_centerline[~valid] = 0
+        for destination, source, resampling in (
+            (probability, source_probability, Resampling.bilinear),
+            (surface, source_surface, Resampling.nearest),
+            (centerline, source_centerline, Resampling.nearest),
+        ):
+            _fast_place_tile_array(
+                destination,
+                source,
+                source_transform=artifact.transform,
+                source_crs=artifact.crs,
+                target_transform=target_transform,
+                target_crs=target_crs,
+                resampling=resampling,
+            )
+        del source_probability, source_surface, source_centerline, valid
+    return probability, (surface > 0).astype(np.uint8), (
+        centerline > 0
+    ).astype(np.uint8)
 
 
-def _fast_centerline_path_labels(
-    centerlines: gpd.GeoDataFrame,
-    grid: FastProbabilityGrid,
-) -> np.ndarray:
-    """Rasterize noded centerline paths without turning them into road surfaces."""
-    if centerlines.empty:
-        return np.zeros(grid.before.shape, dtype=np.int32)
-    parts = _fast_line_parts(centerlines.geometry.union_all())
-    if len(parts) > 1:
-        parts = _fast_line_parts(linemerge(parts))
-    paths = [part for part in parts if not part.is_empty and float(part.length) > 0]
-    if not paths:
-        return np.zeros(grid.before.shape, dtype=np.int32)
-    return rasterize(
-        [(path, path_id) for path_id, path in enumerate(paths, start=1)],
-        out_shape=grid.before.shape,
-        transform=grid.transform,
-        fill=0,
-        all_touched=True,
-        dtype="int32",
+def _fast_tile_topology_frame(
+    catalog: dict[str, FastTileArtifacts],
+    *,
+    target_bounds: tuple[float, float, float, float],
+    target_crs,
+) -> gpd.GeoDataFrame:
+    """Load topology edges only for tiles crossing the current halo."""
+    target_geometry = box(*target_bounds)
+    records = []
+    for artifact in catalog.values():
+        if artifact.crs != target_crs:
+            raise ValueError("Fast change tiles must use one normalized CRS")
+        if not target_geometry.intersects(box(*artifact.bounds)):
+            continue
+        with np.load(artifact.topology, allow_pickle=False) as topology:
+            nodes = np.asarray(topology["nodes"], dtype=np.float32).reshape(-1, 2)
+            edges = _unique_topology_edges(nodes, topology["edges"])
+        for edge_id, (source, target) in enumerate(edges.tolist()):
+            line = _world_line(artifact.transform, nodes[source], nodes[target])
+            if not line.intersects(target_geometry):
+                continue
+            clipped = make_valid(line.intersection(target_geometry))
+            for part in _fast_line_parts(clipped):
+                if not part.is_empty and float(part.length) > 0:
+                    records.append({
+                        "tile": artifact.stem,
+                        "edge_id": int(edge_id),
+                        "geometry": part,
+                    })
+    if records:
+        return gpd.GeoDataFrame(records, geometry="geometry", crs=target_crs)
+    return gpd.GeoDataFrame(
+        {"tile": [], "edge_id": []},
+        geometry=gpd.GeoSeries([], crs=target_crs),
+        crs=target_crs,
     )
 
 
@@ -3050,15 +3348,17 @@ def _fast_presence_records(
 
 def _detect_probability_presence_changes(
     grid: FastProbabilityGrid,
-    before_surfaces: gpd.GeoDataFrame,
-    after_surfaces: gpd.GeoDataFrame,
-    before_centerlines: gpd.GeoDataFrame,
-    after_centerlines: gpd.GeoDataFrame,
+    before_surface_mask: np.ndarray,
+    after_surface_mask: np.ndarray,
+    before_line_anchor: np.ndarray,
+    after_line_anchor: np.ndarray,
+    before_path_labels: np.ndarray,
+    after_path_labels: np.ndarray,
     *,
     before_period: str,
     after_period: str,
     min_area: float,
-) -> tuple[dict[str, list[dict]], dict, np.ndarray, np.ndarray]:
+) -> tuple[dict[str, list[dict]], dict]:
     radius = FAST_PRESENCE_ALIGNMENT_RADIUS_PX
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
     before_neighborhood = cv2.dilate(grid.before, kernel)
@@ -3072,12 +3372,6 @@ def _detect_probability_presence_changes(
         (grid.before >= FAST_PRESENCE_HIGH_THRESHOLD)
         & (after_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
         & ((grid.before - after_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
-    )
-    before_surface_mask, before_line_anchor, before_path_labels = _fast_period_road_masks(
-        before_surfaces, before_centerlines, grid,
-    )
-    after_surface_mask, after_line_anchor, after_path_labels = _fast_period_road_masks(
-        after_surfaces, after_centerlines, grid,
     )
     added_mask = _clean_fast_presence_mask(
         added_raw & (after_surface_mask > 0),
@@ -3119,7 +3413,7 @@ def _detect_probability_presence_changes(
         "removed_split_component_count": removed_split["split_component_count"],
         "removed_split_region_count": removed_split["split_region_count"],
     }
-    return records, diagnostics, before_surface_mask, after_surface_mask
+    return records, diagnostics
 
 
 def _fast_width_value(row) -> float:
@@ -3154,8 +3448,9 @@ def _fast_sampled_line_coverage(
     target: LineString,
     *,
     tolerance: float,
+    sample_spacing: float = FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
 ) -> float:
-    distances = _fast_sample_distances(source, FAST_PAIRED_WIDTH_SAMPLE_SPACING_M)
+    distances = _fast_sample_distances(source, sample_spacing)
     if not distances.size:
         return 0.0
     covered = sum(
@@ -3170,6 +3465,7 @@ def _fast_nearest_centerline_matches(
     target: gpd.GeoDataFrame,
     *,
     tolerance: float,
+    sample_spacing: float = FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
 ) -> dict[int, int]:
     if source.empty or target.empty:
         return {}
@@ -3191,7 +3487,10 @@ def _fast_nearest_centerline_matches(
             distance = float(source_line.distance(target_line))
             direction_similarity = _fast_direction_similarity(source_line, target_line)
             coverage = _fast_sampled_line_coverage(
-                source_line, target_line, tolerance=tolerance,
+                source_line,
+                target_line,
+                tolerance=tolerance,
+                sample_spacing=sample_spacing,
             )
             if (
                 distance > tolerance
@@ -3212,12 +3511,13 @@ def _fast_mutual_centerline_matches(
     after: gpd.GeoDataFrame,
     *,
     tolerance: float,
+    sample_spacing: float = FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
 ) -> list[tuple[int, int]]:
     before_to_after = _fast_nearest_centerline_matches(
-        before, after, tolerance=tolerance,
+        before, after, tolerance=tolerance, sample_spacing=sample_spacing,
     )
     after_to_before = _fast_nearest_centerline_matches(
-        after, before, tolerance=tolerance,
+        after, before, tolerance=tolerance, sample_spacing=sample_spacing,
     )
     return [
         (before_position, after_position)
@@ -3242,6 +3542,7 @@ def _fast_mask_width_at_position(
     transform,
     point_xy: tuple[float, float],
     normal_xy: np.ndarray,
+    physical_pixel_size: float,
 ) -> float:
     inverse = ~transform
     center_col, center_row = inverse * point_xy
@@ -3256,9 +3557,7 @@ def _fast_mask_width_at_position(
     if direction_norm <= 1e-9:
         return 0.0
     pixel_direction /= direction_norm
-    map_dx = transform.a * pixel_direction[0] + transform.b * pixel_direction[1]
-    map_dy = transform.d * pixel_direction[0] + transform.e * pixel_direction[1]
-    map_step_per_pixel = float(np.hypot(map_dx, map_dy))
+    map_step_per_pixel = max(float(physical_pixel_size), 1e-9)
     if map_step_per_pixel <= 1e-9:
         return 0.0
 
@@ -3289,10 +3588,11 @@ def _fast_paired_width_samples(
     grid: FastProbabilityGrid,
     *,
     tolerance: float,
+    sample_spacing: float = FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
 ) -> list[dict]:
     samples = []
     for distance in _fast_sample_distances(
-        before_line, FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
+        before_line, sample_spacing,
     ):
         before_point = before_line.interpolate(float(distance))
         after_distance = float(after_line.project(before_point))
@@ -3300,7 +3600,7 @@ def _fast_paired_width_samples(
         if before_point.distance(after_point) > tolerance:
             continue
         normal = _fast_local_normal(
-            before_line, float(distance), FAST_PAIRED_WIDTH_SAMPLE_SPACING_M,
+            before_line, float(distance), sample_spacing,
         )
         if normal is None:
             continue
@@ -3309,10 +3609,18 @@ def _fast_paired_width_samples(
             (float(before_point.y) + float(after_point.y)) / 2.0,
         )
         before_width = _fast_mask_width_at_position(
-            before_surface_mask, grid.transform, common_xy, normal,
+            before_surface_mask,
+            grid.transform,
+            common_xy,
+            normal,
+            grid.pixel_size,
         )
         after_width = _fast_mask_width_at_position(
-            after_surface_mask, grid.transform, common_xy, normal,
+            after_surface_mask,
+            grid.transform,
+            common_xy,
+            normal,
+            grid.pixel_size,
         )
         if before_width <= 0 or after_width <= 0:
             continue
@@ -3324,6 +3632,14 @@ def _fast_paired_width_samples(
             "delta": after_width - before_width,
         })
     return samples
+
+
+def _fast_map_units_per_meter(grid: FastProbabilityGrid) -> float:
+    x_step = float(np.hypot(grid.transform.a, grid.transform.d))
+    y_step = float(np.hypot(grid.transform.b, grid.transform.e))
+    map_steps = [value for value in (x_step, y_step) if value > 1e-12]
+    map_units_per_pixel = float(np.mean(map_steps)) if map_steps else 1.0
+    return map_units_per_pixel / max(float(grid.pixel_size), 1e-9)
 
 
 def _detect_sparse_paired_width_changes(
@@ -3340,8 +3656,14 @@ def _detect_sparse_paired_width_changes(
     after_period: str,
     min_area: float,
 ) -> tuple[list[dict], dict]:
+    map_units_per_meter = _fast_map_units_per_meter(grid)
+    map_tolerance = float(tolerance) * map_units_per_meter
+    sample_spacing = FAST_PAIRED_WIDTH_SAMPLE_SPACING_M * map_units_per_meter
     matches = _fast_mutual_centerline_matches(
-        before_centerlines, after_centerlines, tolerance=tolerance,
+        before_centerlines,
+        after_centerlines,
+        tolerance=map_tolerance,
+        sample_spacing=sample_spacing,
     )
     records: list[dict] = []
     valid_sample_count = 0
@@ -3353,7 +3675,8 @@ def _detect_sparse_paired_width_changes(
             continue
         samples = _fast_paired_width_samples(
             before_line, after_line, before_surface_mask, after_surface_mask, grid,
-            tolerance=tolerance,
+            tolerance=map_tolerance,
+            sample_spacing=sample_spacing,
         )
         valid_sample_count += len(samples)
         if len(samples) < FAST_PAIRED_WIDTH_MIN_SAMPLES:
@@ -3375,8 +3698,10 @@ def _detect_sparse_paired_width_changes(
         widened = width_delta > 0
         outer_width = after_width if widened else before_width
         inner_width = before_width if widened else after_width
-        change_geometry = common_axis.buffer(outer_width / 2.0).difference(
-            common_axis.buffer(inner_width / 2.0)
+        change_geometry = common_axis.buffer(
+            outer_width * map_units_per_meter / 2.0,
+        ).difference(
+            common_axis.buffer(inner_width * map_units_per_meter / 2.0)
         )
         change_type = "widened" if widened else "narrowed"
         for part in _fast_polygon_parts(change_geometry, min_area=min_area):
@@ -3398,6 +3723,95 @@ def _detect_sparse_paired_width_changes(
     }
 
 
+def _clip_fast_tile_records_to_core(
+    records: list[dict],
+    core_geometry,
+    *,
+    tile_stem: str,
+) -> list[dict]:
+    """Keep halo context for detection but publish pixels only from tile core."""
+    clipped_records = []
+    for source_record in records:
+        geometry = source_record.get("geometry")
+        if geometry is None or geometry.is_empty or not geometry.intersects(core_geometry):
+            continue
+        clipped = make_valid(geometry.intersection(core_geometry))
+        for part in _fast_polygon_parts(clipped, min_area=0.0):
+            record = dict(source_record)
+            record["geometry"] = part
+            record["_tile_stem"] = str(tile_stem)
+            clipped_records.append(record)
+    return clipped_records
+
+
+def _merge_fast_tile_change_records(
+    records: list[dict],
+    *,
+    min_area: float,
+) -> list[dict]:
+    """Join same-type pieces that meet across different tile core boundaries."""
+    if not records:
+        return []
+    frame = gpd.GeoDataFrame(records, geometry="geometry")
+    parent = list(range(len(frame)))
+
+    def find(position: int) -> int:
+        while parent[position] != position:
+            parent[position] = parent[parent[position]]
+            position = parent[position]
+        return position
+
+    def union(first: int, second: int) -> None:
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    spatial_index = frame.sindex
+    for position, row in frame.iterrows():
+        candidates = spatial_index.query(row.geometry, predicate="intersects")
+        for candidate in np.asarray(candidates, dtype=int).reshape(-1).tolist():
+            if candidate <= position:
+                continue
+            if str(row.get("change_typ")) != str(frame.iloc[candidate].get("change_typ")):
+                continue
+            if str(row.get("_tile_stem")) == str(frame.iloc[candidate].get("_tile_stem")):
+                continue
+            union(int(position), int(candidate))
+
+    groups: dict[int, list[int]] = {}
+    for position in range(len(frame)):
+        groups.setdefault(find(position), []).append(position)
+    merged_records = []
+    for positions in groups.values():
+        members = frame.iloc[positions]
+        geometry = make_valid(members.geometry.union_all())
+        record = dict(members.iloc[0])
+        record.pop("_tile_stem", None)
+        for field in ("width_bef", "width_aft", "width_diff"):
+            values = np.asarray(members.get(field, []), dtype=np.float64)
+            values = values[np.isfinite(values)]
+            if values.size:
+                record[field] = float(np.median(values))
+        for part in _fast_polygon_parts(geometry, min_area=min_area):
+            merged = dict(record)
+            merged["geometry"] = part
+            merged_records.append(merged)
+    return merged_records
+
+
+def _sum_fast_change_diagnostics(items: list[dict]) -> dict:
+    keys = {
+        key
+        for item in items
+        for key, value in item.items()
+        if isinstance(value, (int, np.integer))
+    }
+    return {
+        key: int(sum(int(item.get(key, 0)) for item in items))
+        for key in sorted(keys)
+    }
+
+
 def detect_fast_changes(
     before_result: Path | dict,
     after_result: Path | dict,
@@ -3412,71 +3826,192 @@ def detect_fast_changes(
     min_change_length: float | None = None,
     internal_outputs: bool = False,
 ) -> dict:
-    """Detect no-truth Fast changes from probability presence and paired widths."""
+    """Detect no-truth Fast changes tile by tile from extraction intermediates."""
     total_started = time.perf_counter()
     before_payload = _load_fast_period_result(before_result)
     after_payload = _load_fast_period_result(after_result)
-    grid = _fast_probability_grid(before_payload, after_payload)
-    before_surfaces = _align_fast_change_frame(
-        _read_fast_change_layer(before_payload, "surfaces", "corridors"),
-        grid.crs,
-    )
-    after_surfaces = _align_fast_change_frame(
-        _read_fast_change_layer(after_payload, "surfaces", "corridors"),
-        grid.crs,
-    )
-    before_centerlines = _align_fast_change_frame(
-        _read_fast_change_layer(before_payload, "centerlines", "width_segments"),
-        grid.crs,
-    )
-    after_centerlines = _align_fast_change_frame(
-        _read_fast_change_layer(after_payload, "centerlines", "width_segments"),
-        grid.crs,
-    )
-
+    before_tiles = _fast_tile_catalog(before_payload)
+    after_tiles = _fast_tile_catalog(after_payload)
+    before_stems, after_stems = set(before_tiles), set(after_tiles)
+    if before_stems != after_stems:
+        raise ValueError(
+            "Fast change requires matching normalized tile sets; "
+            f"before-only={sorted(before_stems - after_stems)}, "
+            f"after-only={sorted(after_stems - before_stems)}"
+        )
+    tile_stems = sorted(before_stems)
     tolerance = max(0.0, float(position_tolerance))
     minimum_area = max(0.0, float(min_change_area))
     _ = min_change_length  # Accepted for the stable external API; no longer a detector rule.
-    presence_started = time.perf_counter()
-    presence_records, presence_diagnostics, before_surface_mask, after_surface_mask = (
-        _detect_probability_presence_changes(
+    record_groups = {
+        "added": [], "removed": [], "widened": [], "narrowed": [],
+        "width_changed": [],
+    }
+    presence_diagnostic_rows = []
+    width_diagnostic_rows = []
+    tile_timings = []
+    presence_change_seconds = 0.0
+    width_change_seconds = 0.0
+    maximum_processing_shape = (0, 0)
+    target_crs = before_tiles[tile_stems[0]].crs
+    pixel_sizes = []
+    map_unit_scales = []
+    for tile_stem in tile_stems:
+        tile_started = time.perf_counter()
+        before_tile = before_tiles[tile_stem]
+        after_tile = after_tiles[tile_stem]
+        if before_tile.crs != target_crs or after_tile.crs != target_crs:
+            raise ValueError("Fast change tiles must use one normalized CRS")
+        pixel_size = float(before_tile.pixel_size)
+        if not np.isclose(
+            pixel_size, float(after_tile.pixel_size), rtol=0.05, atol=1e-6,
+        ):
+            raise ValueError(
+                f"Fast tile physical pixel size mismatch: {tile_stem}"
+            )
+        pixel_sizes.append(pixel_size)
+        halo_px = _fast_change_halo_pixels(pixel_size, tolerance)
+        core_height, core_width = before_tile.shape
+        halo_window = rasterio.windows.Window(
+            -halo_px, -halo_px,
+            core_width + 2 * halo_px,
+            core_height + 2 * halo_px,
+        )
+        local_transform = rasterio.windows.transform(
+            halo_window, before_tile.transform,
+        )
+        local_shape = (int(halo_window.height), int(halo_window.width))
+        maximum_processing_shape = max(
+            maximum_processing_shape, local_shape,
+            key=lambda shape_2d: int(shape_2d[0] * shape_2d[1]),
+        )
+        local_bounds = tuple(rasterio.windows.bounds(
+            rasterio.windows.Window(0, 0, local_shape[1], local_shape[0]),
+            local_transform,
+        ))
+        core_geometry = box(*before_tile.bounds)
+
+        before_probability, before_surface_mask, before_centerline_mask = (
+            _fast_tile_halo_layers(
+                before_tiles,
+                target_transform=local_transform,
+                target_shape=local_shape,
+                target_crs=target_crs,
+            )
+        )
+        after_probability, after_surface_mask, after_centerline_mask = (
+            _fast_tile_halo_layers(
+                after_tiles,
+                target_transform=local_transform,
+                target_shape=local_shape,
+                target_crs=target_crs,
+            )
+        )
+        grid = FastProbabilityGrid(
+            _probability01(before_probability),
+            _probability01(after_probability),
+            local_transform,
+            target_crs,
+            pixel_size,
+        )
+        map_units_per_meter = _fast_map_units_per_meter(grid)
+        map_unit_scales.append(map_units_per_meter)
+        minimum_area_map = minimum_area * map_units_per_meter ** 2
+        del before_probability, after_probability
+        before_centerlines = _fast_tile_topology_frame(
+            before_tiles, target_bounds=local_bounds, target_crs=target_crs,
+        )
+        after_centerlines = _fast_tile_topology_frame(
+            after_tiles, target_bounds=local_bounds, target_crs=target_crs,
+        )
+
+        presence_started = time.perf_counter()
+        presence_records, presence_diagnostics = _detect_probability_presence_changes(
             grid,
-            before_surfaces,
-            after_surfaces,
+            before_surface_mask,
+            after_surface_mask,
+            before_centerline_mask,
+            after_centerline_mask,
+            before_centerline_mask,
+            after_centerline_mask,
+                before_period=before_period,
+                after_period=after_period,
+                min_area=minimum_area_map,
+        )
+        tile_presence_seconds = time.perf_counter() - presence_started
+        presence_change_seconds += tile_presence_seconds
+        presence_diagnostic_rows.append(presence_diagnostics)
+        for change_type in ("added", "removed"):
+            record_groups[change_type].extend(_clip_fast_tile_records_to_core(
+                presence_records[change_type],
+                core_geometry,
+                tile_stem=tile_stem,
+            ))
+
+        width_started = time.perf_counter()
+        width_records, width_diagnostics = _detect_sparse_paired_width_changes(
             before_centerlines,
             after_centerlines,
+            before_surface_mask,
+            after_surface_mask,
+            grid,
+            tolerance=tolerance,
+            absolute_threshold=max(0.0, float(width_change_absolute)),
+            ratio_threshold=max(0.0, float(width_change_ratio)),
             before_period=before_period,
             after_period=after_period,
-            min_area=minimum_area,
+            min_area=minimum_area_map,
         )
+        tile_width_seconds = time.perf_counter() - width_started
+        width_change_seconds += tile_width_seconds
+        width_diagnostic_rows.append(width_diagnostics)
+        for change_type in ("widened", "narrowed"):
+            record_groups[change_type].extend(_clip_fast_tile_records_to_core(
+                [
+                    record for record in width_records
+                    if record["change_typ"] == change_type
+                ],
+                core_geometry,
+                tile_stem=tile_stem,
+            ))
+        tile_seconds = time.perf_counter() - tile_started
+        tile_timings.append({
+            "tile": tile_stem,
+            "halo_px": int(halo_px),
+            "processing_shape": [int(local_shape[0]), int(local_shape[1])],
+            "presence_seconds": float(tile_presence_seconds),
+            "width_seconds": float(tile_width_seconds),
+            "total_seconds": float(tile_seconds),
+        })
+        print(
+            f"[Fast Change Tile] {tile_stem}: "
+            f"presence={tile_presence_seconds:.3f}s, "
+            f"width={tile_width_seconds:.3f}s, "
+            f"total={tile_seconds:.3f}s",
+            flush=True,
+        )
+        del (
+            grid,
+            before_surface_mask, after_surface_mask,
+            before_centerline_mask, after_centerline_mask,
+            before_centerlines, after_centerlines,
+            presence_records, width_records,
+        )
+
+    merge_started = time.perf_counter()
+    minimum_area_map = minimum_area * float(np.mean(map_unit_scales)) ** 2
+    for change_type in ("added", "removed", "widened", "narrowed"):
+        record_groups[change_type] = _merge_fast_tile_change_records(
+            record_groups[change_type], min_area=minimum_area_map,
+        )
+    tile_merge_seconds = time.perf_counter() - merge_started
+    presence_diagnostics = _sum_fast_change_diagnostics(
+        presence_diagnostic_rows,
     )
-    presence_change_seconds = time.perf_counter() - presence_started
-    record_groups = {
-        "added": presence_records["added"],
-        "removed": presence_records["removed"],
-    }
-    width_started = time.perf_counter()
-    width_records, width_diagnostics = _detect_sparse_paired_width_changes(
-        before_centerlines,
-        after_centerlines,
-        before_surface_mask,
-        after_surface_mask,
-        grid,
-        tolerance=tolerance,
-        absolute_threshold=max(0.0, float(width_change_absolute)),
-        ratio_threshold=max(0.0, float(width_change_ratio)),
-        before_period=before_period,
-        after_period=after_period,
-        min_area=minimum_area,
-    )
-    width_change_seconds = time.perf_counter() - width_started
-    record_groups["widened"] = [
-        record for record in width_records if record["change_typ"] == "widened"
-    ]
-    record_groups["narrowed"] = [
-        record for record in width_records if record["change_typ"] == "narrowed"
-    ]
-    record_groups["width_changed"] = []
+    width_diagnostics = _sum_fast_change_diagnostics(width_diagnostic_rows)
+    width_records = record_groups["widened"] + record_groups["narrowed"]
+    grid_crs = target_crs
+    grid_pixel_size = float(np.mean(pixel_sizes))
     columns = {
         "change_typ": [], "before_per": [], "after_per": [], "source": [],
         "width_bef": [], "width_aft": [], "width_diff": [],
@@ -3484,10 +4019,10 @@ def detect_fast_changes(
 
     def frame_from(records: list[dict]) -> gpd.GeoDataFrame:
         if records:
-            return gpd.GeoDataFrame(records, geometry="geometry", crs=before_surfaces.crs)
+            return gpd.GeoDataFrame(records, geometry="geometry", crs=target_crs)
         return gpd.GeoDataFrame(
-            columns.copy(), geometry=gpd.GeoSeries([], crs=before_surfaces.crs),
-            crs=before_surfaces.crs,
+            columns.copy(), geometry=gpd.GeoSeries([], crs=target_crs),
+            crs=target_crs,
         )
 
     typed_layers = {name: frame_from(records) for name, records in record_groups.items()}
@@ -3544,8 +4079,18 @@ def detect_fast_changes(
         "before_period": str(before_period), "after_period": str(after_period),
         "presence_change_source": "enhanced_probability_difference",
         "width_change_source": "shared_position_sparse_width",
-        "probability_grid_crs": str(grid.crs),
-        "probability_pixel_size": float(grid.pixel_size),
+        "probability_grid_crs": str(grid_crs),
+        "probability_pixel_size": float(grid_pixel_size),
+        "auto_change_processing_mode": "per_tile_intermediates",
+        "regional_probability_mosaic_used": False,
+        "tile_count": int(len(tile_stems)),
+        "tile_timings": tile_timings,
+        "maximum_processing_shape": [
+            int(maximum_processing_shape[0]), int(maximum_processing_shape[1]),
+        ],
+        "maximum_processing_pixel_count": int(
+            maximum_processing_shape[0] * maximum_processing_shape[1]
+        ),
         "presence_high_threshold": FAST_PRESENCE_HIGH_THRESHOLD,
         "presence_low_threshold": FAST_PRESENCE_LOW_THRESHOLD,
         "presence_delta_threshold": FAST_PRESENCE_DELTA_THRESHOLD,
@@ -3560,7 +4105,9 @@ def detect_fast_changes(
         "width_change_ratio": float(width_change_ratio),
         "presence_change_seconds": float(presence_change_seconds),
         "width_change_seconds": float(width_change_seconds),
+        "tile_merge_seconds": float(tile_merge_seconds),
         "write_seconds": float(write_seconds),
+        "auto_change_total_seconds": float(total_seconds),
         "total_seconds": float(total_seconds),
         **presence_diagnostics,
         **width_diagnostics,
@@ -3573,6 +4120,7 @@ def detect_fast_changes(
         f"[Fast Change] {before_period}->{after_period}: "
         f"presence={presence_change_seconds:.3f}s, "
         f"width={width_change_seconds:.3f}s, "
+        f"merge={tile_merge_seconds:.3f}s, "
         f"write={write_seconds:.3f}s, total={total_seconds:.3f}s, "
         f"added={len(record_groups['added'])}, removed={len(record_groups['removed'])}, "
         f"width_pairs={width_diagnostics['matched_centerline_pair_count']}, "

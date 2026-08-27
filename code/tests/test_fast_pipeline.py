@@ -50,6 +50,7 @@ from engine.fast_pipeline import (
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
     _fast_change_preview_title,
+    _fast_change_halo_pixels,
     _fast_gt_low_frequency_dropout,
     _fast_gt_mask_geometry,
     _perturb_fast_gt_geometry_stages,
@@ -1220,9 +1221,28 @@ class FastTruthChangeTests(unittest.TestCase):
 class FastAutomaticChangeTests(unittest.TestCase):
     transform = from_origin(0, 240, 1, 1)
 
-    def _write_period(self, root, name, roads, *, transform=None):
-        directory = root / name
-        directory.mkdir()
+    def _write_period(
+        self,
+        root,
+        name,
+        roads,
+        *,
+        transform=None,
+        tile_count=1,
+        crs="EPSG:3857",
+        pixel_size=1.0,
+    ):
+        run_root = root / name
+        width_dir = run_root / "width_review"
+        surface_dir = run_root / "surfaces" / "masks" / "period"
+        inference_dir = run_root / "inference" / "road_graphs" / "period"
+        probability_dir = inference_dir / "mask"
+        topology_dir = inference_dir / "graph"
+        image_dir = run_root / "images"
+        for directory in (
+            width_dir, surface_dir, probability_dir, topology_dir, image_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
         transform = transform or self.transform
         lines = [road[0] for road in roads]
         widths = [road[1] for road in roads]
@@ -1230,45 +1250,120 @@ class FastAutomaticChangeTests(unittest.TestCase):
             line.buffer(width / 2.0, cap_style="flat")
             for line, width in zip(lines, widths)
         ]
-        centerline_path = directory / "road_centerlines.shp"
-        surface_path = directory / "road_surfaces.shp"
-        probability_path = directory / "road_probability.tif"
-        gpd.GeoDataFrame(
-            {"source": ["native_toponet"] * len(lines)},
-            geometry=lines,
-            crs="EPSG:3857",
-        ).to_file(centerline_path)
-        gpd.GeoDataFrame(
-            {"source": ["fast"] * len(lines)},
-            geometry=surface_geometries,
-            crs="EPSG:3857",
-        ).to_file(surface_path)
-        road_mask = rasterize(
-            [(geometry, 1) for geometry in surface_geometries],
-            out_shape=(240, 260),
-            transform=transform,
-            fill=0,
-            all_touched=True,
-            dtype="uint8",
+        total_width, tile_height = 260, 240
+        tile_width = total_width // int(tile_count)
+        rows = []
+        for tile_index in range(int(tile_count)):
+            stem = f"v{tile_index + 1:04d}"
+            column_offset = tile_index * tile_width
+            current_width = (
+                total_width - column_offset
+                if tile_index == tile_count - 1 else tile_width
+            )
+            tile_transform = rasterio.windows.transform(
+                rasterio.windows.Window(
+                    column_offset, 0, current_width, tile_height,
+                ),
+                transform,
+            )
+            tile_bounds = rasterio.windows.bounds(
+                rasterio.windows.Window(0, 0, current_width, tile_height),
+                tile_transform,
+            )
+            tile_geometry = box(*tile_bounds)
+            tile_lines = []
+            for line in lines:
+                clipped = line.intersection(tile_geometry)
+                if clipped.geom_type == "LineString" and not clipped.is_empty:
+                    tile_lines.append(clipped)
+                elif clipped.geom_type == "MultiLineString":
+                    tile_lines.extend(
+                        part for part in clipped.geoms if not part.is_empty
+                    )
+            road_mask = (
+                rasterize(
+                    [(geometry, 1) for geometry in surface_geometries],
+                    out_shape=(tile_height, current_width),
+                    transform=tile_transform,
+                    fill=0,
+                    all_touched=True,
+                    dtype="uint8",
+                )
+                if surface_geometries else np.zeros(
+                    (tile_height, current_width), dtype=np.uint8,
+                )
+            )
+            centerline_mask = (
+                rasterize(
+                    [(geometry, 1) for geometry in tile_lines],
+                    out_shape=(tile_height, current_width),
+                    transform=tile_transform,
+                    fill=0,
+                    all_touched=True,
+                    dtype="uint8",
+                )
+                if tile_lines else np.zeros_like(road_mask)
+            )
+            probability = np.full(road_mask.shape, round(0.03 * 255), dtype=np.uint8)
+            probability[road_mask > 0] = round(0.80 * 255)
+            image_path = image_dir / f"{stem}.tif"
+            with rasterio.open(
+                image_path,
+                "w",
+                driver="GTiff",
+                width=current_width,
+                height=tile_height,
+                count=1,
+                dtype="uint8",
+                crs=crs,
+                transform=tile_transform,
+            ) as dataset:
+                dataset.write(np.ones((1, tile_height, current_width), dtype=np.uint8))
+                dataset.write_mask(np.full(road_mask.shape, 255, dtype=np.uint8))
+            probability_path = probability_dir / f"{stem}_road.png"
+            surface_path = surface_dir / f"{stem}_mask.png"
+            centerline_path = surface_dir / f"{stem}_centerline.png"
+            self.assertTrue(cv2.imwrite(str(probability_path), probability))
+            self.assertTrue(cv2.imwrite(str(surface_path), road_mask * 255))
+            self.assertTrue(cv2.imwrite(str(centerline_path), centerline_mask * 255))
+            self.assertTrue(cv2.imwrite(
+                str(width_dir / f"{stem}_centerline_probability.png"), probability,
+            ))
+            nodes = []
+            edges = []
+            inverse = ~tile_transform
+            for line in tile_lines:
+                coordinates = list(line.coords)
+                for start, end in zip(coordinates[:-1], coordinates[1:]):
+                    start_column, start_row = inverse * start
+                    end_column, end_row = inverse * end
+                    source = len(nodes)
+                    nodes.extend(((start_row, start_column), (end_row, end_column)))
+                    edges.append((source, source + 1))
+            np.savez_compressed(
+                topology_dir / f"{stem}_fast_topology.npz",
+                nodes=np.asarray(nodes, dtype=np.float32).reshape(-1, 2),
+                edges=np.asarray(edges, dtype=np.int32).reshape(-1, 2),
+                scores=np.ones(len(edges), dtype=np.float32),
+            )
+            rows.append({
+                "stem": stem,
+                "image": str(image_path),
+                "surface_mask": str(surface_path),
+                "centerline_mask": str(centerline_path),
+                "pixel_size": float(pixel_size),
+            })
+        (width_dir / "batch_width_summary.json").write_text(
+            json.dumps({
+                "execution_profile": "fast",
+                "images": rows,
+            }),
+            encoding="utf-8",
         )
-        probability = np.full((240, 260), 0.03, dtype=np.float32)
-        probability[road_mask > 0] = 0.80
-        with rasterio.open(
-            probability_path,
-            "w",
-            driver="GTiff",
-            width=260,
-            height=240,
-            count=1,
-            dtype="float32",
-            crs="EPSG:3857",
-            transform=transform,
-        ) as dataset:
-            dataset.write(probability, 1)
         return {
-            "centerlines": str(centerline_path),
-            "surfaces": str(surface_path),
-            "road_probability": str(probability_path),
+            "width_review": str(width_dir),
+            "run_root": str(run_root),
+            "execution_profile": "fast",
         }
 
     def test_probability_presence_and_shared_position_width_changes(self) -> None:
@@ -1326,6 +1421,13 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 summary["width_change_source"],
                 "shared_position_sparse_width",
             )
+            self.assertEqual(
+                summary["auto_change_processing_mode"],
+                "per_tile_intermediates",
+            )
+            self.assertFalse(summary["regional_probability_mosaic_used"])
+            self.assertEqual(summary["tile_count"], 1)
+            self.assertEqual(len(summary["tile_timings"]), 1)
             self.assertGreaterEqual(summary["matched_centerline_pair_count"], 4)
             self.assertNotIn("presence_guard_mode", summary)
             self.assertNotIn("width_guard_mode", summary)
@@ -1350,6 +1452,86 @@ class FastAutomaticChangeTests(unittest.TestCase):
             self.assertEqual(summary["added_final_pixel_count"], 0)
             self.assertEqual(summary["removed_final_pixel_count"], 0)
             self.assertEqual(summary["width_change_feature_count"], 0)
+
+    def test_change_crossing_tile_boundary_is_merged_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before = self._write_period(
+                root, "before", [], tile_count=2,
+            )
+            after = self._write_period(
+                root,
+                "after",
+                [(LineString([(20, 120), (240, 120)]), 8.0)],
+                tile_count=2,
+            )
+
+            result = detect_fast_changes(
+                before,
+                after,
+                root / "changes",
+                before_period="2021",
+                after_period="2022",
+                position_tolerance=2.0,
+            )
+
+            changes = gpd.read_file(result["road_changes"])
+            added = changes.loc[changes["change_typ"] == "added"]
+            self.assertEqual(len(added), 1)
+            self.assertLess(added.total_bounds[0], 130.0)
+            self.assertGreater(added.total_bounds[2], 130.0)
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            self.assertEqual(summary["tile_count"], 2)
+            self.assertGreaterEqual(summary["tile_merge_seconds"], 0.0)
+            self.assertEqual(len(summary["tile_timings"]), 2)
+
+    def test_nine_4096_tiles_use_one_tile_sized_processing_window(self) -> None:
+        halo = _fast_change_halo_pixels(1.0, 3.0)
+        processing_side = 4096 + 2 * halo
+        regional_side = 3 * 4096
+
+        self.assertLess(processing_side, regional_side)
+        self.assertLess(
+            processing_side * processing_side,
+            (regional_side * regional_side) / 8.0,
+        )
+
+    def test_geographic_tile_uses_physical_pixel_size_for_halo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            geographic_transform = from_origin(120.0, 30.0, 0.00001, 0.00001)
+            before = self._write_period(
+                root,
+                "before",
+                [],
+                transform=geographic_transform,
+                crs="EPSG:4326",
+                pixel_size=0.00001,
+            )
+            after = self._write_period(
+                root,
+                "after",
+                [(LineString([
+                    (120.0002, 29.9990), (120.0022, 29.9990),
+                ]), 8.0)],
+                transform=geographic_transform,
+                crs="EPSG:4326",
+                pixel_size=0.00001,
+            )
+
+            result = detect_fast_changes(
+                before,
+                after,
+                root / "changes",
+                position_tolerance=3.0,
+            )
+
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            self.assertLess(summary["maximum_processing_shape"][0], 500)
+            self.assertLess(summary["maximum_processing_shape"][1], 600)
+            self.assertGreater(summary["probability_pixel_size"], 0.5)
+            self.assertLess(summary["probability_pixel_size"], 1.5)
+            self.assertGreater(summary["added_feature_count"], 0)
 
     def test_probability_rasters_are_aligned_before_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
