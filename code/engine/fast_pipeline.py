@@ -20,7 +20,7 @@ from rasterio.warp import reproject
 from shapely import make_valid
 from shapely.affinity import translate
 from shapely.geometry import LineString, box, shape
-from shapely.ops import linemerge, substring
+from shapely.ops import linemerge, substring, unary_union
 
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
@@ -48,10 +48,8 @@ FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
-FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN = 0.94
-FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX = 0.98
-FAST_GT_ASSISTED_SHIFT_MAX_PX = 1.25
-FAST_GT_ASSISTED_BUFFER_JITTER_PX = 0.50
+FAST_GT_ASSISTED_BOUNDARY_NOISE_MAX_PX = 1.75
+FAST_GT_ASSISTED_BOUNDARY_NOISE_SIGMA_PX = 4.0
 FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
@@ -1163,6 +1161,88 @@ def _jitter_fast_change_geometry(
     return make_valid(shifted)
 
 
+def _perturb_fast_gt_boundary(
+    geometry,
+    rng: np.random.Generator,
+    pixel_size: float,
+):
+    """Apply deterministic low-frequency boundary noise on the Fast pixel grid."""
+    geometry = make_valid(geometry)
+    if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+        return geometry
+    resolution = max(float(pixel_size), 1e-9)
+    max_offset_px = FAST_GT_ASSISTED_BOUNDARY_NOISE_MAX_PX
+    sigma_px = FAST_GT_ASSISTED_BOUNDARY_NOISE_SIGMA_PX
+    padding_px = int(np.ceil(max_offset_px + 3.0 * sigma_px))
+    perturbed_parts = []
+    for polygon in _fast_polygon_parts(
+        geometry, min_area=0.25 * resolution * resolution,
+    ):
+        minx, miny, maxx, maxy = polygon.bounds
+        width = max(1, int(np.ceil((maxx - minx) / resolution)) + 2 * padding_px)
+        height = max(1, int(np.ceil((maxy - miny) / resolution)) + 2 * padding_px)
+        transform = rasterio.transform.from_origin(
+            minx - padding_px * resolution,
+            maxy + padding_px * resolution,
+            resolution,
+            resolution,
+        )
+        mask = rasterize(
+            [(polygon, 1)],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+        )
+        if not np.any(mask):
+            perturbed_parts.append(polygon)
+            continue
+
+        inside_distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        outside_distance = cv2.distanceTransform(1 - mask, cv2.DIST_L2, 5)
+        signed_distance = inside_distance - outside_distance
+        noise = rng.standard_normal(mask.shape).astype(np.float32)
+        noise = cv2.GaussianBlur(
+            noise, (0, 0), sigmaX=sigma_px, sigmaY=sigma_px,
+            borderType=cv2.BORDER_REFLECT,
+        )
+        noise -= float(np.median(noise))
+        noise_scale = float(np.percentile(np.abs(noise), 95.0))
+        if noise_scale > 1e-9:
+            noise = np.clip(noise / noise_scale, -1.0, 1.0) * max_offset_px
+        else:
+            noise.fill(0.0)
+        perturbed_mask = (signed_distance + noise >= 0.0).astype(np.uint8)
+
+        component_count, labels, _, _ = cv2.connectedComponentsWithStats(
+            perturbed_mask, connectivity=8,
+        )
+        if component_count > 2:
+            overlap = np.bincount(
+                labels[mask.astype(bool)].ravel(), minlength=component_count,
+            )
+            overlap[0] = 0
+            perturbed_mask = (labels == int(np.argmax(overlap))).astype(np.uint8)
+        polygons = [
+            make_valid(shape(mapping))
+            for mapping, value in shapes(
+                perturbed_mask,
+                mask=perturbed_mask.astype(bool),
+                transform=transform,
+            )
+            if int(value) == 1
+        ]
+        polygons = [item for item in polygons if not item.is_empty]
+        perturbed_parts.append(
+            max(polygons, key=lambda item: float(item.area))
+            if polygons else polygon
+        )
+    if not perturbed_parts:
+        return geometry
+    perturbed = make_valid(unary_union(perturbed_parts))
+    return geometry if perturbed.is_empty else perturbed
+
+
 def _select_fast_change_positions(
     positions: list[int],
     geometries: gpd.GeoSeries,
@@ -1663,18 +1743,10 @@ def _augment_fast_typed_layer(
                 change_type,
             )
             rng = np.random.default_rng(local_seed)
-            assisted_geometry = _degrade_fast_change_geometry(
+            assisted_geometry = _perturb_fast_gt_boundary(
                 part,
                 rng,
-                retain_min=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN,
-                retain_max=FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX,
-            )
-            assisted_geometry = _jitter_fast_change_geometry(
-                assisted_geometry,
-                rng,
                 max(float(pixel_size), 1e-9),
-                shift_max_px=FAST_GT_ASSISTED_SHIFT_MAX_PX,
-                buffer_jitter_px=FAST_GT_ASSISTED_BUFFER_JITTER_PX,
             )
             assisted_candidates.append({
                 "geometry": assisted_geometry,

@@ -45,6 +45,7 @@ from engine.fast_pipeline import (
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
     _fast_change_preview_title,
+    _perturb_fast_gt_boundary,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
@@ -904,6 +905,39 @@ class FastTruthChangeTests(unittest.TestCase):
         small_buffer = abs((small.bounds[2] - small.bounds[0]) - 100.0) / 2.0
         large_buffer = abs((large.bounds[2] - large.bounds[0]) - 100.0) / 2.0
         self.assertAlmostEqual(large_buffer, 4.0 * small_buffer, places=6)
+
+    def test_gt_assisted_boundary_uses_local_nonrigid_noise(self) -> None:
+        source = box(0, 0, 120, 20)
+        perturbed = _perturb_fast_gt_boundary(
+            source, np.random.default_rng(20260826), pixel_size=1.0,
+        )
+        area_ratio = float(perturbed.area / source.area)
+        source_vertices = len(source.exterior.coords)
+        perturbed_vertices = sum(
+            len(part.exterior.coords)
+            for part in (
+                [perturbed] if perturbed.geom_type == "Polygon"
+                else list(perturbed.geoms)
+            )
+        )
+        print(
+            "GT boundary perturbation debug:",
+            {
+                "original_vertices": source_vertices,
+                "perturbed_vertices": perturbed_vertices,
+                "area_ratio": round(area_ratio, 4),
+                "original_wkt": source.wkt,
+                "perturbed_wkt": perturbed.wkt,
+            },
+        )
+        self.assertTrue(perturbed.is_valid)
+        self.assertFalse(perturbed.is_empty)
+        self.assertGreaterEqual(area_ratio, 0.85)
+        self.assertLessEqual(area_ratio, 1.15)
+        self.assertFalse(perturbed.equals(source))
+        self.assertGreater(perturbed_vertices, source_vertices)
+        for original_bound, perturbed_bound in zip(source.bounds, perturbed.bounds):
+            self.assertLessEqual(abs(perturbed_bound - original_bound), 3.0)
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
