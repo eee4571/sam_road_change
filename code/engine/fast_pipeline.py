@@ -54,6 +54,9 @@ FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX = 1.75
 FAST_GT_ASSISTED_LOCAL_SIGMA_MIN_PX = 4.0
 FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX = 10.0
 FAST_GT_ASSISTED_LOCAL_PATCH_MAX_COUNT = 6
+FAST_GT_ASSISTED_STRUCTURE_RETAIN_MIN = 0.78
+FAST_GT_ASSISTED_STRUCTURE_RETAIN_MAX = 0.92
+FAST_GT_ASSISTED_STRUCTURE_MAX_OPERATIONS = 4
 FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
@@ -1214,21 +1217,278 @@ def _jitter_fast_change_geometry(
     return make_valid(shifted)
 
 
-def _perturb_fast_gt_boundary(
+def _fast_gt_path_interval(
+    path: FastRoadPath,
+    rng: np.random.Generator,
+    operation: str,
+) -> np.ndarray:
+    """Choose one continuous skeleton interval for a road-level omission."""
+    pixels = np.rint(path.pixels).astype(np.int32)
+    if pixels.shape[0] < 3:
+        return pixels
+    if operation == "branch":
+        # Keep the junction core itself so only this approach direction disappears.
+        if path.start_degree == 1:
+            return pixels[:-1]
+        if path.end_degree == 1:
+            return pixels[1:]
+        return pixels
+    if operation == "junction":
+        fraction = float(rng.uniform(0.16, 0.28))
+        count = max(3, int(round(pixels.shape[0] * fraction)))
+        if path.start_degree >= 3:
+            return pixels[1:count + 1]
+        if path.end_degree >= 3:
+            return pixels[-count - 1:-1]
+    fraction = float(rng.uniform(0.18, 0.34))
+    count = min(pixels.shape[0] - 2, max(3, int(round(pixels.shape[0] * fraction))))
+    start_low = max(1, int(round(pixels.shape[0] * 0.20)))
+    start_high = max(start_low, pixels.shape[0] - count - start_low)
+    start = int(rng.integers(start_low, start_high + 1))
+    return pixels[start:start + count]
+
+
+def _fast_gt_structural_removal(
+    mask: np.ndarray,
+    path_pixels: np.ndarray,
+    inside_distance: np.ndarray,
+    *,
+    width_scale: float = 1.15,
+) -> np.ndarray:
+    """Remove original GT pixels around one selected path using its local GT width."""
+    removal = np.zeros_like(mask, dtype=np.uint8)
+    height, width = mask.shape
+    for row, col in np.asarray(path_pixels, dtype=np.int32):
+        if not (0 <= row < height and 0 <= col < width):
+            continue
+        local_half_width = max(1.0, float(inside_distance[row, col]))
+        radius = max(1, int(np.ceil(local_half_width * float(width_scale))))
+        cv2.circle(removal, (int(col), int(row)), radius, 1, thickness=-1)
+    return (removal & (np.asarray(mask) > 0)).astype(np.uint8)
+
+
+def _perturb_fast_gt_structure_mask(
+    mask: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict]:
+    """Create a few continuous branch/gap omissions without rebuilding the surface."""
+    source = (np.asarray(mask) > 0).astype(np.uint8)
+    source_area = int(source.sum())
+    skeleton = _skeletonize_mask(source)
+    paths = [path for path in _trace_skeleton_paths(skeleton) if path.length_px >= 5.0]
+    diagnostics = {
+        "path_count": int(len(paths)),
+        "removed_operation_count": 0,
+        "removed_pixel_count": 0,
+        "retained_ratio": 1.0,
+    }
+    if source_area < 24 or not paths:
+        return source, diagnostics
+
+    inside_distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    target_loss_ratio = float(rng.uniform(
+        1.0 - FAST_GT_ASSISTED_STRUCTURE_RETAIN_MAX,
+        1.0 - FAST_GT_ASSISTED_STRUCTURE_RETAIN_MIN,
+    ))
+    target_loss = max(1, int(round(source_area * target_loss_ratio)))
+    maximum_loss = max(1, int(round(
+        source_area * (1.0 - FAST_GT_ASSISTED_STRUCTURE_RETAIN_MIN)
+    )))
+    lengths = np.asarray([path.length_px for path in paths], dtype=np.float32)
+    medium_limit = max(10.0, float(np.percentile(lengths, 70.0)))
+    branch_indices = [
+        index for index, path in enumerate(paths)
+        if (path.start_degree == 1 or path.end_degree == 1)
+        and path.length_px <= medium_limit
+    ]
+    junction_indices = [
+        index for index, path in enumerate(paths)
+        if path.start_degree >= 3 or path.end_degree >= 3
+    ]
+    interior_indices = [
+        index for index, path in enumerate(paths)
+        if path.start_degree >= 3 and path.end_degree >= 3
+    ]
+    all_indices = list(range(len(paths)))
+    rng.shuffle(branch_indices)
+    rng.shuffle(junction_indices)
+    rng.shuffle(interior_indices)
+    rng.shuffle(all_indices)
+    plans: list[tuple[str, int]] = []
+    # An interior gap is the clearest automatic-detection-like structural error.
+    if interior_indices:
+        plans.append(("gap", interior_indices.pop()))
+    if branch_indices:
+        plans.append(("branch", branch_indices.pop()))
+    if junction_indices:
+        plans.append(("junction", junction_indices.pop()))
+    plans.extend(("gap", index) for index in all_indices)
+
+    result = source.copy()
+    used_paths: set[int] = set()
+    operations = 0
+    for operation, path_index in plans:
+        if operations >= FAST_GT_ASSISTED_STRUCTURE_MAX_OPERATIONS:
+            break
+        if path_index in used_paths:
+            continue
+        interval = _fast_gt_path_interval(paths[path_index], rng, operation)
+        removal = _fast_gt_structural_removal(
+            source,
+            interval,
+            inside_distance,
+            width_scale=1.40 if operation == "branch" else 1.15,
+        )
+        proposed = (result > 0) & (removal > 0)
+        loss = int(proposed.sum())
+        current_loss = source_area - int(result.sum())
+        if loss < 2 or current_loss + loss > maximum_loss:
+            continue
+        result[proposed] = 0
+        used_paths.add(path_index)
+        operations += 1
+        if source_area - int(result.sum()) >= target_loss:
+            break
+
+    # Keep intentional road-network breaks, removing only raster crumbs.
+    minimum_fragment_area = max(6, int(round(source_area * 0.01)))
+    result = _remove_small_components(
+        result, min_area_px2=minimum_fragment_area,
+    )
+    removed = source_area - int(result.sum())
+    diagnostics.update({
+        "removed_operation_count": int(operations),
+        "removed_pixel_count": int(max(0, removed)),
+        "retained_ratio": float(result.sum() / source_area),
+    })
+    return result, diagnostics
+
+
+def _perturb_fast_gt_boundary_mask(
+    mask: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Add sparse low-frequency boundary errors after structural omissions."""
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    inside_distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    outside_distance = cv2.distanceTransform(1 - mask, cv2.DIST_L2, 5)
+    signed_distance = inside_distance - outside_distance
+    global_noise = rng.standard_normal(mask.shape).astype(np.float32)
+    global_noise = cv2.GaussianBlur(
+        global_noise,
+        (0, 0),
+        sigmaX=FAST_GT_ASSISTED_GLOBAL_NOISE_SIGMA_PX,
+        sigmaY=FAST_GT_ASSISTED_GLOBAL_NOISE_SIGMA_PX,
+        borderType=cv2.BORDER_REFLECT,
+    )
+    global_noise -= float(np.median(global_noise))
+    noise_scale = float(np.percentile(np.abs(global_noise), 95.0))
+    if noise_scale > 1e-9:
+        global_noise = (
+            np.clip(global_noise / noise_scale, -1.0, 1.0)
+            * FAST_GT_ASSISTED_GLOBAL_NOISE_MAX_PX
+        )
+    else:
+        global_noise.fill(0.0)
+
+    deformation = global_noise
+    boundary = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_GRADIENT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    boundary_pixels = np.argwhere(boundary > 0)
+    if boundary_pixels.size:
+        patch_count = int(np.clip(
+            2 + boundary_pixels.shape[0] // 1000,
+            2,
+            FAST_GT_ASSISTED_LOCAL_PATCH_MAX_COUNT,
+        ))
+        selected = np.atleast_1d(rng.choice(
+            boundary_pixels.shape[0],
+            size=min(patch_count, boundary_pixels.shape[0]),
+            replace=False,
+        ))
+        patch_signs = np.resize(np.asarray((-1.0, 1.0)), selected.size)
+        rng.shuffle(patch_signs)
+        height, width = mask.shape
+        for patch_position, boundary_index in enumerate(selected):
+            center_y, center_x = boundary_pixels[int(boundary_index)]
+            sigma = float(rng.uniform(
+                FAST_GT_ASSISTED_LOCAL_SIGMA_MIN_PX,
+                FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX,
+            ))
+            amplitude = float(
+                patch_signs[patch_position]
+                * rng.uniform(0.70, 1.0)
+                * FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX
+            )
+            radius = int(np.ceil(3.0 * sigma))
+            y0, y1 = max(0, center_y - radius), min(height, center_y + radius + 1)
+            x0, x1 = max(0, center_x - radius), min(width, center_x + radius + 1)
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            deformation[y0:y1, x0:x1] += amplitude * np.exp(
+                -((yy - center_y) ** 2 + (xx - center_x) ** 2)
+                / (2.0 * sigma * sigma)
+            )
+    perturbed = (signed_distance + deformation >= 0.0).astype(np.uint8)
+    change_budget = max(1, int(round(float(mask.sum()) * 0.05)))
+    lost = np.argwhere((mask > 0) & (perturbed == 0))
+    if lost.shape[0] > change_budget:
+        strengths = deformation[lost[:, 0], lost[:, 1]]
+        keep = np.argsort(strengths)[:change_budget]
+        perturbed[lost[:, 0], lost[:, 1]] = 1
+        retained = lost[keep]
+        perturbed[retained[:, 0], retained[:, 1]] = 0
+    gained = np.argwhere((mask == 0) & (perturbed > 0))
+    if gained.shape[0] > change_budget:
+        strengths = deformation[gained[:, 0], gained[:, 1]]
+        keep = np.argsort(strengths)[-change_budget:]
+        perturbed[gained[:, 0], gained[:, 1]] = 0
+        retained = gained[keep]
+        perturbed[retained[:, 0], retained[:, 1]] = 1
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        perturbed, connectivity=8,
+    )
+    overlap = np.bincount(labels[mask.astype(bool)], minlength=count)
+    minimum_fragment_area = max(6, int(round(float(mask.sum()) * 0.01)))
+    keep = (
+        (stats[:, cv2.CC_STAT_AREA] >= minimum_fragment_area)
+        & (overlap[:count] > 0)
+    )
+    keep[0] = False
+    return keep[labels].astype(np.uint8)
+
+
+def _fast_gt_mask_geometry(mask: np.ndarray, transform):
+    polygons = [
+        make_valid(shape(mapping))
+        for mapping, value in shapes(
+            mask.astype(np.uint8), mask=mask.astype(bool), transform=transform,
+        )
+        if int(value) == 1
+    ]
+    polygons = [item for item in polygons if not item.is_empty]
+    return make_valid(unary_union(polygons)) if polygons else None
+
+
+def _perturb_fast_gt_geometry_stages(
     geometry,
     rng: np.random.Generator,
     pixel_size: float,
-):
-    """Apply deterministic low-frequency boundary noise on the Fast pixel grid."""
+) -> tuple[object, object, list[dict]]:
+    """Return structural and final GT-assisted geometries for tests and production."""
     geometry = make_valid(geometry)
     if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
-        return geometry
+        return geometry, geometry, []
     resolution = max(float(pixel_size), 1e-9)
-    global_sigma_px = FAST_GT_ASSISTED_GLOBAL_NOISE_SIGMA_PX
-    local_offset_px = FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX
-    local_sigma_max_px = FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX
-    padding_px = int(np.ceil(local_offset_px + 3.0 * local_sigma_max_px))
-    perturbed_parts = []
+    padding_px = int(np.ceil(
+        FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX
+        + 3.0 * FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX
+    ))
+    structural_parts = []
+    final_parts = []
+    diagnostics = []
     for polygon in _fast_polygon_parts(
         geometry, min_area=0.25 * resolution * resolution,
     ):
@@ -1241,136 +1501,38 @@ def _perturb_fast_gt_boundary(
             resolution,
             resolution,
         )
-        mask = rasterize(
-            [(polygon, 1)],
-            out_shape=(height, width),
-            transform=transform,
-            fill=0,
-            dtype=np.uint8,
+        source_mask = rasterize(
+            [(polygon, 1)], out_shape=(height, width), transform=transform,
+            fill=0, dtype=np.uint8,
         )
-        if not np.any(mask):
-            perturbed_parts.append(polygon)
+        if not source_mask.any():
+            structural_parts.append(polygon)
+            final_parts.append(polygon)
             continue
+        structural_mask, part_diagnostics = _perturb_fast_gt_structure_mask(
+            source_mask, rng,
+        )
+        final_mask = _perturb_fast_gt_boundary_mask(structural_mask, rng)
+        structural = _fast_gt_mask_geometry(structural_mask, transform)
+        final = _fast_gt_mask_geometry(final_mask, transform)
+        structural_parts.append(structural if structural is not None else polygon)
+        final_parts.append(final if final is not None else polygon)
+        diagnostics.append(part_diagnostics)
+    structural_geometry = make_valid(unary_union(structural_parts))
+    final_geometry = make_valid(unary_union(final_parts))
+    return structural_geometry, final_geometry, diagnostics
 
-        inside_distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        outside_distance = cv2.distanceTransform(1 - mask, cv2.DIST_L2, 5)
-        signed_distance = inside_distance - outside_distance
-        global_noise = rng.standard_normal(mask.shape).astype(np.float32)
-        global_noise = cv2.GaussianBlur(
-            global_noise, (0, 0), sigmaX=global_sigma_px, sigmaY=global_sigma_px,
-            borderType=cv2.BORDER_REFLECT,
-        )
-        global_noise -= float(np.median(global_noise))
-        noise_scale = float(np.percentile(np.abs(global_noise), 95.0))
-        if noise_scale > 1e-9:
-            global_noise = (
-                np.clip(global_noise / noise_scale, -1.0, 1.0)
-                * FAST_GT_ASSISTED_GLOBAL_NOISE_MAX_PX
-            )
-        else:
-            global_noise.fill(0.0)
 
-        deformation = global_noise
-        boundary = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_GRADIENT,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-        )
-        boundary_pixels = np.argwhere(boundary > 0)
-        if boundary_pixels.size:
-            patch_count = int(np.clip(
-                2 + boundary_pixels.shape[0] // 1000,
-                2,
-                FAST_GT_ASSISTED_LOCAL_PATCH_MAX_COUNT,
-            ))
-            selected = rng.choice(
-                boundary_pixels.shape[0],
-                size=min(patch_count, boundary_pixels.shape[0]),
-                replace=False,
-            )
-            selected = np.atleast_1d(selected)
-            patch_signs = np.resize(np.asarray((-1.0, 1.0)), selected.size)
-            rng.shuffle(patch_signs)
-            for patch_position, boundary_index in enumerate(selected):
-                center_y, center_x = boundary_pixels[int(boundary_index)]
-                sigma = float(rng.uniform(
-                    FAST_GT_ASSISTED_LOCAL_SIGMA_MIN_PX,
-                    FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX,
-                ))
-                amplitude = float(
-                    patch_signs[patch_position]
-                    * rng.uniform(0.70, 1.0)
-                    * local_offset_px
-                )
-                radius = int(np.ceil(3.0 * sigma))
-                y0, y1 = max(0, center_y - radius), min(height, center_y + radius + 1)
-                x0, x1 = max(0, center_x - radius), min(width, center_x + radius + 1)
-                yy, xx = np.ogrid[y0:y1, x0:x1]
-                deformation[y0:y1, x0:x1] += amplitude * np.exp(
-                    -(
-                        (yy - center_y) ** 2 + (xx - center_x) ** 2
-                    ) / (2.0 * sigma * sigma)
-                )
-        perturbed_mask = (signed_distance + deformation >= 0.0).astype(np.uint8)
-        change_budget = max(1, int(round(float(mask.sum()) * 0.05)))
-        lost_pixels = np.argwhere((mask > 0) & (perturbed_mask == 0))
-        if lost_pixels.shape[0] > change_budget:
-            strengths = deformation[lost_pixels[:, 0], lost_pixels[:, 1]]
-            keep = np.argsort(strengths)[:change_budget]
-            perturbed_mask[lost_pixels[:, 0], lost_pixels[:, 1]] = 1
-            retained_loss = lost_pixels[keep]
-            perturbed_mask[retained_loss[:, 0], retained_loss[:, 1]] = 0
-        gained_pixels = np.argwhere((mask == 0) & (perturbed_mask > 0))
-        if gained_pixels.shape[0] > change_budget:
-            strengths = deformation[gained_pixels[:, 0], gained_pixels[:, 1]]
-            keep = np.argsort(strengths)[-change_budget:]
-            perturbed_mask[gained_pixels[:, 0], gained_pixels[:, 1]] = 0
-            retained_gain = gained_pixels[keep]
-            perturbed_mask[retained_gain[:, 0], retained_gain[:, 1]] = 1
-
-        component_count, labels, _, _ = cv2.connectedComponentsWithStats(
-            perturbed_mask, connectivity=8,
-        )
-        if component_count > 2:
-            overlap = np.bincount(
-                labels[mask.astype(bool)].ravel(), minlength=component_count,
-            )
-            overlap[0] = 0
-            perturbed_mask = (labels == int(np.argmax(overlap))).astype(np.uint8)
-        background_count, background_labels, background_stats, _ = (
-            cv2.connectedComponentsWithStats(1 - perturbed_mask, connectivity=8)
-        )
-        for background_id in range(1, background_count):
-            x = int(background_stats[background_id, cv2.CC_STAT_LEFT])
-            y = int(background_stats[background_id, cv2.CC_STAT_TOP])
-            width_px = int(background_stats[background_id, cv2.CC_STAT_WIDTH])
-            height_px = int(background_stats[background_id, cv2.CC_STAT_HEIGHT])
-            touches_border = (
-                x == 0 or y == 0 or x + width_px == width or y + height_px == height
-            )
-            if (
-                not touches_border
-                and int(background_stats[background_id, cv2.CC_STAT_AREA]) <= 4
-            ):
-                perturbed_mask[background_labels == background_id] = 1
-        polygons = [
-            make_valid(shape(mapping))
-            for mapping, value in shapes(
-                perturbed_mask,
-                mask=perturbed_mask.astype(bool),
-                transform=transform,
-            )
-            if int(value) == 1
-        ]
-        polygons = [item for item in polygons if not item.is_empty]
-        perturbed_parts.append(
-            max(polygons, key=lambda item: float(item.area))
-            if polygons else polygon
-        )
-    if not perturbed_parts:
-        return geometry
-    perturbed = make_valid(unary_union(perturbed_parts))
-    return geometry if perturbed.is_empty else perturbed
+def _perturb_fast_gt_boundary(
+    geometry,
+    rng: np.random.Generator,
+    pixel_size: float,
+):
+    """Apply road-level structural omissions, then sparse boundary noise."""
+    _structural, final, _diagnostics = _perturb_fast_gt_geometry_stages(
+        geometry, rng, pixel_size,
+    )
+    return final
 
 
 def _select_fast_change_positions(

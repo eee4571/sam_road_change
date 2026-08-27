@@ -12,7 +12,7 @@ import geopandas as gpd
 import cv2
 import numpy as np
 import rasterio
-from PIL import Image
+from PIL import Image, ImageDraw
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, box
@@ -49,6 +49,7 @@ from engine.fast_pipeline import (
     _partition_fast_presence_components,
     _fast_change_preview_title,
     _perturb_fast_gt_boundary,
+    _perturb_fast_gt_geometry_stages,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
@@ -1022,9 +1023,10 @@ class FastTruthChangeTests(unittest.TestCase):
             *(box(10, y, 122, y + 7) for y in (10, 45, 80, 113)),
         ]
         source = unary_union(roads)
-        perturbed = _perturb_fast_gt_boundary(
+        structural, perturbed, diagnostics = _perturb_fast_gt_geometry_stages(
             source, np.random.default_rng(20260827), pixel_size=1.0,
         )
+        structural_area_ratio = float(structural.area / source.area)
         area_ratio = float(perturbed.area / source.area)
         source_holes = sum(len(part.interiors) for part in [source])
         perturbed_parts = (
@@ -1033,13 +1035,16 @@ class FastTruthChangeTests(unittest.TestCase):
         perturbed_holes = sum(len(part.interiors) for part in perturbed_parts)
         self.assertTrue(perturbed.is_valid)
         self.assertFalse(perturbed.is_empty)
-        self.assertEqual(perturbed.geom_type, "Polygon")
-        self.assertGreaterEqual(area_ratio, 0.85)
-        self.assertLessEqual(area_ratio, 1.15)
+        self.assertFalse(structural.equals(source))
+        self.assertGreaterEqual(structural_area_ratio, 0.75)
+        self.assertLessEqual(structural_area_ratio, 0.93)
+        self.assertGreaterEqual(area_ratio, 0.75)
+        self.assertLessEqual(area_ratio, 1.00)
         self.assertFalse(perturbed.equals(source))
-        self.assertLessEqual(abs(perturbed_holes - source_holes), 2)
+        self.assertGreater(sum(item["removed_operation_count"] for item in diagnostics), 0)
+        self.assertLessEqual(abs(perturbed_holes - source_holes), 4)
 
-        minx, miny, maxx, maxy = unary_union([source, perturbed]).bounds
+        minx, miny, maxx, maxy = unary_union([source, structural, perturbed]).bounds
         transform = from_origin(minx - 3, maxy + 3, 1, 1)
         width = int(np.ceil(maxx - minx)) + 6
         height = int(np.ceil(maxy - miny)) + 6
@@ -1047,25 +1052,48 @@ class FastTruthChangeTests(unittest.TestCase):
             [(source, 1)], out_shape=(height, width), transform=transform,
             fill=0, dtype=np.uint8,
         )
+        structural_mask = rasterize(
+            [(structural, 1)], out_shape=(height, width), transform=transform,
+            fill=0, dtype=np.uint8,
+        )
+        removed_mask = ((source_mask > 0) & (structural_mask == 0)).astype(np.uint8)
+        removed_count, _removed_labels, removed_stats, _ = (
+            cv2.connectedComponentsWithStats(removed_mask, connectivity=8)
+        )
+        self.assertGreater(removed_count, 1)
+        self.assertLessEqual(removed_count - 1, 4)
+        self.assertGreater(
+            int(removed_stats[1:, cv2.CC_STAT_AREA].max()), 20,
+        )
         perturbed_mask = rasterize(
             [(perturbed, 1)], out_shape=(height, width), transform=transform,
             fill=0, dtype=np.uint8,
         )
-        comparison = np.full((height, width * 2, 3), 255, dtype=np.uint8)
+        comparison = np.full((height, width * 3, 3), 255, dtype=np.uint8)
         comparison[:, :width][source_mask > 0] = (220, 80, 110)
-        comparison[:, width:][perturbed_mask > 0] = (40, 165, 95)
+        comparison[:, width:2 * width][structural_mask > 0] = (235, 150, 45)
+        comparison[:, 2 * width:][perturbed_mask > 0] = (40, 165, 95)
         debug_path = (
             Path(tempfile.gettempdir())
             / "samroad_fast_gt_boundary_grid_comparison.png"
         )
-        Image.fromarray(comparison).save(debug_path)
+        preview = Image.new("RGB", (width * 3, height + 22), "white")
+        preview.paste(Image.fromarray(comparison), (0, 22))
+        draw = ImageDraw.Draw(preview)
+        for panel, label in enumerate((
+            "Original GT", "Structure gaps", "Final result",
+        )):
+            draw.text((panel * width + 3, 4), label, fill=(25, 25, 25))
+        preview.save(debug_path)
         print(
             "GT complex boundary perturbation debug:",
             {
                 "comparison": str(debug_path),
+                "structural_area_ratio": round(structural_area_ratio, 4),
                 "area_ratio": round(area_ratio, 4),
                 "original_holes": source_holes,
                 "perturbed_holes": perturbed_holes,
+                "diagnostics": diagnostics,
             },
         )
 
