@@ -77,6 +77,29 @@ class ResultPublisherTests(unittest.TestCase):
             self.assertEqual(one["changes"], two["changes"])
             self.assertEqual(Path(two["changes"]).read_text(encoding="utf-8"), "new.shp")
 
+    def test_fast_change_publishes_only_combined_shapefile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            output = project / "成果输出"
+            work = project / "_work"
+            changes = make_shapefile(work, "road_changes", "combined")
+            added = make_shapefile(work, "added_roads", "classified")
+            publisher = ResultPublisher(output, project_root=project)
+            publisher.publish_change("区域A", "2021", "2022", {
+                "layers": {"changes": str(changes), "added": str(added)},
+            })
+
+            published = publisher.publish_change("区域A", "2021", "2022", {
+                "execution_profile": "fast",
+                "road_changes": str(changes),
+                "layers": {"changes": str(changes), "added": str(added)},
+            })
+
+            target = output / "区域A" / "02_变化检测" / "2021_to_2022"
+            self.assertEqual(set(published), {"changes"})
+            self.assertTrue((target / "road_changes.shp").is_file())
+            self.assertFalse((target / "added_roads.shp").exists())
+
     def test_only_whole_area_png_files_are_published(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"

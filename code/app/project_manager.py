@@ -748,11 +748,21 @@ def discover_project_result_context(
             "output": str(directory.resolve()), "layers": layers,
             "previews": previews, "status": "completed",
         }
+        if layers.get("changes"):
+            recovered["road_changes"] = layers["changes"]
         gpkg, summary = directory / "road_changes.gpkg", directory / "change_summary.json"
         if gpkg.is_file():
             recovered["gpkg"] = str(gpkg.resolve())
         if summary.is_file():
             recovered["summary"] = str(summary.resolve())
+            summary_payload = _read_json_object(summary) or {}
+            if summary_payload.get("execution_profile"):
+                recovered["execution_profile"] = summary_payload["execution_profile"]
+            if str(summary_payload.get("execution_profile") or "").casefold() == "fast":
+                recovered["layers"] = {
+                    "changes": layers["changes"],
+                } if layers.get("changes") else {}
+                recovered.pop("gpkg", None)
         change_map.setdefault((area, before, after), recovered)
 
     temporal_map: dict[str, dict] = {

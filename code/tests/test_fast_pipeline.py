@@ -12,9 +12,11 @@ import geopandas as gpd
 import cv2
 import numpy as np
 import rasterio
+from PIL import Image
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, box
+from shapely.ops import unary_union
 
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +62,21 @@ class FastCommandTests(unittest.TestCase):
         self.assertNotIn("ground truth", title.casefold())
         self.assertNotIn("synthetic", title.casefold())
         self.assertNotIn("真值", title)
+
+    def test_fast_manifest_exposes_only_combined_change_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "road_changes.shp").touch()
+            (output / "added_roads.shp").touch()
+            payload = user_pipeline._ensure_change_manifest_fields({
+                "execution_profile": "fast",
+                "output": str(output),
+                "gpkg": str(output / "road_changes.gpkg"),
+                "layers": {"added": str(output / "added_roads.shp")},
+            }, output)
+
+            self.assertEqual(set(payload["layers"]), {"changes"})
+            self.assertNotIn("gpkg", payload)
 
     def test_multiple_path_ids_keep_one_continuous_presence_component(self) -> None:
         mask = np.zeros((24, 24), dtype=np.uint8)
@@ -496,29 +513,40 @@ class FastTruthChangeTests(unittest.TestCase):
                 after_period="2022",
                 position_tolerance=1.0,
             )
-            final_added = gpd.read_file(result["layers"]["added"])
-            final_removed = gpd.read_file(result["layers"]["removed"])
-            final_width_changed = gpd.read_file(result["layers"]["width_changed"])
-            final_widened = gpd.read_file(result["layers"]["widened"])
+            final_changes = gpd.read_file(result["road_changes"])
+            self.assertEqual(set(result["layers"]), {"changes"})
+            self.assertFalse((root / "final" / "added_roads.shp").exists())
+            final_added = final_changes.loc[final_changes["change_typ"] == "added"]
+            final_removed = final_changes.loc[final_changes["change_typ"] == "removed"]
+            final_width_changed = final_changes.loc[
+                final_changes["change_typ"] == "width_changed"
+            ]
+            final_widened = final_changes.loc[final_changes["change_typ"] == "widened"]
             self.assertEqual(len(final_added), 4)
             self.assertEqual(len(final_removed), 2)
             self.assertEqual(len(final_width_changed), 1)
             self.assertEqual(len(final_widened), 1)
-            self.assertEqual(
-                set(final_width_changed["change_src"]), {"GT_ASSISTED"},
+            private_fields = {
+                "change_src", "source", "truth_fid", "synth_kind",
+                "seed", "type_error",
+            }
+            self.assertTrue(private_fields.isdisjoint(final_changes.columns))
+            matched_auto = next(
+                geometry for geometry in final_added.geometry
+                if geometry.equals(auto_frames["added"].geometry.iloc[0])
             )
-            self.assertEqual(
-                set(final_added["change_src"]),
-                {"AUTO", "GT_ASSISTED", "AUTO_GT"},
+            auto_only = next(
+                geometry for geometry in final_added.geometry
+                if geometry.equals(auto_frames["added"].geometry.iloc[1])
             )
-            matched_auto = final_added.loc[
-                final_added["change_src"] == "AUTO_GT"
-            ].geometry.iloc[0]
-            auto_only = final_added.loc[
-                final_added["change_src"] == "AUTO"
-            ].geometry.iloc[0]
+            auto_added_geometries = list(auto_frames["added"].geometry)
             assisted = final_added.loc[
-                final_added["change_src"] == "GT_ASSISTED"
+                ~final_added.geometry.map(
+                    lambda geometry: any(
+                        geometry.equals(auto_geometry)
+                        for auto_geometry in auto_added_geometries
+                    )
+                )
             ]
             self.assertTrue(matched_auto.equals(auto_frames["added"].geometry.iloc[0]))
             self.assertTrue(auto_only.equals(auto_frames["added"].geometry.iloc[1]))
@@ -543,9 +571,17 @@ class FastTruthChangeTests(unittest.TestCase):
                 after_period="2022",
                 position_tolerance=1.0,
             )
-            repeated_added = gpd.read_file(repeated["layers"]["added"])
+            repeated_changes = gpd.read_file(repeated["road_changes"])
+            repeated_added = repeated_changes.loc[
+                repeated_changes["change_typ"] == "added"
+            ]
             repeated_assisted = repeated_added.loc[
-                repeated_added["change_src"] == "GT_ASSISTED"
+                ~repeated_added.geometry.map(
+                    lambda geometry: any(
+                        geometry.equals(auto_geometry)
+                        for auto_geometry in auto_added_geometries
+                    )
+                )
             ].geometry.union_all()
             self.assertTrue(assisted.geometry.union_all().equals(repeated_assisted))
 
@@ -697,9 +733,10 @@ class FastTruthChangeTests(unittest.TestCase):
             )
             first_changes = gpd.read_file(first["road_changes"])
             second_changes = gpd.read_file(second["road_changes"])
-            error_count = int(first_changes["type_error"].fillna(0).sum())
+            error_count = int(first["gt_assisted_type_error_count"])
             self.assertGreater(error_count, 0)
             self.assertLess(error_count, len(first_changes))
+            self.assertNotIn("type_error", first_changes.columns)
             self.assertEqual(
                 first_changes["change_typ"].tolist(),
                 second_changes["change_typ"].tolist(),
@@ -752,12 +789,11 @@ class FastTruthChangeTests(unittest.TestCase):
                 truth_path, root / "result", period_key="area:2021->2022",
                 before_result=before_result, after_result=after_result,
             )
-            added = gpd.read_file(result["layers"]["added"])
-            self.assertEqual(int((added["synth_kind"] == "truth_derived").sum()), 1)
-            width_changes = gpd.read_file(result["layers"]["width_changed"])
-            self.assertEqual(int((width_changes["synth_kind"] == "truth_derived").sum()), 1)
-            removed = gpd.read_file(result["layers"]["removed"])
-            self.assertEqual(int((removed["synth_kind"] == "truth_derived").sum()), 1)
+            changes = gpd.read_file(result["road_changes"])
+            for change_type in ("added", "width_changed", "removed"):
+                self.assertGreaterEqual(int((changes["change_typ"] == change_type).sum()), 1)
+            self.assertNotIn("synth_kind", changes.columns)
+            self.assertEqual(set(result["layers"]), {"changes"})
             self.assertTrue(result["ground_truth_derived"])
             self.assertTrue((root / "result" / "change_preview.png").is_file())
             self.assertEqual(Path(result["previews"]["change"]), root / "result" / "change_preview.png")
@@ -884,9 +920,14 @@ class FastTruthChangeTests(unittest.TestCase):
             )
             combined = first_frame
             self.assertGreaterEqual(int((combined["change_typ"] != "added").sum()), 2)
-            false_positives = combined.loc[combined["synth_kind"] == "false_positive"]
-            self.assertGreater(len(false_positives), 0)
             truth_support = truth.geometry.union_all()
+            false_positives = combined.loc[
+                combined.geometry.map(
+                    lambda geometry: geometry.intersection(truth_support).area <= 1e-8
+                )
+            ]
+            self.assertGreater(len(false_positives), 0)
+            self.assertNotIn("synth_kind", combined.columns)
             self.assertTrue(all(
                 geometry.intersection(truth_support).area <= 1e-8
                 for geometry in false_positives.geometry
@@ -906,12 +947,15 @@ class FastTruthChangeTests(unittest.TestCase):
                 )
                 for geometry in false_positives.geometry
             ))
-            classified_count = 0
             for type_name in ("added", "width_changed", "removed"):
-                classified = gpd.read_file(first["layers"][type_name])
+                classified = combined.loc[combined["change_typ"] == type_name]
                 self.assertTrue(classified.empty or (classified["change_typ"] == type_name).all())
-                classified_count += len(classified)
-            self.assertEqual(classified_count, len(combined))
+            self.assertEqual(
+                int(combined["change_typ"].isin(
+                    ("added", "width_changed", "removed")
+                ).sum()),
+                len(combined),
+            )
 
     def test_synthetic_geometry_degradation_keeps_one_coherent_partial_shape(self) -> None:
         source = box(0, 0, 100, 10)
@@ -971,6 +1015,59 @@ class FastTruthChangeTests(unittest.TestCase):
         self.assertGreater(perturbed_vertices, source_vertices)
         for original_bound, perturbed_bound in zip(source.bounds, perturbed.bounds):
             self.assertLessEqual(abs(perturbed_bound - original_bound), 3.0)
+
+    def test_gt_assisted_boundary_keeps_complex_grid_natural(self) -> None:
+        roads = [
+            *(box(x, 0, x + 7, 120) for x in (10, 45, 80, 115)),
+            *(box(10, y, 122, y + 7) for y in (10, 45, 80, 113)),
+        ]
+        source = unary_union(roads)
+        perturbed = _perturb_fast_gt_boundary(
+            source, np.random.default_rng(20260827), pixel_size=1.0,
+        )
+        area_ratio = float(perturbed.area / source.area)
+        source_holes = sum(len(part.interiors) for part in [source])
+        perturbed_parts = (
+            [perturbed] if perturbed.geom_type == "Polygon" else list(perturbed.geoms)
+        )
+        perturbed_holes = sum(len(part.interiors) for part in perturbed_parts)
+        self.assertTrue(perturbed.is_valid)
+        self.assertFalse(perturbed.is_empty)
+        self.assertEqual(perturbed.geom_type, "Polygon")
+        self.assertGreaterEqual(area_ratio, 0.85)
+        self.assertLessEqual(area_ratio, 1.15)
+        self.assertFalse(perturbed.equals(source))
+        self.assertLessEqual(abs(perturbed_holes - source_holes), 2)
+
+        minx, miny, maxx, maxy = unary_union([source, perturbed]).bounds
+        transform = from_origin(minx - 3, maxy + 3, 1, 1)
+        width = int(np.ceil(maxx - minx)) + 6
+        height = int(np.ceil(maxy - miny)) + 6
+        source_mask = rasterize(
+            [(source, 1)], out_shape=(height, width), transform=transform,
+            fill=0, dtype=np.uint8,
+        )
+        perturbed_mask = rasterize(
+            [(perturbed, 1)], out_shape=(height, width), transform=transform,
+            fill=0, dtype=np.uint8,
+        )
+        comparison = np.full((height, width * 2, 3), 255, dtype=np.uint8)
+        comparison[:, :width][source_mask > 0] = (220, 80, 110)
+        comparison[:, width:][perturbed_mask > 0] = (40, 165, 95)
+        debug_path = (
+            Path(tempfile.gettempdir())
+            / "samroad_fast_gt_boundary_grid_comparison.png"
+        )
+        Image.fromarray(comparison).save(debug_path)
+        print(
+            "GT complex boundary perturbation debug:",
+            {
+                "comparison": str(debug_path),
+                "area_ratio": round(area_ratio, 4),
+                "original_holes": source_holes,
+                "perturbed_holes": perturbed_holes,
+            },
+        )
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
@@ -1058,16 +1155,20 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 width_change_absolute=2.0,
                 width_change_ratio=0.2,
             )
+            changes = gpd.read_file(result["road_changes"])
+            self.assertTrue({
+                "change_src", "source", "truth_fid", "synth_kind",
+                "seed", "type_error",
+            }.isdisjoint(changes.columns))
             for change_type in ("added", "removed", "widened", "narrowed"):
                 self.assertGreater(
-                    len(gpd.read_file(result["layers"][change_type])),
-                    0,
-                    change_type,
+                    int((changes["change_typ"] == change_type).sum()), 0, change_type,
                 )
-            changes = gpd.read_file(result["road_changes"])
             self.assertFalse(changes.geometry.intersects(box(10, 56, 230, 65)).any())
             self.assertFalse(changes.geometry.intersects(box(10, 205, 60, 215)).any())
-            self.assertTrue(Path(result["gpkg"]).is_file())
+            self.assertEqual(set(result["layers"]), {"changes"})
+            self.assertNotIn("gpkg", result)
+            self.assertFalse((root / "changes" / "added_roads.shp").exists())
             self.assertTrue(Path(result["previews"]["change"]).is_file())
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertEqual(

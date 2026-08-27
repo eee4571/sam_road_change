@@ -348,19 +348,32 @@ def _ensure_change_manifest_fields(result: dict | None, output: Path | None = No
                 previews.pop(key, None)
     payload["previews"] = previews
     if target is not None:
-        layers = dict(payload.get("layers")) if isinstance(payload.get("layers"), dict) else {}
-        for key, name in (
-            ("changes", "road_changes.shp"), ("review", "review_changes.shp"),
-            ("added", "added_roads.shp"), ("removed", "removed_roads.shp"),
-            ("widened", "widened_road_parts.shp"), ("narrowed", "narrowed_road_parts.shp"),
-            ("width_changed", "width_changed_road_parts.shp"),
-            ("width_segments", "road_width_segments.shp"), ("corridors", "road_corridors.shp"),
-            ("matches", "road_matches.shp"), ("canonical_roads", "canonical_roads.shp"),
-        ):
+        fast_profile = str(payload.get("execution_profile") or "").casefold() == "fast"
+        layers = {}
+        if not fast_profile and isinstance(payload.get("layers"), dict):
+            layers = dict(payload["layers"])
+        layer_names = (
+            (("changes", "road_changes.shp"),)
+            if fast_profile else
+            (
+                ("changes", "road_changes.shp"), ("review", "review_changes.shp"),
+                ("added", "added_roads.shp"), ("removed", "removed_roads.shp"),
+                ("widened", "widened_road_parts.shp"),
+                ("narrowed", "narrowed_road_parts.shp"),
+                ("width_changed", "width_changed_road_parts.shp"),
+                ("width_segments", "road_width_segments.shp"),
+                ("corridors", "road_corridors.shp"),
+                ("matches", "road_matches.shp"),
+                ("canonical_roads", "canonical_roads.shp"),
+            )
+        )
+        for key, name in layer_names:
             path = target / name
             if path.is_file():
                 layers[key] = str(path.resolve())
         payload["layers"] = layers
+        if fast_profile:
+            payload.pop("gpkg", None)
     return payload
 
 
@@ -395,6 +408,7 @@ def _run_fast_change_result(
         position_tolerance=float(position_tolerance),
         width_change_absolute=float(width_change_absolute),
         width_change_ratio=float(width_change_ratio),
+        internal_outputs=truth_path is not None,
     )
     if truth_path is None:
         return automatic
@@ -951,10 +965,7 @@ def _scene_state_result(state_value: str, project_root: Path, expected_name: str
         return {
             "summary": str(state_path),
             "layers": {
-                "added": str(state_path.parent / "added_roads.shp"),
-                "removed": str(state_path.parent / "removed_roads.shp"),
-                "widened": str(state_path.parent / "widened_road_parts.shp"),
-                "narrowed": str(state_path.parent / "narrowed_road_parts.shp"),
+                "changes": str(state_path.parent / "road_changes.shp"),
             },
         }
     if state.get("status") != "completed":
@@ -1417,9 +1428,17 @@ def change_project_periods(args: argparse.Namespace) -> dict:
     try:
         prior_result = prior.get("result_manifest") if isinstance(prior.get("result_manifest"), dict) else None
         prior_layers = prior_result.get("layers", {}) if prior_result else {}
-        complete_layers = isinstance(prior_layers, dict) and all(
-            Path(str(prior_layers.get(kind) or "")).is_file()
-            for kind in ("added", "removed", "widened", "narrowed")
+        complete_layers = isinstance(prior_layers, dict) and (
+            Path(str(
+                prior_layers.get("changes")
+                or (prior_result or {}).get("road_changes")
+                or ""
+            )).is_file()
+            if fast_profile else
+            all(
+                Path(str(prior_layers.get(kind) or "")).is_file()
+                for kind in ("added", "removed", "widened", "narrowed")
+            )
         )
         if resume and prior_result and _change_result_ready(prior_result) and complete_layers:
             result = dict(prior_result)
@@ -1449,10 +1468,20 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 validation_area=area["validation_area"], truth_type_field="",
             ))
         summary_data = read_json(Path(result["summary"])) if Path(result["summary"]).is_file() else {}
-        result["layers"] = {**dict(result.get("layers") or {}),
-            "added": str(products / "added_roads.shp"), "removed": str(products / "removed_roads.shp"),
-            "widened": str(products / "widened_road_parts.shp"), "narrowed": str(products / "narrowed_road_parts.shp"),
-        }
+        if fast_profile:
+            result["layers"] = {
+                "changes": str(
+                    result.get("road_changes") or products / "road_changes.shp"
+                ),
+            }
+        else:
+            result["layers"] = {
+                **dict(result.get("layers") or {}),
+                "added": str(products / "added_roads.shp"),
+                "removed": str(products / "removed_roads.shp"),
+                "widened": str(products / "widened_road_parts.shp"),
+                "narrowed": str(products / "narrowed_road_parts.shp"),
+            }
         result["statistics"] = {
             kind: {"feature_count": int(summary_data.get(f"{kind}_feature_count", 0) or 0), "length_m": float(summary_data.get(f"{kind}_length_m", 0) or 0), "area_m2": float(summary_data.get(f"{kind}_area_m2", 0) or 0)}
             for kind in ("added", "removed", "widened", "narrowed")
@@ -2882,6 +2911,12 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     entry = matches[0]
     output = Path(str(entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
+    entry_layers = entry.get("layers") if isinstance(entry.get("layers"), dict) else {}
+    changes_path = Path(str(
+        entry_layers.get("changes")
+        or entry.get("road_changes")
+        or output / "road_changes.shp"
+    )).expanduser().resolve()
     summary_path = Path(
         str(entry.get("summary") or output / "change_summary.json")
     ).expanduser().resolve()
@@ -2931,7 +2966,9 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         truth, evaluation_truth_type_field = apply_truth_value_mapping(
             truth, original_truth_type_field, truth_value_map,
         )
-    if gpkg.is_file():
+    if changes_path.is_file():
+        predicted = gpd.read_file(changes_path)
+    elif gpkg.is_file():
         predicted = gpd.read_file(gpkg, layer="road_changes")
     else:
         summary_path = Path(str(entry.get("summary") or output / "change_summary.json")).expanduser().resolve()
@@ -2941,7 +2978,10 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             for change_type in ("added", "removed", "widened", "narrowed", "width_changed")
         )
         if detected_count:
-            raise FileNotFoundError(f"变化摘要记录了 {detected_count} 个对象，但成果 GPKG 不存在：{gpkg}")
+            raise FileNotFoundError(
+                f"变化摘要记录了 {detected_count} 个对象，但正式成果不存在："
+                f"{changes_path}"
+            )
         predicted = gpd.GeoDataFrame(
             {"change_typ": []}, geometry=gpd.GeoSeries([], crs=truth.crs), crs=truth.crs,
         )
@@ -3028,6 +3068,15 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         entry.get("change_source") or summary.get("change_source") or ""
     ) == "synthetic_from_truth"
     if is_fast_truth:
+        internal_changes_path = Path(str(
+            entry.get("internal_road_changes")
+            or summary.get("internal_road_changes")
+            or ""
+        )).expanduser()
+        metric_predicted = (
+            gpd.read_file(internal_changes_path)
+            if internal_changes_path.is_file() else predicted
+        )
         truth_axes_path = Path(str(
             entry.get("truth_change_centerlines")
             or output / "truth_change_centerlines.shp"
@@ -3038,7 +3087,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         )).expanduser()
         if truth_axes_path.is_file() and predicted_axes_path.is_file():
             fast_metrics = evaluate_fast_truth_metrics(
-                predicted,
+                metric_predicted,
                 truth,
                 gpd.read_file(truth_axes_path),
                 gpd.read_file(predicted_axes_path),
@@ -3495,12 +3544,22 @@ def _period_result_ready(entry: dict) -> bool:
 
 
 def _change_result_ready(entry: dict) -> bool:
-    """A no-change run may omit a GPKG, so the summary is the stable marker."""
+    """Require the summary and, for Fast, its single formal change Shapefile."""
     status = str(entry.get("status") or "").casefold()
     if status and status != "completed":
         return False
     try:
-        return Path(str(entry.get("summary") or "")).expanduser().is_file()
+        if not Path(str(entry.get("summary") or "")).expanduser().is_file():
+            return False
+        if str(entry.get("execution_profile") or "").casefold() != "fast":
+            return True
+        layers = entry.get("layers") if isinstance(entry.get("layers"), dict) else {}
+        changes = Path(str(
+            layers.get("changes")
+            or entry.get("road_changes")
+            or Path(str(entry.get("output") or "")) / "road_changes.shp"
+        )).expanduser()
+        return changes.is_file()
     except (OSError, ValueError, TypeError):
         return False
 

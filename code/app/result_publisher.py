@@ -200,6 +200,17 @@ def copy_dataset(source: Path | str, destination: Path | str) -> Path:
     return target
 
 
+def remove_dataset(path: Path | str) -> None:
+    """Remove one exact formal dataset and its Shapefile sidecars."""
+    target = Path(path).expanduser()
+    if not target.parent.is_dir():
+        return
+    members = _dataset_members(target) if target.suffix.casefold() == ".shp" else [target]
+    for member in members:
+        if member.is_file():
+            member.unlink()
+
+
 def shapefile_has_records(path: Path | str | None) -> bool:
     """Read the DBF header count without loading a geospatial dataframe."""
     source = _manifest_path(path)
@@ -334,14 +345,31 @@ class ResultPublisher:
         target = self.layout.results_root / safe_name(area) / "02_变化检测" / pair
         layers = dict(result.get("layers") or {})
         layers.setdefault("changes", result.get("road_changes"))
-        published = self._copy_fields(layers, target, (
-            ("changes", "road_changes.shp"),
-            ("added", "added_roads.shp"),
-            ("removed", "removed_roads.shp"),
-            ("widened", "widened_road_parts.shp"),
-            ("narrowed", "narrowed_road_parts.shp"),
-            ("width_changed", "width_changed_road_parts.shp"),
-        ), base_dir=base_dir)
+        fast_profile = str(result.get("execution_profile") or "").casefold() == "fast"
+        layer_mapping = (
+            (("changes", "road_changes.shp"),)
+            if fast_profile else
+            (
+                ("changes", "road_changes.shp"),
+                ("added", "added_roads.shp"),
+                ("removed", "removed_roads.shp"),
+                ("widened", "widened_road_parts.shp"),
+                ("narrowed", "narrowed_road_parts.shp"),
+                ("width_changed", "width_changed_road_parts.shp"),
+            )
+        )
+        if fast_profile:
+            for _key, filename in (
+                ("added", "added_roads.shp"),
+                ("removed", "removed_roads.shp"),
+                ("widened", "widened_road_parts.shp"),
+                ("narrowed", "narrowed_road_parts.shp"),
+                ("width_changed", "width_changed_road_parts.shp"),
+            ):
+                remove_dataset(target / filename)
+        published = self._copy_fields(
+            layers, target, layer_mapping, base_dir=base_dir,
+        )
         previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
         review_preview = result.get("review_change")
         if not review_preview and shapefile_has_records(layers.get("review")):

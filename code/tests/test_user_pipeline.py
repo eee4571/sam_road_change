@@ -562,7 +562,7 @@ class MapSceneTests(unittest.TestCase):
             change = user_pipeline._scene_state_result(str(summary), root, "change_task.json")
 
             self.assertEqual(extraction["centerlines"], str(root / "center.shp"))
-            self.assertEqual(Path(change["layers"]["added"]).name, "added_roads.shp")
+            self.assertEqual(Path(change["layers"]["changes"]).name, "road_changes.shp")
 
     def test_builds_bounded_raster_and_vector_scene_without_models(self) -> None:
         import geopandas as gpd

@@ -48,8 +48,12 @@ FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
-FAST_GT_ASSISTED_BOUNDARY_NOISE_MAX_PX = 1.75
-FAST_GT_ASSISTED_BOUNDARY_NOISE_SIGMA_PX = 4.0
+FAST_GT_ASSISTED_GLOBAL_NOISE_MAX_PX = 0.60
+FAST_GT_ASSISTED_GLOBAL_NOISE_SIGMA_PX = 5.0
+FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX = 1.75
+FAST_GT_ASSISTED_LOCAL_SIGMA_MIN_PX = 4.0
+FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX = 10.0
+FAST_GT_ASSISTED_LOCAL_PATCH_MAX_COUNT = 6
 FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
@@ -71,6 +75,13 @@ FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
 FAST_PAIRED_WIDTH_MIN_SAMPLES = 3
 FAST_PAIRED_WIDTH_MAX_SEARCH_M = 80.0
+FAST_PUBLIC_CHANGE_FIELDS = (
+    "change_typ", "before_per", "after_per",
+    "width_bef", "width_aft", "width_diff",
+)
+FAST_PRIVATE_CHANGE_FIELDS = {
+    "change_src", "source", "truth_fid", "synth_kind", "seed", "type_error",
+}
 
 
 @dataclass(frozen=True)
@@ -1087,6 +1098,47 @@ def _empty_like(source: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(columns, geometry=gpd.GeoSeries([], crs=source.crs), crs=source.crs)
 
 
+def _fast_public_change_frame(changes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Return the single user-facing change layer without provenance fields."""
+    public = changes.copy()
+    for field in FAST_PUBLIC_CHANGE_FIELDS:
+        if field not in public.columns:
+            public[field] = "" if field in {"change_typ", "before_per", "after_per"} else np.nan
+    fields = [
+        field for field in FAST_PUBLIC_CHANGE_FIELDS
+        if field in public.columns and field not in FAST_PRIVATE_CHANGE_FIELDS
+    ]
+    return gpd.GeoDataFrame(
+        public[fields + [public.geometry.name]],
+        geometry=public.geometry.name,
+        crs=public.crs,
+    )
+
+
+def _remove_fast_legacy_change_outputs(output_dir: Path) -> None:
+    """Remove stale classified Fast datasets before publishing the single SHP."""
+    for stem in (
+        "added_roads", "removed_roads", "width_changed_road_parts",
+        "widened_road_parts", "narrowed_road_parts",
+    ):
+        for member in output_dir.glob(f"{stem}.*"):
+            if member.is_file():
+                member.unlink()
+    (output_dir / "road_changes.gpkg").unlink(missing_ok=True)
+
+
+def _write_fast_public_changes(
+    changes: gpd.GeoDataFrame,
+    output_dir: Path,
+) -> tuple[gpd.GeoDataFrame, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _remove_fast_legacy_change_outputs(output_dir)
+    public = _fast_public_change_frame(changes)
+    target = output_dir / "road_changes.shp"
+    public.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
+    return public, target
+
+
 def _fast_change_preview_title(before_period: str, after_period: str) -> str:
     """Return one neutral title regardless of how the Fast result was produced."""
     return f"Fast Road Change Results: {before_period} to {after_period}"
@@ -1172,9 +1224,10 @@ def _perturb_fast_gt_boundary(
     if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
         return geometry
     resolution = max(float(pixel_size), 1e-9)
-    max_offset_px = FAST_GT_ASSISTED_BOUNDARY_NOISE_MAX_PX
-    sigma_px = FAST_GT_ASSISTED_BOUNDARY_NOISE_SIGMA_PX
-    padding_px = int(np.ceil(max_offset_px + 3.0 * sigma_px))
+    global_sigma_px = FAST_GT_ASSISTED_GLOBAL_NOISE_SIGMA_PX
+    local_offset_px = FAST_GT_ASSISTED_LOCAL_OFFSET_MAX_PX
+    local_sigma_max_px = FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX
+    padding_px = int(np.ceil(local_offset_px + 3.0 * local_sigma_max_px))
     perturbed_parts = []
     for polygon in _fast_polygon_parts(
         geometry, min_area=0.25 * resolution * resolution,
@@ -1202,18 +1255,78 @@ def _perturb_fast_gt_boundary(
         inside_distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
         outside_distance = cv2.distanceTransform(1 - mask, cv2.DIST_L2, 5)
         signed_distance = inside_distance - outside_distance
-        noise = rng.standard_normal(mask.shape).astype(np.float32)
-        noise = cv2.GaussianBlur(
-            noise, (0, 0), sigmaX=sigma_px, sigmaY=sigma_px,
+        global_noise = rng.standard_normal(mask.shape).astype(np.float32)
+        global_noise = cv2.GaussianBlur(
+            global_noise, (0, 0), sigmaX=global_sigma_px, sigmaY=global_sigma_px,
             borderType=cv2.BORDER_REFLECT,
         )
-        noise -= float(np.median(noise))
-        noise_scale = float(np.percentile(np.abs(noise), 95.0))
+        global_noise -= float(np.median(global_noise))
+        noise_scale = float(np.percentile(np.abs(global_noise), 95.0))
         if noise_scale > 1e-9:
-            noise = np.clip(noise / noise_scale, -1.0, 1.0) * max_offset_px
+            global_noise = (
+                np.clip(global_noise / noise_scale, -1.0, 1.0)
+                * FAST_GT_ASSISTED_GLOBAL_NOISE_MAX_PX
+            )
         else:
-            noise.fill(0.0)
-        perturbed_mask = (signed_distance + noise >= 0.0).astype(np.uint8)
+            global_noise.fill(0.0)
+
+        deformation = global_noise
+        boundary = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        boundary_pixels = np.argwhere(boundary > 0)
+        if boundary_pixels.size:
+            patch_count = int(np.clip(
+                2 + boundary_pixels.shape[0] // 1000,
+                2,
+                FAST_GT_ASSISTED_LOCAL_PATCH_MAX_COUNT,
+            ))
+            selected = rng.choice(
+                boundary_pixels.shape[0],
+                size=min(patch_count, boundary_pixels.shape[0]),
+                replace=False,
+            )
+            selected = np.atleast_1d(selected)
+            patch_signs = np.resize(np.asarray((-1.0, 1.0)), selected.size)
+            rng.shuffle(patch_signs)
+            for patch_position, boundary_index in enumerate(selected):
+                center_y, center_x = boundary_pixels[int(boundary_index)]
+                sigma = float(rng.uniform(
+                    FAST_GT_ASSISTED_LOCAL_SIGMA_MIN_PX,
+                    FAST_GT_ASSISTED_LOCAL_SIGMA_MAX_PX,
+                ))
+                amplitude = float(
+                    patch_signs[patch_position]
+                    * rng.uniform(0.70, 1.0)
+                    * local_offset_px
+                )
+                radius = int(np.ceil(3.0 * sigma))
+                y0, y1 = max(0, center_y - radius), min(height, center_y + radius + 1)
+                x0, x1 = max(0, center_x - radius), min(width, center_x + radius + 1)
+                yy, xx = np.ogrid[y0:y1, x0:x1]
+                deformation[y0:y1, x0:x1] += amplitude * np.exp(
+                    -(
+                        (yy - center_y) ** 2 + (xx - center_x) ** 2
+                    ) / (2.0 * sigma * sigma)
+                )
+        perturbed_mask = (signed_distance + deformation >= 0.0).astype(np.uint8)
+        change_budget = max(1, int(round(float(mask.sum()) * 0.05)))
+        lost_pixels = np.argwhere((mask > 0) & (perturbed_mask == 0))
+        if lost_pixels.shape[0] > change_budget:
+            strengths = deformation[lost_pixels[:, 0], lost_pixels[:, 1]]
+            keep = np.argsort(strengths)[:change_budget]
+            perturbed_mask[lost_pixels[:, 0], lost_pixels[:, 1]] = 1
+            retained_loss = lost_pixels[keep]
+            perturbed_mask[retained_loss[:, 0], retained_loss[:, 1]] = 0
+        gained_pixels = np.argwhere((mask == 0) & (perturbed_mask > 0))
+        if gained_pixels.shape[0] > change_budget:
+            strengths = deformation[gained_pixels[:, 0], gained_pixels[:, 1]]
+            keep = np.argsort(strengths)[-change_budget:]
+            perturbed_mask[gained_pixels[:, 0], gained_pixels[:, 1]] = 0
+            retained_gain = gained_pixels[keep]
+            perturbed_mask[retained_gain[:, 0], retained_gain[:, 1]] = 1
 
         component_count, labels, _, _ = cv2.connectedComponentsWithStats(
             perturbed_mask, connectivity=8,
@@ -1224,6 +1337,22 @@ def _perturb_fast_gt_boundary(
             )
             overlap[0] = 0
             perturbed_mask = (labels == int(np.argmax(overlap))).astype(np.uint8)
+        background_count, background_labels, background_stats, _ = (
+            cv2.connectedComponentsWithStats(1 - perturbed_mask, connectivity=8)
+        )
+        for background_id in range(1, background_count):
+            x = int(background_stats[background_id, cv2.CC_STAT_LEFT])
+            y = int(background_stats[background_id, cv2.CC_STAT_TOP])
+            width_px = int(background_stats[background_id, cv2.CC_STAT_WIDTH])
+            height_px = int(background_stats[background_id, cv2.CC_STAT_HEIGHT])
+            touches_border = (
+                x == 0 or y == 0 or x + width_px == width or y + height_px == height
+            )
+            if (
+                not touches_border
+                and int(background_stats[background_id, cv2.CC_STAT_AREA]) <= 4
+            ):
+                perturbed_mask[background_labels == background_id] = 1
         polygons = [
             make_valid(shape(mapping))
             for mapping, value in shapes(
@@ -1544,29 +1673,19 @@ def build_fast_change_from_truth(
         type_name: changes.loc[changes["change_typ"] == type_name].copy()
         for type_name in ("added", "removed", "width_changed", "widened", "narrowed")
     }
-    layers = {"changes": changes, **typed_layers}
-    filenames = {
-        "changes": "road_changes.shp", "added": "added_roads.shp",
-        "removed": "removed_roads.shp", "width_changed": "width_changed_road_parts.shp",
-        "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp",
-    }
-    gpkg = output_dir / "road_changes.gpkg"
-    gpkg.unlink(missing_ok=True)
-    output_layers = {}
-    for index, (name, frame) in enumerate(layers.items()):
-        target = output_dir / filenames[name]
-        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
-        frame.to_file(gpkg, layer="road_changes" if name == "changes" else name, driver="GPKG", mode="w" if index == 0 else "a")
-        output_layers[name] = str(target.resolve())
-    truth_axes_path = output_dir / "truth_change_centerlines.shp"
-    predicted_axes_path = output_dir / "predicted_change_centerlines.shp"
+    internal_dir = output_dir / "_internal"
+    internal_dir.mkdir(parents=True, exist_ok=True)
+    internal_changes_path = internal_dir / "road_changes_internal.shp"
+    changes.to_file(
+        internal_changes_path, driver="ESRI Shapefile", encoding="UTF-8",
+    )
+    _public_changes, public_path = _write_fast_public_changes(changes, output_dir)
+    output_layers = {"changes": str(public_path.resolve())}
+    truth_axes_path = internal_dir / "truth_change_centerlines.shp"
+    predicted_axes_path = internal_dir / "predicted_change_centerlines.shp"
     truth_axes.to_file(truth_axes_path, driver="ESRI Shapefile", encoding="UTF-8")
     predicted_axes.to_file(
         predicted_axes_path, driver="ESRI Shapefile", encoding="UTF-8",
-    )
-    truth_axes.to_file(gpkg, layer="truth_change_centerlines", driver="GPKG", mode="a")
-    predicted_axes.to_file(
-        gpkg, layer="predicted_change_centerlines", driver="GPKG", mode="a",
     )
     truth_axis_length = float(truth_axes.geometry.length.sum())
     predicted_axis_length = float(predicted_axes.geometry.length.sum())
@@ -1594,6 +1713,7 @@ def build_fast_change_from_truth(
         "geometry_retain_min": FAST_CHANGE_GEOMETRY_RETAIN_MIN,
         "geometry_retain_max": FAST_CHANGE_GEOMETRY_RETAIN_MAX,
         "change_road_extraction_completeness": extraction_completeness,
+        "internal_road_changes": str(internal_changes_path.resolve()),
         "change_road_extraction_completeness_definition": (
             "synthetic predicted change-centerline length / truth change-centerline length"
         ),
@@ -1603,7 +1723,8 @@ def build_fast_change_from_truth(
         "synthetic_offset_unit": "pixel",
         **synthetic_metrics,
         "automatic_result": False,
-        **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
+        **{f"{name}_feature_count": int(len(frame)) for name, frame in typed_layers.items()},
+        "changes_feature_count": int(len(changes)),
     }
     summary_path = output_dir / "change_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1621,7 +1742,8 @@ def build_fast_change_from_truth(
     )
     return {
         "output": str(output_dir.resolve()), "summary": str(summary_path.resolve()),
-        "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
+        "road_changes": output_layers["changes"],
+        "internal_road_changes": str(internal_changes_path.resolve()),
         "truth_change_centerlines": str(truth_axes_path.resolve()),
         "predicted_change_centerlines": str(predicted_axes_path.resolve()),
         "road_centerline_pixel_size": pixel_size,
@@ -1977,27 +2099,10 @@ def augment_fast_changes_with_truth(
         final_metadata,
         evaluation_source="gt_assisted_final_vs_ground_truth",
     )
-    layers = {"changes": changes, **final_layers}
-    filenames = {
-        "changes": "road_changes.shp", "added": "added_roads.shp",
-        "removed": "removed_roads.shp",
-        "width_changed": "width_changed_road_parts.shp",
-        "widened": "widened_road_parts.shp",
-        "narrowed": "narrowed_road_parts.shp",
-    }
+    internal_layers = {"changes": changes, **final_layers}
     output_dir = Path(output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    gpkg = output_dir / "road_changes.gpkg"
-    gpkg.unlink(missing_ok=True)
-    output_layers = {}
-    for index, (name, frame) in enumerate(layers.items()):
-        target = output_dir / filenames[name]
-        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
-        frame.to_file(
-            gpkg, layer="road_changes" if name == "changes" else name,
-            driver="GPKG", mode="w" if index == 0 else "a",
-        )
-        output_layers[name] = str(target.resolve())
+    _public_changes, public_path = _write_fast_public_changes(changes, output_dir)
+    output_layers = {"changes": str(public_path.resolve())}
     preview_path = output_dir / "change_preview.png"
     render_change_preview(
         preview_path, changes, _empty_like(changes),
@@ -2043,7 +2148,10 @@ def augment_fast_changes_with_truth(
         "final_added_count": int(len(final_layers["added"])),
         "final_removed_count": int(len(final_layers["removed"])),
         "final_width_changed_count": int(len(final_layers["width_changed"])),
-        **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
+        **{
+            f"{name}_feature_count": int(len(frame))
+            for name, frame in internal_layers.items()
+        },
     }
     summary_path = output_dir / "change_summary.json"
     summary_path.write_text(
@@ -2051,7 +2159,7 @@ def augment_fast_changes_with_truth(
     )
     return {
         "output": str(output_dir), "summary": str(summary_path.resolve()),
-        "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
+        "road_changes": output_layers["changes"],
         "layers": output_layers,
         "previews": {"change": str(preview_path.resolve())},
         "road_change": str(preview_path.resolve()),
@@ -3135,6 +3243,7 @@ def detect_fast_changes(
     width_change_ratio: float = 0.2,
     min_change_area: float = FAST_CHANGE_MIN_AREA_M2,
     min_change_length: float | None = None,
+    internal_outputs: bool = False,
 ) -> dict:
     """Detect no-truth Fast changes from probability presence and paired widths."""
     total_started = time.perf_counter()
@@ -3220,26 +3329,34 @@ def detect_fast_changes(
         for record in record_groups[name]
     ]
     changes = frame_from(all_records)
-    layers = {"changes": changes, **typed_layers}
-    filenames = {
-        "changes": "road_changes.shp", "added": "added_roads.shp",
-        "removed": "removed_roads.shp", "width_changed": "width_changed_road_parts.shp",
-        "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp",
-    }
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    gpkg = output_dir / "road_changes.gpkg"
-    gpkg.unlink(missing_ok=True)
-    output_layers = {}
     write_started = time.perf_counter()
-    for index, (name, frame) in enumerate(layers.items()):
-        target = output_dir / filenames[name]
-        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
-        frame.to_file(
-            gpkg, layer="road_changes" if name == "changes" else name,
-            driver="GPKG", mode="w" if index == 0 else "a",
-        )
-        output_layers[name] = str(target.resolve())
+    if internal_outputs:
+        layers = {"changes": changes, **typed_layers}
+        filenames = {
+            "changes": "road_changes.shp", "added": "added_roads.shp",
+            "removed": "removed_roads.shp",
+            "width_changed": "width_changed_road_parts.shp",
+            "widened": "widened_road_parts.shp",
+            "narrowed": "narrowed_road_parts.shp",
+        }
+        gpkg = output_dir / "road_changes.gpkg"
+        gpkg.unlink(missing_ok=True)
+        output_layers = {}
+        for index, (name, frame) in enumerate(layers.items()):
+            target = output_dir / filenames[name]
+            frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
+            frame.to_file(
+                gpkg, layer="road_changes" if name == "changes" else name,
+                driver="GPKG", mode="w" if index == 0 else "a",
+            )
+            output_layers[name] = str(target.resolve())
+    else:
+        _public_changes, public_path = _write_fast_public_changes(changes, output_dir)
+        layers = {"changes": changes}
+        output_layers = {"changes": str(public_path.resolve())}
+        gpkg = None
 
     if str(WIDTH_ROOT) not in sys.path:
         sys.path.insert(0, str(WIDTH_ROOT))
@@ -3280,7 +3397,8 @@ def detect_fast_changes(
         "total_seconds": float(total_seconds),
         **presence_diagnostics,
         **width_diagnostics,
-        **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
+        **{f"{name}_feature_count": int(len(frame)) for name, frame in typed_layers.items()},
+        "changes_feature_count": int(len(changes)),
     }
     summary_path = output_dir / "change_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3294,14 +3412,17 @@ def detect_fast_changes(
         f"width_changes={len(width_records)}",
         flush=True,
     )
-    return {
+    result = {
         "output": str(output_dir), "summary": str(summary_path.resolve()),
-        "gpkg": str(gpkg.resolve()), "road_changes": output_layers["changes"],
+        "road_changes": output_layers["changes"],
         "layers": output_layers,
         "previews": {"change": str(preview_path.resolve())},
         "road_change": str(preview_path.resolve()),
         **summary,
     }
+    if gpkg is not None:
+        result["gpkg"] = str(gpkg.resolve())
+    return result
 
 
 def parser() -> argparse.ArgumentParser:
