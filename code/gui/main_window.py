@@ -277,6 +277,8 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.scan_cancel_event: threading.Event | None = None
         self._result_tree_fingerprint: tuple | None = None
         self._evaluation_tree_fingerprint: tuple | None = None
+        self._evaluation_source_fingerprint: tuple | None = None
+        self._batch_evaluation_progress: tuple[int, int] | None = None
         self.result_tree_paths: dict[str, Path] = {}
         self.vars = {
             key: StringVar(value=value)

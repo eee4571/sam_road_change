@@ -2044,6 +2044,21 @@ def render_change_preview(
         def pixels(coords):
             return [(offset_x + (x - minx) * scale, offset_y + (maxy - y) * scale) for x, y in coords]
 
+        def render_polygon(part, fill, line_styles) -> None:
+            """Draw a polygon without filling its interior rings."""
+            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            overlay_draw = ImageDraw.Draw(overlay, "RGBA")
+            exterior = pixels(part.exterior.coords)
+            interiors = [pixels(ring.coords) for ring in part.interiors]
+            overlay_draw.polygon(exterior, fill=fill)
+            for interior in interiors:
+                overlay_draw.polygon(interior, fill=(0, 0, 0, 0))
+            for color, width in line_styles:
+                overlay_draw.line(exterior, fill=color, width=width, joint="curve")
+                for interior in interiors:
+                    overlay_draw.line(interior, fill=color, width=width, joint="curve")
+            image.alpha_composite(overlay)
+
         def render(frame: gpd.GeoDataFrame, default_type: str, as_review: bool = False) -> None:
             for _, row in frame.iterrows():
                 change_type = normalized_type(row.get("change_typ", default_type), default_type)
@@ -2053,13 +2068,18 @@ def render_change_preview(
                     if part.geom_type == "Polygon":
                         if as_review:
                             pale = tuple(round(channel + (255 - channel) * 0.35) for channel in base)
-                            coords = pixels(part.exterior.coords)
-                            draw.polygon(coords, fill=pale + (165,))
-                            draw.line(coords, fill=review_outline, width=5, joint="curve")
-                            draw.line(coords, fill=base + (255,), width=2, joint="curve")
+                            render_polygon(
+                                part,
+                                pale + (165,),
+                                ((review_outline, 5), (base + (255,), 2)),
+                            )
                         else:
                             alpha = 55 if change_type == "unchanged" else 185
-                            draw.polygon(pixels(part.exterior.coords), fill=base + (alpha,), outline=base + (255,))
+                            render_polygon(
+                                part,
+                                base + (alpha,),
+                                ((base + (255,), 1),),
+                            )
                     else:
                         if as_review:
                             coords = pixels(part.coords)

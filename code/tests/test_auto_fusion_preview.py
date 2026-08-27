@@ -13,6 +13,7 @@ import cv2
 import networkx as nx
 import numpy as np
 import rasterio
+from PIL import Image
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import linemerge, unary_union
 
@@ -822,6 +823,29 @@ class ChangePreviewTests(unittest.TestCase):
             self.assertTrue((detected_empty / "change_preview.png").is_file())
             self.assertTrue((detected_empty / "review_preview.png").is_file())
             self.assertGreater((detected_empty / "review_preview.png").stat().st_size, 100)
+
+    def test_change_preview_preserves_polygon_interior_rings(self) -> None:
+        crs = "EPSG:3857"
+        road_network = Polygon(
+            [(0, 0), (10, 0), (10, 10), (0, 10)],
+            holes=[[(3, 3), (7, 3), (7, 7), (3, 7)]],
+        )
+        changes = gpd.GeoDataFrame(
+            {"change_typ": ["removed"]}, geometry=[road_network], crs=crs,
+        )
+        reference = changes.iloc[0:0].copy()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "change_preview.png"
+            change.render_change_preview(
+                output,
+                changes,
+                reference,
+                title="Polygon hole test",
+                empty_message="No changes",
+            )
+            with Image.open(output) as preview:
+                self.assertEqual(preview.getpixel((550, 374)), (250, 252, 253))
+                self.assertNotEqual(preview.getpixel((312, 374)), (250, 252, 253))
 
     def test_only_review_rows_are_sent_exclusively_to_review_preview(self) -> None:
         crs = "EPSG:3857"

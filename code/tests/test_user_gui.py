@@ -185,6 +185,8 @@ class UserGuiInputCommandTests(unittest.TestCase):
     def test_evaluation_table_ignores_ordinary_change_stage_events(self) -> None:
         app = object.__new__(gui.UserApp)
         app._refresh_active_evaluation_results = mock.Mock()
+        app.evaluation_status = mock.Mock()
+        app._batch_evaluation_progress = None
 
         app.handle_evaluation_backend_event({
             "kind": "pipeline", "stage": "变化检测", "status": "running",
@@ -196,8 +198,86 @@ class UserGuiInputCommandTests(unittest.TestCase):
 
         app.handle_evaluation_backend_event({
             "kind": "stage", "stage": "批量精度评价", "status": "running",
+            "completed": 0, "total": 24, "grid": "区域A",
+            "before_period": "2020", "after_period": "2021",
+        })
+        app.handle_evaluation_backend_event({
+            "kind": "stage", "stage": "精度评价", "status": "running",
+            "grid": "区域A", "before_period": "2020", "after_period": "2021",
+        })
+        app._refresh_active_evaluation_results.assert_not_called()
+
+        app.handle_evaluation_backend_event({
+            "kind": "stage", "stage": "精度评价", "status": "complete",
+            "grid": "区域A", "before_period": "2020", "after_period": "2021",
+        })
+        app.handle_evaluation_backend_event({
+            "kind": "complete", "stage": "evaluate-existing",
+            "grid": "区域A", "before_period": "2020", "after_period": "2021",
         })
         app._refresh_active_evaluation_results.assert_called_once_with()
+
+    def test_batch_evaluation_refreshes_once_per_pair_and_once_at_final_total(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app._refresh_active_evaluation_results = mock.Mock()
+        app.evaluation_status = mock.Mock()
+        app._batch_evaluation_progress = None
+
+        for index in range(24):
+            payload = {
+                "grid": f"区域{index // 2 + 1}",
+                "before_period": str(2000 + index),
+                "after_period": str(2001 + index),
+            }
+            app.handle_evaluation_backend_event({
+                "kind": "stage", "stage": "批量精度评价", "status": "running",
+                "completed": index, "total": 24, **payload,
+            })
+            app.handle_evaluation_backend_event({
+                "kind": "stage", "stage": "精度评价", "status": "running", **payload,
+            })
+            app.handle_evaluation_backend_event({
+                "kind": "stage", "stage": "精度评价", "status": "complete", **payload,
+            })
+            app.handle_evaluation_backend_event({
+                "kind": "complete", "stage": "evaluate-existing", **payload,
+            })
+
+        app.handle_evaluation_backend_event({
+            "kind": "stage", "stage": "批量精度评价", "status": "complete",
+            "completed": 24, "total": 24,
+        })
+        self.assertEqual(app._refresh_active_evaluation_results.call_count, 24)
+
+        app.handle_evaluation_backend_event({
+            "kind": "complete", "stage": "evaluate-all-existing",
+        })
+        self.assertEqual(app._refresh_active_evaluation_results.call_count, 25)
+
+    def test_evaluation_source_fingerprint_skips_reloading_unchanged_summaries(self) -> None:
+        app = object.__new__(gui.UserApp)
+        app._evaluation_source_fingerprint = None
+        app._refresh_evaluation_results = mock.Mock()
+        manifest = {
+            "updated_at": "2026-08-27 12:00:00",
+            "change_results": [{
+                "grid": "区域A", "before_period": "2020", "after_period": "2021",
+                "evaluation_state": "completed", "evaluated_at": "2026-08-27 12:00:00",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pipeline_result.json"
+            path.write_text("{}", encoding="utf-8")
+            app._active_evaluation_manifest = mock.Mock(return_value=(manifest, path))
+
+            app._refresh_active_evaluation_results()
+            app._refresh_active_evaluation_results()
+
+            app._refresh_evaluation_results.assert_called_once_with(manifest)
+
+            manifest["updated_at"] = "2026-08-27 12:00:01"
+            app._refresh_active_evaluation_results()
+            self.assertEqual(app._refresh_evaluation_results.call_count, 2)
 
     def test_evaluation_tree_fingerprint_avoids_unchanged_rebuild(self) -> None:
         app = object.__new__(gui.UserApp)

@@ -299,9 +299,9 @@ class ResultPage:
             "type_accuracy": "动态过程检测正确率", "status": "状态",
         }
         widths = {
-            "area": 130, "change_progress": 78, "evaluation_progress": 78,
-            "recall": 115, "precision": 115, "completeness": 135,
-            "offset": 110, "type_accuracy": 135, "status": 90,
+            "area": 145, "change_progress": 105, "evaluation_progress": 105,
+            "recall": 130, "precision": 130, "completeness": 160,
+            "offset": 135, "type_accuracy": 160, "status": 100,
         }
         for name in evaluation_columns:
             anchor = "w" if name == "area" else "center"
@@ -481,6 +481,31 @@ class ResultPage:
     def _refresh_active_evaluation_results(self) -> None:
         manifest, path = self._active_evaluation_manifest()
         self.active_evaluation_manifest_path = path
+        try:
+            path_stat = path.stat() if path is not None else None
+        except OSError:
+            path_stat = None
+        source_fingerprint = (
+            str(path or ""),
+            getattr(path_stat, "st_mtime_ns", None),
+            getattr(path_stat, "st_size", None),
+            str((manifest or {}).get("updated_at") or ""),
+            tuple(
+                (
+                    str(entry.get("grid") or ""),
+                    str(entry.get("before_period") or ""),
+                    str(entry.get("after_period") or ""),
+                    str(entry.get("evaluation_state") or ""),
+                    str(entry.get("evaluated_at") or ""),
+                    bool(entry.get("evaluation_stale")),
+                )
+                for entry in ((manifest or {}).get("change_results", []) or [])
+                if isinstance(entry, dict)
+            ),
+        )
+        if source_fingerprint == getattr(self, "_evaluation_source_fingerprint", None):
+            return
+        self._evaluation_source_fingerprint = source_fingerprint
         self._refresh_evaluation_results(manifest or {})
 
     def handle_evaluation_backend_event(self, payload: dict) -> None:
@@ -488,16 +513,52 @@ class ResultPage:
         stage = str(payload.get("stage") or "")
         status = str(payload.get("status") or "")
         kind = str(payload.get("kind") or "")
-        evaluation_event = stage in {"精度评价", "批量精度评价"}
+        area = str(payload.get("grid") or payload.get("area_id") or "").strip()
+        before = str(payload.get("before_period") or "").strip()
+        after = str(payload.get("after_period") or "").strip()
+        pair_text = " / ".join(value for value in (area, f"{before} → {after}" if before or after else "") if value)
+
+        if stage == "批量精度评价":
+            completed = int(payload.get("completed", 0) or 0)
+            total = int(payload.get("total", 0) or 0)
+            if status == "running":
+                self._batch_evaluation_progress = (completed, total)
+                if hasattr(self, "evaluation_status"):
+                    detail = f"；当前 {pair_text}" if pair_text else ""
+                    self.evaluation_status.set(f"批量评价进度 {completed} / {total}{detail}")
+            elif status == "complete":
+                if hasattr(self, "evaluation_status"):
+                    self.evaluation_status.set(
+                        f"批量评价已完成 {completed} / {total}，正在汇总项目总精度…"
+                    )
+            return
+
+        if stage == "精度评价":
+            if status == "running":
+                if hasattr(self, "evaluation_status"):
+                    batch_progress = getattr(self, "_batch_evaluation_progress", None)
+                    if batch_progress:
+                        completed, total = batch_progress
+                        prefix = f"批量评价进度 {min(completed + 1, total)} / {total}"
+                    else:
+                        prefix = "正在评价"
+                    detail = f"：{pair_text}" if pair_text else ""
+                    self.evaluation_status.set(f"{prefix}{detail}")
+                return
+            if status in {"complete", "failed", "skipped"}:
+                self._refresh_active_evaluation_results()
+            return
+
         rerun_event = stage in {
             "变化检测重跑", "批量变化检测重跑", "相关变化对更新",
             "道路提取后的变化更新", "编辑后变化检测重跑",
             "rerun-change", "rerun-all-changes", "rerun-period", "rerun-all-periods",
         } and (kind == "complete" or status in {"complete", "failed", "skipped"})
-        task_finished = kind == "complete" and stage in {
-            "evaluate-existing", "evaluate-all-existing", "all",
-        }
-        if evaluation_event or rerun_event or task_finished:
+        batch_finished = kind == "complete" and stage == "evaluate-all-existing"
+        task_finished = kind == "complete" and stage == "all"
+        if batch_finished:
+            self._batch_evaluation_progress = None
+        if rerun_event or batch_finished or task_finished:
             self._refresh_active_evaluation_results()
 
     def handle_result_backend_event(self, payload: dict) -> None:
