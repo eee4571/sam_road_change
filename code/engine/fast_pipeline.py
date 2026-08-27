@@ -65,6 +65,7 @@ FAST_PRESENCE_DELTA_THRESHOLD = 0.25
 FAST_PRESENCE_ALIGNMENT_RADIUS_PX = 2
 FAST_PRESENCE_MIN_BLOB_AREA_PX2 = 12
 FAST_PRESENCE_MIN_PATH_SEED_PIXELS = 2
+FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PX2 = 48
 FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY = 0.90
 FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
@@ -2628,8 +2629,9 @@ def _fast_centerline_path_labels(
 def _clean_fast_presence_mask(
     mask: np.ndarray,
     centerline_anchor: np.ndarray,
+    road_support: np.ndarray,
 ) -> np.ndarray:
-    binary = np.asarray(mask, dtype=np.uint8)
+    binary = _bridge_fast_presence_gaps(mask, road_support)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         binary, connectivity=8,
     )
@@ -2644,11 +2646,37 @@ def _clean_fast_presence_mask(
     return keep_labels[labels].astype(np.uint8)
 
 
+def _bridge_fast_presence_gaps(
+    mask: np.ndarray,
+    road_support: np.ndarray,
+) -> np.ndarray:
+    """Fill only straight 1-2 px gaps whose missing pixels remain on road support."""
+    source = (np.asarray(mask) > 0)
+    support = (np.asarray(road_support) > 0)
+    bridged = source.copy()
+    for gap_size in (1, 2):
+        span = gap_size + 1
+        horizontal = source[:, :-span] & source[:, span:]
+        for offset in range(1, span):
+            horizontal &= support[:, offset:offset - span]
+        for offset in range(1, span):
+            target = bridged[:, offset:offset - span]
+            target[horizontal] = True
+
+        vertical = source[:-span, :] & source[span:, :]
+        for offset in range(1, span):
+            vertical &= support[offset:offset - span, :]
+        for offset in range(1, span):
+            target = bridged[offset:offset - span, :]
+            target[vertical] = True
+    return bridged.astype(np.uint8)
+
+
 def _partition_fast_presence_components(
     mask: np.ndarray,
     path_labels: np.ndarray,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Assign every retained change pixel to its nearest centerline path seed."""
+    """Keep normal mask components whole; split only large, spatially distinct roads."""
     binary = (np.asarray(mask) > 0).astype(np.uint8)
     component_count, components, stats, _centroids = cv2.connectedComponentsWithStats(
         binary, connectivity=8,
@@ -2663,16 +2691,32 @@ def _partition_fast_presence_components(
         width = int(stats[component_id, cv2.CC_STAT_WIDTH])
         height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
         component = components[y:y + height, x:x + width] == component_id
-        seeds = np.where(component, path_labels[y:y + height, x:x + width], 0)
-        seed_paths, seed_counts = np.unique(seeds[seeds > 0], return_counts=True)
-        valid_paths = seed_paths[seed_counts >= FAST_PRESENCE_MIN_PATH_SEED_PIXELS]
-        if valid_paths.size <= 1:
+        seed_mask = component & (path_labels[y:y + height, x:x + width] > 0)
+        grouped_seed_support = cv2.dilate(
+            seed_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        ).astype(bool) & component
+        seed_group_count, seed_groups = cv2.connectedComponents(
+            grouped_seed_support.astype(np.uint8), connectivity=8,
+        )
+        seed_counts = np.bincount(
+            seed_groups[seed_mask], minlength=seed_group_count,
+        )
+        valid_groups = np.flatnonzero(
+            seed_counts >= FAST_PRESENCE_MIN_PATH_SEED_PIXELS
+        )
+        valid_groups = valid_groups[valid_groups > 0]
+        component_area = int(stats[component_id, cv2.CC_STAT_AREA])
+        if (
+            component_area < FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PX2
+            or valid_groups.size <= 1
+        ):
             region_crop = regions[y:y + height, x:x + width]
             region_crop[component] = next_region
             next_region += 1
             continue
 
-        valid_seed_mask = component & np.isin(seeds, valid_paths)
+        valid_seed_mask = seed_mask & np.isin(seed_groups, valid_groups)
         distance_source = np.ones(component.shape, dtype=np.uint8)
         distance_source[valid_seed_mask] = 0
         _distance, nearest_seed = cv2.distanceTransformWithLabels(
@@ -2681,13 +2725,13 @@ def _partition_fast_presence_components(
             cv2.DIST_MASK_5,
             labelType=cv2.DIST_LABEL_PIXEL,
         )
-        seed_owners = seeds[valid_seed_mask]
+        seed_owners = seed_groups[valid_seed_mask]
         owner_by_label = np.zeros(seed_owners.size + 1, dtype=np.int32)
         owner_by_label[1:] = seed_owners
-        nearest_path = owner_by_label[nearest_seed]
+        nearest_group = owner_by_label[nearest_seed]
         region_crop = regions[y:y + height, x:x + width]
-        for path_id in valid_paths:
-            owned = component & (nearest_path == path_id)
+        for group_id in valid_groups:
+            owned = component & (nearest_group == group_id)
             if owned.any():
                 region_crop[owned] = next_region
                 next_region += 1
@@ -2701,7 +2745,6 @@ def _partition_fast_presence_components(
 
 def _fast_presence_records(
     regions: np.ndarray,
-    source_surfaces: gpd.GeoDataFrame,
     grid: FastProbabilityGrid,
     *,
     change_type: str,
@@ -2709,14 +2752,13 @@ def _fast_presence_records(
     after_period: str,
     min_area: float,
 ) -> list[dict]:
-    surface_union = source_surfaces.geometry.union_all()
     records = []
     for mapping, value in shapes(
         regions.astype(np.int32), mask=regions.astype(bool), transform=grid.transform,
     ):
         if int(value) <= 0:
             continue
-        change_geometry = make_valid(shape(mapping)).intersection(surface_union)
+        change_geometry = make_valid(shape(mapping))
         for part in _fast_polygon_parts(change_geometry, min_area=min_area):
             records.append({
                 "change_typ": change_type,
@@ -2763,10 +2805,14 @@ def _detect_probability_presence_changes(
         after_surfaces, after_centerlines, grid,
     )
     added_mask = _clean_fast_presence_mask(
-        added_raw & (after_surface_mask > 0), after_line_anchor,
+        added_raw & (after_surface_mask > 0),
+        after_line_anchor,
+        after_surface_mask,
     )
     removed_mask = _clean_fast_presence_mask(
-        removed_raw & (before_surface_mask > 0), before_line_anchor,
+        removed_raw & (before_surface_mask > 0),
+        before_line_anchor,
+        before_surface_mask,
     )
     added_regions, added_split = _partition_fast_presence_components(
         added_mask, after_path_labels,
@@ -2776,12 +2822,12 @@ def _detect_probability_presence_changes(
     )
     records = {
         "added": _fast_presence_records(
-            added_regions, after_surfaces, grid, change_type="added",
+            added_regions, grid, change_type="added",
             before_period=before_period, after_period=after_period,
             min_area=min_area,
         ),
         "removed": _fast_presence_records(
-            removed_regions, before_surfaces, grid, change_type="removed",
+            removed_regions, grid, change_type="removed",
             before_period=before_period, after_period=after_period,
             min_area=min_area,
         ),

@@ -35,6 +35,7 @@ from engine.fast_pipeline import (
     measure_fast_path_widths,
     measure_fast_widths,
     _build_fast_road_geometry,
+    _bridge_fast_presence_gaps,
     _bridge_small_supported_gaps,
     _cleanup_road_paths,
     _consistent_relative_score,
@@ -60,18 +61,50 @@ class FastCommandTests(unittest.TestCase):
         self.assertNotIn("synthetic", title.casefold())
         self.assertNotIn("真值", title)
 
-    def test_presence_component_is_partitioned_without_changing_mask_pixels(self) -> None:
+    def test_multiple_path_ids_keep_one_continuous_presence_component(self) -> None:
         mask = np.zeros((24, 24), dtype=np.uint8)
-        mask[4:20, 4:20] = 1
+        mask[8:13, 2:22] = 1
         path_labels = np.zeros_like(mask, dtype=np.int32)
-        path_labels[8, 4:20] = 1
-        path_labels[4:20, 15] = 2
+        path_labels[10, 2:12] = 1
+        path_labels[10, 12:22] = 2
 
         regions, diagnostics = _partition_fast_presence_components(mask, path_labels)
 
         self.assertTrue(np.array_equal(regions > 0, mask > 0))
-        self.assertEqual(len(np.unique(regions[regions > 0])), 2)
-        self.assertEqual(diagnostics["split_component_count"], 1)
+        self.assertEqual(len(np.unique(regions[regions > 0])), 1)
+        self.assertEqual(diagnostics["split_component_count"], 0)
+        polygon_count = sum(
+            1 for _mapping, value in rasterio.features.shapes(
+                regions.astype(np.int32), mask=regions.astype(bool),
+            )
+            if int(value) > 0
+        )
+        self.assertEqual(polygon_count, 1)
+
+    def test_presence_gap_bridge_repairs_only_one_or_two_pixel_gaps(self) -> None:
+        mask = np.zeros((20, 28), dtype=np.uint8)
+        mask[8:12, 2:10] = 1
+        mask[8:12, 12:24] = 1
+        road_support = np.zeros_like(mask)
+        road_support[8:12, 2:24] = 1
+
+        bridged = _bridge_fast_presence_gaps(mask, road_support)
+
+        count, _labels = cv2.connectedComponents(bridged, connectivity=8)
+        self.assertEqual(count - 1, 1)
+        self.assertTrue(np.all(bridged[8:12, 10:12] == 1))
+
+    def test_presence_gap_bridge_does_not_join_separate_roads(self) -> None:
+        mask = np.zeros((20, 28), dtype=np.uint8)
+        mask[5:11, 2:8] = 1
+        mask[5:11, 11:17] = 1
+        road_support = np.ones_like(mask)
+
+        bridged = _bridge_fast_presence_gaps(mask, road_support)
+
+        count, _labels = cv2.connectedComponents(bridged, connectivity=8)
+        self.assertEqual(count - 1, 2)
+        self.assertEqual(int(bridged.sum()), int(mask.sum()))
 
     def test_full_keeps_legacy_cli_and_fast_adds_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
