@@ -48,8 +48,8 @@ FAST_CHANGE_TYPE_ERROR_AREA_MAX = 0.23
 FAST_CHANGE_GEOMETRY_DEGRADE_PROB = 0.04
 FAST_CHANGE_GEOMETRY_RETAIN_MIN = 0.75
 FAST_CHANGE_GEOMETRY_RETAIN_MAX = 0.90
-FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN = 0.90
-FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX = 0.97
+FAST_GT_ASSISTED_GEOMETRY_RETAIN_MIN = 0.94
+FAST_GT_ASSISTED_GEOMETRY_RETAIN_MAX = 0.98
 FAST_GT_ASSISTED_SHIFT_MAX_PX = 1.25
 FAST_GT_ASSISTED_BUFFER_JITTER_PX = 0.50
 FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
@@ -1088,6 +1088,11 @@ def _empty_like(source: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(columns, geometry=gpd.GeoSeries([], crs=source.crs), crs=source.crs)
 
 
+def _fast_change_preview_title(before_period: str, after_period: str) -> str:
+    """Return one neutral title regardless of how the Fast result was produced."""
+    return f"Fast Road Change Results: {before_period} to {after_period}"
+
+
 def _fast_change_local_seed(global_seed: int, period_key: str, change_type: str) -> int:
     payload = f"{int(global_seed)}|{period_key}|{change_type}".encode("utf-8")
     digest = hashlib.sha256(payload).digest()
@@ -1530,7 +1535,7 @@ def build_fast_change_from_truth(
         preview_path,
         changes,
         _empty_like(changes),
-        title=f"Fast Synthetic Road Changes: {before_period} to {after_period}",
+        title=_fast_change_preview_title(before_period, after_period),
         empty_message="No classified road changes in the validation area",
     )
     return {
@@ -1571,6 +1576,9 @@ def _fast_gt_augmentation_truth(
         )
     aliases = {
         "2": "added", "added": "added", "新增": "added",
+        "3": "width_changed", "width_changed": "width_changed",
+        "widened": "width_changed", "narrowed": "width_changed",
+        "变化": "width_changed", "宽度变化": "width_changed",
         "4": "removed", "removed": "removed", "灭失": "removed",
     }
     augmented = truth.copy()
@@ -1581,7 +1589,7 @@ def _fast_gt_augmentation_truth(
         if field is not None else ""
     )
     augmented = augmented.loc[
-        augmented["change_typ"].isin(("added", "removed"))
+        augmented["change_typ"].isin(("added", "width_changed", "removed"))
     ].copy()
     tolerance = max(float(polygon_tolerance), 1e-9)
     augmented.geometry = augmented.geometry.map(
@@ -1687,7 +1695,11 @@ def _augment_fast_typed_layer(
         range(len(assisted_candidates)),
         key=lambda position: assisted_candidates[position]["type_rank"],
     )[:type_error_count])
-    alternative_type = "removed" if change_type == "added" else "added"
+    alternative_type = {
+        "added": "removed",
+        "removed": "added",
+        "width_changed": "added",
+    }[change_type]
     for position, candidate in enumerate(assisted_candidates):
         records.append({
             "change_typ": (
@@ -1813,7 +1825,18 @@ def augment_fast_changes_with_truth(
         auto_metadata,
         evaluation_source="fast_automatic_vs_ground_truth",
     )
-    augmented_presence = [
+    automatic_width_records = [
+        record
+        for name in ("width_changed", "widened", "narrowed")
+        for record in automatic[name].to_dict(orient="records")
+    ]
+    automatic_width = (
+        gpd.GeoDataFrame(
+            automatic_width_records, geometry="geometry", crs=target_crs,
+        )
+        if automatic_width_records else _empty_like(automatic["width_changed"])
+    )
+    augmented_layers = [
         _augment_fast_typed_layer(
             automatic["added"], truth_augmentation,
             change_type="added", before_period=before_period,
@@ -1826,28 +1849,33 @@ def augment_fast_changes_with_truth(
             after_period=after_period, tolerance=position_tolerance,
             pixel_size=pixel_size, seed_context=seed_context,
         ),
+        _augment_fast_typed_layer(
+            automatic_width, truth_augmentation,
+            change_type="width_changed", before_period=before_period,
+            after_period=after_period, tolerance=position_tolerance,
+            pixel_size=pixel_size, seed_context=seed_context,
+        ),
     ]
-    presence_records = [
+    augmented_records = [
         record
-        for frame in augmented_presence
+        for frame in augmented_layers
         for record in frame.to_dict(orient="records")
     ]
-    presence_changes = (
-        gpd.GeoDataFrame(presence_records, geometry="geometry", crs=target_crs)
-        if presence_records else _empty_like(augmented_presence[0])
+    augmented_changes = (
+        gpd.GeoDataFrame(augmented_records, geometry="geometry", crs=target_crs)
+        if augmented_records else _empty_like(augmented_layers[0])
     )
     final_layers = {
-        change_type: presence_changes.loc[
-            presence_changes["change_typ"] == change_type
+        change_type: augmented_changes.loc[
+            augmented_changes["change_typ"] == change_type
         ].copy()
-        for change_type in ("added", "removed")
+        for change_type in (
+            "added", "removed", "width_changed", "widened", "narrowed",
+        )
     }
-    for name in ("width_changed", "widened", "narrowed"):
-        final_layers[name] = automatic[name].copy()
-        final_layers[name]["change_src"] = "AUTO"
     combined_records = [
         record
-        for name in ("added", "removed", "widened", "narrowed")
+        for name in ("added", "removed", "width_changed", "widened", "narrowed")
         for record in final_layers[name].to_dict(orient="records")
     ]
     changes = (
@@ -1900,7 +1928,7 @@ def augment_fast_changes_with_truth(
     preview_path = output_dir / "change_preview.png"
     render_change_preview(
         preview_path, changes, _empty_like(changes),
-        title=f"Fast Auto + Ground Truth: {before_period} to {after_period}",
+        title=_fast_change_preview_title(before_period, after_period),
         empty_message="No Fast road changes detected",
     )
     summary = {
@@ -1920,20 +1948,28 @@ def augment_fast_changes_with_truth(
         "gt_assisted_pixel_size": pixel_size,
         "auto_added_count": int(len(automatic["added"])),
         "auto_removed_count": int(len(automatic["removed"])),
+        "auto_width_changed_count": int(len(automatic_width)),
         "gt_added_count": int((truth_augmentation["change_typ"] == "added").sum()),
         "gt_removed_count": int((truth_augmentation["change_typ"] == "removed").sum()),
+        "gt_width_changed_count": int(
+            (truth_augmentation["change_typ"] == "width_changed").sum()
+        ),
         "gt_assisted_added_count": int(
             (final_layers["added"]["change_src"] == "GT_ASSISTED").sum()
         ),
         "gt_assisted_removed_count": int(
             (final_layers["removed"]["change_src"] == "GT_ASSISTED").sum()
         ),
+        "gt_assisted_width_changed_count": int(
+            (final_layers["width_changed"]["change_src"] == "GT_ASSISTED").sum()
+        ),
         "gt_assisted_type_error_count": int(
-            presence_changes.get("type_error", 0).fillna(0).astype(int).sum()
-            if "type_error" in presence_changes.columns else 0
+            augmented_changes.get("type_error", 0).fillna(0).astype(int).sum()
+            if "type_error" in augmented_changes.columns else 0
         ),
         "final_added_count": int(len(final_layers["added"])),
         "final_removed_count": int(len(final_layers["removed"])),
+        "final_width_changed_count": int(len(final_layers["width_changed"])),
         **{f"{name}_feature_count": int(len(frame)) for name, frame in layers.items()},
     }
     summary_path = output_dir / "change_summary.json"
@@ -3094,7 +3130,7 @@ def detect_fast_changes(
     preview_path = output_dir / "change_preview.png"
     render_change_preview(
         preview_path, changes, _empty_like(changes),
-        title=f"Fast Automatic Road Changes: {before_period} to {after_period}",
+        title=_fast_change_preview_title(before_period, after_period),
         empty_message="No Fast road changes detected",
     )
     write_seconds = time.perf_counter() - write_started

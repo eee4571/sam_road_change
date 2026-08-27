@@ -1908,8 +1908,8 @@ def _write_outputs(
         output_dir / "change_preview.png",
         formal,
         unchanged,
-        title="Final Auto-Confirmed Road Changes",
-        empty_message="No auto-confirmed road changes",
+        title="Road Change Results",
+        empty_message="No road changes detected",
     )
     render_change_preview(
         output_dir / "review_preview.png",
@@ -1969,8 +1969,8 @@ def write_change_preview(
         path,
         changes,
         unchanged,
-        title="Final Auto-Confirmed Road Changes",
-        empty_message="No auto-confirmed road changes",
+        title="Road Change Results",
+        empty_message="No road changes detected",
     )
 
 

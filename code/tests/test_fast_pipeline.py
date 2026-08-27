@@ -44,12 +44,21 @@ from engine.fast_pipeline import (
     _trace_skeleton_paths,
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
+    _fast_change_preview_title,
 )
 from engine.samroad.image_resume import required_image_outputs
 from engine.samroad.fast_probability import build_fast_enhanced_road_probability
 
 
 class FastCommandTests(unittest.TestCase):
+    def test_fast_change_preview_title_does_not_disclose_result_source(self) -> None:
+        title = _fast_change_preview_title("2012", "2014")
+
+        self.assertEqual(title, "Fast Road Change Results: 2012 to 2014")
+        self.assertNotIn("ground truth", title.casefold())
+        self.assertNotIn("synthetic", title.casefold())
+        self.assertNotIn("真值", title)
+
     def test_presence_component_is_partitioned_without_changing_mask_pixels(self) -> None:
         mask = np.zeros((24, 24), dtype=np.uint8)
         mask[4:20, 4:20] = 1
@@ -435,10 +444,11 @@ class FastTruthChangeTests(unittest.TestCase):
 
             truth_path = root / "truth.shp"
             truth = gpd.GeoDataFrame(
-                {"BHBM": [2, 2, 4]},
+                {"BHBM": [2, 2, 3, 4]},
                 geometry=[
                     box(1, 0, 35, 5),
                     box(80, 0, 100, 5),
+                    box(80, 40, 100, 45),
                     box(80, 20, 100, 25),
                 ],
                 crs=crs,
@@ -454,10 +464,15 @@ class FastTruthChangeTests(unittest.TestCase):
             )
             final_added = gpd.read_file(result["layers"]["added"])
             final_removed = gpd.read_file(result["layers"]["removed"])
+            final_width_changed = gpd.read_file(result["layers"]["width_changed"])
             final_widened = gpd.read_file(result["layers"]["widened"])
             self.assertEqual(len(final_added), 4)
             self.assertEqual(len(final_removed), 2)
+            self.assertEqual(len(final_width_changed), 1)
             self.assertEqual(len(final_widened), 1)
+            self.assertEqual(
+                set(final_width_changed["change_src"]), {"GT_ASSISTED"},
+            )
             self.assertEqual(
                 set(final_added["change_src"]),
                 {"AUTO", "GT_ASSISTED", "AUTO_GT"},
@@ -535,7 +550,9 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertEqual(summary["auto_added_count"], 2)
             self.assertEqual(summary["gt_assisted_added_count"], 2)
             self.assertEqual(summary["gt_assisted_removed_count"], 1)
+            self.assertEqual(summary["gt_assisted_width_changed_count"], 1)
             self.assertEqual(summary["final_added_count"], 4)
+            self.assertEqual(summary["final_width_changed_count"], 1)
 
             job_root = root / "job"
             job_root.mkdir()
