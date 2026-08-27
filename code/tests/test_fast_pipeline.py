@@ -40,6 +40,8 @@ from engine.fast_pipeline import (
     _build_fast_road_geometry,
     _bridge_fast_presence_gaps,
     _bridge_small_supported_gaps,
+    _cleanup_fast_final_centerline,
+    _cleanup_fast_final_surface,
     _cleanup_road_paths,
     _consistent_relative_score,
     _degrade_fast_change_geometry,
@@ -224,6 +226,37 @@ class FastRelativeTests(unittest.TestCase):
 
 
 class FastSkeletonCleanupTests(unittest.TestCase):
+    def test_final_tile_cleanup_removes_fragments_and_bridges_supported_gap(self) -> None:
+        centerline = np.zeros((80, 100), dtype=np.uint8)
+        centerline[40, 10:40] = 1
+        centerline[40, 45:80] = 1
+        centerline[10, 8:13] = 1
+        enhanced_molra = np.zeros_like(centerline)
+        enhanced_molra[37:44, 8:82] = 1
+
+        cleaned, paths, diagnostics = _cleanup_fast_final_centerline(
+            centerline,
+            enhanced_molra,
+            support_score=enhanced_molra.astype(np.float32),
+        )
+
+        self.assertEqual(diagnostics["removed_centerline_component_count"], 1)
+        self.assertGreater(diagnostics["removed_centerline_length_px"], 0.0)
+        self.assertEqual(diagnostics["bridged_gap_count"], 1)
+        self.assertGreater(diagnostics["bridged_gap_length_px"], 0.0)
+        self.assertTrue(np.all(cleaned[40, 40:45] == 1))
+        self.assertEqual(int(cleaned[10, 8:13].sum()), 0)
+        self.assertEqual(len(paths), 1)
+
+        surface = enhanced_molra.copy()
+        surface[60:65, 85:90] = 1
+        final_surface, surface_diagnostics = _cleanup_fast_final_surface(
+            surface, cleaned,
+        )
+        self.assertEqual(surface_diagnostics["removed_surface_component_count"], 1)
+        self.assertEqual(surface_diagnostics["removed_surface_pixel_count"], 25)
+        self.assertEqual(int(final_surface[60:65, 85:90].sum()), 0)
+
     def test_isolated_short_fragment_is_removed(self) -> None:
         skeleton = np.zeros((60, 80), dtype=np.uint8)
         skeleton[20, 10:21] = 1
@@ -282,8 +315,11 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         paths = _trace_skeleton_paths(skeleton)
         support = np.zeros_like(skeleton)
         support[25, 8:42] = 1
-        bridged, bridge_count = _bridge_small_supported_gaps(skeleton, paths, support)
+        bridged, bridge_count, bridge_length = _bridge_small_supported_gaps(
+            skeleton, paths, support,
+        )
         self.assertEqual(bridge_count, 1)
+        self.assertGreater(bridge_length, 0.0)
         bridged_paths = _trace_skeleton_paths(bridged)
         kept, removed = _cleanup_road_paths(bridged_paths)
         self.assertEqual(removed["isolated"], 0)
@@ -304,10 +340,11 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         skeleton[25, 8:22] = 1
         skeleton[25, 26:42] = 1
         paths = _trace_skeleton_paths(skeleton)
-        _bridged, bridge_count = _bridge_small_supported_gaps(
+        _bridged, bridge_count, bridge_length = _bridge_small_supported_gaps(
             skeleton, paths, np.zeros_like(skeleton),
         )
         self.assertEqual(bridge_count, 0)
+        self.assertEqual(bridge_length, 0.0)
 
     def test_centerline_is_derived_only_from_native_toponet(self) -> None:
         probability = np.full((100, 100), 0.24, dtype=np.float32)

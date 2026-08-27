@@ -439,7 +439,7 @@ def _bridge_small_supported_gaps(
     paths: list[FastRoadPath],
     bridge_support: np.ndarray,
     max_distance_px: float = FAST_GAP_BRIDGE_DISTANCE_PX,
-) -> tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int, float]:
     """Bridge close facing endpoints from different components using local support."""
     endpoints: list[tuple[tuple[int, int], np.ndarray, int]] = []
     for path in paths:
@@ -454,7 +454,7 @@ def _bridge_small_supported_gaps(
                 _endpoint_direction(path, False), path.component_id,
             ))
     if len(endpoints) < 2:
-        return (np.asarray(skeleton) > 0).astype(np.uint8), 0
+        return (np.asarray(skeleton) > 0).astype(np.uint8), 0, 0.0
     cell_size = max(1, int(np.ceil(max_distance_px)))
     buckets: dict[tuple[int, int], list[int]] = {}
     for endpoint_id, (point, _direction, _component_id) in enumerate(endpoints):
@@ -496,7 +496,8 @@ def _bridge_small_supported_gaps(
     bridged = (np.asarray(skeleton) > 0).astype(np.uint8).copy()
     used: set[int] = set()
     bridge_count = 0
-    for _distance, first_id, second_id in sorted(candidates):
+    bridge_length_px = 0.0
+    for distance, first_id, second_id in sorted(candidates):
         if first_id in used or second_id in used:
             continue
         first = endpoints[first_id][0]
@@ -504,7 +505,8 @@ def _bridge_small_supported_gaps(
         cv2.line(bridged, (first[1], first[0]), (second[1], second[0]), 1, 1)
         used.update((first_id, second_id))
         bridge_count += 1
-    return bridged, bridge_count
+        bridge_length_px += float(distance)
+    return bridged, bridge_count, bridge_length_px
 
 
 def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], dict]:
@@ -555,6 +557,127 @@ def _cleanup_road_paths(paths: list[FastRoadPath]) -> tuple[list[FastRoadPath], 
             reasons["spur"] += 1
     reasons["total"] = len(removed)
     return [path for path_id, path in enumerate(paths) if path_id not in removed], reasons
+
+
+def _skeleton_total_length_px(skeleton: np.ndarray) -> float:
+    binary = (np.asarray(skeleton) > 0).astype(np.uint8)
+    count, labels = cv2.connectedComponents(binary, connectivity=8)
+    return float(_component_skeleton_lengths(labels, count)[1:].sum())
+
+
+def _removed_centerline_component_count(
+    before: np.ndarray, after: np.ndarray,
+) -> int:
+    count, labels = cv2.connectedComponents(
+        (np.asarray(before) > 0).astype(np.uint8), connectivity=8,
+    )
+    if count <= 1:
+        return 0
+    retained = np.bincount(
+        labels[np.asarray(after) > 0], minlength=count,
+    )
+    return int(np.count_nonzero(retained[1:] == 0))
+
+
+def _cleanup_fast_final_centerline(
+    centerline: np.ndarray,
+    enhanced_molra_surface: np.ndarray | None,
+    *,
+    support_score: np.ndarray | None = None,
+) -> tuple[np.ndarray, list[FastRoadPath], dict]:
+    """Run one tile-local cleanup/bridge pass before final vectorization."""
+    original = (np.asarray(centerline) > 0).astype(np.uint8)
+    cleaned = _remove_short_isolated_skeleton_components(
+        original, FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
+    )
+    paths = _trace_skeleton_paths(cleaned, support_score)
+    paths, _first_path_cleanup = _cleanup_road_paths(paths)
+    cleaned = _paths_to_skeleton(paths, original.shape)
+
+    bridged_gap_count = 0
+    bridged_gap_length_px = 0.0
+    if enhanced_molra_surface is not None and np.any(enhanced_molra_surface):
+        cleaned, bridged_gap_count, bridged_gap_length_px = _bridge_small_supported_gaps(
+            cleaned,
+            paths,
+            enhanced_molra_surface,
+            FAST_GAP_BRIDGE_DISTANCE_PX,
+        )
+
+    cleaned = _remove_short_isolated_skeleton_components(
+        cleaned, FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
+    )
+    final_paths = _trace_skeleton_paths(cleaned, support_score)
+    final_paths, _second_path_cleanup = _cleanup_road_paths(final_paths)
+    cleaned = _paths_to_skeleton(final_paths, original.shape)
+    cleaned = _remove_short_isolated_skeleton_components(
+        cleaned, FAST_MIN_SKELETON_COMPONENT_LENGTH_PX,
+    )
+    final_paths = _trace_skeleton_paths(cleaned, support_score)
+
+    original_length_px = _skeleton_total_length_px(original)
+    final_length_px = _skeleton_total_length_px(cleaned)
+    diagnostics = {
+        "removed_centerline_component_count": _removed_centerline_component_count(
+            original, cleaned,
+        ),
+        "removed_centerline_length_px": float(max(
+            0.0,
+            original_length_px + bridged_gap_length_px - final_length_px,
+        )),
+        "bridged_gap_count": int(bridged_gap_count),
+        "bridged_gap_length_px": float(bridged_gap_length_px),
+    }
+    return cleaned, final_paths, diagnostics
+
+
+def _cleanup_fast_final_surface(
+    surface: np.ndarray,
+    cleaned_centerline: np.ndarray,
+) -> tuple[np.ndarray, dict]:
+    """Remove unsupported tile-local islands, then close only 1-2 px cracks."""
+    original = (np.asarray(surface) > 0).astype(np.uint8)
+    small_cleaned = _remove_small_components(
+        original, FAST_SURFACE_MIN_COMPONENT_AREA_PX2,
+    )
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        small_cleaned, connectivity=8,
+    )
+    nearby_radius = max(1, int(np.ceil(FAST_GAP_BRIDGE_DISTANCE_PX / 2.0)))
+    kernel_size = 2 * nearby_radius + 1
+    centerline_neighborhood = cv2.dilate(
+        (np.asarray(cleaned_centerline) > 0).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+    )
+    supported_counts = np.bincount(
+        labels[centerline_neighborhood > 0], minlength=count,
+    )
+    keep_labels = (
+        (stats[:, cv2.CC_STAT_AREA] >= FAST_SURFACE_MIN_COMPONENT_AREA_PX2)
+        & (supported_counts[:count] > 0)
+    )
+    keep_labels[0] = False
+    supported = keep_labels[labels].astype(np.uint8)
+
+    original_count, original_labels = cv2.connectedComponents(
+        original, connectivity=8,
+    )
+    retained_original = np.bincount(
+        original_labels[supported > 0], minlength=original_count,
+    )
+    removed_component_count = int(np.count_nonzero(retained_original[1:] == 0))
+    removed_pixel_count = int(
+        np.count_nonzero(original) - np.count_nonzero(supported)
+    )
+    final_surface = cv2.morphologyEx(
+        supported,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    return final_surface.astype(np.uint8), {
+        "removed_surface_component_count": removed_component_count,
+        "removed_surface_pixel_count": removed_pixel_count,
+    }
 
 
 def _fill_small_holes(
@@ -1270,22 +1393,37 @@ def measure_fast_widths(
                 molra_binary, molra_diagnostics = _enhance_fast_molra_surface(
                     molra_probability, topology_centerline,
                 )
+            cleaned_centerline, final_paths, centerline_cleanup = (
+                _cleanup_fast_final_centerline(
+                    topology_centerline,
+                    molra_binary,
+                    support_score=molra_probability,
+                )
+            )
+            cleaned_surface, surface_cleanup = _cleanup_fast_final_surface(
+                binary, cleaned_centerline,
+            )
+            if molra_binary is not None:
                 _write_fast_molra_surface(molra_surface_path, molra_binary)
+            if not cv2.imwrite(str(centerline_path), cleaned_centerline * 255):
+                raise OSError(f"Cannot write cleaned Fast centerline mask: {centerline_path}")
+            if not cv2.imwrite(str(mask_path), cleaned_surface * 255):
+                raise OSError(f"Cannot write cleaned Fast surface mask: {mask_path}")
             molra_seconds = time.perf_counter() - molra_started
-            width_rows = measure_fast_edge_widths(
-                nodes, edges, binary, pixel_size,
+            width_rows = measure_fast_path_widths(
+                final_paths, cleaned_surface, pixel_size,
                 molra_binary=molra_binary,
                 sample_function=sample_widths_by_normal,
             )
-            for edge_id, (src, dst) in enumerate(edges.tolist()):
-                line = _world_line(transform, nodes[src], nodes[dst])
-                width = float(width_rows[edge_id]["width_units"])
-                width_px = float(width_rows[edge_id]["width_px"])
-                width_source = str(width_rows[edge_id]["width_source"])
+            for path_id, path in enumerate(final_paths):
+                line = _world_path(transform, _simplify_path_pixels(path))
+                width = float(width_rows[path_id]["width_units"])
+                width_px = float(width / max(pixel_size, 1e-9)) if width > 0 else 0.0
+                width_source = str(width_rows[path_id]["width_source"])
                 if width <= 0:
                     continue
                 common = {
-                    "tile": image_path.stem, "edge_id": int(edge_id),
+                    "tile": image_path.stem, "edge_id": int(path_id),
                     "width_m": float(width), "width_src": width_source,
                     "exec_prof": "fast", "geometry": line,
                 }
@@ -1296,7 +1434,11 @@ def measure_fast_widths(
                     "geometry": line.buffer(width_px * map_pixel_size / 2.0),
                 })
             valid = dataset.dataset_mask() > 0
-            for mapping, value in shapes(binary, mask=(binary > 0) & valid, transform=transform):
+            for mapping, value in shapes(
+                cleaned_surface,
+                mask=(cleaned_surface > 0) & valid,
+                transform=transform,
+            ):
                 if int(value) != 1:
                     continue
                 geometry = make_valid(shape(mapping))
@@ -1308,9 +1450,7 @@ def measure_fast_widths(
         if probability_path.is_file():
             target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
             target_probability.write_bytes(probability_path.read_bytes())
-        centerline_length_px = float(sum(
-            np.linalg.norm(nodes[src] - nodes[dst]) for src, dst in edges.tolist()
-        ))
+        centerline_length_px = float(sum(path.length_px for path in final_paths))
         surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
         surface_diagnostics = {}
         if surface_diagnostics_path.is_file():
@@ -1321,8 +1461,8 @@ def measure_fast_widths(
         tile_summary = {
             "stem": image_path.stem, "image": str(image_path),
             "surface_mask": str(mask_path), "centerline_mask": str(centerline_path),
-            "edge_count": int(len(edges)), "path_count": int(len(edges)),
-            "final_centerline_path_count": int(len(edges)),
+            "edge_count": int(len(edges)), "path_count": int(len(final_paths)),
+            "final_centerline_path_count": int(len(final_paths)),
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,
@@ -1338,9 +1478,11 @@ def measure_fast_widths(
                 for source in ("enhanced_molra", "fast_mask_fallback", "neighbor_fallback")
             },
             **molra_diagnostics,
+            **centerline_cleanup,
+            **surface_cleanup,
             "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
             "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
-            "final_mask_pixel_count": int(surface_diagnostics.get("final_mask_pixel_count", np.count_nonzero(binary))),
+            "final_mask_pixel_count": int(np.count_nonzero(cleaned_surface)),
             "final_centerline_length": centerline_length_px * float(pixel_size),
             "final_centerline_length_px": centerline_length_px,
             "relative_support_component_count": int(surface_diagnostics.get("relative_support_component_count", 0)),
@@ -1352,7 +1494,9 @@ def measure_fast_widths(
             "path_cleanup_spur_count": int(surface_diagnostics.get("path_cleanup_spur_count", 0)),
             "path_cleanup_loop_count": int(surface_diagnostics.get("path_cleanup_loop_count", 0)),
             "gap_bridge_added_count": int(surface_diagnostics.get("gap_bridge_added_count", 0)),
-            "final_road_surface_count": int(surface_diagnostics.get("final_road_surface_count", 0)),
+            "final_road_surface_count": int(
+                cv2.connectedComponents(cleaned_surface, connectivity=8)[0] - 1
+            ),
             "fast_mask_elapsed_seconds": float(surface_diagnostics.get("fast_mask_elapsed_seconds", 0.0)),
             "skeleton_path_processing_seconds": float(surface_diagnostics.get("skeleton_path_processing_seconds", 0.0)),
             "fast_width_elapsed_seconds": float(time.perf_counter() - tile_started),
@@ -1360,7 +1504,7 @@ def measure_fast_widths(
         enhanced_count = int(tile_summary["width_source_counts"]["enhanced_molra"])
         tile_summary["enhanced_molra_width_count"] = enhanced_count
         tile_summary["enhanced_molra_width_ratio"] = float(
-            enhanced_count / max(int(len(edges)), 1)
+            enhanced_count / max(int(len(final_paths)), 1)
         )
         tile_summary["fast_mask_fallback_count"] = int(
             tile_summary["width_source_counts"]["fast_mask_fallback"]
@@ -1380,6 +1524,12 @@ def measure_fast_widths(
             f"{tile_summary['enhanced_molra_surface_pixel_count']}, "
             f"centerline_coverage={tile_summary['raw_molra_centerline_coverage']:.3f}->"
             f"{tile_summary['enhanced_molra_centerline_coverage']:.3f}, "
+            f"cleanup=centerline-{tile_summary['removed_centerline_component_count']}"
+            f"/{tile_summary['removed_centerline_length_px']:.1f}px, "
+            f"bridge={tile_summary['bridged_gap_count']}"
+            f"/{tile_summary['bridged_gap_length_px']:.1f}px, "
+            f"surface-{tile_summary['removed_surface_component_count']}"
+            f"/{tile_summary['removed_surface_pixel_count']}px, "
             f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
             f"molra={molra_seconds:.3f}s, "
             f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
@@ -1418,10 +1568,28 @@ def measure_fast_widths(
         "abnormal_width_over_30m_count": int(sum(
             row.get("abnormal_width_over_30m_count", 0) for row in image_rows
         )),
+        "removed_centerline_component_count": int(sum(
+            row.get("removed_centerline_component_count", 0) for row in image_rows
+        )),
+        "removed_centerline_length_px": float(sum(
+            row.get("removed_centerline_length_px", 0.0) for row in image_rows
+        )),
+        "bridged_gap_count": int(sum(
+            row.get("bridged_gap_count", 0) for row in image_rows
+        )),
+        "bridged_gap_length_px": float(sum(
+            row.get("bridged_gap_length_px", 0.0) for row in image_rows
+        )),
+        "removed_surface_component_count": int(sum(
+            row.get("removed_surface_component_count", 0) for row in image_rows
+        )),
+        "removed_surface_pixel_count": int(sum(
+            row.get("removed_surface_pixel_count", 0) for row in image_rows
+        )),
     }
-    total_edges = int(sum(row.get("edge_count", 0) for row in image_rows))
+    total_paths = int(sum(row.get("final_centerline_path_count", 0) for row in image_rows))
     summary["enhanced_molra_width_ratio"] = float(
-        summary["enhanced_molra_width_count"] / max(total_edges, 1)
+        summary["enhanced_molra_width_count"] / max(total_paths, 1)
     )
     total_centerline_pixels = float(sum(
         row.get("molra_centerline_pixel_count", 0) for row in image_rows
