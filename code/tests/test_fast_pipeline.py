@@ -392,6 +392,62 @@ class FastWidthTests(unittest.TestCase):
 
 
 class FastTruthChangeTests(unittest.TestCase):
+    def test_fast_assisted_centerline_metrics_use_image_pixels_across_crs(self) -> None:
+        width_root = str(CODE_ROOT / "engine" / "width")
+        if width_root not in sys.path:
+            sys.path.insert(0, width_root)
+        from road_change_detection import evaluate_fast_assisted_centerline_metrics
+
+        image_crs = "EPSG:3857"
+        image_transform = from_origin(0.0, 100.0, 1.0, 1.0)
+        truth = gpd.GeoDataFrame(
+            {"BHBM": [2]}, geometry=[box(10, 40, 60, 50)], crs=image_crs,
+        )
+
+        def evaluate(predicted: gpd.GeoDataFrame) -> dict:
+            return evaluate_fast_assisted_centerline_metrics(
+                predicted,
+                truth,
+                truth_type_field="BHBM",
+                image_crs=image_crs,
+                image_transform=image_transform,
+                image_shape=(100, 100),
+            )
+
+        same = evaluate(gpd.GeoDataFrame(
+            {"change_typ": ["added"]},
+            geometry=[box(10, 40, 60, 50)], crs=image_crs,
+        ))
+        self.assertAlmostEqual(same["road_centerline_completeness"], 1.0)
+        self.assertAlmostEqual(same["centerline_mean_offset_px"], 0.0)
+
+        shifted_two = evaluate(gpd.GeoDataFrame(
+            {"change_typ": ["added"]},
+            geometry=[box(10, 42, 60, 52)], crs=image_crs,
+        ))
+        self.assertAlmostEqual(shifted_two["centerline_mean_offset_px"], 2.0, delta=0.2)
+
+        shifted_six = evaluate(gpd.GeoDataFrame(
+            {"change_typ": ["added"]},
+            geometry=[box(10, 46, 60, 56)], crs=image_crs,
+        ))
+        self.assertLess(shifted_six["road_centerline_completeness"], 0.5)
+        self.assertGreater(shifted_six["centerline_mean_offset_px"], 5.0)
+
+        truth_in_geographic_crs = truth.to_crs("EPSG:4326")
+        same_crs = evaluate_fast_assisted_centerline_metrics(
+            gpd.GeoDataFrame(
+                {"change_typ": ["added"]},
+                geometry=[box(10, 40, 60, 50)], crs=image_crs,
+            ),
+            truth_in_geographic_crs,
+            truth_type_field="BHBM",
+            image_crs=image_crs,
+            image_transform=image_transform,
+            image_shape=(100, 100),
+        )
+        self.assertAlmostEqual(same_crs["centerline_mean_offset_px"], 0.0)
+
     @staticmethod
     def _dropout_test_grid() -> FastProbabilityGrid:
         transform = from_origin(-16.5, 160.5, 1.0, 1.0)

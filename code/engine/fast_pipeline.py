@@ -2819,7 +2819,9 @@ def augment_fast_changes_with_truth(
         changes,
         truth_evaluation,
         truth_type_field=evaluation_type_field,
-        pixel_size=pixel_size,
+        image_crs=probability_grid.crs,
+        image_transform=probability_grid.transform,
+        image_shape=probability_grid.before.shape,
         validation_area=validation,
     ))
     final_metadata["fast_assisted_centerline_metrics"] = True
@@ -2885,6 +2887,12 @@ def augment_fast_changes_with_truth(
         "evaluation": evaluation,
         "auto_evaluation": auto_evaluation,
         "gt_assisted_pixel_size": pixel_size,
+        "gt_assisted_grid_crs": str(probability_grid.crs),
+        "gt_assisted_grid_transform": list(probability_grid.transform)[:6],
+        "gt_assisted_grid_shape": [
+            int(probability_grid.before.shape[0]),
+            int(probability_grid.before.shape[1]),
+        ],
         "auto_added_count": int(len(automatic["added"])),
         "auto_removed_count": int(len(automatic["removed"])),
         "auto_width_changed_count": int(sum(

@@ -2891,6 +2891,56 @@ def apply_truth_value_mapping(truth, type_field: str, value_map: dict[str, str])
     return mapped, target_field
 
 
+def _fast_assisted_evaluation_grid(
+    manifest: dict,
+    change_entry: dict,
+    summary: dict,
+):
+    """Resolve the real before-period raster grid for pixel-space evaluation."""
+    stored_crs = summary.get("gt_assisted_grid_crs")
+    stored_transform = summary.get("gt_assisted_grid_transform")
+    stored_shape = summary.get("gt_assisted_grid_shape")
+    if (
+        stored_crs
+        and isinstance(stored_transform, list)
+        and len(stored_transform) >= 6
+        and isinstance(stored_shape, list)
+        and len(stored_shape) >= 2
+    ):
+        return stored_crs, stored_transform[:6], (
+            int(stored_shape[0]), int(stored_shape[1]),
+        )
+
+    grid = str(change_entry.get("grid") or "")
+    before_period = str(change_entry.get("before_period") or "")
+    period_entry = next((
+        row for row in (manifest.get("period_results", []) or [])
+        if isinstance(row, dict)
+        and str(row.get("grid") or "") == grid
+        and str(row.get("period") or "") == before_period
+    ), None)
+    if period_entry is None:
+        raise ValueError(
+            f"无法定位 Fast 精度评价影像网格：{grid} / {before_period}"
+        )
+    probability_path = Path(str(
+        period_entry.get("road_probability") or ""
+    )).expanduser().resolve()
+    if not probability_path.is_file():
+        result_path = Path(str(period_entry.get("result") or "")).expanduser()
+        period_summary = read_json(result_path) if result_path.is_file() else {}
+        probability_path = Path(str(
+            period_summary.get("road_probability") or ""
+        )).expanduser().resolve()
+    if not probability_path.is_file():
+        raise FileNotFoundError(
+            f"找不到 Fast 精度评价所需道路概率栅格：{probability_path}"
+        )
+    import rasterio
+    with rasterio.open(probability_path) as dataset:
+        return dataset.crs, dataset.transform, dataset.shape
+
+
 def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     """Evaluate one saved change result without rerunning extraction or detection."""
     started = time.monotonic()
@@ -3035,15 +3085,16 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
         }
+        image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(
+            manifest, entry, summary,
+        )
         rows[0].update(evaluate_fast_assisted_centerline_metrics(
             predicted,
             truth,
             truth_type_field=evaluation_truth_type_field,
-            pixel_size=float(
-                entry.get("gt_assisted_pixel_size")
-                or summary.get("gt_assisted_pixel_size")
-                or 1.0
-            ),
+            image_crs=image_crs,
+            image_transform=image_transform,
+            image_shape=image_shape,
             validation_area=validation,
         ))
         metadata["fast_assisted_centerline_metrics"] = True

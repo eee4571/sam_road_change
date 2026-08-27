@@ -12,12 +12,14 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyogrio
+from affine import Affine
 from rasterio.features import rasterize, shapes
 from rasterio.transform import from_bounds, from_origin
 from scipy.ndimage import distance_transform_edt
 from shapely import STRtree, box, make_valid, union_all
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform as transform_geometry
 from skimage.measure import label
 from skimage.morphology import skeletonize
 from PIL import Image, ImageDraw, ImageFont
@@ -1629,22 +1631,28 @@ def evaluate_fast_assisted_centerline_metrics(
     truth: gpd.GeoDataFrame,
     *,
     truth_type_field: str = "",
-    pixel_size: float,
+    image_crs,
+    image_transform,
+    image_shape: tuple[int, int],
     validation_area: gpd.GeoDataFrame | None = None,
     centerline_match_tolerance_px: float = 4.0,
 ) -> dict:
-    """Measure Final added/removed axis coverage and offset in image pixels."""
-    if pixel_size <= 0:
-        raise ValueError("Fast assisted evaluation pixel size must be greater than zero.")
+    """Measure Final added/removed axes directly on the source image grid."""
+    if image_crs is None:
+        raise ValueError("Fast assisted evaluation image CRS is required.")
+    transform = Affine(*tuple(image_transform)[:6])
+    height, width = (int(image_shape[0]), int(image_shape[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError("Fast assisted evaluation image shape must be positive.")
     predicted = _clean_geometries(predicted)
     truth = _clean_geometries(truth)
     if predicted.crs is None or truth.crs is None:
         raise ValueError("Fast assisted prediction and truth must define a CRS.")
-    if predicted.crs != truth.crs:
-        predicted = predicted.to_crs(truth.crs)
+    predicted = predicted.to_crs(image_crs)
+    truth = truth.to_crs(image_crs)
     if validation_area is not None and not validation_area.empty:
         validation = _polygon_union(
-            _clean_geometries(validation_area).to_crs(truth.crs)
+            _clean_geometries(validation_area).to_crs(image_crs)
         )
         truth = _clip_frame(truth, validation)
         predicted = _clip_frame(predicted, validation)
@@ -1664,81 +1672,126 @@ def evaluate_fast_assisted_centerline_metrics(
     eligible = {"added", "removed"}
     truth = truth.loc[truth["_fast_type"].isin(eligible)].copy()
     predicted = predicted.loc[predicted["_fast_type"].isin(eligible)].copy()
-    tolerance = float(centerline_match_tolerance_px) * float(pixel_size)
-    predicted_index = predicted.sindex if not predicted.empty else None
+
+    inverse = ~transform
+
+    def to_pixel_geometry(geometry):
+        def coordinates(x, y, z=None):
+            columns = inverse.a * np.asarray(x) + inverse.b * np.asarray(y) + inverse.c
+            rows = inverse.d * np.asarray(x) + inverse.e * np.asarray(y) + inverse.f
+            if z is None:
+                return columns, rows
+            return columns, rows, z
+
+        return make_valid(transform_geometry(coordinates, geometry))
+
+    image_extent = box(0.0, 0.0, float(width), float(height))
+    truth.geometry = truth.geometry.map(
+        lambda geometry: make_valid(to_pixel_geometry(geometry).intersection(image_extent))
+    )
+    predicted.geometry = predicted.geometry.map(
+        lambda geometry: make_valid(to_pixel_geometry(geometry).intersection(image_extent))
+    )
+    truth = truth.loc[~truth.geometry.is_empty].copy()
+    predicted = predicted.loc[~predicted.geometry.is_empty].copy()
+
+    tolerance = float(centerline_match_tolerance_px)
+    search_radius = max(32.0, 8.0 * tolerance)
+
+    def raster_axes(primary_geometry, reference_geometries) -> tuple[np.ndarray, np.ndarray]:
+        reference_geometry = (
+            union_all(np.asarray(reference_geometries, dtype=object))
+            if reference_geometries else None
+        )
+        bounds_geometry = (
+            primary_geometry.union(reference_geometry)
+            if reference_geometry is not None and not reference_geometry.is_empty
+            else primary_geometry
+        )
+        min_x, min_y, max_x, max_y = bounds_geometry.bounds
+        padding = int(math.ceil(max(2.0, tolerance + 2.0)))
+        column_start = max(0, int(math.floor(min_x)) - padding)
+        row_start = max(0, int(math.floor(min_y)) - padding)
+        column_stop = min(width, int(math.ceil(max_x)) + padding + 1)
+        row_stop = min(height, int(math.ceil(max_y)) + padding + 1)
+        local_shape = (row_stop - row_start, column_stop - column_start)
+        if local_shape[0] <= 0 or local_shape[1] <= 0:
+            empty = np.zeros((0, 0), dtype=bool)
+            return empty, empty
+        local_transform = Affine.translation(column_start, row_start)
+        primary_mask = rasterize(
+            [(primary_geometry, 1)], out_shape=local_shape,
+            transform=local_transform, fill=0, dtype="uint8", all_touched=True,
+        ).astype(bool)
+        reference_mask = (
+            rasterize(
+                [(reference_geometry, 1)], out_shape=local_shape,
+                transform=local_transform, fill=0, dtype="uint8", all_touched=True,
+            ).astype(bool)
+            if reference_geometry is not None and not reference_geometry.is_empty
+            else np.zeros(local_shape, dtype=bool)
+        )
+        return skeletonize(primary_mask), skeletonize(reference_mask)
+
     truth_length_px = covered_truth_length_px = 0.0
     predicted_length_px = offset_integral_px2 = 0.0
 
-    for truth_geometry in truth.geometry:
-        candidates = predicted.iloc[[]]
-        if predicted_index is not None:
-            positions = np.asarray(
-                predicted_index.query(
-                    truth_geometry.buffer(tolerance), predicate="intersects",
-                ),
-                dtype=int,
-            ).reshape(-1)
-            if positions.size:
-                candidates = predicted.iloc[positions.tolist()]
-        predicted_geometry = (
-            candidates.geometry.union_all().intersection(
-                truth_geometry.buffer(tolerance)
+    for change_type in ("added", "removed"):
+        truth_part = truth.loc[truth["_fast_type"] == change_type].copy()
+        predicted_part = predicted.loc[predicted["_fast_type"] == change_type].copy()
+        predicted_index = predicted_part.sindex if not predicted_part.empty else None
+        truth_index = truth_part.sindex if not truth_part.empty else None
+
+        for truth_geometry in truth_part.geometry:
+            candidate_geometries = []
+            if predicted_index is not None:
+                positions = np.asarray(
+                    predicted_index.query(
+                        truth_geometry.buffer(search_radius), predicate="intersects",
+                    ),
+                    dtype=int,
+                ).reshape(-1)
+                candidate_geometries = predicted_part.iloc[
+                    positions.tolist()
+                ].geometry.tolist()
+            truth_axis, predicted_axis = raster_axes(
+                truth_geometry, candidate_geometries,
             )
-            if not candidates.empty else None
-        )
-        bounds_source = (
-            truth_geometry.union(predicted_geometry)
-            if predicted_geometry is not None and not predicted_geometry.is_empty
-            else truth_geometry
-        )
-        minx, miny, maxx, maxy = bounds_source.bounds
-        resolution = float(pixel_size)
-        padding = 2.0 * resolution
-        width = max(1, int(math.ceil((maxx - minx + 2 * padding) / resolution)))
-        height = max(1, int(math.ceil((maxy - miny + 2 * padding) / resolution)))
-        max_pixels = 8_000_000
-        if width * height > max_pixels:
-            scale = math.sqrt((width * height) / max_pixels)
-            resolution *= scale
-            width = max(1, int(math.ceil((maxx - minx + 2 * padding) / resolution)))
-            height = max(1, int(math.ceil((maxy - miny + 2 * padding) / resolution)))
-        transform = from_origin(
-            minx - padding, maxy + padding, resolution, resolution,
-        )
-        truth_mask = rasterize(
-            [(truth_geometry, 1)], out_shape=(height, width), transform=transform,
-            fill=0, dtype="uint8", all_touched=True,
-        ).astype(bool)
-        truth_axis = skeletonize(truth_mask)
-        truth_count = int(truth_axis.sum())
-        if truth_count == 0:
-            continue
-        truth_length_px += truth_count * resolution / pixel_size
-        if predicted_geometry is None or predicted_geometry.is_empty:
-            continue
-        predicted_mask = rasterize(
-            [(predicted_geometry, 1)], out_shape=(height, width), transform=transform,
-            fill=0, dtype="uint8", all_touched=True,
-        ).astype(bool)
-        predicted_axis = skeletonize(predicted_mask)
-        predicted_count = int(predicted_axis.sum())
-        if predicted_count == 0:
-            continue
-        distance_to_predicted = distance_transform_edt(
-            ~predicted_axis, sampling=(resolution, resolution),
-        )
-        covered_truth_length_px += float(
-            np.count_nonzero(distance_to_predicted[truth_axis] <= tolerance)
-            * resolution / pixel_size
-        )
-        distance_to_truth = distance_transform_edt(
-            ~truth_axis, sampling=(resolution, resolution),
-        )
-        current_predicted_length_px = predicted_count * resolution / pixel_size
-        predicted_length_px += current_predicted_length_px
-        offset_integral_px2 += float(
-            np.mean(distance_to_truth[predicted_axis]) / pixel_size
-        ) * current_predicted_length_px
+            truth_count = int(truth_axis.sum())
+            if truth_count == 0:
+                continue
+            truth_length_px += float(truth_count)
+            if predicted_axis.any():
+                distance_to_predicted = distance_transform_edt(~predicted_axis)
+                covered_truth_length_px += float(np.count_nonzero(
+                    distance_to_predicted[truth_axis] <= tolerance
+                ))
+
+        for predicted_geometry in predicted_part.geometry:
+            candidate_geometries = []
+            if truth_index is not None:
+                positions = np.asarray(
+                    truth_index.query(
+                        predicted_geometry.buffer(search_radius), predicate="intersects",
+                    ),
+                    dtype=int,
+                ).reshape(-1)
+                candidate_geometries = truth_part.iloc[
+                    positions.tolist()
+                ].geometry.tolist()
+            if not candidate_geometries:
+                continue
+            predicted_axis, truth_axis = raster_axes(
+                predicted_geometry, candidate_geometries,
+            )
+            predicted_count = int(predicted_axis.sum())
+            if predicted_count == 0 or not truth_axis.any():
+                continue
+            distance_to_truth = distance_transform_edt(~truth_axis)
+            predicted_length_px += float(predicted_count)
+            offset_integral_px2 += float(
+                distance_to_truth[predicted_axis].sum()
+            )
 
     return {
         "road_centerline_completeness": (
