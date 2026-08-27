@@ -237,6 +237,7 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         cleaned, paths, diagnostics = _cleanup_fast_final_centerline(
             centerline,
             enhanced_molra,
+            1.0,
             support_score=enhanced_molra.astype(np.float32),
         )
 
@@ -251,11 +252,58 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         surface = enhanced_molra.copy()
         surface[60:65, 85:90] = 1
         final_surface, surface_diagnostics = _cleanup_fast_final_surface(
-            surface, cleaned,
+            surface, cleaned, 1.0,
         )
         self.assertEqual(surface_diagnostics["removed_surface_component_count"], 1)
         self.assertEqual(surface_diagnostics["removed_surface_pixel_count"], 25)
         self.assertEqual(int(final_surface[60:65, 85:90].sum()), 0)
+
+    def test_final_cleanup_thresholds_are_resolution_invariant(self) -> None:
+        for pixel_size_m in (0.5, 1.0, 2.0):
+            with self.subTest(pixel_size_m=pixel_size_m):
+                centerline = np.zeros((100, 400), dtype=np.uint8)
+                road_length_px = int(np.ceil(30.0 / pixel_size_m))
+                gap_px = max(2, int(round(6.0 / pixel_size_m)))
+                first_start = 20
+                first_stop = first_start + road_length_px + 1
+                second_start = first_stop + gap_px
+                second_stop = second_start + road_length_px + 1
+                centerline[45, first_start:first_stop] = 1
+                centerline[45, second_start:second_stop] = 1
+                isolated_stop = 20 + int(np.ceil(15.0 / pixel_size_m)) + 1
+                centerline[12, 20:isolated_stop] = 1
+
+                support = np.zeros_like(centerline)
+                support[42:49, first_start:second_stop] = 1
+                cleaned, _paths, diagnostics = _cleanup_fast_final_centerline(
+                    centerline,
+                    support,
+                    pixel_size_m,
+                    support_score=support.astype(np.float32),
+                )
+                self.assertEqual(diagnostics["removed_centerline_component_count"], 1)
+                self.assertEqual(diagnostics["bridged_gap_count"], 1)
+                self.assertAlmostEqual(
+                    diagnostics["isolated_length_threshold_px"],
+                    20.0 / pixel_size_m,
+                )
+                self.assertAlmostEqual(
+                    diagnostics["gap_bridge_distance_px"],
+                    8.0 / pixel_size_m,
+                )
+
+                surface = support.copy()
+                island_pixels = max(1, int(np.ceil(20.0 / pixel_size_m**2)))
+                surface[75, 250:250 + island_pixels] = 1
+                final_surface, surface_diagnostics = _cleanup_fast_final_surface(
+                    surface, cleaned, pixel_size_m,
+                )
+                self.assertEqual(surface_diagnostics["removed_surface_component_count"], 1)
+                self.assertEqual(
+                    surface_diagnostics["surface_min_area_px2"],
+                    int(np.ceil(24.0 / pixel_size_m**2)),
+                )
+                self.assertEqual(int(final_surface[75].sum()), 0)
 
     def test_isolated_short_fragment_is_removed(self) -> None:
         skeleton = np.zeros((60, 80), dtype=np.uint8)
@@ -299,12 +347,14 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         score[50, 10:91] = 2.0
         score[43:50, 50] = 0.6
         paths = _trace_skeleton_paths(skeleton, score)
-        kept, removed = _cleanup_road_paths(paths)
+        kept, removed = _cleanup_road_paths(paths, 1.0)
         self.assertEqual(removed["spur"], 1)
         self.assertEqual(len(kept), 2)
 
         score[43:50, 50] = 1.8
-        kept, removed = _cleanup_road_paths(_trace_skeleton_paths(skeleton, score))
+        kept, removed = _cleanup_road_paths(
+            _trace_skeleton_paths(skeleton, score), 1.0,
+        )
         self.assertEqual(removed["total"], 0)
         self.assertEqual(len(kept), 3)
 
@@ -316,12 +366,12 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         support = np.zeros_like(skeleton)
         support[25, 8:42] = 1
         bridged, bridge_count, bridge_length = _bridge_small_supported_gaps(
-            skeleton, paths, support,
+            skeleton, paths, support, 1.0,
         )
         self.assertEqual(bridge_count, 1)
         self.assertGreater(bridge_length, 0.0)
         bridged_paths = _trace_skeleton_paths(bridged)
-        kept, removed = _cleanup_road_paths(bridged_paths)
+        kept, removed = _cleanup_road_paths(bridged_paths, 1.0)
         self.assertEqual(removed["isolated"], 0)
         self.assertEqual(len(kept), 1)
         self.assertGreater(kept[0].length_px, 30.0)
@@ -331,7 +381,7 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         cv2.circle(skeleton, (25, 25), 3, 1, 1)
         score = np.full_like(skeleton, 0.7, dtype=np.float32)
         paths = _trace_skeleton_paths(skeleton, score)
-        kept, removed = _cleanup_road_paths(paths)
+        kept, removed = _cleanup_road_paths(paths, 1.0)
         self.assertEqual(removed["loop"], 1)
         self.assertEqual(len(kept), 0)
 
@@ -341,7 +391,7 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         skeleton[25, 26:42] = 1
         paths = _trace_skeleton_paths(skeleton)
         _bridged, bridge_count, bridge_length = _bridge_small_supported_gaps(
-            skeleton, paths, np.zeros_like(skeleton),
+            skeleton, paths, np.zeros_like(skeleton), 1.0,
         )
         self.assertEqual(bridge_count, 0)
         self.assertEqual(bridge_length, 0.0)
@@ -503,6 +553,15 @@ class FastWidthTests(unittest.TestCase):
             self.assertGreater(summary["raw_molra_mask_pixel_count"], 0)
             self.assertGreater(summary["enhanced_molra_surface_pixel_count"], 0)
             self.assertGreater(summary["enhanced_molra_centerline_coverage"], 0.0)
+            tile_summary = summary["images"][0]
+            self.assertEqual(tile_summary["physical_pixel_size_m"], 1.0)
+            self.assertEqual(tile_summary["isolated_length_threshold_m"], 20.0)
+            self.assertEqual(tile_summary["isolated_length_threshold_px"], 20.0)
+            self.assertEqual(tile_summary["spur_length_threshold_m"], 8.0)
+            self.assertEqual(tile_summary["gap_bridge_distance_m"], 8.0)
+            self.assertEqual(tile_summary["surface_min_area_m2"], 24.0)
+            self.assertEqual(tile_summary["surface_min_area_px2"], 24)
+            self.assertEqual(tile_summary["junction_exclusion_distance_m"], 12.0)
             centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
             self.assertEqual(len(centerlines), 1)
             self.assertEqual(centerlines.iloc[0]["source"], "native_toponet")
