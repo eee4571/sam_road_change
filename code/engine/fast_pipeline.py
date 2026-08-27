@@ -52,7 +52,6 @@ FAST_GT_ASSISTED_DROPOUT_RETAIN_MIN = 0.88
 FAST_GT_ASSISTED_DROPOUT_RETAIN_MAX = 0.95
 FAST_GT_ASSISTED_DROPOUT_BLOB_MIN_COUNT = 1
 FAST_GT_ASSISTED_DROPOUT_BLOB_MAX_COUNT = 3
-FAST_GT_ASSISTED_AUTO_BUFFER_PX = 0.75
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
 FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
@@ -1219,7 +1218,7 @@ def _fill_fast_gt_new_internal_holes(
     """Fill dropout holes that do not connect to pre-existing GT background."""
     source_background = np.asarray(source) == 0
     background = (np.asarray(perturbed) == 0).astype(np.uint8)
-    count, labels = cv2.connectedComponents(background, connectivity=8)
+    count, labels = cv2.connectedComponents(background, connectivity=4)
     original_counts = np.bincount(labels[source_background], minlength=count)
     border_labels = np.unique(np.concatenate((
         labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1],
@@ -1849,27 +1848,11 @@ def _augment_fast_typed_layer(
     change_type: str,
     before_period: str,
     after_period: str,
-    tolerance: float,
     probability_grid: FastProbabilityGrid,
     seed_context: str,
 ) -> gpd.GeoDataFrame:
-    automatic = automatic.copy()
-    automatic["change_src"] = "AUTO"
-    records = automatic.to_dict(orient="records")
-    automatic_positions = range(len(records))
-    automatic_support = (
-        automatic.geometry.union_all() if not automatic.empty else None
-    )
-    coverage_buffer = min(
-        max(float(tolerance), 0.0),
-        FAST_GT_ASSISTED_AUTO_BUFFER_PX
-        * max(float(probability_grid.pixel_size), 1e-9),
-    )
-    covered_support = (
-        automatic_support.buffer(coverage_buffer)
-        if automatic_support is not None and coverage_buffer > 0
-        else automatic_support
-    )
+    """Build GT-assisted features from complete GT before considering Auto."""
+    records = []
     minimum_residual_area = (
         FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2
         * max(float(probability_grid.pixel_size), 1e-9) ** 2
@@ -1879,46 +1862,33 @@ def _augment_fast_typed_layer(
         truth["change_typ"] == change_type
     ].geometry
     for ordinal, (truth_index, geometry) in enumerate(truth_geometries.items()):
-        support = geometry.buffer(max(float(tolerance), 0.0))
-        matches = [
-            position for position in automatic_positions
-            if records[position][automatic.geometry.name].intersects(support)
-        ]
-        if matches:
-            for position in matches:
-                records[position]["change_src"] = "AUTO_GT"
-                records[position]["source"] = "fast_automatic_gt"
-        uncovered = (
-            make_valid(geometry.difference(covered_support))
-            if covered_support is not None else geometry
+        geometry_digest = hashlib.sha256(geometry.wkb).hexdigest()
+        local_seed = _fast_change_local_seed(
+            FAST_CHANGE_GLOBAL_SEED,
+            f"{seed_context}|{truth_index}|{ordinal}|{geometry_digest}",
+            change_type,
         )
-        for part_index, part in enumerate(_fast_polygon_parts(
-            uncovered, min_area=minimum_residual_area,
-        )):
-            geometry_digest = hashlib.sha256(part.wkb).hexdigest()
-            local_seed = _fast_change_local_seed(
+        rng = np.random.default_rng(local_seed)
+        assisted_geometry = _dropout_fast_gt_geometry(
+            geometry,
+            rng,
+            probability_grid,
+        )
+        if (
+            assisted_geometry is None
+            or assisted_geometry.is_empty
+            or float(assisted_geometry.area) < minimum_residual_area
+        ):
+            continue
+        assisted_candidates.append({
+            "geometry": assisted_geometry,
+            "truth_fid": str(truth_index),
+            "type_rank": _fast_change_local_seed(
                 FAST_CHANGE_GLOBAL_SEED,
-                (
-                    f"{seed_context}|{truth_index}|{ordinal}|"
-                    f"{part_index}|{geometry_digest}"
-                ),
-                change_type,
-            )
-            rng = np.random.default_rng(local_seed)
-            assisted_geometry = _dropout_fast_gt_geometry(
-                part,
-                rng,
-                probability_grid,
-            )
-            assisted_candidates.append({
-                "geometry": assisted_geometry,
-                "truth_fid": str(truth_index),
-                "type_rank": _fast_change_local_seed(
-                    FAST_CHANGE_GLOBAL_SEED,
-                    f"{seed_context}|{truth_index}|{ordinal}|{part_index}",
-                    f"type_error:{change_type}",
-                ),
-            })
+                f"{seed_context}|{truth_index}|{ordinal}",
+                f"type_error:{change_type}",
+            ),
+        })
 
     type_error_count = int(np.floor(
         len(assisted_candidates) * FAST_GT_ASSISTED_TYPE_ERROR_PROB
@@ -1962,6 +1932,36 @@ def _augment_fast_typed_layer(
     return gpd.GeoDataFrame(
         columns, geometry=gpd.GeoSeries([], crs=automatic.crs), crs=automatic.crs,
     )
+
+
+def _subtract_fast_assisted_from_auto(
+    automatic: gpd.GeoDataFrame,
+    assisted_support,
+    *,
+    min_area: float,
+) -> gpd.GeoDataFrame:
+    """Keep Auto attributes while removing only GT-assisted polygon overlap."""
+    records = []
+    geometry_name = automatic.geometry.name
+    for source_record in automatic.to_dict(orient="records"):
+        geometry = source_record.get(geometry_name)
+        if geometry is None or geometry.is_empty:
+            continue
+        difference = (
+            make_valid(geometry.difference(assisted_support))
+            if assisted_support is not None and not assisted_support.is_empty
+            else make_valid(geometry)
+        )
+        for polygon in _fast_polygon_parts(difference, min_area=min_area):
+            record = dict(source_record)
+            record[geometry_name] = polygon
+            record["change_src"] = "AUTO"
+            records.append(record)
+    if records:
+        return gpd.GeoDataFrame(
+            records, geometry=geometry_name, crs=automatic.crs,
+        )
+    return _empty_like(automatic)
 
 
 def _fast_evaluation_payload(
@@ -2061,45 +2061,74 @@ def augment_fast_changes_with_truth(
         auto_metadata,
         evaluation_source="fast_automatic_vs_ground_truth",
     )
-    automatic_width_records = [
-        record
-        for name in ("width_changed", "widened", "narrowed")
-        for record in automatic[name].to_dict(orient="records")
-    ]
-    automatic_width = (
-        gpd.GeoDataFrame(
-            automatic_width_records, geometry="geometry", crs=target_crs,
-        )
-        if automatic_width_records else _empty_like(automatic["width_changed"])
-    )
-    augmented_layers = [
+    assisted_layers = [
         _augment_fast_typed_layer(
             automatic["added"], truth_augmentation,
             change_type="added", before_period=before_period,
-            after_period=after_period, tolerance=position_tolerance,
+            after_period=after_period,
             probability_grid=probability_grid, seed_context=seed_context,
         ),
         _augment_fast_typed_layer(
             automatic["removed"], truth_augmentation,
             change_type="removed", before_period=before_period,
-            after_period=after_period, tolerance=position_tolerance,
+            after_period=after_period,
             probability_grid=probability_grid, seed_context=seed_context,
         ),
         _augment_fast_typed_layer(
-            automatic_width, truth_augmentation,
+            automatic["width_changed"], truth_augmentation,
             change_type="width_changed", before_period=before_period,
-            after_period=after_period, tolerance=position_tolerance,
+            after_period=after_period,
             probability_grid=probability_grid, seed_context=seed_context,
         ),
     ]
-    augmented_records = [
+    assisted_records = [
         record
-        for frame in augmented_layers
+        for frame in assisted_layers
         for record in frame.to_dict(orient="records")
     ]
+    assisted_changes = (
+        gpd.GeoDataFrame(assisted_records, geometry="geometry", crs=target_crs)
+        if assisted_records else _empty_like(assisted_layers[0])
+    )
+    assisted_support = (
+        assisted_changes.geometry.union_all()
+        if not assisted_changes.empty else None
+    )
+    minimum_auto_residual_area = (
+        FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2
+        * max(float(pixel_size), 1e-9) ** 2
+    )
+    clipped_automatic = {
+        name: _subtract_fast_assisted_from_auto(
+            frame,
+            assisted_support,
+            min_area=minimum_auto_residual_area,
+        )
+        for name, frame in automatic.items()
+    }
+    clipped_auto_geometries = [
+        geometry
+        for frame in clipped_automatic.values()
+        for geometry in frame.geometry
+        if geometry is not None and not geometry.is_empty
+    ]
+    clipped_auto_support = (
+        unary_union(clipped_auto_geometries)
+        if clipped_auto_geometries else None
+    )
+    gt_assisted_auto_overlap_area = (
+        float(clipped_auto_support.intersection(assisted_support).area)
+        if clipped_auto_support is not None and assisted_support is not None
+        else 0.0
+    )
+    augmented_records = [
+        record
+        for name in ("added", "removed", "width_changed", "widened", "narrowed")
+        for record in clipped_automatic[name].to_dict(orient="records")
+    ] + assisted_records
     augmented_changes = (
         gpd.GeoDataFrame(augmented_records, geometry="geometry", crs=target_crs)
-        if augmented_records else _empty_like(augmented_layers[0])
+        if augmented_records else _empty_like(assisted_layers[0])
     )
     final_layers = {
         change_type: augmented_changes.loc[
@@ -2157,6 +2186,8 @@ def augment_fast_changes_with_truth(
         "change_output_mode": "fast_auto_plus_gt_assisted",
         "detection_source": "fast_automatic_change_detection",
         "ground_truth_usage": "augment_auto_misses_with_perturbed_geometry",
+        "gt_assisted_merge_mode": "prioritize_gt_assisted_then_clip_auto_overlap",
+        "gt_assisted_auto_overlap_area": gt_assisted_auto_overlap_area,
         "ground_truth_derived": True,
         "automatic_result": False,
         "automatic_output": str(automatic_result.get("output") or ""),
@@ -2167,7 +2198,10 @@ def augment_fast_changes_with_truth(
         "gt_assisted_pixel_size": pixel_size,
         "auto_added_count": int(len(automatic["added"])),
         "auto_removed_count": int(len(automatic["removed"])),
-        "auto_width_changed_count": int(len(automatic_width)),
+        "auto_width_changed_count": int(sum(
+            len(automatic[name])
+            for name in ("width_changed", "widened", "narrowed")
+        )),
         "gt_added_count": int((truth_augmentation["change_typ"] == "added").sum()),
         "gt_removed_count": int((truth_augmentation["change_typ"] == "removed").sum()),
         "gt_width_changed_count": int(

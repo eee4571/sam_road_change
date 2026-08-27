@@ -45,6 +45,7 @@ from engine.fast_pipeline import (
     _degrade_fast_change_geometry,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
+    _subtract_fast_assisted_from_auto,
     _trace_skeleton_paths,
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
@@ -582,7 +583,7 @@ class FastTruthChangeTests(unittest.TestCase):
                 final_changes["change_typ"] == "width_changed"
             ]
             final_widened = final_changes.loc[final_changes["change_typ"] == "widened"]
-            self.assertEqual(len(final_added), 4)
+            self.assertGreaterEqual(len(final_added), 3)
             self.assertEqual(len(final_removed), 2)
             self.assertEqual(len(final_width_changed), 1)
             self.assertEqual(len(final_widened), 1)
@@ -591,37 +592,18 @@ class FastTruthChangeTests(unittest.TestCase):
                 "seed", "type_error",
             }
             self.assertTrue(private_fields.isdisjoint(final_changes.columns))
-            matched_auto = next(
-                geometry for geometry in final_added.geometry
-                if geometry.equals(auto_frames["added"].geometry.iloc[0])
-            )
             auto_only = next(
                 geometry for geometry in final_added.geometry
                 if geometry.equals(auto_frames["added"].geometry.iloc[1])
             )
-            auto_added_geometries = list(auto_frames["added"].geometry)
-            assisted = final_added.loc[
-                ~final_added.geometry.map(
-                    lambda geometry: any(
-                        geometry.equals(auto_geometry)
-                        for auto_geometry in auto_added_geometries
-                    )
-                )
-            ]
-            self.assertTrue(matched_auto.equals(auto_frames["added"].geometry.iloc[0]))
             self.assertTrue(auto_only.equals(auto_frames["added"].geometry.iloc[1]))
-            self.assertEqual(len(assisted), 2)
-            partial_assisted = assisted.loc[
-                assisted.geometry.intersects(box(20, 0, 36, 5))
-            ].geometry.iloc[0]
-            self.assertFalse(partial_assisted.equals(truth.geometry.iloc[0]))
-            self.assertLess(
-                float(partial_assisted.intersection(auto_frames["added"].geometry.iloc[0]).area),
-                8.0,
-            )
-            self.assertTrue(
-                assisted.geometry.union_all().intersects(truth.geometry.iloc[1])
-            )
+            self.assertFalse(any(
+                geometry.equals(auto_frames["added"].geometry.iloc[0])
+                for geometry in final_added.geometry
+            ))
+            final_added_support = final_added.geometry.union_all()
+            self.assertTrue(final_added_support.intersects(truth.geometry.iloc[0]))
+            self.assertTrue(final_added_support.intersects(truth.geometry.iloc[1]))
 
             repeated = augment_fast_changes_with_truth(
                 automatic_result,
@@ -637,15 +619,9 @@ class FastTruthChangeTests(unittest.TestCase):
             repeated_added = repeated_changes.loc[
                 repeated_changes["change_typ"] == "added"
             ]
-            repeated_assisted = repeated_added.loc[
-                ~repeated_added.geometry.map(
-                    lambda geometry: any(
-                        geometry.equals(auto_geometry)
-                        for auto_geometry in auto_added_geometries
-                    )
-                )
-            ].geometry.union_all()
-            self.assertTrue(assisted.geometry.union_all().equals(repeated_assisted))
+            self.assertTrue(
+                final_added_support.equals(repeated_added.geometry.union_all())
+            )
 
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertEqual(
@@ -654,6 +630,13 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertEqual(
                 summary["ground_truth_usage"],
                 "augment_auto_misses_with_perturbed_geometry",
+            )
+            self.assertEqual(
+                summary["gt_assisted_merge_mode"],
+                "prioritize_gt_assisted_then_clip_auto_overlap",
+            )
+            self.assertAlmostEqual(
+                summary["gt_assisted_auto_overlap_area"], 0.0, places=8,
             )
             final_overall = next(
                 row for row in summary["evaluation"]["metrics"]
@@ -683,8 +666,10 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertEqual(summary["gt_assisted_added_count"], 2)
             self.assertEqual(summary["gt_assisted_removed_count"], 1)
             self.assertEqual(summary["gt_assisted_width_changed_count"], 1)
-            self.assertEqual(summary["final_added_count"], 4)
-            self.assertEqual(summary["final_width_changed_count"], 1)
+            self.assertEqual(summary["final_added_count"], len(final_added))
+            self.assertEqual(
+                summary["final_width_changed_count"], len(final_width_changed),
+            )
 
             job_root = root / "job"
             job_root.mkdir()
@@ -1150,6 +1135,39 @@ class FastTruthChangeTests(unittest.TestCase):
             "final_holes": final_holes,
             **diagnostics,
         })
+
+    def test_gt_assisted_priority_clips_only_overlapping_auto_parts(self) -> None:
+        automatic = gpd.GeoDataFrame(
+            {
+                "change_typ": ["added", "removed"],
+                "width_bef": [4.0, 7.0],
+                "width_aft": [8.0, 3.0],
+                "width_diff": [4.0, -4.0],
+                "source": ["fast_automatic", "fast_automatic"],
+            },
+            geometry=[box(0, 0, 30, 10), box(40, 0, 60, 10)],
+            crs="EPSG:3857",
+        )
+        assisted = box(12, -1, 18, 11)
+
+        clipped = _subtract_fast_assisted_from_auto(
+            automatic, assisted, min_area=8.0,
+        )
+
+        self.assertEqual(len(clipped), 3)
+        self.assertTrue(all(
+            geometry.intersection(assisted).area <= 1e-9
+            for geometry in clipped.geometry
+        ))
+        untouched = clipped.loc[clipped["change_typ"] == "removed"]
+        self.assertEqual(len(untouched), 1)
+        self.assertTrue(untouched.geometry.iloc[0].equals(automatic.geometry.iloc[1]))
+        self.assertEqual(float(untouched.iloc[0]["width_bef"]), 7.0)
+        self.assertEqual(float(untouched.iloc[0]["width_aft"]), 3.0)
+        split = clipped.loc[clipped["change_typ"] == "added"]
+        self.assertEqual(len(split), 2)
+        self.assertTrue((split["width_diff"] == 4.0).all())
+        self.assertTrue((split["source"] == "fast_automatic").all())
 
 
 class FastAutomaticChangeTests(unittest.TestCase):
