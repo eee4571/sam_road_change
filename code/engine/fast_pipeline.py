@@ -823,6 +823,78 @@ def _normal_width_evidence(
     return by_edge, sample_counts
 
 
+def _enhance_fast_molra_surface(
+    probability: np.ndarray,
+    topology_centerline: np.ndarray,
+    *,
+    min_area_px2: int = FAST_SURFACE_MIN_COMPONENT_AREA_PX2,
+) -> tuple[np.ndarray, dict]:
+    """Recover weak MLoRA road surfaces using the existing Fast Relative logic."""
+    values = _probability01(probability)
+    centerline = (np.asarray(topology_centerline) > 0).astype(np.uint8)
+    if values.shape != centerline.shape:
+        raise ValueError(
+            f"MLoRA probability/centerline shape mismatch: {values.shape} != {centerline.shape}"
+        )
+    raw_mask = values >= 0.5
+    relative_score = _fast_relative_score(values)
+    relative_mask = _relative_hysteresis_mask(relative_score, min_area_px2)
+
+    # On a broad, weak road the scale-consistent Relative response is often
+    # strongest along both road edges.  Close only those Relative responses so
+    # the enclosed road interior is recovered before the TopoNet anchor check;
+    # no absolute MLoRA probability gate is introduced here.
+    relative_mask = cv2.morphologyEx(
+        relative_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+    )
+
+    candidate = (raw_mask | (relative_mask > 0)).astype(np.uint8)
+    candidate = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    candidate = _fill_small_holes(candidate)
+    candidate = _remove_small_components(candidate, min_area_px2)
+
+    # MLoRA can also respond to roofs and parking lots.  Those components are
+    # irrelevant for width unless they touch the known TopoNet road location.
+    anchor = cv2.dilate(
+        centerline,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+    )
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        candidate, connectivity=8,
+    )
+    anchor_counts = np.bincount(labels[anchor > 0], minlength=count)
+    keep_labels = (
+        (stats[:, cv2.CC_STAT_AREA] >= int(min_area_px2))
+        & (anchor_counts[:count] > 0)
+    )
+    keep_labels[0] = False
+    enhanced = keep_labels[labels].astype(np.uint8)
+
+    centerline_count = int(np.count_nonzero(centerline))
+    diagnostics = {
+        "molra_centerline_pixel_count": centerline_count,
+        "raw_molra_mask_pixel_count": int(np.count_nonzero(raw_mask)),
+        "relative_molra_pixel_count": int(np.count_nonzero(relative_mask)),
+        "enhanced_molra_surface_pixel_count": int(np.count_nonzero(enhanced)),
+        "raw_molra_centerline_coverage": float(
+            np.count_nonzero(centerline & raw_mask) / max(centerline_count, 1)
+        ),
+        "enhanced_molra_centerline_coverage": float(
+            np.count_nonzero(centerline & (enhanced > 0)) / max(centerline_count, 1)
+        ),
+        "enhanced_molra_component_count": int(
+            cv2.connectedComponents(enhanced, connectivity=8)[0] - 1
+        ),
+    }
+    return enhanced, diagnostics
+
+
 def _ordered_edge_chains(edges: np.ndarray, node_count: int) -> list[list[int]]:
     """Return degree-2 edge chains without crossing a junction."""
     node_edges: list[list[int]] = [[] for _ in range(node_count)]
@@ -875,54 +947,41 @@ def _stabilize_fast_width_rows(
     """Replace isolated spikes and unresolved short edges within road chains."""
     stabilized = [dict(row) for row in rows]
     lengths = [float(np.linalg.norm(nodes[int(src)] - nodes[int(dst)])) for src, dst in edges.tolist()]
-    reliable_sources = {"molra", "molra_assisted", "neighbor_fallback"}
+    donor_source = "enhanced_molra"
+    maximum_donor_width_m = 30.0
 
     for chain in _ordered_edge_chains(edges, int(nodes.shape[0])):
         original_widths = [float(stabilized[edge_id].get("width_units", 0.0)) for edge_id in chain]
         original_sources = [str(stabilized[edge_id].get("width_source", "")) for edge_id in chain]
         for index, edge_id in enumerate(chain):
-            neighbor_indexes = [candidate for candidate in range(max(0, index - 2), min(len(chain), index + 3)) if candidate != index]
-            reliable_neighbors = [
-                original_widths[candidate]
-                for candidate in neighbor_indexes
-                if original_widths[candidate] > 0 and original_sources[candidate] in reliable_sources
-            ]
-            if not reliable_neighbors:
+            if index == 0 or index == len(chain) - 1:
                 continue
-            neighbor_median = _robust_median(reliable_neighbors)
+            neighbor_indexes = (index - 1, index + 1)
+            if not all(
+                original_sources[candidate] == donor_source
+                and 0 < original_widths[candidate] <= maximum_donor_width_m
+                for candidate in neighbor_indexes
+            ):
+                continue
+            reliable_neighbors = [original_widths[candidate] for candidate in neighbor_indexes]
+            neighbor_median = float(np.median(reliable_neighbors))
             if neighbor_median <= 0:
                 continue
             width = original_widths[index]
             source = original_sources[index]
-            should_fill = width <= 0
-            if source in {"molra_assisted", "fast_mask_fallback"}:
+            should_fill = width <= 0 and lengths[edge_id] <= short_edge_px
+            if source == donor_source:
+                neighbor_spread = abs(reliable_neighbors[0] - reliable_neighbors[1]) / max(neighbor_median, 1e-6)
                 ratio = width / neighbor_median if width > 0 else 0.0
-                should_fill = (
-                    lengths[edge_id] <= short_edge_px
-                    or ratio < (0.75 if source == "molra_assisted" else 0.65)
-                    or ratio > 1.55
+                should_fill = neighbor_spread <= 0.30 and (
+                    ratio < 0.60 or ratio > 1.65 or width > maximum_donor_width_m
                 )
             if should_fill:
                 stabilized[edge_id]["width_units"] = neighbor_median
                 stabilized[edge_id]["width_source"] = "neighbor_fallback"
 
-        # Only replace an isolated spike when its immediate neighbours agree.
-        for index in range(1, len(chain) - 1):
-            edge_id = chain[index]
-            left = float(stabilized[chain[index - 1]].get("width_units", 0.0))
-            value = float(stabilized[edge_id].get("width_units", 0.0))
-            right = float(stabilized[chain[index + 1]].get("width_units", 0.0))
-            if min(left, value, right) <= 0:
-                continue
-            neighbor_median = float(np.median((left, right)))
-            neighbor_spread = abs(left - right) / max(neighbor_median, 1e-6)
-            ratio = value / max(neighbor_median, 1e-6)
-            if neighbor_spread <= 0.30 and (ratio < 0.60 or ratio > 1.65):
-                stabilized[edge_id]["width_units"] = neighbor_median
-                stabilized[edge_id]["width_source"] = "neighbor_fallback"
-
-    # A very short junction edge may form a one-edge chain.  Fill it only when
-    # widths on all adjoining branches are mutually consistent.
+    # A one-edge gap next to a junction is filled from original enhanced MLoRA
+    # measurements only.  Rows filled above are deliberately never donors.
     node_edges: list[list[int]] = [[] for _ in range(nodes.shape[0])]
     for edge_id, (src, dst) in enumerate(edges.tolist()):
         node_edges[int(src)].append(edge_id)
@@ -933,12 +992,12 @@ def _stabilize_fast_width_rows(
             continue
         neighbor_ids = set(node_edges[int(src)] + node_edges[int(dst)]) - {edge_id}
         neighbor_widths = [
-            float(stabilized[candidate].get("width_units", 0.0))
+            float(rows[candidate].get("width_units", 0.0))
             for candidate in neighbor_ids
-            if str(stabilized[candidate].get("width_source", "")) in reliable_sources
-            and float(stabilized[candidate].get("width_units", 0.0)) > 0
+            if str(rows[candidate].get("width_source", "")) == donor_source
+            and 0 < float(rows[candidate].get("width_units", 0.0)) <= maximum_donor_width_m
         ]
-        if not neighbor_widths:
+        if len(neighbor_widths) < 2:
             continue
         median = float(np.median(neighbor_widths))
         if max(neighbor_widths) / max(min(neighbor_widths), 1e-6) <= 1.35:
@@ -956,7 +1015,7 @@ def measure_fast_edge_widths(
     molra_binary: np.ndarray | None = None,
     sample_function=None,
 ) -> list[dict]:
-    """Measure TopoNet edges from MLoRA surface evidence with Fast fallbacks."""
+    """Measure TopoNet edges from enhanced MLoRA evidence with Fast fallbacks."""
     if sample_function is None:
         if str(WIDTH_ROOT) not in sys.path:
             sys.path.insert(0, str(WIDTH_ROOT))
@@ -967,16 +1026,10 @@ def measure_fast_edge_widths(
         raise ValueError(f"MLoRA/Fast mask shape mismatch: {molra.shape} != {fast_binary.shape}")
 
     molra_widths: dict[int, list[float]] = {}
-    assisted_widths: dict[int, list[float]] = {}
     if molra is not None and np.any(molra):
         molra_widths, _counts = _normal_width_evidence(
             nodes, edges, molra, pixel_size, sample_function=sample_function,
             max_asymmetry_ratio=0.65,
-        )
-        assisted = np.maximum(molra, fast_binary)
-        assisted_widths, _counts = _normal_width_evidence(
-            nodes, edges, assisted, pixel_size, sample_function=sample_function,
-            max_asymmetry_ratio=0.90,
         )
     fast_widths, _counts = _normal_width_evidence(
         nodes, edges, fast_binary, pixel_size, sample_function=sample_function,
@@ -986,10 +1039,7 @@ def measure_fast_edge_widths(
     rows = []
     for edge_id, (src, dst) in enumerate(edges.tolist()):
         width = _robust_median(molra_widths.get(edge_id, []))
-        source = "molra" if width > 0 else ""
-        if width <= 0:
-            width = _robust_median(assisted_widths.get(edge_id, []))
-            source = "molra_assisted" if width > 0 else ""
+        source = "enhanced_molra" if width > 0 else ""
         if width <= 0:
             width = _robust_median(fast_widths.get(edge_id, []))
             if width <= 0:
@@ -1000,7 +1050,7 @@ def measure_fast_edge_widths(
             "width_units": float(width),
             "width_px": float(width / max(pixel_size, 1e-9)) if width > 0 else 0.0,
             "width_source": source,
-            "molra_valid_sample_count": len(molra_widths.get(edge_id, [])),
+            "enhanced_molra_valid_sample_count": len(molra_widths.get(edge_id, [])),
         })
     sample_step_px = max(3.0, 15.0 / max(pixel_size, 1e-6))
     stabilized = _stabilize_fast_width_rows(
@@ -1071,7 +1121,7 @@ def measure_fast_path_widths(
     for path_id, path in enumerate(paths):
         path_rows = by_path.get(path_id, [])
         width = _robust_median([float(row["width_units"]) for row in path_rows])
-        source_priority = ("molra", "molra_assisted", "neighbor_fallback", "fast_mask_fallback")
+        source_priority = ("enhanced_molra", "neighbor_fallback", "fast_mask_fallback")
         source = next(
             (candidate for candidate in source_priority if any(row["width_source"] == candidate for row in path_rows)),
             "",
@@ -1080,13 +1130,21 @@ def measure_fast_path_widths(
     return rows
 
 
-def _cached_fast_molra_surface(cache_path: Path, expected_shape: tuple[int, int]) -> np.ndarray | None:
+def _cached_fast_molra_probability(cache_path: Path, expected_shape: tuple[int, int]) -> np.ndarray | None:
     if not cache_path.is_file():
         return None
-    cached = cv2.imread(str(cache_path), cv2.IMREAD_GRAYSCALE)
-    if cached is None or cached.shape != expected_shape:
+    try:
+        cached = np.asarray(np.load(cache_path, allow_pickle=False), dtype=np.float32)
+    except (OSError, ValueError):
         return None
-    return (cached > 0).astype(np.uint8)
+    if cached.shape != expected_shape:
+        return None
+    return _probability01(cached)
+
+
+def _write_fast_molra_probability(cache_path: Path, probability: np.ndarray) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, _probability01(probability).astype(np.float16), allow_pickle=False)
 
 
 def _write_fast_molra_surface(cache_path: Path, mask: np.ndarray) -> None:
@@ -1122,6 +1180,7 @@ def measure_fast_widths(
     molra_predictor = None
     molra_disabled_reason = ""
     molra_cache_dir = output_dir / "molra_surface_cache"
+    molra_probability_cache_dir = output_dir / "molra_probability_cache"
     for image_path in _raster_paths(image_dir):
         tile_started = time.perf_counter()
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
@@ -1153,14 +1212,26 @@ def measure_fast_widths(
                 transform, dataset.crs, binary.shape, requested_pixel_size,
             )
             molra_started = time.perf_counter()
-            molra_cache_path = molra_cache_dir / f"{image_path.stem}_mask.png"
-            molra_binary = _cached_fast_molra_surface(molra_cache_path, binary.shape)
-            molra_cache_hit = molra_binary is not None
+            molra_probability_path = molra_probability_cache_dir / f"{image_path.stem}_probability.npy"
+            molra_surface_path = molra_cache_dir / f"{image_path.stem}_enhanced_mask.png"
+            molra_probability = _cached_fast_molra_probability(
+                molra_probability_path, binary.shape,
+            )
+            molra_cache_hit = molra_probability is not None
             molra_error = ""
-            if len(edges) and molra_binary is None:
+            molra_diagnostics = {
+                "molra_centerline_pixel_count": 0,
+                "raw_molra_mask_pixel_count": 0,
+                "relative_molra_pixel_count": 0,
+                "enhanced_molra_surface_pixel_count": 0,
+                "raw_molra_centerline_coverage": 0.0,
+                "enhanced_molra_centerline_coverage": 0.0,
+                "enhanced_molra_component_count": 0,
+            }
+            if len(edges) and molra_probability is None:
                 try:
                     if molra_surface_provider is not None:
-                        molra_binary = (np.asarray(molra_surface_provider(image_path)) > 0).astype(np.uint8)
+                        molra_probability = _probability01(molra_surface_provider(image_path))
                     elif not molra_disabled_reason:
                         if sam_pretrained_path is None or molra_weight_path is None:
                             raise FileNotFoundError("Fast MLoRA model paths were not configured")
@@ -1171,14 +1242,16 @@ def measure_fast_widths(
                                 device=device, tile=molra_tile, overlap=molra_overlap,
                                 threshold=molra_threshold,
                             )
-                        molra_binary = molra_predictor.predict_mask(image_path)
-                    if molra_binary is not None and molra_binary.shape != binary.shape:
+                        molra_probability = molra_predictor.predict_probability(image_path)
+                    if molra_probability is not None and molra_probability.shape != binary.shape:
                         raise ValueError(
                             f"MLoRA/image shape mismatch for {image_path.stem}: "
-                            f"{molra_binary.shape} != {binary.shape}"
+                            f"{molra_probability.shape} != {binary.shape}"
                         )
-                    if molra_binary is not None:
-                        _write_fast_molra_surface(molra_cache_path, molra_binary)
+                    if molra_probability is not None:
+                        _write_fast_molra_probability(
+                            molra_probability_path, molra_probability,
+                        )
                 except Exception as exc:  # model absence must retain the documented Fast fallback
                     molra_error = f"{type(exc).__name__}: {exc}"
                     if molra_surface_provider is None and molra_predictor is None:
@@ -1188,7 +1261,16 @@ def measure_fast_widths(
                         f"using Fast mask fallback. {molra_error}",
                         RuntimeWarning,
                     )
-                    molra_binary = None
+                    molra_probability = None
+            topology_centerline, _topology_edge_count = _rasterize_fast_topology(
+                binary.shape, nodes, edges,
+            )
+            molra_binary = None
+            if molra_probability is not None:
+                molra_binary, molra_diagnostics = _enhance_fast_molra_surface(
+                    molra_probability, topology_centerline,
+                )
+                _write_fast_molra_surface(molra_surface_path, molra_binary)
             molra_seconds = time.perf_counter() - molra_started
             width_rows = measure_fast_edge_widths(
                 nodes, edges, binary, pixel_size,
@@ -1244,15 +1326,18 @@ def measure_fast_widths(
             "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
             "pixel_size": pixel_size,
-            "molra_surface_mask": str(molra_cache_path) if molra_binary is not None else "",
+            "molra_probability": str(molra_probability_path) if molra_probability is not None else "",
+            "molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
+            "enhanced_molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
             "molra_surface_available": bool(molra_binary is not None),
             "molra_surface_cache_hit": bool(molra_cache_hit),
             "molra_surface_seconds": float(molra_seconds),
             "molra_surface_error": molra_error or molra_disabled_reason,
             "width_source_counts": {
                 source: sum(str(row.get("width_source", "")) == source for row in width_rows)
-                for source in ("molra", "molra_assisted", "fast_mask_fallback", "neighbor_fallback")
+                for source in ("enhanced_molra", "fast_mask_fallback", "neighbor_fallback")
             },
+            **molra_diagnostics,
             "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
             "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
             "final_mask_pixel_count": int(surface_diagnostics.get("final_mask_pixel_count", np.count_nonzero(binary))),
@@ -1272,11 +1357,30 @@ def measure_fast_widths(
             "skeleton_path_processing_seconds": float(surface_diagnostics.get("skeleton_path_processing_seconds", 0.0)),
             "fast_width_elapsed_seconds": float(time.perf_counter() - tile_started),
         }
+        enhanced_count = int(tile_summary["width_source_counts"]["enhanced_molra"])
+        tile_summary["enhanced_molra_width_count"] = enhanced_count
+        tile_summary["enhanced_molra_width_ratio"] = float(
+            enhanced_count / max(int(len(edges)), 1)
+        )
+        tile_summary["fast_mask_fallback_count"] = int(
+            tile_summary["width_source_counts"]["fast_mask_fallback"]
+        )
+        tile_summary["neighbor_fallback_count"] = int(
+            tile_summary["width_source_counts"]["neighbor_fallback"]
+        )
+        tile_summary["abnormal_width_over_30m_count"] = int(sum(
+            float(row.get("width_units", 0.0)) > 30.0 for row in width_rows
+        ))
         print(
             f"[Fast Centerline] {image_path.stem}: "
             f"paths={tile_summary['final_centerline_path_count']}, "
             f"length={tile_summary['final_centerline_length']:.3f}, "
             f"width_sources={tile_summary['width_source_counts']}, "
+            f"molra_pixels={tile_summary['raw_molra_mask_pixel_count']}->"
+            f"{tile_summary['enhanced_molra_surface_pixel_count']}, "
+            f"centerline_coverage={tile_summary['raw_molra_centerline_coverage']:.3f}->"
+            f"{tile_summary['enhanced_molra_centerline_coverage']:.3f}, "
+            f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
             f"molra={molra_seconds:.3f}s, "
             f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
         )
@@ -1293,10 +1397,46 @@ def measure_fast_widths(
         )
         frame.to_file(working, layer=layer, driver="GPKG", mode="w" if index == 0 else "a")
     summary = {
-        "execution_profile": "fast", "width_source": "molra_surface_normal",
+        "execution_profile": "fast", "width_source": "enhanced_molra_surface_normal",
         "working_gpkg": str(working), "images": image_rows,
         "fast_width_elapsed_seconds": float(time.perf_counter() - batch_started),
+        "raw_molra_mask_pixel_count": int(sum(
+            row.get("raw_molra_mask_pixel_count", 0) for row in image_rows
+        )),
+        "enhanced_molra_surface_pixel_count": int(sum(
+            row.get("enhanced_molra_surface_pixel_count", 0) for row in image_rows
+        )),
+        "enhanced_molra_width_count": int(sum(
+            row.get("enhanced_molra_width_count", 0) for row in image_rows
+        )),
+        "fast_mask_fallback_count": int(sum(
+            row.get("fast_mask_fallback_count", 0) for row in image_rows
+        )),
+        "neighbor_fallback_count": int(sum(
+            row.get("neighbor_fallback_count", 0) for row in image_rows
+        )),
+        "abnormal_width_over_30m_count": int(sum(
+            row.get("abnormal_width_over_30m_count", 0) for row in image_rows
+        )),
     }
+    total_edges = int(sum(row.get("edge_count", 0) for row in image_rows))
+    summary["enhanced_molra_width_ratio"] = float(
+        summary["enhanced_molra_width_count"] / max(total_edges, 1)
+    )
+    total_centerline_pixels = float(sum(
+        row.get("molra_centerline_pixel_count", 0) for row in image_rows
+    ))
+    if total_centerline_pixels > 0:
+        summary["raw_molra_centerline_coverage"] = float(sum(
+            row.get("raw_molra_centerline_coverage", 0.0)
+            * row.get("molra_centerline_pixel_count", 0)
+            for row in image_rows
+        ) / total_centerline_pixels)
+        summary["enhanced_molra_centerline_coverage"] = float(sum(
+            row.get("enhanced_molra_centerline_coverage", 0.0)
+            * row.get("molra_centerline_pixel_count", 0)
+            for row in image_rows
+        ) / total_centerline_pixels)
     (output_dir / "batch_width_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 

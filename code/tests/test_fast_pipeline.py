@@ -43,6 +43,7 @@ from engine.fast_pipeline import (
     _cleanup_road_paths,
     _consistent_relative_score,
     _degrade_fast_change_geometry,
+    _enhance_fast_molra_surface,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
     _subtract_fast_assisted_from_auto,
@@ -344,8 +345,23 @@ class FastWidthTests(unittest.TestCase):
             nodes, self.edges, fast_mask, 1.0, molra_binary=molra_mask,
         )
 
-        self.assertEqual(rows[0]["width_source"], "molra")
+        self.assertEqual(rows[0]["width_source"], "enhanced_molra")
         self.assertAlmostEqual(rows[0]["width_units"], 12.0, delta=1.0)
+
+    def test_relative_molra_recovers_low_absolute_probability_surface(self) -> None:
+        probability = np.full((96, 96), 0.004, dtype=np.float32)
+        probability[:, 42:54] = 0.040
+        centerline = np.zeros((96, 96), dtype=np.uint8)
+        centerline[8:88, 48] = 1
+
+        enhanced, diagnostics = _enhance_fast_molra_surface(
+            probability, centerline,
+        )
+
+        self.assertEqual(diagnostics["raw_molra_mask_pixel_count"], 0)
+        self.assertGreater(diagnostics["enhanced_molra_surface_pixel_count"], 0)
+        self.assertGreater(diagnostics["enhanced_molra_centerline_coverage"], 0.9)
+        self.assertGreater(int(enhanced[:, 42:54].sum()), 0)
 
     def test_local_molra_gap_uses_neighbor_width_instead_of_shrinking(self) -> None:
         nodes = np.asarray(
@@ -355,6 +371,7 @@ class FastWidthTests(unittest.TestCase):
         edges = np.asarray([[0, 1], [1, 2], [2, 3]], dtype=np.int32)
         fast_mask = np.zeros((80, 80), dtype=np.uint8)
         fast_mask[:, 34:37] = 1
+        fast_mask[33:48, :] = 0
         molra_mask = np.zeros((80, 80), dtype=np.uint8)
         molra_mask[:33, 30:41] = 1
         molra_mask[48:, 30:41] = 1
@@ -365,6 +382,25 @@ class FastWidthTests(unittest.TestCase):
 
         self.assertEqual(rows[1]["width_source"], "neighbor_fallback")
         self.assertAlmostEqual(rows[1]["width_units"], 11.0, delta=2.0)
+
+    def test_neighbor_fallback_does_not_propagate_across_two_missing_edges(self) -> None:
+        nodes = np.asarray(
+            [[5.0, 40.0], [20.0, 40.0], [35.0, 40.0], [50.0, 40.0], [65.0, 40.0]],
+            dtype=np.float32,
+        )
+        edges = np.asarray([[0, 1], [1, 2], [2, 3], [3, 4]], dtype=np.int32)
+        fast_mask = np.zeros((80, 80), dtype=np.uint8)
+        molra_mask = np.zeros_like(fast_mask)
+        fast_mask[3:21, 35:46] = 1
+        fast_mask[50:68, 35:46] = 1
+        molra_mask[:] = fast_mask
+
+        rows = measure_fast_edge_widths(
+            nodes, edges, fast_mask, 1.0, molra_binary=molra_mask,
+        )
+
+        self.assertNotEqual(rows[1]["width_source"], "neighbor_fallback")
+        self.assertNotEqual(rows[2]["width_source"], "neighbor_fallback")
 
     def test_junction_samples_do_not_inflate_road_width(self) -> None:
         nodes = np.asarray(
@@ -426,7 +462,10 @@ class FastWidthTests(unittest.TestCase):
             self.assertEqual(Path(exported["previews"]["width"]), products / "road_width_overview.png")
             self.assertGreater(summary["images"][0]["final_centerline_length"], 0)
             self.assertGreater(summary["images"][0]["measured_edge_count"], 0)
-            self.assertEqual(summary["images"][0]["width_source_counts"]["molra"], 1)
+            self.assertEqual(summary["images"][0]["width_source_counts"]["enhanced_molra"], 1)
+            self.assertGreater(summary["raw_molra_mask_pixel_count"], 0)
+            self.assertGreater(summary["enhanced_molra_surface_pixel_count"], 0)
+            self.assertGreater(summary["enhanced_molra_centerline_coverage"], 0.0)
             centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
             self.assertEqual(len(centerlines), 1)
             self.assertEqual(centerlines.iloc[0]["source"], "native_toponet")
