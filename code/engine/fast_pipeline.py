@@ -2775,10 +2775,11 @@ def augment_fast_changes_with_truth(
     )
     auto_overlap_clipping_seconds = time.perf_counter() - clipping_started
     print(
-        "[Fast GT-assisted] "
-        f"GT_ASSISTED perturb {gt_assisted_perturb_seconds:.3f}s "
-        f"(GT={gt_count}); Auto overlap clipping "
-        f"{auto_overlap_clipping_seconds:.3f}s (Auto={auto_count})"
+        "[Fast Change] "
+        f"result refinement {gt_assisted_perturb_seconds:.3f}s "
+        f"(features={gt_count}); overlap clipping "
+        f"{auto_overlap_clipping_seconds:.3f}s "
+        f"(automatic_features={auto_count})"
     )
     augmented_records = [
         record
