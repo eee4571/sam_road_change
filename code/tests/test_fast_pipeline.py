@@ -50,6 +50,8 @@ from engine.fast_pipeline import (
     _jitter_fast_change_geometry,
     _partition_fast_presence_components,
     _fast_change_preview_title,
+    _fast_gt_low_frequency_dropout,
+    _fast_gt_mask_geometry,
     _perturb_fast_gt_geometry_stages,
 )
 from engine.samroad.image_resume import required_image_outputs
@@ -638,6 +640,10 @@ class FastTruthChangeTests(unittest.TestCase):
             self.assertAlmostEqual(
                 summary["gt_assisted_auto_overlap_area"], 0.0, places=8,
             )
+            self.assertGreaterEqual(summary["gt_assisted_perturb_seconds"], 0.0)
+            self.assertGreaterEqual(summary["auto_overlap_clipping_seconds"], 0.0)
+            self.assertEqual(summary["gt_assisted_truth_count"], 4)
+            self.assertEqual(summary["gt_assisted_auto_count"], 4)
             final_overall = next(
                 row for row in summary["evaluation"]["metrics"]
                 if row["class"] == "all"
@@ -1051,6 +1057,9 @@ class FastTruthChangeTests(unittest.TestCase):
         self.assertGreater(diagnostics["dropout_pixel_count"], 0)
         self.assertGreaterEqual(diagnostics["dropout_blob_count"], 1)
         self.assertLessEqual(diagnostics["dropout_blob_count"], 3)
+        self.assertLess(
+            diagnostics["raster_window_pixel_count"], grid.before.size,
+        )
         self.assertEqual(
             sum(len(part.interiors) for part in (
                 [final] if final.geom_type == "Polygon" else list(final.geoms)
@@ -1073,6 +1082,39 @@ class FastTruthChangeTests(unittest.TestCase):
             "area_ratio": round(area_ratio, 4),
             **diagnostics,
         })
+
+    def test_gt_assisted_local_window_matches_previous_full_grid_result(self) -> None:
+        source = box(0.35, 40.45, 120.65, 60.55)
+        grid = self._dropout_test_grid()
+        full_source_mask = rasterize(
+            [(source, 1)], out_shape=grid.before.shape,
+            transform=grid.transform, fill=0, dtype=np.uint8,
+        )
+        full_dropout_mask, full_diagnostics = _fast_gt_low_frequency_dropout(
+            full_source_mask, np.random.default_rng(20260826),
+        )
+        expected_rasterized = _fast_gt_mask_geometry(
+            full_source_mask, grid.transform,
+        )
+        expected_final = _fast_gt_mask_geometry(
+            full_dropout_mask, grid.transform,
+        )
+
+        rasterized, _dropout, final, diagnostics = (
+            _perturb_fast_gt_geometry_stages(
+                source, np.random.default_rng(20260826), grid,
+            )
+        )
+
+        self.assertTrue(rasterized.equals(expected_rasterized))
+        self.assertTrue(final.equals(expected_final))
+        self.assertEqual(
+            diagnostics["dropout_pixel_count"],
+            full_diagnostics["dropout_pixel_count"],
+        )
+        self.assertLess(
+            diagnostics["raster_window_pixel_count"], grid.before.size,
+        )
 
     def test_gt_assisted_dropout_keeps_complex_grid_natural(self) -> None:
         roads = [
@@ -1148,7 +1190,12 @@ class FastTruthChangeTests(unittest.TestCase):
             geometry=[box(0, 0, 30, 10), box(40, 0, 60, 10)],
             crs="EPSG:3857",
         )
-        assisted = box(12, -1, 18, 11)
+        assisted_geometry = box(12, -1, 18, 11)
+        assisted = gpd.GeoDataFrame(
+            {"change_src": ["GT_ASSISTED", "GT_ASSISTED"]},
+            geometry=[assisted_geometry, box(1000, 1000, 1010, 1010)],
+            crs=automatic.crs,
+        )
 
         clipped = _subtract_fast_assisted_from_auto(
             automatic, assisted, min_area=8.0,
@@ -1156,7 +1203,7 @@ class FastTruthChangeTests(unittest.TestCase):
 
         self.assertEqual(len(clipped), 3)
         self.assertTrue(all(
-            geometry.intersection(assisted).area <= 1e-9
+            geometry.intersection(assisted_geometry).area <= 1e-9
             for geometry in clipped.geometry
         ))
         untouched = clipped.loc[clipped["change_typ"] == "removed"]

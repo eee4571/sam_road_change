@@ -54,6 +54,7 @@ FAST_GT_ASSISTED_DROPOUT_BLOB_MIN_COUNT = 1
 FAST_GT_ASSISTED_DROPOUT_BLOB_MAX_COUNT = 3
 FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2 = 8.0
 FAST_GT_ASSISTED_TYPE_ERROR_PROB = 0.08
+FAST_GT_ASSISTED_WINDOW_PADDING_PX = 2
 FAST_CHANGE_CENTERLINE_RETAIN_MIN = 0.76
 FAST_CHANGE_CENTERLINE_RETAIN_MAX = 0.86
 FAST_CHANGE_CENTERLINE_SHIFT_MIN_PX = 2.0
@@ -1371,6 +1372,47 @@ def _fast_gt_mask_geometry(mask: np.ndarray, transform):
     return make_valid(unary_union(polygons)) if polygons else None
 
 
+def _fast_gt_geometry_window(
+    geometry,
+    grid: FastProbabilityGrid,
+    *,
+    padding_px: int = FAST_GT_ASSISTED_WINDOW_PADDING_PX,
+):
+    """Return an integer pixel window aligned exactly to the Fast raster grid."""
+    inverse = ~grid.transform
+    min_x, min_y, max_x, max_y = geometry.bounds
+    pixel_corners = [
+        inverse * (x, y)
+        for x, y in (
+            (min_x, min_y), (min_x, max_y),
+            (max_x, min_y), (max_x, max_y),
+        )
+    ]
+    padding = max(0, int(padding_px))
+    column_start = max(
+        0, int(np.floor(min(column for column, _row in pixel_corners))) - padding,
+    )
+    row_start = max(
+        0, int(np.floor(min(row for _column, row in pixel_corners))) - padding,
+    )
+    column_stop = min(
+        int(grid.before.shape[1]),
+        int(np.ceil(max(column for column, _row in pixel_corners))) + padding,
+    )
+    row_stop = min(
+        int(grid.before.shape[0]),
+        int(np.ceil(max(row for _column, row in pixel_corners))) + padding,
+    )
+    if column_stop <= column_start or row_stop <= row_start:
+        return None
+    return rasterio.windows.Window(
+        column_start,
+        row_start,
+        column_stop - column_start,
+        row_stop - row_start,
+    )
+
+
 def _perturb_fast_gt_geometry_stages(
     geometry,
     rng: np.random.Generator,
@@ -1380,18 +1422,28 @@ def _perturb_fast_gt_geometry_stages(
     geometry = make_valid(geometry)
     if geometry.is_empty or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
         return geometry, geometry, geometry, {}
+    window = _fast_gt_geometry_window(geometry, grid)
+    if window is None:
+        return geometry, geometry, geometry, {}
+    local_shape = (int(window.height), int(window.width))
+    local_transform = rasterio.windows.transform(window, grid.transform)
     source_mask = rasterize(
         [(geometry, 1)],
-        out_shape=grid.before.shape,
-        transform=grid.transform,
+        out_shape=local_shape,
+        transform=local_transform,
         fill=0,
         dtype=np.uint8,
     )
     if not source_mask.any():
         return geometry, geometry, geometry, {}
     dropout_mask, diagnostics = _fast_gt_low_frequency_dropout(source_mask, rng)
-    rasterized = _fast_gt_mask_geometry(source_mask, grid.transform)
-    dropout = _fast_gt_mask_geometry(dropout_mask, grid.transform)
+    diagnostics.update({
+        "raster_window_height": int(window.height),
+        "raster_window_width": int(window.width),
+        "raster_window_pixel_count": int(window.height * window.width),
+    })
+    rasterized = _fast_gt_mask_geometry(source_mask, local_transform)
+    dropout = _fast_gt_mask_geometry(dropout_mask, local_transform)
     rasterized = rasterized if rasterized is not None else geometry
     dropout = dropout if dropout is not None else rasterized
     # No signed-distance or vector smoothing: final geometry preserves pixel steps.
@@ -1936,22 +1988,34 @@ def _augment_fast_typed_layer(
 
 def _subtract_fast_assisted_from_auto(
     automatic: gpd.GeoDataFrame,
-    assisted_support,
+    assisted: gpd.GeoDataFrame,
     *,
     min_area: float,
 ) -> gpd.GeoDataFrame:
-    """Keep Auto attributes while removing only GT-assisted polygon overlap."""
+    """Clip Auto only against spatially intersecting GT-assisted polygons."""
     records = []
     geometry_name = automatic.geometry.name
+    assisted_index = assisted.sindex if not assisted.empty else None
     for source_record in automatic.to_dict(orient="records"):
         geometry = source_record.get(geometry_name)
         if geometry is None or geometry.is_empty:
             continue
-        difference = (
-            make_valid(geometry.difference(assisted_support))
-            if assisted_support is not None and not assisted_support.is_empty
-            else make_valid(geometry)
+        intersecting_positions = (
+            np.asarray(
+                assisted_index.query(geometry, predicate="intersects"),
+                dtype=np.int64,
+            )
+            if assisted_index is not None else np.empty(0, dtype=np.int64)
         )
+        if intersecting_positions.size:
+            intersecting = assisted.geometry.iloc[intersecting_positions]
+            local_support = (
+                intersecting.iloc[0]
+                if len(intersecting) == 1 else intersecting.union_all()
+            )
+            difference = make_valid(geometry.difference(local_support))
+        else:
+            difference = make_valid(geometry)
         for polygon in _fast_polygon_parts(difference, min_area=min_area):
             record = dict(source_record)
             record[geometry_name] = polygon
@@ -1962,6 +2026,34 @@ def _subtract_fast_assisted_from_auto(
             records, geometry=geometry_name, crs=automatic.crs,
         )
     return _empty_like(automatic)
+
+
+def _fast_assisted_auto_overlap_area(
+    automatic_layers: dict[str, gpd.GeoDataFrame],
+    assisted: gpd.GeoDataFrame,
+) -> float:
+    """Measure residual overlap without constructing whole-network unions."""
+    if assisted.empty:
+        return 0.0
+    assisted_index = assisted.sindex
+    overlap_area = 0.0
+    for frame in automatic_layers.values():
+        for geometry in frame.geometry:
+            if geometry is None or geometry.is_empty:
+                continue
+            positions = np.asarray(
+                assisted_index.query(geometry, predicate="intersects"),
+                dtype=np.int64,
+            )
+            if not positions.size:
+                continue
+            intersecting = assisted.geometry.iloc[positions]
+            local_support = (
+                intersecting.iloc[0]
+                if len(intersecting) == 1 else intersecting.union_all()
+            )
+            overlap_area += float(geometry.intersection(local_support).area)
+    return float(overlap_area)
 
 
 def _fast_evaluation_payload(
@@ -2061,6 +2153,9 @@ def augment_fast_changes_with_truth(
         auto_metadata,
         evaluation_source="fast_automatic_vs_ground_truth",
     )
+    gt_count = int(len(truth_augmentation))
+    auto_count = int(sum(len(frame) for frame in automatic.values()))
+    perturb_started = time.perf_counter()
     assisted_layers = [
         _augment_fast_typed_layer(
             automatic["added"], truth_augmentation,
@@ -2081,6 +2176,7 @@ def augment_fast_changes_with_truth(
             probability_grid=probability_grid, seed_context=seed_context,
         ),
     ]
+    gt_assisted_perturb_seconds = time.perf_counter() - perturb_started
     assisted_records = [
         record
         for frame in assisted_layers
@@ -2090,36 +2186,28 @@ def augment_fast_changes_with_truth(
         gpd.GeoDataFrame(assisted_records, geometry="geometry", crs=target_crs)
         if assisted_records else _empty_like(assisted_layers[0])
     )
-    assisted_support = (
-        assisted_changes.geometry.union_all()
-        if not assisted_changes.empty else None
-    )
     minimum_auto_residual_area = (
         FAST_GT_ASSISTED_MIN_RESIDUAL_AREA_PX2
         * max(float(pixel_size), 1e-9) ** 2
     )
+    clipping_started = time.perf_counter()
     clipped_automatic = {
         name: _subtract_fast_assisted_from_auto(
             frame,
-            assisted_support,
+            assisted_changes,
             min_area=minimum_auto_residual_area,
         )
         for name, frame in automatic.items()
     }
-    clipped_auto_geometries = [
-        geometry
-        for frame in clipped_automatic.values()
-        for geometry in frame.geometry
-        if geometry is not None and not geometry.is_empty
-    ]
-    clipped_auto_support = (
-        unary_union(clipped_auto_geometries)
-        if clipped_auto_geometries else None
+    gt_assisted_auto_overlap_area = _fast_assisted_auto_overlap_area(
+        clipped_automatic, assisted_changes,
     )
-    gt_assisted_auto_overlap_area = (
-        float(clipped_auto_support.intersection(assisted_support).area)
-        if clipped_auto_support is not None and assisted_support is not None
-        else 0.0
+    auto_overlap_clipping_seconds = time.perf_counter() - clipping_started
+    print(
+        "[Fast GT-assisted] "
+        f"GT_ASSISTED perturb {gt_assisted_perturb_seconds:.3f}s "
+        f"(GT={gt_count}); Auto overlap clipping "
+        f"{auto_overlap_clipping_seconds:.3f}s (Auto={auto_count})"
     )
     augmented_records = [
         record
@@ -2188,6 +2276,10 @@ def augment_fast_changes_with_truth(
         "ground_truth_usage": "augment_auto_misses_with_perturbed_geometry",
         "gt_assisted_merge_mode": "prioritize_gt_assisted_then_clip_auto_overlap",
         "gt_assisted_auto_overlap_area": gt_assisted_auto_overlap_area,
+        "gt_assisted_perturb_seconds": float(gt_assisted_perturb_seconds),
+        "auto_overlap_clipping_seconds": float(auto_overlap_clipping_seconds),
+        "gt_assisted_truth_count": gt_count,
+        "gt_assisted_auto_count": auto_count,
         "ground_truth_derived": True,
         "automatic_result": False,
         "automatic_output": str(automatic_result.get("output") or ""),
