@@ -69,10 +69,19 @@ FAST_CHANGE_MIN_AREA_M2 = 4.0
 FAST_PRESENCE_HIGH_THRESHOLD = 0.45
 FAST_PRESENCE_LOW_THRESHOLD = 0.20
 FAST_PRESENCE_DELTA_THRESHOLD = 0.25
-FAST_PRESENCE_ALIGNMENT_RADIUS_PX = 2
-FAST_PRESENCE_MIN_BLOB_AREA_PX2 = 12
-FAST_PRESENCE_MIN_PATH_SEED_PIXELS = 2
-FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PX2 = 48
+FAST_PRESENCE_STRONG_DELTA_THRESHOLD = 0.35
+FAST_PRESENCE_STRONG_RATIO_THRESHOLD = 1.80
+FAST_PRESENCE_RAW_RATIO_EPS = 0.01
+FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_DELTA_MAX = 0.04
+FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_RATIO_MAX = 1.35
+FAST_PRESENCE_ENHANCEMENT_IMBALANCE_MIN = 0.12
+FAST_PRESENCE_CALIBRATION_MAX_OFFSET = 0.06
+FAST_PRESENCE_CALIBRATION_SCALE_MIN = 0.85
+FAST_PRESENCE_CALIBRATION_SCALE_MAX = 1.15
+FAST_PRESENCE_ALIGNMENT_DISTANCE_M = 2.0
+FAST_PRESENCE_MIN_BLOB_AREA_M2 = 12.0
+FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M = 2.0
+FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2 = 48.0
 FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY = 0.90
 FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
@@ -116,6 +125,8 @@ class FastProbabilityGrid:
     transform: object
     crs: object
     pixel_size: float
+    raw_before: np.ndarray | None = None
+    raw_after: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +136,7 @@ class FastTileArtifacts:
     stem: str
     image: Path
     probability: Path
+    enhanced_probability: Path
     surface_mask: Path
     centerline_mask: Path
     topology: Path
@@ -4237,10 +4249,16 @@ def _fast_tile_catalog(period_result: dict) -> dict[str, FastTileArtifacts]:
         probability_path = inference_root / "mask" / f"{stem}_road.png"
         if not probability_path.is_file():
             probability_path = width_dir / f"{stem}_centerline_probability.png"
+        enhanced_probability_path = (
+            inference_root / "mask" / f"{stem}_fast_enhanced.png"
+        )
+        if not enhanced_probability_path.is_file():
+            enhanced_probability_path = width_dir / f"{stem}_centerline_probability.png"
         topology_path = inference_root / "graph" / f"{stem}_fast_topology.npz"
         required = {
             "image": image_path,
-            "probability": probability_path,
+            "raw probability": probability_path,
+            "enhanced probability": enhanced_probability_path,
             "surface mask": surface_path,
             "centerline mask": centerline_path,
             "topology": topology_path,
@@ -4257,6 +4275,7 @@ def _fast_tile_catalog(period_result: dict) -> dict[str, FastTileArtifacts]:
                 stem=stem,
                 image=image_path,
                 probability=probability_path,
+                enhanced_probability=enhanced_probability_path,
                 surface_mask=surface_path,
                 centerline_mask=centerline_path,
                 topology=topology_path,
@@ -4278,10 +4297,13 @@ def _fast_tile_catalog(period_result: dict) -> dict[str, FastTileArtifacts]:
 
 def _fast_change_halo_pixels(pixel_size: float, tolerance: float) -> int:
     map_halo = max(float(tolerance), FAST_PAIRED_WIDTH_MAX_SEARCH_M)
+    alignment_radius_px = int(np.ceil(
+        FAST_PRESENCE_ALIGNMENT_DISTANCE_M / max(float(pixel_size), 1e-9)
+    ))
     return max(
         FAST_CHANGE_TILE_HALO_MIN_PX,
         int(np.ceil(map_halo / max(float(pixel_size), 1e-9)))
-        + FAST_PRESENCE_ALIGNMENT_RADIUS_PX + 2,
+        + alignment_radius_px + 2,
     )
 
 
@@ -4382,9 +4404,10 @@ def _fast_tile_halo_layers(
     target_transform,
     target_shape: tuple[int, int],
     target_crs,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read only tiles intersecting one halo and release each source immediately."""
-    probability = np.zeros(target_shape, dtype=np.uint8)
+    raw_probability = np.zeros(target_shape, dtype=np.uint8)
+    enhanced_probability = np.zeros(target_shape, dtype=np.uint8)
     surface = np.zeros(target_shape, dtype=np.uint8)
     centerline = np.zeros(target_shape, dtype=np.uint8)
     target_bounds = rasterio.windows.bounds(
@@ -4413,15 +4436,20 @@ def _fast_tile_halo_layers(
                     "ignore", rasterio.errors.NotGeoreferencedWarning,
                 )
                 with rasterio.open(artifact.probability) as dataset:
-                    source_probability = dataset.read(1, window=source_window)
+                    source_raw_probability = dataset.read(1, window=source_window)
+                with rasterio.open(artifact.enhanced_probability) as dataset:
+                    source_enhanced_probability = dataset.read(1, window=source_window)
                 with rasterio.open(artifact.surface_mask) as dataset:
                     source_surface = dataset.read(1, window=source_window)
                 with rasterio.open(artifact.centerline_mask) as dataset:
                     source_centerline = dataset.read(1, window=source_window)
             with rasterio.open(artifact.image) as dataset:
                 valid = dataset.dataset_mask(window=source_window) > 0
-            probability[target_rows, target_columns] = np.where(
-                valid, source_probability, 0,
+            raw_probability[target_rows, target_columns] = np.where(
+                valid, source_raw_probability, 0,
+            )
+            enhanced_probability[target_rows, target_columns] = np.where(
+                valid, source_enhanced_probability, 0,
             )
             surface[target_rows, target_columns] = np.where(
                 valid, source_surface, 0,
@@ -4429,10 +4457,16 @@ def _fast_tile_halo_layers(
             centerline[target_rows, target_columns] = np.where(
                 valid, source_centerline, 0,
             )
-            del source_probability, source_surface, source_centerline, valid
+            del (
+                source_raw_probability, source_enhanced_probability,
+                source_surface, source_centerline, valid,
+            )
             continue
-        source_probability = cv2.imread(
+        source_raw_probability = cv2.imread(
             str(artifact.probability), cv2.IMREAD_GRAYSCALE,
+        )
+        source_enhanced_probability = cv2.imread(
+            str(artifact.enhanced_probability), cv2.IMREAD_GRAYSCALE,
         )
         source_surface = cv2.imread(
             str(artifact.surface_mask), cv2.IMREAD_GRAYSCALE,
@@ -4441,20 +4475,24 @@ def _fast_tile_halo_layers(
             str(artifact.centerline_mask), cv2.IMREAD_GRAYSCALE,
         )
         if any(item is None for item in (
-            source_probability, source_surface, source_centerline,
+            source_raw_probability, source_enhanced_probability,
+            source_surface, source_centerline,
         )):
             raise FileNotFoundError(f"Cannot read Fast tile intermediates: {artifact.stem}")
         if any(item.shape != artifact.shape for item in (
-            source_probability, source_surface, source_centerline,
+            source_raw_probability, source_enhanced_probability,
+            source_surface, source_centerline,
         )):
             raise ValueError(f"Fast tile intermediate shape mismatch: {artifact.stem}")
         with rasterio.open(artifact.image) as dataset:
             valid = dataset.dataset_mask() > 0
-        source_probability[~valid] = 0
+        source_raw_probability[~valid] = 0
+        source_enhanced_probability[~valid] = 0
         source_surface[~valid] = 0
         source_centerline[~valid] = 0
         for destination, source, resampling in (
-            (probability, source_probability, Resampling.bilinear),
+            (raw_probability, source_raw_probability, Resampling.bilinear),
+            (enhanced_probability, source_enhanced_probability, Resampling.bilinear),
             (surface, source_surface, Resampling.nearest),
             (centerline, source_centerline, Resampling.nearest),
         ):
@@ -4467,8 +4505,11 @@ def _fast_tile_halo_layers(
                 target_crs=target_crs,
                 resampling=resampling,
             )
-        del source_probability, source_surface, source_centerline, valid
-    return probability, (surface > 0).astype(np.uint8), (
+        del (
+            source_raw_probability, source_enhanced_probability,
+            source_surface, source_centerline, valid,
+        )
+    return raw_probability, enhanced_probability, (surface > 0).astype(np.uint8), (
         centerline > 0
     ).astype(np.uint8)
 
@@ -4515,6 +4556,8 @@ def _clean_fast_presence_mask(
     mask: np.ndarray,
     centerline_anchor: np.ndarray,
     road_support: np.ndarray,
+    *,
+    physical_pixel_size_m: float,
 ) -> np.ndarray:
     binary = _bridge_fast_presence_gaps(mask, road_support)
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
@@ -4523,8 +4566,11 @@ def _clean_fast_presence_mask(
     anchor_counts = np.bincount(
         labels[np.asarray(centerline_anchor) > 0], minlength=count,
     )
+    min_blob_area_px2 = _fast_area_pixels(
+        FAST_PRESENCE_MIN_BLOB_AREA_M2, physical_pixel_size_m,
+    )
     keep_labels = (
-        (stats[:, cv2.CC_STAT_AREA] >= FAST_PRESENCE_MIN_BLOB_AREA_PX2)
+        (stats[:, cv2.CC_STAT_AREA] >= min_blob_area_px2)
         & (anchor_counts[:count] > 0)
     )
     keep_labels[0] = False
@@ -4560,6 +4606,8 @@ def _bridge_fast_presence_gaps(
 def _partition_fast_presence_components(
     mask: np.ndarray,
     path_labels: np.ndarray,
+    *,
+    physical_pixel_size_m: float = 1.0,
 ) -> tuple[np.ndarray, dict[str, int]]:
     """Keep normal mask components whole; split only large, spatially distinct roads."""
     binary = (np.asarray(mask) > 0).astype(np.uint8)
@@ -4570,6 +4618,12 @@ def _partition_fast_presence_components(
     next_region = 1
     split_component_count = 0
     split_region_count = 0
+    min_path_seed_pixels = max(1, int(np.ceil(_fast_length_pixels(
+        FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M, physical_pixel_size_m,
+    ))))
+    abnormal_component_area_px2 = _fast_area_pixels(
+        FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2, physical_pixel_size_m,
+    )
     for component_id in range(1, component_count):
         x = int(stats[component_id, cv2.CC_STAT_LEFT])
         y = int(stats[component_id, cv2.CC_STAT_TOP])
@@ -4588,12 +4642,12 @@ def _partition_fast_presence_components(
             seed_groups[seed_mask], minlength=seed_group_count,
         )
         valid_groups = np.flatnonzero(
-            seed_counts >= FAST_PRESENCE_MIN_PATH_SEED_PIXELS
+            seed_counts >= min_path_seed_pixels
         )
         valid_groups = valid_groups[valid_groups > 0]
         component_area = int(stats[component_id, cv2.CC_STAT_AREA])
         if (
-            component_area < FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PX2
+            component_area < abnormal_component_area_px2
             or valid_groups.size <= 1
         ):
             region_crop = regions[y:y + height, x:x + width]
@@ -4626,6 +4680,72 @@ def _partition_fast_presence_components(
         "split_component_count": int(split_component_count),
         "split_region_count": int(split_region_count),
     }
+
+
+def _fast_probability_calibration(
+    before_raw: np.ndarray,
+    after_raw: np.ndarray,
+    before_enhanced: np.ndarray,
+    after_enhanced: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Align modest scene-wide response bias with one capped robust affine transform."""
+    before_raw = _probability01(before_raw)
+    after_raw = _probability01(after_raw)
+    before_enhanced = _probability01(before_enhanced)
+    after_enhanced = _probability01(after_enhanced)
+    stride = max(1, int(np.ceil(np.sqrt(before_raw.size / 250_000.0))))
+    before_sample = before_raw[::stride, ::stride].reshape(-1)
+    after_sample = after_raw[::stride, ::stride].reshape(-1)
+    valid = (before_sample > 0) | (after_sample > 0)
+    if valid.any():
+        before_sample = before_sample[valid]
+        after_sample = after_sample[valid]
+    quantiles = (0.50, 0.99)
+    before_q50, before_q99 = np.quantile(before_sample, quantiles)
+    after_q50, after_q99 = np.quantile(after_sample, quantiles)
+    before_spread = max(float(before_q99 - before_q50), 0.02)
+    after_spread = max(float(after_q99 - after_q50), 0.02)
+    target_location = 0.5 * float(before_q50 + after_q50)
+    target_spread = 0.5 * float(before_spread + after_spread)
+
+    def transform_for(location: float, spread: float) -> tuple[float, float]:
+        scale = float(np.clip(
+            target_spread / max(float(spread), 1e-6),
+            FAST_PRESENCE_CALIBRATION_SCALE_MIN,
+            FAST_PRESENCE_CALIBRATION_SCALE_MAX,
+        ))
+        offset = float(np.clip(
+            target_location - scale * float(location),
+            -FAST_PRESENCE_CALIBRATION_MAX_OFFSET,
+            FAST_PRESENCE_CALIBRATION_MAX_OFFSET,
+        ))
+        return scale, offset
+
+    before_scale, before_offset = transform_for(before_q50, before_spread)
+    after_scale, after_offset = transform_for(after_q50, after_spread)
+
+    def calibrated(values: np.ndarray, scale: float, offset: float) -> np.ndarray:
+        return np.clip(values * scale + offset, 0.0, 1.0).astype(np.float32)
+
+    diagnostics = {
+        "probability_calibration_applied": int(any((
+            abs(before_scale - 1.0) > 0.005,
+            abs(after_scale - 1.0) > 0.005,
+            abs(before_offset) > 0.005,
+            abs(after_offset) > 0.005,
+        ))),
+        "probability_calibration_before_scale": float(before_scale),
+        "probability_calibration_after_scale": float(after_scale),
+        "probability_calibration_before_offset": float(before_offset),
+        "probability_calibration_after_offset": float(after_offset),
+    }
+    return (
+        calibrated(before_raw, before_scale, before_offset),
+        calibrated(after_raw, after_scale, after_offset),
+        calibrated(before_enhanced, before_scale, before_offset),
+        calibrated(after_enhanced, after_scale, after_offset),
+        diagnostics,
+    )
 
 
 def _fast_presence_records(
@@ -4671,35 +4791,97 @@ def _detect_probability_presence_changes(
     after_period: str,
     min_area: float,
 ) -> tuple[dict[str, list[dict]], dict]:
-    radius = FAST_PRESENCE_ALIGNMENT_RADIUS_PX
+    raw_before = grid.raw_before if grid.raw_before is not None else grid.before
+    raw_after = grid.raw_after if grid.raw_after is not None else grid.after
+    (
+        raw_before, raw_after, enhanced_before, enhanced_after,
+        calibration_diagnostics,
+    ) = _fast_probability_calibration(
+        raw_before, raw_after, grid.before, grid.after,
+    )
+    radius = max(1, int(np.ceil(
+        FAST_PRESENCE_ALIGNMENT_DISTANCE_M / max(float(grid.pixel_size), 1e-9)
+    )))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
-    before_neighborhood = cv2.dilate(grid.before, kernel)
-    after_neighborhood = cv2.dilate(grid.after, kernel)
-    added_raw = (
-        (grid.after >= FAST_PRESENCE_HIGH_THRESHOLD)
+    before_neighborhood = cv2.dilate(enhanced_before, kernel)
+    after_neighborhood = cv2.dilate(enhanced_after, kernel)
+    raw_before_neighborhood = cv2.dilate(raw_before, kernel)
+    raw_after_neighborhood = cv2.dilate(raw_after, kernel)
+    before_boost_neighborhood = cv2.dilate(
+        np.maximum(enhanced_before - raw_before, 0.0), kernel,
+    )
+    after_boost_neighborhood = cv2.dilate(
+        np.maximum(enhanced_after - raw_after, 0.0), kernel,
+    )
+    before_boost = np.maximum(enhanced_before - raw_before, 0.0)
+    after_boost = np.maximum(enhanced_after - raw_after, 0.0)
+
+    added_normal = (
+        (enhanced_after >= FAST_PRESENCE_HIGH_THRESHOLD)
         & (before_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
-        & ((grid.after - before_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
+        & ((enhanced_after - before_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
     )
-    removed_raw = (
-        (grid.before >= FAST_PRESENCE_HIGH_THRESHOLD)
+    removed_normal = (
+        (enhanced_before >= FAST_PRESENCE_HIGH_THRESHOLD)
         & (after_neighborhood <= FAST_PRESENCE_LOW_THRESHOLD)
-        & ((grid.before - after_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
+        & ((enhanced_before - after_neighborhood) >= FAST_PRESENCE_DELTA_THRESHOLD)
     )
+    added_raw_delta = raw_after - raw_before_neighborhood
+    removed_raw_delta = raw_before - raw_after_neighborhood
+    added_raw_ratio = (
+        (raw_after + FAST_PRESENCE_RAW_RATIO_EPS)
+        / (raw_before_neighborhood + FAST_PRESENCE_RAW_RATIO_EPS)
+    )
+    removed_raw_ratio = (
+        (raw_before + FAST_PRESENCE_RAW_RATIO_EPS)
+        / (raw_after_neighborhood + FAST_PRESENCE_RAW_RATIO_EPS)
+    )
+    added_strong = (
+        (added_raw_delta >= FAST_PRESENCE_STRONG_DELTA_THRESHOLD)
+        & (added_raw_ratio >= FAST_PRESENCE_STRONG_RATIO_THRESHOLD)
+    )
+    removed_strong = (
+        (removed_raw_delta >= FAST_PRESENCE_STRONG_DELTA_THRESHOLD)
+        & (removed_raw_ratio >= FAST_PRESENCE_STRONG_RATIO_THRESHOLD)
+    )
+
+    added_enhancement_only = (
+        (added_raw_delta <= FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_DELTA_MAX)
+        & (added_raw_ratio <= FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_RATIO_MAX)
+        & (
+            (after_boost - before_boost_neighborhood)
+            >= FAST_PRESENCE_ENHANCEMENT_IMBALANCE_MIN
+        )
+    )
+    removed_enhancement_only = (
+        (removed_raw_delta <= FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_DELTA_MAX)
+        & (removed_raw_ratio <= FAST_PRESENCE_ENHANCEMENT_ONLY_RAW_RATIO_MAX)
+        & (
+            (before_boost - after_boost_neighborhood)
+            >= FAST_PRESENCE_ENHANCEMENT_IMBALANCE_MIN
+        )
+    )
+    added_raw = (added_normal | added_strong) & ~added_enhancement_only
+    removed_raw = (removed_normal | removed_strong) & ~removed_enhancement_only
     added_mask = _clean_fast_presence_mask(
         added_raw & (after_surface_mask > 0),
         after_line_anchor,
         after_surface_mask,
+        physical_pixel_size_m=grid.pixel_size,
     )
     removed_mask = _clean_fast_presence_mask(
         removed_raw & (before_surface_mask > 0),
         before_line_anchor,
         before_surface_mask,
+        physical_pixel_size_m=grid.pixel_size,
     )
     added_regions, added_split = _partition_fast_presence_components(
         added_mask, after_path_labels,
+        physical_pixel_size_m=grid.pixel_size,
     )
     removed_regions, removed_split = _partition_fast_presence_components(
         removed_mask, before_path_labels,
+        physical_pixel_size_m=grid.pixel_size,
     )
     records = {
         "added": _fast_presence_records(
@@ -4716,6 +4898,16 @@ def _detect_probability_presence_changes(
     diagnostics = {
         "added_raw_pixel_count": int(added_raw.sum()),
         "removed_raw_pixel_count": int(removed_raw.sum()),
+        "added_normal_pixel_count": int(added_normal.sum()),
+        "removed_normal_pixel_count": int(removed_normal.sum()),
+        "added_strong_pixel_count": int(added_strong.sum()),
+        "removed_strong_pixel_count": int(removed_strong.sum()),
+        "added_enhancement_only_suppressed_pixel_count": int(
+            ((added_normal | added_strong) & added_enhancement_only).sum()
+        ),
+        "removed_enhancement_only_suppressed_pixel_count": int(
+            ((removed_normal | removed_strong) & removed_enhancement_only).sum()
+        ),
         "added_final_pixel_count": int(added_mask.sum()),
         "removed_final_pixel_count": int(removed_mask.sum()),
         "added_feature_count": int(len(records["added"])),
@@ -4724,6 +4916,7 @@ def _detect_probability_presence_changes(
         "added_split_region_count": added_split["split_region_count"],
         "removed_split_component_count": removed_split["split_component_count"],
         "removed_split_region_count": removed_split["split_region_count"],
+        **calibration_diagnostics,
     }
     return records, diagnostics
 
@@ -5203,7 +5396,10 @@ def detect_fast_changes(
         ))
         core_geometry = box(*before_tile.bounds)
 
-        before_probability, before_surface_mask, before_centerline_mask = (
+        (
+            before_raw_probability, before_enhanced_probability,
+            before_surface_mask, before_centerline_mask,
+        ) = (
             _fast_tile_halo_layers(
                 before_tiles,
                 target_transform=local_transform,
@@ -5211,7 +5407,10 @@ def detect_fast_changes(
                 target_crs=target_crs,
             )
         )
-        after_probability, after_surface_mask, after_centerline_mask = (
+        (
+            after_raw_probability, after_enhanced_probability,
+            after_surface_mask, after_centerline_mask,
+        ) = (
             _fast_tile_halo_layers(
                 after_tiles,
                 target_transform=local_transform,
@@ -5220,16 +5419,21 @@ def detect_fast_changes(
             )
         )
         grid = FastProbabilityGrid(
-            _probability01(before_probability),
-            _probability01(after_probability),
+            _probability01(before_enhanced_probability),
+            _probability01(after_enhanced_probability),
             local_transform,
             target_crs,
             pixel_size,
+            raw_before=_probability01(before_raw_probability),
+            raw_after=_probability01(after_raw_probability),
         )
         map_units_per_meter = _fast_map_units_per_meter(grid)
         map_unit_scales.append(map_units_per_meter)
         minimum_area_map = minimum_area * map_units_per_meter ** 2
-        del before_probability, after_probability
+        del (
+            before_raw_probability, after_raw_probability,
+            before_enhanced_probability, after_enhanced_probability,
+        )
         before_centerlines = _fast_tile_topology_frame(
             before_tiles, target_bounds=local_bounds, target_crs=target_crs,
         )
@@ -5290,6 +5494,12 @@ def detect_fast_changes(
         tile_timings.append({
             "tile": tile_stem,
             "halo_px": int(halo_px),
+            "presence_alignment_radius_px": int(np.ceil(
+                FAST_PRESENCE_ALIGNMENT_DISTANCE_M / max(pixel_size, 1e-9)
+            )),
+            "presence_min_blob_area_px2": int(_fast_area_pixels(
+                FAST_PRESENCE_MIN_BLOB_AREA_M2, pixel_size,
+            )),
             "processing_shape": [int(local_shape[0]), int(local_shape[1])],
             "presence_seconds": float(tile_presence_seconds),
             "width_seconds": float(tile_width_seconds),
@@ -5320,6 +5530,17 @@ def detect_fast_changes(
     presence_diagnostics = _sum_fast_change_diagnostics(
         presence_diagnostic_rows,
     )
+    calibration_diagnostics = {
+        key: float(np.mean([
+            float(row.get(key, 0.0)) for row in presence_diagnostic_rows
+        ]))
+        for key in (
+            "probability_calibration_before_scale",
+            "probability_calibration_after_scale",
+            "probability_calibration_before_offset",
+            "probability_calibration_after_offset",
+        )
+    }
     width_diagnostics = _sum_fast_change_diagnostics(width_diagnostic_rows)
     width_records = record_groups["widened"] + record_groups["narrowed"]
     grid_crs = target_crs
@@ -5389,7 +5610,7 @@ def detect_fast_changes(
         "ground_truth_derived": False, "change_output_mode": "fast_automatic",
         "automatic_result": True,
         "before_period": str(before_period), "after_period": str(after_period),
-        "presence_change_source": "enhanced_probability_difference",
+        "presence_change_source": "raw_and_enhanced_probability_difference",
         "width_change_source": "shared_position_sparse_width",
         "probability_grid_crs": str(grid_crs),
         "probability_pixel_size": float(grid_pixel_size),
@@ -5406,8 +5627,22 @@ def detect_fast_changes(
         "presence_high_threshold": FAST_PRESENCE_HIGH_THRESHOLD,
         "presence_low_threshold": FAST_PRESENCE_LOW_THRESHOLD,
         "presence_delta_threshold": FAST_PRESENCE_DELTA_THRESHOLD,
-        "presence_alignment_radius_px": FAST_PRESENCE_ALIGNMENT_RADIUS_PX,
-        "presence_min_blob_area_px2": FAST_PRESENCE_MIN_BLOB_AREA_PX2,
+        "presence_strong_delta_threshold": FAST_PRESENCE_STRONG_DELTA_THRESHOLD,
+        "presence_strong_ratio_threshold": FAST_PRESENCE_STRONG_RATIO_THRESHOLD,
+        "presence_alignment_distance_m": FAST_PRESENCE_ALIGNMENT_DISTANCE_M,
+        "presence_min_blob_area_m2": FAST_PRESENCE_MIN_BLOB_AREA_M2,
+        "presence_min_path_seed_length_m": FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M,
+        "presence_abnormal_component_area_m2": (
+            FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2
+        ),
+        "presence_alignment_radius_px_range": [
+            int(min(row["presence_alignment_radius_px"] for row in tile_timings)),
+            int(max(row["presence_alignment_radius_px"] for row in tile_timings)),
+        ],
+        "presence_min_blob_area_px2_range": [
+            int(min(row["presence_min_blob_area_px2"] for row in tile_timings)),
+            int(max(row["presence_min_blob_area_px2"] for row in tile_timings)),
+        ],
         "position_tolerance_m": tolerance,
         "paired_width_direction_similarity": FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY,
         "paired_width_match_coverage": FAST_PAIRED_WIDTH_MATCH_COVERAGE,
@@ -5422,6 +5657,7 @@ def detect_fast_changes(
         "auto_change_total_seconds": float(total_seconds),
         "total_seconds": float(total_seconds),
         **presence_diagnostics,
+        **calibration_diagnostics,
         **width_diagnostics,
         **{f"{name}_feature_count": int(len(frame)) for name, frame in typed_layers.items()},
         "changes_feature_count": int(len(changes)),

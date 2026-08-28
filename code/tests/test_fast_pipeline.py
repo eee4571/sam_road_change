@@ -43,8 +43,10 @@ from engine.fast_pipeline import (
     _cleanup_fast_final_centerline,
     _cleanup_fast_final_surface,
     _cleanup_road_paths,
+    _clean_fast_presence_mask,
     _consistent_relative_score,
     _degrade_fast_change_geometry,
+    _detect_probability_presence_changes,
     _enhance_fast_molra_surface,
     _remove_short_isolated_skeleton_components,
     _relative_hysteresis_mask,
@@ -1700,9 +1702,11 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 dataset.write(np.ones((1, tile_height, current_width), dtype=np.uint8))
                 dataset.write_mask(np.full(road_mask.shape, 255, dtype=np.uint8))
             probability_path = probability_dir / f"{stem}_road.png"
+            enhanced_probability_path = probability_dir / f"{stem}_fast_enhanced.png"
             surface_path = surface_dir / f"{stem}_mask.png"
             centerline_path = surface_dir / f"{stem}_centerline.png"
             self.assertTrue(cv2.imwrite(str(probability_path), probability))
+            self.assertTrue(cv2.imwrite(str(enhanced_probability_path), probability))
             self.assertTrue(cv2.imwrite(str(surface_path), road_mask * 255))
             self.assertTrue(cv2.imwrite(str(centerline_path), centerline_mask * 255))
             self.assertTrue(cv2.imwrite(
@@ -1744,6 +1748,134 @@ class FastAutomaticChangeTests(unittest.TestCase):
             "run_root": str(run_root),
             "execution_profile": "fast",
         }
+
+    def _detect_presence_arrays(
+        self,
+        raw_before: np.ndarray,
+        raw_after: np.ndarray,
+        enhanced_before: np.ndarray,
+        enhanced_after: np.ndarray,
+        *,
+        before_has_road: bool,
+        after_has_road: bool,
+        pixel_size: float = 1.0,
+    ):
+        shape_2d = raw_before.shape
+        road = np.zeros(shape_2d, dtype=np.uint8)
+        road[shape_2d[0] // 2 - 4:shape_2d[0] // 2 + 4, 8:-8] = 1
+        centerline = np.zeros(shape_2d, dtype=np.uint8)
+        centerline[shape_2d[0] // 2, 8:-8] = 1
+        before_surface = road if before_has_road else np.zeros_like(road)
+        after_surface = road if after_has_road else np.zeros_like(road)
+        before_anchor = centerline if before_has_road else np.zeros_like(centerline)
+        after_anchor = centerline if after_has_road else np.zeros_like(centerline)
+        grid = FastProbabilityGrid(
+            enhanced_before,
+            enhanced_after,
+            from_origin(0, shape_2d[0] * pixel_size, pixel_size, pixel_size),
+            "EPSG:3857",
+            pixel_size,
+            raw_before=raw_before,
+            raw_after=raw_after,
+        )
+        return _detect_probability_presence_changes(
+            grid,
+            before_surface,
+            after_surface,
+            before_anchor,
+            after_anchor,
+            before_anchor,
+            after_anchor,
+            before_period="before",
+            after_period="after",
+            min_area=1.0,
+        )
+
+    def test_one_period_enhancement_alone_does_not_create_presence_change(self) -> None:
+        shape_2d = (64, 64)
+        road_slice = (slice(28, 36), slice(8, 56))
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[road_slice] = 0.12
+        raw_after[road_slice] = 0.12
+        enhanced_before = raw_before.copy()
+        enhanced_after = raw_after.copy()
+        enhanced_after[road_slice] = 0.55
+
+        records, diagnostics = self._detect_presence_arrays(
+            raw_before, raw_after, enhanced_before, enhanced_after,
+            before_has_road=True, after_has_road=True,
+        )
+
+        self.assertFalse(records["added"])
+        self.assertFalse(records["removed"])
+        self.assertGreater(
+            diagnostics["added_enhancement_only_suppressed_pixel_count"], 0,
+        )
+
+    def test_real_low_to_high_added_road_is_detected(self) -> None:
+        shape_2d = (64, 64)
+        road_slice = (slice(28, 36), slice(8, 56))
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_after[road_slice] = 0.75
+
+        records, _diagnostics = self._detect_presence_arrays(
+            raw_before, raw_after, raw_before, raw_after,
+            before_has_road=False, after_has_road=True,
+        )
+
+        self.assertGreater(len(records["added"]), 0)
+
+    def test_strong_channel_accepts_clear_change_with_nonzero_old_response(self) -> None:
+        shape_2d = (64, 64)
+        road_slice = (slice(28, 36), slice(8, 56))
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[road_slice] = 0.25
+        raw_after[road_slice] = 0.80
+
+        records, diagnostics = self._detect_presence_arrays(
+            raw_before, raw_after, raw_before, raw_after,
+            before_has_road=False, after_has_road=True,
+        )
+
+        self.assertGreater(len(records["added"]), 0)
+        self.assertGreater(diagnostics["added_strong_pixel_count"], 0)
+
+    def test_global_probability_bias_is_robustly_aligned(self) -> None:
+        shape_2d = (64, 64)
+        raw_before = np.full(shape_2d, 0.19, dtype=np.float32)
+        raw_after = np.full(shape_2d, 0.46, dtype=np.float32)
+
+        records, diagnostics = self._detect_presence_arrays(
+            raw_before, raw_after, raw_before, raw_after,
+            before_has_road=True, after_has_road=True,
+        )
+
+        self.assertFalse(records["added"])
+        self.assertFalse(records["removed"])
+        self.assertEqual(diagnostics["probability_calibration_applied"], 1)
+
+    def test_presence_blob_filter_uses_same_physical_area_across_gsd(self) -> None:
+        def cleaned(pixel_size: float, small_shape, large_shape):
+            mask = np.zeros((48, 96), dtype=np.uint8)
+            anchor = np.zeros_like(mask)
+            small_rows, small_cols = small_shape
+            large_rows, large_cols = large_shape
+            mask[4:4 + small_rows, 4:4 + small_cols] = 1
+            mask[20:20 + large_rows, 20:20 + large_cols] = 1
+            anchor[4, 4] = 1
+            anchor[20, 20] = 1
+            return _clean_fast_presence_mask(
+                mask, anchor, mask, physical_pixel_size_m=pixel_size,
+            )
+
+        half_meter = cleaned(0.5, (4, 8), (4, 16))
+        two_meter = cleaned(2.0, (1, 2), (1, 4))
+
+        self.assertEqual(int(half_meter.sum()), 64)
+        self.assertEqual(int(two_meter.sum()), 4)
 
     def test_probability_presence_and_shared_position_width_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1794,7 +1926,7 @@ class FastAutomaticChangeTests(unittest.TestCase):
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
             self.assertEqual(
                 summary["presence_change_source"],
-                "enhanced_probability_difference",
+                "raw_and_enhanced_probability_difference",
             )
             self.assertEqual(
                 summary["width_change_source"],
