@@ -79,9 +79,15 @@ FAST_PRESENCE_CALIBRATION_MAX_OFFSET = 0.06
 FAST_PRESENCE_CALIBRATION_SCALE_MIN = 0.85
 FAST_PRESENCE_CALIBRATION_SCALE_MAX = 1.15
 FAST_PRESENCE_ALIGNMENT_DISTANCE_M = 2.0
+FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M = 6.0
+FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO = 0.65
+FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO = 0.20
 FAST_PRESENCE_MIN_BLOB_AREA_M2 = 12.0
+FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR = 12
 FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M = 2.0
+FAST_PRESENCE_MIN_PATH_SEED_PIXEL_FLOOR = 2
 FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2 = 48.0
+FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PIXEL_FLOOR = 48
 FAST_PAIRED_WIDTH_DIRECTION_SIMILARITY = 0.90
 FAST_PAIRED_WIDTH_MATCH_COVERAGE = 0.70
 FAST_PAIRED_WIDTH_SAMPLE_SPACING_M = 15.0
@@ -4566,8 +4572,11 @@ def _clean_fast_presence_mask(
     anchor_counts = np.bincount(
         labels[np.asarray(centerline_anchor) > 0], minlength=count,
     )
-    min_blob_area_px2 = _fast_area_pixels(
-        FAST_PRESENCE_MIN_BLOB_AREA_M2, physical_pixel_size_m,
+    min_blob_area_px2 = max(
+        FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR,
+        _fast_area_pixels(
+            FAST_PRESENCE_MIN_BLOB_AREA_M2, physical_pixel_size_m,
+        ),
     )
     keep_labels = (
         (stats[:, cv2.CC_STAT_AREA] >= min_blob_area_px2)
@@ -4603,6 +4612,65 @@ def _bridge_fast_presence_gaps(
     return bridged.astype(np.uint8)
 
 
+def _suppress_fast_presence_spatial_jitter(
+    candidate_mask: np.ndarray,
+    reference_centerline: np.ndarray,
+    reference_surface: np.ndarray,
+    *,
+    physical_pixel_size_m: float,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Suppress candidate components already explained by the other-period road."""
+    candidate = (np.asarray(candidate_mask) > 0).astype(np.uint8)
+    reference = (
+        (np.asarray(reference_centerline) > 0)
+        | (np.asarray(reference_surface) > 0)
+    ).astype(np.uint8)
+    if not candidate.any() or not reference.any():
+        return candidate, {
+            "spatial_suppressed_component_count": 0,
+            "spatial_suppressed_pixel_count": 0,
+            "spatial_trimmed_component_count": 0,
+            "spatial_trimmed_pixel_count": 0,
+        }
+    radius_px = max(1, int(np.ceil(
+        FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M
+        / max(float(physical_pixel_size_m), 1e-9)
+    )))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius_px + 1,) * 2,
+    )
+    reference_neighborhood = cv2.dilate(reference, kernel) > 0
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        candidate, connectivity=8,
+    )
+    component_areas = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    supported_areas = np.bincount(
+        labels[reference_neighborhood], minlength=component_count,
+    ).astype(np.float64)
+    overlap_ratio = np.divide(
+        supported_areas,
+        np.maximum(component_areas, 1.0),
+        out=np.zeros(component_count, dtype=np.float64),
+    )
+    suppress_labels = overlap_ratio >= FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO
+    suppress_labels[0] = False
+    partial_labels = (
+        (overlap_ratio >= FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO)
+        & ~suppress_labels
+    )
+    partial_labels[0] = False
+    suppressed_pixels = suppress_labels[labels]
+    trimmed_pixels = partial_labels[labels] & reference_neighborhood
+    result = candidate.astype(bool)
+    result[suppressed_pixels | trimmed_pixels] = False
+    return result.astype(np.uint8), {
+        "spatial_suppressed_component_count": int(suppress_labels.sum()),
+        "spatial_suppressed_pixel_count": int(suppressed_pixels.sum()),
+        "spatial_trimmed_component_count": int(partial_labels.sum()),
+        "spatial_trimmed_pixel_count": int(trimmed_pixels.sum()),
+    }
+
+
 def _partition_fast_presence_components(
     mask: np.ndarray,
     path_labels: np.ndarray,
@@ -4618,11 +4686,17 @@ def _partition_fast_presence_components(
     next_region = 1
     split_component_count = 0
     split_region_count = 0
-    min_path_seed_pixels = max(1, int(np.ceil(_fast_length_pixels(
-        FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M, physical_pixel_size_m,
-    ))))
-    abnormal_component_area_px2 = _fast_area_pixels(
-        FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2, physical_pixel_size_m,
+    min_path_seed_pixels = max(
+        FAST_PRESENCE_MIN_PATH_SEED_PIXEL_FLOOR,
+        int(np.ceil(_fast_length_pixels(
+            FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M, physical_pixel_size_m,
+        ))),
+    )
+    abnormal_component_area_px2 = max(
+        FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PIXEL_FLOOR,
+        _fast_area_pixels(
+            FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2, physical_pixel_size_m,
+        ),
     )
     for component_id in range(1, component_count):
         x = int(stats[component_id, cv2.CC_STAT_LEFT])
@@ -4863,14 +4937,26 @@ def _detect_probability_presence_changes(
     )
     added_raw = (added_normal | added_strong) & ~added_enhancement_only
     removed_raw = (removed_normal | removed_strong) & ~removed_enhancement_only
-    added_mask = _clean_fast_presence_mask(
+    added_stable, added_spatial = _suppress_fast_presence_spatial_jitter(
         added_raw & (after_surface_mask > 0),
+        before_line_anchor,
+        before_surface_mask,
+        physical_pixel_size_m=grid.pixel_size,
+    )
+    removed_stable, removed_spatial = _suppress_fast_presence_spatial_jitter(
+        removed_raw & (before_surface_mask > 0),
+        after_line_anchor,
+        after_surface_mask,
+        physical_pixel_size_m=grid.pixel_size,
+    )
+    added_mask = _clean_fast_presence_mask(
+        added_stable,
         after_line_anchor,
         after_surface_mask,
         physical_pixel_size_m=grid.pixel_size,
     )
     removed_mask = _clean_fast_presence_mask(
-        removed_raw & (before_surface_mask > 0),
+        removed_stable,
         before_line_anchor,
         before_surface_mask,
         physical_pixel_size_m=grid.pixel_size,
@@ -4916,6 +5002,8 @@ def _detect_probability_presence_changes(
         "added_split_region_count": added_split["split_region_count"],
         "removed_split_component_count": removed_split["split_component_count"],
         "removed_split_region_count": removed_split["split_region_count"],
+        **{f"added_{key}": value for key, value in added_spatial.items()},
+        **{f"removed_{key}": value for key, value in removed_spatial.items()},
         **calibration_diagnostics,
     }
     return records, diagnostics
@@ -5497,8 +5585,9 @@ def detect_fast_changes(
             "presence_alignment_radius_px": int(np.ceil(
                 FAST_PRESENCE_ALIGNMENT_DISTANCE_M / max(pixel_size, 1e-9)
             )),
-            "presence_min_blob_area_px2": int(_fast_area_pixels(
-                FAST_PRESENCE_MIN_BLOB_AREA_M2, pixel_size,
+            "presence_min_blob_area_px2": int(max(
+                FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR,
+                _fast_area_pixels(FAST_PRESENCE_MIN_BLOB_AREA_M2, pixel_size),
             )),
             "processing_shape": [int(local_shape[0]), int(local_shape[1])],
             "presence_seconds": float(tile_presence_seconds),
@@ -5630,7 +5719,17 @@ def detect_fast_changes(
         "presence_strong_delta_threshold": FAST_PRESENCE_STRONG_DELTA_THRESHOLD,
         "presence_strong_ratio_threshold": FAST_PRESENCE_STRONG_RATIO_THRESHOLD,
         "presence_alignment_distance_m": FAST_PRESENCE_ALIGNMENT_DISTANCE_M,
+        "presence_spatial_consistency_distance_m": (
+            FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M
+        ),
+        "presence_spatial_suppress_ratio": FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO,
+        "presence_spatial_partial_trim_ratio": (
+            FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO
+        ),
         "presence_min_blob_area_m2": FAST_PRESENCE_MIN_BLOB_AREA_M2,
+        "presence_min_blob_area_pixel_floor": (
+            FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR
+        ),
         "presence_min_path_seed_length_m": FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M,
         "presence_abnormal_component_area_m2": (
             FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2

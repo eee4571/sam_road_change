@@ -1791,6 +1791,137 @@ class FastAutomaticChangeTests(unittest.TestCase):
             min_area=1.0,
         )
 
+    def _detect_custom_presence(
+        self,
+        before_surface: np.ndarray,
+        after_surface: np.ndarray,
+        before_centerline: np.ndarray,
+        after_centerline: np.ndarray,
+        raw_before: np.ndarray,
+        raw_after: np.ndarray,
+        *,
+        pixel_size: float = 1.0,
+    ):
+        grid = FastProbabilityGrid(
+            raw_before.copy(),
+            raw_after.copy(),
+            from_origin(
+                0, raw_before.shape[0] * pixel_size, pixel_size, pixel_size,
+            ),
+            "EPSG:3857",
+            pixel_size,
+            raw_before=raw_before,
+            raw_after=raw_after,
+        )
+        return _detect_probability_presence_changes(
+            grid,
+            before_surface,
+            after_surface,
+            before_centerline,
+            after_centerline,
+            before_centerline,
+            after_centerline,
+            before_period="before",
+            after_period="after",
+            min_area=1.0,
+        )
+
+    def test_lateral_centerline_shift_is_suppressed_as_extraction_jitter(self) -> None:
+        shape_2d = (80, 80)
+        before_surface = np.zeros(shape_2d, dtype=np.uint8)
+        after_surface = np.zeros_like(before_surface)
+        before_surface[28:34, 8:72] = 1
+        after_surface[31:37, 8:72] = 1
+        before_line = np.zeros_like(before_surface)
+        after_line = np.zeros_like(before_surface)
+        before_line[31, 8:72] = 1
+        after_line[34, 8:72] = 1
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[before_surface > 0] = 0.80
+        raw_after[after_surface > 0] = 0.80
+
+        records, diagnostics = self._detect_custom_presence(
+            before_surface, after_surface, before_line, after_line,
+            raw_before, raw_after,
+        )
+
+        self.assertFalse(records["added"])
+        self.assertFalse(records["removed"])
+        self.assertGreater(
+            diagnostics["added_spatial_suppressed_component_count"]
+            + diagnostics["removed_spatial_suppressed_component_count"],
+            0,
+        )
+
+    def test_parallel_nonoverlapping_extraction_jitter_does_not_make_red_green_pair(self) -> None:
+        shape_2d = (80, 80)
+        before_surface = np.zeros(shape_2d, dtype=np.uint8)
+        after_surface = np.zeros_like(before_surface)
+        before_surface[27:30, 8:72] = 1
+        after_surface[32:35, 8:72] = 1
+        before_line = np.zeros_like(before_surface)
+        after_line = np.zeros_like(before_surface)
+        before_line[28, 8:72] = 1
+        after_line[33, 8:72] = 1
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[before_surface > 0] = 0.80
+        raw_after[after_surface > 0] = 0.80
+
+        records, _diagnostics = self._detect_custom_presence(
+            before_surface, after_surface, before_line, after_line,
+            raw_before, raw_after,
+        )
+
+        self.assertFalse(records["added"])
+        self.assertFalse(records["removed"])
+
+    def test_short_single_period_gap_is_not_reported_as_added(self) -> None:
+        shape_2d = (80, 80)
+        after_surface = np.zeros(shape_2d, dtype=np.uint8)
+        after_surface[28:36, 8:72] = 1
+        before_surface = after_surface.copy()
+        before_surface[28:36, 34:42] = 0
+        after_line = np.zeros_like(after_surface)
+        after_line[32, 8:72] = 1
+        before_line = after_line.copy()
+        before_line[32, 34:42] = 0
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[before_surface > 0] = 0.80
+        raw_after[after_surface > 0] = 0.80
+
+        records, _diagnostics = self._detect_custom_presence(
+            before_surface, after_surface, before_line, after_line,
+            raw_before, raw_after,
+        )
+
+        self.assertFalse(records["added"])
+
+    def test_new_branch_connected_to_existing_road_keeps_unsupported_body(self) -> None:
+        shape_2d = (80, 80)
+        before_surface = np.zeros(shape_2d, dtype=np.uint8)
+        before_surface[20:26, 8:50] = 1
+        after_surface = before_surface.copy()
+        after_surface[20:70, 44:50] = 1
+        before_line = np.zeros_like(before_surface)
+        before_line[23, 8:50] = 1
+        after_line = before_line.copy()
+        after_line[23:70, 47] = 1
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[before_surface > 0] = 0.80
+        raw_after[after_surface > 0] = 0.80
+
+        records, diagnostics = self._detect_custom_presence(
+            before_surface, after_surface, before_line, after_line,
+            raw_before, raw_after,
+        )
+
+        self.assertGreater(len(records["added"]), 0)
+        self.assertGreater(diagnostics["added_final_pixel_count"], 40)
+
     def test_one_period_enhancement_alone_does_not_create_presence_change(self) -> None:
         shape_2d = (64, 64)
         road_slice = (slice(28, 36), slice(8, 56))
@@ -1843,6 +1974,25 @@ class FastAutomaticChangeTests(unittest.TestCase):
         self.assertGreater(len(records["added"]), 0)
         self.assertGreater(diagnostics["added_strong_pixel_count"], 0)
 
+    def test_strong_probability_change_is_suppressed_when_old_road_exists(self) -> None:
+        shape_2d = (64, 64)
+        road_slice = (slice(28, 36), slice(8, 56))
+        raw_before = np.full(shape_2d, 0.03, dtype=np.float32)
+        raw_after = raw_before.copy()
+        raw_before[road_slice] = 0.25
+        raw_after[road_slice] = 0.80
+
+        records, diagnostics = self._detect_presence_arrays(
+            raw_before, raw_after, raw_before, raw_after,
+            before_has_road=True, after_has_road=True,
+        )
+
+        self.assertFalse(records["added"])
+        self.assertGreater(diagnostics["added_strong_pixel_count"], 0)
+        self.assertGreater(
+            diagnostics["added_spatial_suppressed_component_count"], 0,
+        )
+
     def test_global_probability_bias_is_robustly_aligned(self) -> None:
         shape_2d = (64, 64)
         raw_before = np.full(shape_2d, 0.19, dtype=np.float32)
@@ -1871,11 +2021,11 @@ class FastAutomaticChangeTests(unittest.TestCase):
                 mask, anchor, mask, physical_pixel_size_m=pixel_size,
             )
 
-        half_meter = cleaned(0.5, (4, 8), (4, 16))
-        two_meter = cleaned(2.0, (1, 2), (1, 4))
+        half_meter = cleaned(0.5, (4, 8), (8, 24))
+        two_meter = cleaned(2.0, (1, 2), (3, 4))
 
-        self.assertEqual(int(half_meter.sum()), 64)
-        self.assertEqual(int(two_meter.sum()), 4)
+        self.assertEqual(int(half_meter.sum()), 192)
+        self.assertEqual(int(two_meter.sum()), 12)
 
     def test_probability_presence_and_shared_position_width_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
