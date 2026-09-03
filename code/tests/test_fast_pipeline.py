@@ -701,6 +701,98 @@ class FastRoadNetworkRegularizationTests(unittest.TestCase):
         self.assertEqual(diagnostics["merged_road_entity_count"], 2)
         self.assertGreater(diagnostics["generated_connection_length_m"], 0.0)
 
+    def test_regional_t_junction_attaches_to_complete_main_road(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 10.0, 0),
+            RegionalRoadObservation(np.asarray([[50.0, 30.0], [50.0, 8.0]]), 8.0, 1),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        main = max(final_roads, key=lambda road: np.ptp(road.points[:, 0]))
+        branch = max(final_roads, key=lambda road: np.ptp(road.points[:, 1]))
+        main_nodes = {tuple(np.round(point, 3)) for point in main.points}
+        branch_nodes = {tuple(np.round(point, 3)) for point in branch.points}
+        self.assertIn((50.0, 0.0), main_nodes & branch_nodes)
+        self.assertEqual(diagnostics["endpoint_to_road_attachment_count"], 1)
+        self.assertEqual(diagnostics["t_junction_count"], 1)
+        self.assertLess(diagnostics["dangling_endpoint_count_after"], diagnostics["dangling_endpoint_count_before"])
+        self.assertEqual(diagnostics["connected_component_count_after"], 1)
+        self.assertLess(float(np.ptp(main.points[:, 1])), 0.1)
+
+    def test_overlapping_observations_merge_as_one_corridor(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[40.0, 1.5], [150.0, 1.5]]), 8.5, 1),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(diagnostics["corridor_merge_count"], 1)
+        self.assertGreater(float(np.ptp(final_roads[0].points[:, 0])), 145.0)
+
+    def test_parallel_carriageways_twelve_metres_apart_remain_independent(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [150.0, 0.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[0.0, 12.0], [150.0, 12.0]]), 9.0, 1),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 2)
+        self.assertEqual(diagnostics["corridor_merge_count"], 0)
+        means = sorted(float(np.mean(road.points[:, 1])) for road in final_roads)
+        self.assertGreater(means[1] - means[0], 10.0)
+
+    def test_regional_cross_axes_create_one_shared_graph_node(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[-80.0, 0.0], [-6.0, 0.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[7.0, 0.0], [80.0, 0.0]]), 9.0, 1),
+            RegionalRoadObservation(np.asarray([[0.0, -75.0], [0.0, -8.0]]), 9.0, 2),
+            RegionalRoadObservation(np.asarray([[0.0, 6.0], [0.0, 75.0]]), 9.0, 3),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 2)
+        shared = set.intersection(*(
+            {tuple(np.round(point, 3)) for point in road.points}
+            for road in final_roads
+        ))
+        self.assertIn((0.0, 0.0), shared)
+        self.assertEqual(diagnostics["cross_junction_count"], 1)
+        self.assertGreaterEqual(diagnostics["axis_intersection_count"], 1)
+
+    def test_regional_y_axes_share_one_inferred_node(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[-90.0, 0.0], [-8.0, 0.0]]), 8.0, 0),
+            RegionalRoadObservation(np.asarray([[65.0, 72.0], [6.0, 7.0]]), 8.0, 1),
+            RegionalRoadObservation(np.asarray([[65.0, -72.0], [6.0, -7.0]]), 8.0, 2),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        node_sets = [{tuple(np.round(point, 2)) for point in road.points} for road in final_roads]
+        shared = node_sets[0] & node_sets[1] & node_sets[2]
+        self.assertTrue(shared)
+        self.assertGreaterEqual(diagnostics["y_junction_count"], 1)
+        self.assertEqual(diagnostics["connected_component_count_after"], 1)
+
+    def test_road_surface_recenters_a_biased_straight_observation(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 3.0], [100.0, 3.0]]), 10.0, 0),
+        ]
+        surface = box(-5.0, -5.0, 105.0, 5.0)
+
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=surface,
+        )
+
+        final_offset = abs(float(np.mean(final_roads[0].points[:, 1])))
+        self.assertLess(final_offset, 1.0)
+        self.assertEqual(diagnostics["surface_center_correction_count"], 1)
+
     def test_near_endpoints_with_incompatible_headings_are_not_joined(self) -> None:
         paths = [
             self._path([[40, 10], [40, 40]], 1),

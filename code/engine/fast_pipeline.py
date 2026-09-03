@@ -2811,6 +2811,12 @@ def measure_fast_widths(
                 metric_crs = estimated
                 target_unit_m = 1.0
         metric_frame = tile_frame.to_crs(metric_crs)
+        metric_surface = None
+        if layer_records["surfaces"]:
+            surface_frame = gpd.GeoDataFrame(
+                layer_records["surfaces"], geometry="geometry", crs=target_crs,
+            ).to_crs(metric_crs)
+            metric_surface = unary_union(surface_frame.geometry.tolist())
         before_geometries = [
             np.asarray(geometry.coords, dtype=np.float64)
             for geometry in metric_frame.geometry
@@ -2820,11 +2826,14 @@ def measure_fast_widths(
                 points=points,
                 width_m=float(metric_frame.iloc[source_id]["width_m"]),
                 source_id=source_id,
+                source_tile=str(metric_frame.iloc[source_id].get("tile", "")),
             )
             for source_id, points in enumerate(before_geometries)
         ]
         regional_roads, regional_diagnostics = regularize_regional_road_network(
-            regional_inputs, unit_size_m=target_unit_m,
+            regional_inputs,
+            unit_size_m=target_unit_m,
+            surface_geometry=metric_surface,
         )
         write_before_after_visualization(
             before_geometries,
