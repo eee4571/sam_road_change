@@ -26,6 +26,13 @@ from shapely.geometry import LineString, box, shape
 from shapely.ops import linemerge, substring, unary_union
 from shapely.strtree import STRtree
 
+from .canonical_road_reconstruction import (
+    RegionalRoadObservation,
+    fit_canonical_road_geometry,
+    regularize_regional_road_network,
+    write_before_after_visualization,
+)
+
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
 FAST_LOCAL_STD_FLOOR = 1.0 / (255.0 * np.sqrt(12.0))
@@ -42,9 +49,9 @@ FAST_JUNCTION_EXCLUSION_DISTANCE_M = 12.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 FAST_SURFACE_MIN_AREA_M2 = 24.0
 FAST_SURFACE_MAX_HOLE_AREA_PX2 = 64
-FAST_REGULARIZATION_SNAP_DISTANCE_M = 15.0
+FAST_REGULARIZATION_SNAP_DISTANCE_M = 12.0
 FAST_REGULARIZATION_INTERSECTION_DISTANCE_M = 28.0
-FAST_REGULARIZATION_T_ATTACHMENT_DISTANCE_M = 25.0
+FAST_REGULARIZATION_T_ATTACHMENT_DISTANCE_M = 15.0
 FAST_REGULARIZATION_T_ATTACHMENT_CLEARANCE_M = 5.0
 FAST_REGULARIZATION_JUNCTION_LINK_M = 3.0
 FAST_REGULARIZATION_JUNCTION_CLUSTER_DIAMETER_M = 8.0
@@ -57,9 +64,9 @@ FAST_REGULARIZATION_INTERSECTION_SUPPORT = 0.45
 FAST_REGULARIZATION_INTERSECTION_ARM_SUPPORT = 0.25
 FAST_REGULARIZATION_INTERSECTION_LATERAL_TOLERANCE_M = 3.0
 FAST_REGULARIZATION_WIDTH_RATIO_MAX = 2.0
-FAST_REGULARIZATION_STRAIGHT_RESIDUAL_M = 2.5
-FAST_REGULARIZATION_STRAIGHT_RESIDUAL_RATIO = 0.06
-FAST_REGULARIZATION_STRAIGHT_SUPPORT = 0.80
+FAST_REGULARIZATION_STRAIGHT_RESIDUAL_M = 1.5
+FAST_REGULARIZATION_STRAIGHT_RESIDUAL_RATIO = 0.04
+FAST_REGULARIZATION_STRAIGHT_SUPPORT = 0.85
 FAST_REGULARIZATION_STRAIGHT_MAX_LENGTH_RATIO = 1.12
 FAST_REGULARIZATION_CURVE_SMOOTHING_M = 2.0
 FAST_REGULARIZATION_CURVE_MAX_SHIFT_M = 2.0
@@ -1144,10 +1151,7 @@ def _find_endpoint_connection_candidates(
             if second_id <= first.endpoint_id or second_id in unavailable:
                 continue
             second = endpoints[second_id]
-            if (
-                first.path_id == second.path_id
-                or paths[first.path_id].component_id == paths[second.path_id].component_id
-            ):
+            if first.path_id == second.path_id:
                 continue
             delta = second.point - first.point
             distance = float(np.linalg.norm(delta))
@@ -1164,7 +1168,8 @@ def _find_endpoint_connection_candidates(
             support_ratio = _sample_regularization_support(
                 np.asarray([first.point, second.point], dtype=np.float32), support,
             )
-            if support_ratio < FAST_REGULARIZATION_CONTINUATION_SUPPORT:
+            required_support = 0.15 + 0.45 * (distance / max(max_distance_px, 1e-9))
+            if support_ratio < required_support:
                 continue
             score = distance + 4.0 * (
                 2.0 - first_alignment - second_alignment
@@ -1288,7 +1293,8 @@ def _attach_endpoints_to_path_interiors(
             support_ratio = _sample_regularization_support(
                 np.asarray([endpoint.point, node], dtype=np.float32), support,
             )
-            if support_ratio < FAST_REGULARIZATION_INTERSECTION_SUPPORT:
+            required_support = 0.15 + 0.30 * (distance / max(max_distance_px, 1e-9))
+            if support_ratio < required_support:
                 continue
             row, col = np.rint(node).astype(np.int32)
             if not (0 <= row < surface_distance.shape[0] and 0 <= col < surface_distance.shape[1]):
@@ -1710,29 +1716,25 @@ def regularize_fast_road_network(
         + recollapsed_junction_edges + final_chain_merges
     )
     consolidated_junctions += recollapsed_junctions
-    regularized: list[FastRoadPath] = []
-    straightened_count = 0
-    smoothed_count = 0
-    for chain in chains:
-        straight = _fit_straight_road_chain(
-            chain, support, physical_pixel_size_m,
-        )
-        if straight is not None:
-            regularized.append(straight)
-            straightened_count += 1
-            continue
-        smoothed = _smooth_curved_road_chain(
-            chain, support, physical_pixel_size_m,
-        )
-        if smoothed is not None:
-            regularized.append(smoothed)
-            smoothed_count += 1
-        else:
-            regularized.append(chain)
-    regularized, through_junction_merges = _merge_fast_paths_through_junctions(
-        regularized, physical_pixel_size_m,
+    road_entities, through_junction_merges = _merge_fast_paths_through_junctions(
+        chains, physical_pixel_size_m,
     )
     merged_chain_count += through_junction_merges
+    canonical_roads, _canonical_junctions, canonical_diagnostics = (
+        fit_canonical_road_geometry(
+            [path.pixels for path in road_entities], physical_pixel_size_m,
+        )
+    )
+    regularized = [
+        _copy_fast_path_geometry(road_entities[road.road_id], road.points)
+        for road in canonical_roads
+    ]
+    original_vertex_count = int(sum(path.pixels.shape[0] for path in paths))
+    final_vertex_count = int(sum(path.pixels.shape[0] for path in regularized))
+    generated_connection_length_m = float(sum(
+        np.linalg.norm(node - endpoints[endpoint_id].point)
+        for endpoint_id, node in assignments.items()
+    ) * physical_pixel_size_m)
     skeleton = _paths_to_skeleton(regularized, surface.shape)
     diagnostics = {
         "regularization_original_path_count": int(len(paths)),
@@ -1758,8 +1760,33 @@ def regularize_fast_road_network(
         "regularization_intersection_through_merge_count": int(
             through_junction_merges
         ),
-        "regularization_straightened_chain_count": int(straightened_count),
-        "regularization_smoothed_chain_count": int(smoothed_count),
+        "regularization_straightened_chain_count": int(
+            canonical_diagnostics["canonical_straight_road_count"]
+        ),
+        "regularization_smoothed_chain_count": int(
+            canonical_diagnostics["canonical_curved_road_count"]
+        ),
+        "original_feature_count": int(len(paths)),
+        "final_feature_count": int(len(regularized)),
+        "original_vertex_count": original_vertex_count,
+        "final_vertex_count": final_vertex_count,
+        "generated_junction_count": int(
+            canonical_diagnostics["generated_junction_count"]
+        ),
+        "merged_road_entity_count": int(merged_chain_count),
+        "canonical_straight_road_count": int(
+            canonical_diagnostics["canonical_straight_road_count"]
+        ),
+        "canonical_curved_road_count": int(
+            canonical_diagnostics["canonical_curved_road_count"]
+        ),
+        "mean_vertices_per_road_before": float(
+            original_vertex_count / max(len(paths), 1)
+        ),
+        "mean_vertices_per_road_after": float(
+            final_vertex_count / max(len(regularized), 1)
+        ),
+        "generated_connection_length_m": generated_connection_length_m,
         "regularization_seconds": float(time.perf_counter() - started),
     }
     return skeleton, regularized, diagnostics
@@ -2753,6 +2780,99 @@ def measure_fast_widths(
 
     if target_crs is None:
         raise RuntimeError("Fast width received no georeferenced images")
+    regional_diagnostics: dict[str, float | int] = {
+        "original_feature_count": 0,
+        "final_feature_count": 0,
+        "original_vertex_count": 0,
+        "final_vertex_count": 0,
+        "generated_junction_count": 0,
+        "merged_road_entity_count": 0,
+        "canonical_straight_road_count": 0,
+        "canonical_curved_road_count": 0,
+        "mean_vertices_per_road_before": 0.0,
+        "mean_vertices_per_road_after": 0.0,
+        "generated_connection_length_m": 0.0,
+        "regional_regularization_seconds": 0.0,
+    }
+    comparison_path = output_dir / "before_after_visualization.png"
+    if layer_records["centerlines"]:
+        tile_frame = gpd.GeoDataFrame(
+            layer_records["centerlines"], geometry="geometry", crs=target_crs,
+        )
+        target_definition = CRS.from_user_input(target_crs)
+        target_unit_m = float(
+            target_definition.axis_info[0].unit_conversion_factor
+            if target_definition.axis_info else 1.0
+        )
+        metric_crs = target_crs
+        if target_definition.is_geographic or not np.isclose(target_unit_m, 1.0):
+            estimated = tile_frame.estimate_utm_crs()
+            if estimated is not None:
+                metric_crs = estimated
+                target_unit_m = 1.0
+        metric_frame = tile_frame.to_crs(metric_crs)
+        before_geometries = [
+            np.asarray(geometry.coords, dtype=np.float64)
+            for geometry in metric_frame.geometry
+        ]
+        regional_inputs = [
+            RegionalRoadObservation(
+                points=points,
+                width_m=float(metric_frame.iloc[source_id]["width_m"]),
+                source_id=source_id,
+            )
+            for source_id, points in enumerate(before_geometries)
+        ]
+        regional_roads, regional_diagnostics = regularize_regional_road_network(
+            regional_inputs, unit_size_m=target_unit_m,
+        )
+        write_before_after_visualization(
+            before_geometries,
+            [road.points for road in regional_roads],
+            comparison_path,
+        )
+        metric_centerlines: list[dict] = []
+        metric_width_segments: list[dict] = []
+        metric_corridors: list[dict] = []
+        for road_id, road in enumerate(regional_roads):
+            member_rows = [metric_frame.iloc[source_id] for source_id in road.source_ids]
+            width_source = next(
+                (
+                    source for source in (
+                        "enhanced_molra", "neighbor_fallback", "fast_mask_fallback",
+                    )
+                    if any(str(row.get("width_src", "")) == source for row in member_rows)
+                ),
+                "",
+            )
+            tiles = sorted({str(row.get("tile", "")) for row in member_rows})
+            geometry = LineString(np.asarray(road.points, dtype=np.float64))
+            common = {
+                "tile": ",".join(tiles),
+                "edge_id": int(road_id),
+                "width_m": float(road.width_m),
+                "width_src": width_source,
+                "exec_prof": "fast",
+                "geometry": geometry,
+            }
+            metric_centerlines.append({**common, "source": "final_centerline"})
+            metric_width_segments.append(common)
+            metric_corridors.append({
+                **common,
+                "geometry": geometry.buffer(
+                    float(road.width_m) / max(2.0 * target_unit_m, 1e-9)
+                ),
+            })
+
+        def target_records(records: list[dict]) -> list[dict]:
+            frame = gpd.GeoDataFrame(records, geometry="geometry", crs=metric_crs)
+            if frame.crs != target_crs:
+                frame = frame.to_crs(target_crs)
+            return frame.to_dict(orient="records")
+
+        layer_records["centerlines"] = target_records(metric_centerlines)
+        layer_records["width_segments"] = target_records(metric_width_segments)
+        layer_records["corridors"] = target_records(metric_corridors)
     working = output_dir / "fast_products.gpkg"
     working.unlink(missing_ok=True)
     for index, (layer, records) in enumerate(layer_records.items()):
@@ -2763,6 +2883,8 @@ def measure_fast_widths(
     summary = {
         "execution_profile": "fast", "width_source": "enhanced_molra_surface_normal",
         "working_gpkg": str(working), "images": image_rows,
+        "before_after_visualization": str(comparison_path),
+        **regional_diagnostics,
         "fast_width_elapsed_seconds": float(time.perf_counter() - batch_started),
         "raw_molra_mask_pixel_count": int(sum(
             row.get("raw_molra_mask_pixel_count", 0) for row in image_rows

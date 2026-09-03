@@ -51,6 +51,7 @@ totals = {
     "original": 0, "final": 0, "length_before_m": 0.0, "length_after_m": 0.0,
     "collapsed": 0, "junctions": 0, "attachments": 0, "through_merges": 0,
     "connections": 0,
+    "vertices_before": 0, "vertices_after": 0, "straight": 0, "curved": 0,
 }
 rows = []
 for summary_path in sorted((ROOT / "width_review").glob("v*_summary.json")):
@@ -90,9 +91,17 @@ for summary_path in sorted((ROOT / "width_review").glob("v*_summary.json")):
         "attachments": diagnostics["regularization_path_attachment_count"],
         "through_merges": diagnostics["regularization_intersection_through_merge_count"],
         "connections": diagnostics["regularization_generated_connection_count"],
+        "vertices_before": diagnostics["original_vertex_count"],
+        "vertices_after": diagnostics["final_vertex_count"],
+        "straight": diagnostics["canonical_straight_road_count"],
+        "curved": diagnostics["canonical_curved_road_count"],
     }
     rows.append(row)
-    for key in ("original", "final", "collapsed", "junctions", "attachments", "through_merges", "connections"):
+    for key in (
+        "original", "final", "collapsed", "junctions", "attachments",
+        "through_merges", "connections", "vertices_before", "vertices_after",
+        "straight", "curved",
+    ):
         totals[key] += row[key]
     totals["length_before_m"] += before_length
     totals["length_after_m"] += after_length
