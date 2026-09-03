@@ -15,7 +15,7 @@ import rasterio
 from PIL import Image, ImageDraw
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Point, box
 from shapely.ops import unary_union
 
 
@@ -28,6 +28,7 @@ import user_pipeline
 from engine.fast_pipeline import (
     FAST_CHANGE_FALSE_POSITIVE_MIN_LENGTH_PX,
     FastProbabilityGrid,
+    FastRoadPath,
     augment_fast_changes_with_truth,
     build_fast_change_from_truth,
     build_fast_surface_mask,
@@ -37,6 +38,7 @@ from engine.fast_pipeline import (
     measure_fast_edge_widths,
     measure_fast_path_widths,
     measure_fast_widths,
+    regularize_fast_road_network,
     _build_fast_road_geometry,
     _bridge_fast_presence_gaps,
     _bridge_small_supported_gaps,
@@ -411,6 +413,272 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         self.assertEqual(diagnostics["toponet_edge_count"], 1)
 
 
+class FastRoadNetworkRegularizationTests(unittest.TestCase):
+    @staticmethod
+    def _path(
+        points, component_id: int, start_degree: int = 1, end_degree: int = 1,
+    ) -> FastRoadPath:
+        pixels = np.asarray(points, dtype=np.float32)
+        length = float(np.linalg.norm(np.diff(pixels, axis=0), axis=1).sum())
+        return FastRoadPath(
+            pixels=pixels,
+            length_px=length,
+            start_degree=start_degree,
+            end_degree=end_degree,
+            mean_relative_score=1.0,
+            low_relative_score=1.0,
+            component_id=component_id,
+            component_length_px=length,
+        )
+
+    @staticmethod
+    def _surface(shape_, polylines, thickness: int = 7) -> np.ndarray:
+        surface = np.zeros(shape_, dtype=np.uint8)
+        for points in polylines:
+            coordinates = np.asarray(points, dtype=np.int32)[:, ::-1]
+            cv2.polylines(surface, [coordinates], False, 1, thickness)
+        return surface
+
+    def test_three_collinear_fragments_become_one_canonical_chain(self) -> None:
+        paths = [
+            self._path([[40, 10], [40, 30]], 1),
+            self._path([[40, 35], [40, 55]], 2),
+            self._path([[40, 60], [40, 80]], 3),
+        ]
+        surface = self._surface((90, 100), [[[40, 8], [40, 82]]])
+
+        network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(len(final_paths), 1)
+        self.assertEqual(diagnostics["regularization_final_path_count"], 1)
+        self.assertGreaterEqual(diagnostics["regularization_merged_chain_count"], 2)
+        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 4)
+        self.assertTrue(np.all(network[40, 10:81] == 1))
+
+    def test_close_parallel_roads_remain_independent(self) -> None:
+        paths = [
+            self._path([[30, 10], [30, 80]], 1),
+            self._path([[38, 10], [38, 80]], 2),
+        ]
+        surface = self._surface(
+            (90, 100), [path.pixels for path in paths], thickness=3,
+        )
+
+        _network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 0)
+        self.assertEqual(diagnostics["regularization_intersection_count"], 0)
+
+    def test_cross_intersection_is_reconstructed_from_four_arms(self) -> None:
+        paths = [
+            self._path([[50, 15], [50, 43]], 1),
+            self._path([[50, 57], [50, 85]], 2),
+            self._path([[15, 50], [43, 50]], 3),
+            self._path([[57, 50], [85, 50]], 4),
+        ]
+        surface = self._surface(
+            (100, 100), [
+                [[50, 12], [50, 88]], [[12, 50], [88, 50]],
+            ],
+        )
+
+        network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(diagnostics["regularization_intersection_count"], 1)
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 2)
+        self.assertEqual(int(network[50, 50]), 1)
+        spans = sorted(
+            (float(np.ptp(path.pixels[:, 0])), float(np.ptp(path.pixels[:, 1])))
+            for path in final_paths
+        )
+        self.assertGreater(spans[0][1], 65.0)
+        self.assertGreater(spans[1][0], 65.0)
+
+    def test_t_intersection_is_reconstructed_from_three_arms(self) -> None:
+        paths = [
+            self._path([[45, 12], [45, 42]], 1),
+            self._path([[45, 58], [45, 88]], 2),
+            self._path([[82, 50], [53, 50]], 3),
+        ]
+        surface = self._surface(
+            (100, 100), [
+                [[45, 10], [45, 90]], [[85, 50], [45, 50]],
+            ],
+        )
+
+        network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(diagnostics["regularization_intersection_count"], 1)
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 1)
+        self.assertEqual(int(network[45, 50]), 1)
+        self.assertTrue(any(float(np.ptp(path.pixels[:, 1])) > 70.0 for path in final_paths))
+
+    def test_connected_junction_cluster_collapses_to_one_stable_node(self) -> None:
+        paths = [
+            self._path([[50, 15], [50, 49]], 1, 1, 3),
+            self._path([[15, 49], [50, 49]], 1, 1, 3),
+            self._path([[50, 49], [50, 51]], 1, 3, 3),
+            self._path([[50, 51], [50, 85]], 1, 3, 1),
+            self._path([[50, 51], [85, 51]], 1, 3, 1),
+        ]
+        surface = self._surface(
+            (100, 100), [
+                [[50, 12], [50, 88]],
+                [[12, 49], [88, 51]],
+            ],
+        )
+
+        network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_collapsed_junction_edge_count"], 1)
+        self.assertEqual(diagnostics["regularization_consolidated_junction_count"], 1)
+        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 2)
+        self.assertEqual(int(network[50, 50]), 1)
+
+    def test_dangling_branch_attaches_to_continuous_main_road(self) -> None:
+        paths = [
+            self._path([[45, 12], [45, 88]], 1),
+            self._path([[82, 50], [54, 50]], 2),
+        ]
+        surface = self._surface(
+            (100, 100), [
+                [[45, 10], [45, 90]], [[85, 50], [45, 50]],
+            ],
+        )
+
+        network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(diagnostics["regularization_path_attachment_count"], 1)
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 1)
+        self.assertEqual(int(network[45, 50]), 1)
+        self.assertTrue(any(float(np.ptp(path.pixels[:, 1])) > 70.0 for path in final_paths))
+
+    def test_slightly_wavy_straight_road_is_straightened(self) -> None:
+        cols = np.arange(10, 91, dtype=np.float32)
+        rows = 50.0 + np.sin(cols / 4.0)
+        path = self._path(np.column_stack((rows, cols)), 1)
+        surface = self._surface((110, 110), [path.pixels], thickness=9)
+
+        _network, final_paths, diagnostics = regularize_fast_road_network(
+            [path], surface, 1.0,
+        )
+
+        self.assertEqual(diagnostics["regularization_straightened_chain_count"], 1)
+        self.assertEqual(final_paths[0].pixels.shape[0], 2)
+        self.assertLess(abs(float(final_paths[0].pixels[0, 0] - final_paths[0].pixels[-1, 0])), 2.0)
+
+    def test_real_curve_is_smoothed_without_being_forced_straight(self) -> None:
+        vertical = np.column_stack((np.arange(10, 51), np.full(41, 30)))
+        horizontal = np.column_stack((np.full(50, 50), np.arange(31, 81)))
+        points = np.vstack((vertical, horizontal)).astype(np.float32)
+        path = self._path(points, 1)
+        surface = self._surface((100, 100), [points], thickness=9)
+
+        _network, final_paths, diagnostics = regularize_fast_road_network(
+            [path], surface, 1.0,
+        )
+
+        self.assertEqual(diagnostics["regularization_straightened_chain_count"], 0)
+        self.assertGreater(final_paths[0].pixels.shape[0], 2)
+        chord = LineString(final_paths[0].pixels[[0, -1], ::-1])
+        bend = max(
+            chord.distance(Point(point[::-1]))
+            for point in final_paths[0].pixels[1:-1]
+        )
+        self.assertGreater(bend, 10.0)
+
+    def test_near_endpoints_with_incompatible_headings_are_not_joined(self) -> None:
+        paths = [
+            self._path([[40, 10], [40, 40]], 1),
+            self._path([[44, 44], [75, 44]], 2),
+        ]
+        surface = self._surface((90, 90), [path.pixels for path in paths], thickness=9)
+
+        _network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        self.assertEqual(len(final_paths), 2)
+        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 0)
+
+    def test_generated_connection_stays_near_road_surface(self) -> None:
+        paths = [
+            self._path([[30, 10], [30, 35]], 1),
+            self._path([[30, 44], [30, 70]], 2),
+        ]
+        surface = self._surface((70, 80), [[[30, 8], [30, 72]]], thickness=5)
+
+        network, _final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        nearby_surface = cv2.dilate(surface, np.ones((7, 7), dtype=np.uint8))
+        self.assertGreater(diagnostics["regularization_generated_connection_count"], 0)
+        self.assertTrue(np.all(nearby_surface[network > 0] > 0))
+
+    def test_fragment_reduction_does_not_change_total_length_abnormally(self) -> None:
+        paths = [
+            self._path([[60, 10], [60, 32]], 1),
+            self._path([[60, 36], [60, 58]], 2),
+            self._path([[60, 62], [60, 84]], 3),
+        ]
+        surface = self._surface((100, 100), [[[60, 8], [60, 86]]])
+        original_length = sum(path.length_px for path in paths)
+
+        _network, final_paths, diagnostics = regularize_fast_road_network(
+            paths, surface, 1.0,
+        )
+
+        final_length = sum(path.length_px for path in final_paths)
+        self.assertLess(diagnostics["regularization_final_path_count"], len(paths))
+        self.assertGreater(final_length, 0.90 * original_length)
+        self.assertLess(final_length, 1.25 * original_length)
+
+    def test_endpoint_snap_distance_is_resolution_invariant(self) -> None:
+        for pixel_size_m in (0.5, 1.0, 2.0):
+            with self.subTest(pixel_size_m=pixel_size_m):
+                segment_px = int(round(24.0 / pixel_size_m))
+                gap_px = int(round(10.0 / pixel_size_m))
+                first_start = 10
+                first_end = first_start + segment_px
+                second_start = first_end + gap_px
+                second_end = second_start + segment_px
+                paths = [
+                    self._path([[30, first_start], [30, first_end]], 1),
+                    self._path([[30, second_start], [30, second_end]], 2),
+                ]
+                surface = self._surface(
+                    (70, second_end + 12),
+                    [[[30, first_start - 2], [30, second_end + 2]]],
+                )
+
+                _network, final_paths, diagnostics = regularize_fast_road_network(
+                    paths, surface, pixel_size_m,
+                )
+
+                self.assertEqual(len(final_paths), 1)
+                self.assertEqual(
+                    diagnostics["regularization_snapped_endpoint_count"], 2,
+                )
+
+
 class FastWidthTests(unittest.TestCase):
     def setUp(self) -> None:
         self.mask = np.zeros((80, 80), dtype=np.uint8)
@@ -564,9 +832,22 @@ class FastWidthTests(unittest.TestCase):
             self.assertEqual(tile_summary["surface_min_area_m2"], 24.0)
             self.assertEqual(tile_summary["surface_min_area_px2"], 24)
             self.assertEqual(tile_summary["junction_exclusion_distance_m"], 12.0)
+            for key in (
+                "regularization_original_path_count",
+                "regularization_final_path_count",
+                "regularization_merged_chain_count",
+                "regularization_snapped_endpoint_count",
+                "regularization_generated_connection_count",
+                "regularization_intersection_count",
+                "regularization_straightened_chain_count",
+                "regularization_smoothed_chain_count",
+                "regularization_seconds",
+            ):
+                self.assertIn(key, tile_summary)
+                self.assertIn(key, summary)
             centerlines = gpd.read_file(widths / "fast_products.gpkg", layer="centerlines")
             self.assertEqual(len(centerlines), 1)
-            self.assertEqual(centerlines.iloc[0]["source"], "native_toponet")
+            self.assertEqual(centerlines.iloc[0]["source"], "final_centerline")
 
     def test_distance_transform_is_used_when_normal_probe_fails(self) -> None:
         rows = measure_fast_edge_widths(

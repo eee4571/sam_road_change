@@ -9,6 +9,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,7 @@ from shapely import make_valid
 from shapely.affinity import translate
 from shapely.geometry import LineString, box, shape
 from shapely.ops import linemerge, substring, unary_union
+from shapely.strtree import STRtree
 
 
 WIDTH_ROOT = Path(__file__).resolve().parent / "width"
@@ -40,6 +42,31 @@ FAST_JUNCTION_EXCLUSION_DISTANCE_M = 12.0
 FAST_SURFACE_PROBABILITY_THRESHOLD = 0.20
 FAST_SURFACE_MIN_AREA_M2 = 24.0
 FAST_SURFACE_MAX_HOLE_AREA_PX2 = 64
+FAST_REGULARIZATION_SNAP_DISTANCE_M = 15.0
+FAST_REGULARIZATION_INTERSECTION_DISTANCE_M = 28.0
+FAST_REGULARIZATION_T_ATTACHMENT_DISTANCE_M = 25.0
+FAST_REGULARIZATION_T_ATTACHMENT_CLEARANCE_M = 5.0
+FAST_REGULARIZATION_JUNCTION_LINK_M = 3.0
+FAST_REGULARIZATION_JUNCTION_CLUSTER_DIAMETER_M = 8.0
+FAST_REGULARIZATION_HEADING_LOOKBACK_M = 20.0
+FAST_REGULARIZATION_CONTINUATION_ANGLE_DEG = 30.0
+FAST_REGULARIZATION_INTERSECTION_AXIS_ANGLE_DEG = 35.0
+FAST_REGULARIZATION_SURFACE_NEAR_DISTANCE_M = 2.5
+FAST_REGULARIZATION_CONTINUATION_SUPPORT = 0.70
+FAST_REGULARIZATION_INTERSECTION_SUPPORT = 0.45
+FAST_REGULARIZATION_INTERSECTION_ARM_SUPPORT = 0.25
+FAST_REGULARIZATION_INTERSECTION_LATERAL_TOLERANCE_M = 3.0
+FAST_REGULARIZATION_WIDTH_RATIO_MAX = 2.0
+FAST_REGULARIZATION_STRAIGHT_RESIDUAL_M = 2.5
+FAST_REGULARIZATION_STRAIGHT_RESIDUAL_RATIO = 0.06
+FAST_REGULARIZATION_STRAIGHT_SUPPORT = 0.80
+FAST_REGULARIZATION_STRAIGHT_MAX_LENGTH_RATIO = 1.12
+FAST_REGULARIZATION_CURVE_SMOOTHING_M = 2.0
+FAST_REGULARIZATION_CURVE_MAX_SHIFT_M = 2.0
+FAST_REGULARIZATION_CURVE_SUPPORT = 0.80
+FAST_REGULARIZATION_CURVE_LENGTH_RETAIN_MIN = 0.85
+FAST_REGULARIZATION_CURVE_LENGTH_RETAIN_MAX = 1.05
+FAST_REGULARIZATION_SIMPLIFY_M = 0.75
 FAST_CHANGE_GLOBAL_SEED = 20260826
 FAST_CHANGE_MISS_PROB = 0.05
 FAST_CHANGE_FALSE_POSITIVE_AREA_RATIO_MIN = 0.25
@@ -79,9 +106,7 @@ FAST_PRESENCE_CALIBRATION_MAX_OFFSET = 0.06
 FAST_PRESENCE_CALIBRATION_SCALE_MIN = 0.85
 FAST_PRESENCE_CALIBRATION_SCALE_MAX = 1.15
 FAST_PRESENCE_ALIGNMENT_DISTANCE_M = 2.0
-FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M = 6.0
-FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO = 0.65
-FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO = 0.20
+FAST_LOCAL_ROAD_MATCH_DISTANCE_M = 6.0
 FAST_PRESENCE_MIN_BLOB_AREA_M2 = 12.0
 FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR = 12
 FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M = 2.0
@@ -123,6 +148,30 @@ class FastRoadPath:
 
 
 @dataclass(frozen=True)
+class _FastRegularizationEndpoint:
+    """One true path endpoint with a scale-aware outward heading."""
+
+    endpoint_id: int
+    path_id: int
+    at_start: bool
+    point: np.ndarray
+    heading: np.ndarray
+    local_width_px: float
+
+
+@dataclass(frozen=True)
+class _FastRegularizationAttachment:
+    """One endpoint joined to the interior of another canonical path."""
+
+    endpoint_id: int
+    target_path_id: int
+    segment_index: int
+    segment_fraction: float
+    node: np.ndarray
+    score: float
+
+
+@dataclass(frozen=True)
 class FastProbabilityGrid:
     """Two period probabilities normalized onto the before-period raster grid."""
 
@@ -133,6 +182,19 @@ class FastProbabilityGrid:
     pixel_size: float
     raw_before: np.ndarray | None = None
     raw_after: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class FastLocalRoadCorrespondence:
+    """Raster-local road support shared by both periods."""
+
+    before_axis: np.ndarray
+    after_axis: np.ndarray
+    before_common_axis: np.ndarray
+    after_common_axis: np.ndarray
+    before_common_surface: np.ndarray
+    after_common_surface: np.ndarray
+    match_radius_px: int
 
 
 @dataclass(frozen=True)
@@ -697,6 +759,1010 @@ def _cleanup_fast_final_centerline(
         "gap_bridge_distance_px": float(gap_bridge_distance_px),
     }
     return cleaned, final_paths, diagnostics
+
+
+def _point_at_endpoint_lookback(
+    points: np.ndarray, lookback_px: float,
+) -> np.ndarray:
+    """Interpolate a point a physical lookback distance into a path."""
+    travelled = 0.0
+    for first, second in zip(points, points[1:]):
+        segment = float(np.linalg.norm(second - first))
+        if segment <= 0:
+            continue
+        if travelled + segment >= lookback_px:
+            fraction = (lookback_px - travelled) / segment
+            return first + fraction * (second - first)
+        travelled += segment
+    return points[-1]
+
+
+def _estimate_regularization_endpoint_heading(
+    path: FastRoadPath,
+    at_start: bool,
+    lookback_px: float,
+) -> np.ndarray:
+    """Estimate an outward endpoint heading from a stable section of the road."""
+    points = np.asarray(path.pixels, dtype=np.float32)
+    ordered = points if at_start else points[::-1]
+    inward = _point_at_endpoint_lookback(ordered, max(1.0, float(lookback_px)))
+    vector = ordered[0] - inward
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else vector
+
+
+def _sample_regularization_support(
+    points: np.ndarray,
+    support: np.ndarray,
+) -> float:
+    """Return raster support along a vector path without rerunning skeletonization."""
+    samples: list[np.ndarray] = []
+    for first, second in zip(np.asarray(points), np.asarray(points)[1:]):
+        distance = float(np.linalg.norm(second - first))
+        count = max(2, int(np.ceil(distance)) + 1)
+        samples.append(np.linspace(first, second, count, dtype=np.float32))
+    if not samples:
+        return 0.0
+    indices = np.rint(np.vstack(samples)).astype(np.int32)
+    valid = (
+        (indices[:, 0] >= 0) & (indices[:, 0] < support.shape[0])
+        & (indices[:, 1] >= 0) & (indices[:, 1] < support.shape[1])
+    )
+    if not np.any(valid):
+        return 0.0
+    indices = indices[valid]
+    return float(np.mean(support[indices[:, 0], indices[:, 1]] > 0))
+
+
+def _collapse_fast_junction_clusters(
+    paths: list[FastRoadPath],
+    physical_pixel_size_m: float,
+) -> tuple[list[FastRoadPath], int, int]:
+    """Collapse tiny connected junction subgraphs into stable topology nodes."""
+    node_points: dict[tuple[float, float], np.ndarray] = {}
+    path_nodes: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for path in paths:
+        start = _regularization_node_key(path.pixels[0])
+        end = _regularization_node_key(path.pixels[-1])
+        node_points.setdefault(start, np.asarray(path.pixels[0], dtype=np.float32))
+        node_points.setdefault(end, np.asarray(path.pixels[-1], dtype=np.float32))
+        path_nodes.append((start, end))
+    parent = {node: node for node in node_points}
+    cluster_bounds = {
+        node: np.asarray([*point, *point], dtype=np.float32)
+        for node, point in node_points.items()
+    }
+
+    def find(node: tuple[float, float]) -> tuple[float, float]:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    max_link_px = _fast_length_pixels(
+        FAST_REGULARIZATION_JUNCTION_LINK_M, physical_pixel_size_m,
+    )
+    max_diameter_px = _fast_length_pixels(
+        FAST_REGULARIZATION_JUNCTION_CLUSTER_DIAMETER_M,
+        physical_pixel_size_m,
+    )
+    candidates = sorted(
+        (
+            (path.length_px, start, end)
+            for path, (start, end) in zip(paths, path_nodes)
+            if path.start_degree >= 3
+            and path.end_degree >= 3
+            and start != end
+            and path.length_px <= max_link_px
+        ),
+        key=lambda item: item[0],
+    )
+    for _length, start, end in candidates:
+        first_root, second_root = find(start), find(end)
+        if first_root == second_root:
+            continue
+        first_bounds = cluster_bounds[first_root]
+        second_bounds = cluster_bounds[second_root]
+        combined = np.asarray([
+            min(first_bounds[0], second_bounds[0]),
+            min(first_bounds[1], second_bounds[1]),
+            max(first_bounds[2], second_bounds[2]),
+            max(first_bounds[3], second_bounds[3]),
+        ], dtype=np.float32)
+        if float(np.linalg.norm(combined[2:] - combined[:2])) > max_diameter_px:
+            continue
+        parent[second_root] = first_root
+        cluster_bounds[first_root] = combined
+
+    members: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    for node in node_points:
+        members.setdefault(find(node), []).append(node)
+    representatives: dict[tuple[float, float], np.ndarray] = {}
+    consolidated_count = 0
+    for cluster in members.values():
+        if len(cluster) <= 1:
+            continue
+        representative = np.mean(
+            np.asarray([node_points[node] for node in cluster], dtype=np.float32),
+            axis=0,
+        )
+        for node in cluster:
+            representatives[node] = representative
+        consolidated_count += 1
+
+    collapsed_paths: list[FastRoadPath] = []
+    collapsed_edge_count = 0
+    for path, (start, end) in zip(paths, path_nodes):
+        start_node = representatives.get(start)
+        end_node = representatives.get(end)
+        if (
+            start_node is not None
+            and end_node is not None
+            and np.array_equal(start_node, end_node)
+            and path.start_degree >= 3
+            and path.end_degree >= 3
+            and path.length_px <= max_link_px
+        ):
+            collapsed_edge_count += 1
+            continue
+        points = np.asarray(path.pixels, dtype=np.float32)
+        if start_node is not None and float(np.linalg.norm(start_node - points[0])) > 0.25:
+            points = np.vstack((start_node, points))
+        if end_node is not None and float(np.linalg.norm(end_node - points[-1])) > 0.25:
+            points = np.vstack((points, end_node))
+        collapsed_paths.append(_copy_fast_path_geometry(path, points))
+    return collapsed_paths, collapsed_edge_count, consolidated_count
+
+
+def _regularization_support_mask(
+    road_surface: np.ndarray,
+    physical_pixel_size_m: float,
+) -> np.ndarray:
+    radius = max(1, int(np.ceil(_fast_length_pixels(
+        FAST_REGULARIZATION_SURFACE_NEAR_DISTANCE_M,
+        physical_pixel_size_m,
+    ))))
+    return cv2.dilate(
+        (np.asarray(road_surface) > 0).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2),
+    )
+
+
+def _collect_regularization_endpoints(
+    paths: list[FastRoadPath],
+    road_surface: np.ndarray,
+    physical_pixel_size_m: float,
+) -> list[_FastRegularizationEndpoint]:
+    """Collect true endpoints and their headings/approximate local widths."""
+    lookback_px = _fast_length_pixels(
+        FAST_REGULARIZATION_HEADING_LOOKBACK_M, physical_pixel_size_m,
+    )
+    distance = cv2.distanceTransform(
+        (np.asarray(road_surface) > 0).astype(np.uint8), cv2.DIST_L2, 5,
+    )
+    endpoints: list[_FastRegularizationEndpoint] = []
+    for path_id, path in enumerate(paths):
+        for at_start, degree in ((True, path.start_degree), (False, path.end_degree)):
+            if degree != 1:
+                continue
+            points = np.asarray(path.pixels, dtype=np.float32)
+            ordered = points if at_start else points[::-1]
+            sample_count = min(ordered.shape[0], max(2, int(np.ceil(lookback_px))))
+            indices = np.rint(ordered[:sample_count]).astype(np.int32)
+            indices[:, 0] = np.clip(indices[:, 0], 0, distance.shape[0] - 1)
+            indices[:, 1] = np.clip(indices[:, 1], 0, distance.shape[1] - 1)
+            local_widths = 2.0 * distance[indices[:, 0], indices[:, 1]]
+            positive_widths = local_widths[local_widths > 0]
+            endpoints.append(_FastRegularizationEndpoint(
+                endpoint_id=len(endpoints),
+                path_id=path_id,
+                at_start=at_start,
+                point=ordered[0].copy(),
+                heading=_estimate_regularization_endpoint_heading(
+                    path, at_start, lookback_px,
+                ),
+                local_width_px=float(np.median(positive_widths))
+                if positive_widths.size else 0.0,
+            ))
+    return endpoints
+
+
+def _regularization_endpoint_buckets(
+    endpoints: list[_FastRegularizationEndpoint],
+    cell_size: int,
+) -> dict[tuple[int, int], list[int]]:
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for endpoint in endpoints:
+        row, col = np.floor(endpoint.point / max(cell_size, 1)).astype(int)
+        buckets.setdefault((int(row), int(col)), []).append(endpoint.endpoint_id)
+    return buckets
+
+
+def _nearby_regularization_endpoints(
+    endpoint: _FastRegularizationEndpoint,
+    endpoints: list[_FastRegularizationEndpoint],
+    buckets: dict[tuple[int, int], list[int]],
+    cell_size: int,
+    max_distance_px: float,
+) -> list[int]:
+    row, col = np.floor(endpoint.point / max(cell_size, 1)).astype(int)
+    nearby: list[tuple[float, int]] = []
+    for drow in (-1, 0, 1):
+        for dcol in (-1, 0, 1):
+            for candidate_id in buckets.get((int(row + drow), int(col + dcol)), []):
+                if candidate_id == endpoint.endpoint_id:
+                    continue
+                candidate = endpoints[candidate_id]
+                distance = float(np.linalg.norm(candidate.point - endpoint.point))
+                if distance <= max_distance_px:
+                    nearby.append((distance, candidate_id))
+    return [candidate_id for _distance, candidate_id in sorted(nearby)]
+
+
+def _intersection_heading_layout(headings: np.ndarray) -> bool:
+    continuation_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_CONTINUATION_ANGLE_DEG,
+    )))
+    cross_axis_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_INTERSECTION_AXIS_ANGLE_DEG,
+    )))
+    if headings.shape[0] == 3:
+        for first, second in combinations(range(3), 2):
+            if float(np.dot(headings[first], headings[second])) > -continuation_cosine:
+                continue
+            third = 3 - first - second
+            if abs(float(np.dot(headings[first], headings[third]))) <= cross_axis_cosine:
+                return True
+        return False
+    if headings.shape[0] == 4:
+        for first, second, third, fourth in (
+            (0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2),
+        ):
+            if (
+                float(np.dot(headings[first], headings[second])) <= -continuation_cosine
+                and float(np.dot(headings[third], headings[fourth])) <= -continuation_cosine
+                and abs(float(np.dot(headings[first], headings[third]))) <= cross_axis_cosine
+            ):
+                return True
+    return False
+
+
+def _solve_regularization_intersection(
+    selected: list[_FastRegularizationEndpoint],
+    max_distance_px: float,
+    lateral_tolerance_px: float,
+) -> np.ndarray | None:
+    identity = np.eye(2, dtype=np.float64)
+    matrix = np.zeros((2, 2), dtype=np.float64)
+    vector = np.zeros(2, dtype=np.float64)
+    for endpoint in selected:
+        heading = np.asarray(endpoint.heading, dtype=np.float64)
+        projection = identity - np.outer(heading, heading)
+        matrix += projection
+        vector += projection @ endpoint.point
+    if float(np.linalg.det(matrix)) < 1e-6:
+        return None
+    node = np.linalg.solve(matrix, vector).astype(np.float32)
+    for endpoint in selected:
+        delta = node - endpoint.point
+        forward = float(np.dot(delta, endpoint.heading))
+        lateral = float(np.linalg.norm(delta - forward * endpoint.heading))
+        if forward < -1.0 or forward > max_distance_px or lateral > lateral_tolerance_px:
+            return None
+    return node
+
+
+def _reconstruct_regularization_intersections(
+    endpoints: list[_FastRegularizationEndpoint],
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+) -> tuple[dict[int, np.ndarray], int, int]:
+    """Create conservative T/cross nodes from three or four converging endpoints."""
+    max_distance_px = _fast_length_pixels(
+        FAST_REGULARIZATION_INTERSECTION_DISTANCE_M, physical_pixel_size_m,
+    )
+    lateral_tolerance_px = _fast_length_pixels(
+        FAST_REGULARIZATION_INTERSECTION_LATERAL_TOLERANCE_M,
+        physical_pixel_size_m,
+    )
+    cell_size = max(1, int(np.ceil(max_distance_px)))
+    buckets = _regularization_endpoint_buckets(endpoints, cell_size)
+    candidate_groups: set[tuple[int, ...]] = set()
+    for endpoint in endpoints:
+        nearby = _nearby_regularization_endpoints(
+            endpoint, endpoints, buckets, cell_size, max_distance_px,
+        )[:7]
+        local = [endpoint.endpoint_id, *nearby]
+        for size in (4, 3):
+            for group in combinations(sorted(set(local)), size):
+                if endpoint.endpoint_id in group:
+                    candidate_groups.add(group)
+    candidates: list[tuple[int, float, tuple[int, ...], np.ndarray]] = []
+    for group in candidate_groups:
+        selected = [endpoints[endpoint_id] for endpoint_id in group]
+        if len({endpoint.path_id for endpoint in selected}) != len(selected):
+            continue
+        headings = np.asarray([endpoint.heading for endpoint in selected])
+        if not _intersection_heading_layout(headings):
+            continue
+        node = _solve_regularization_intersection(
+            selected, max_distance_px, lateral_tolerance_px,
+        )
+        if node is None or not (
+            0 <= node[0] < support.shape[0] and 0 <= node[1] < support.shape[1]
+        ):
+            continue
+        arm_support = [
+            _sample_regularization_support(
+                np.asarray([endpoint.point, node], dtype=np.float32), support,
+            )
+            for endpoint in selected
+        ]
+        if (
+            min(arm_support) < FAST_REGULARIZATION_INTERSECTION_ARM_SUPPORT
+            or float(np.mean(arm_support)) < FAST_REGULARIZATION_INTERSECTION_SUPPORT
+        ):
+            continue
+        distance = float(sum(np.linalg.norm(endpoint.point - node) for endpoint in selected))
+        candidates.append((-len(group), distance - 4.0 * float(np.mean(arm_support)), group, node))
+    assignments: dict[int, np.ndarray] = {}
+    intersection_count = 0
+    generated_count = 0
+    for _negative_size, _score, group, node in sorted(candidates, key=lambda item: (item[0], item[1])):
+        if any(endpoint_id in assignments for endpoint_id in group):
+            continue
+        for endpoint_id in group:
+            assignments[endpoint_id] = node.copy()
+        intersection_count += 1
+        generated_count += len(group)
+    return assignments, intersection_count, generated_count
+
+
+def _find_endpoint_connection_candidates(
+    endpoints: list[_FastRegularizationEndpoint],
+    paths: list[FastRoadPath],
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+    unavailable: set[int],
+) -> list[tuple[float, int, int]]:
+    """Find local, facing, surface-supported continuation pairs."""
+    max_distance_px = _fast_length_pixels(
+        FAST_REGULARIZATION_SNAP_DISTANCE_M, physical_pixel_size_m,
+    )
+    cell_size = max(1, int(np.ceil(max_distance_px)))
+    buckets = _regularization_endpoint_buckets(endpoints, cell_size)
+    direction_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_CONTINUATION_ANGLE_DEG,
+    )))
+    candidates: list[tuple[float, int, int]] = []
+    for first in endpoints:
+        if first.endpoint_id in unavailable:
+            continue
+        for second_id in _nearby_regularization_endpoints(
+            first, endpoints, buckets, cell_size, max_distance_px,
+        ):
+            if second_id <= first.endpoint_id or second_id in unavailable:
+                continue
+            second = endpoints[second_id]
+            if (
+                first.path_id == second.path_id
+                or paths[first.path_id].component_id == paths[second.path_id].component_id
+            ):
+                continue
+            delta = second.point - first.point
+            distance = float(np.linalg.norm(delta))
+            if distance < 1.0 or distance > max_distance_px:
+                continue
+            connector = delta / distance
+            first_alignment = float(np.dot(first.heading, connector))
+            second_alignment = float(np.dot(second.heading, -connector))
+            if first_alignment < direction_cosine or second_alignment < direction_cosine:
+                continue
+            widths = (first.local_width_px, second.local_width_px)
+            if min(widths) > 0 and max(widths) / min(widths) > FAST_REGULARIZATION_WIDTH_RATIO_MAX:
+                continue
+            support_ratio = _sample_regularization_support(
+                np.asarray([first.point, second.point], dtype=np.float32), support,
+            )
+            if support_ratio < FAST_REGULARIZATION_CONTINUATION_SUPPORT:
+                continue
+            score = distance + 4.0 * (
+                2.0 - first_alignment - second_alignment
+            ) - 2.0 * support_ratio
+            candidates.append((score, first.endpoint_id, second.endpoint_id))
+    return sorted(candidates)
+
+
+def _snap_regularization_endpoints(
+    endpoints: list[_FastRegularizationEndpoint],
+    paths: list[FastRoadPath],
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+    assignments: dict[int, np.ndarray],
+) -> tuple[dict[int, np.ndarray], int]:
+    used = set(assignments)
+    snapped_pair_count = 0
+    for _score, first_id, second_id in _find_endpoint_connection_candidates(
+        endpoints, paths, support, physical_pixel_size_m, used,
+    ):
+        if first_id in used or second_id in used:
+            continue
+        node = 0.5 * (endpoints[first_id].point + endpoints[second_id].point)
+        assignments[first_id] = node.copy()
+        assignments[second_id] = node.copy()
+        used.update((first_id, second_id))
+        snapped_pair_count += 1
+    return assignments, snapped_pair_count
+
+
+def _nearest_fast_path_segment(
+    point: np.ndarray,
+    path: FastRoadPath,
+) -> tuple[float, int, float, np.ndarray, np.ndarray, float]:
+    points = np.asarray(path.pixels, dtype=np.float32)
+    starts = points[:-1]
+    vectors = points[1:] - starts
+    lengths_squared = np.sum(vectors * vectors, axis=1)
+    fractions = np.zeros(vectors.shape[0], dtype=np.float32)
+    valid = lengths_squared > 0
+    fractions[valid] = np.clip(
+        np.sum((point - starts[valid]) * vectors[valid], axis=1)
+        / lengths_squared[valid],
+        0.0,
+        1.0,
+    )
+    projections = starts + fractions[:, None] * vectors
+    distances = np.linalg.norm(projections - point, axis=1)
+    segment_index = int(np.argmin(distances))
+    segment_length = float(np.sqrt(lengths_squared[segment_index]))
+    cumulative = float(np.sqrt(lengths_squared[:segment_index]).sum())
+    along = cumulative + float(fractions[segment_index]) * segment_length
+    tangent = vectors[segment_index] / max(segment_length, 1e-9)
+    return (
+        float(distances[segment_index]),
+        segment_index,
+        float(fractions[segment_index]),
+        projections[segment_index],
+        tangent,
+        along,
+    )
+
+
+def _attach_endpoints_to_path_interiors(
+    endpoints: list[_FastRegularizationEndpoint],
+    paths: list[FastRoadPath],
+    road_surface: np.ndarray,
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+    assignments: dict[int, np.ndarray],
+) -> tuple[dict[int, np.ndarray], list[_FastRegularizationAttachment]]:
+    """Build conservative T/Y attachments from free endpoints to path interiors."""
+    if not endpoints or not paths:
+        return assignments, []
+    max_distance_px = _fast_length_pixels(
+        FAST_REGULARIZATION_T_ATTACHMENT_DISTANCE_M, physical_pixel_size_m,
+    )
+    clearance_px = _fast_length_pixels(
+        FAST_REGULARIZATION_T_ATTACHMENT_CLEARANCE_M, physical_pixel_size_m,
+    )
+    facing_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_CONTINUATION_ANGLE_DEG,
+    )))
+    cross_axis_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_INTERSECTION_AXIS_ANGLE_DEG,
+    )))
+    geometries = [LineString(np.asarray(path.pixels)) for path in paths]
+    tree = STRtree(geometries)
+    surface_distance = cv2.distanceTransform(
+        (np.asarray(road_surface) > 0).astype(np.uint8), cv2.DIST_L2, 5,
+    )
+    candidates: list[_FastRegularizationAttachment] = []
+    for endpoint in endpoints:
+        if endpoint.endpoint_id in assignments:
+            continue
+        search = LineString([
+            endpoint.point,
+            endpoint.point + max_distance_px * endpoint.heading,
+        ]).buffer(max(1.0, 0.15 * max_distance_px))
+        for target_path_id in tree.query(search):
+            target_path_id = int(target_path_id)
+            if target_path_id == endpoint.path_id:
+                continue
+            target = paths[target_path_id]
+            (
+                distance, segment_index, fraction, node, tangent, along,
+            ) = _nearest_fast_path_segment(endpoint.point, target)
+            if (
+                distance < 1.0
+                or distance > max_distance_px
+                or along < clearance_px
+                or target.length_px - along < clearance_px
+            ):
+                continue
+            connector = (node - endpoint.point) / distance
+            facing = float(np.dot(endpoint.heading, connector))
+            if facing < facing_cosine:
+                continue
+            if abs(float(np.dot(endpoint.heading, tangent))) > cross_axis_cosine:
+                continue
+            support_ratio = _sample_regularization_support(
+                np.asarray([endpoint.point, node], dtype=np.float32), support,
+            )
+            if support_ratio < FAST_REGULARIZATION_INTERSECTION_SUPPORT:
+                continue
+            row, col = np.rint(node).astype(np.int32)
+            if not (0 <= row < surface_distance.shape[0] and 0 <= col < surface_distance.shape[1]):
+                continue
+            target_width_px = 2.0 * float(surface_distance[row, col])
+            if (
+                min(endpoint.local_width_px, target_width_px) > 0
+                and max(endpoint.local_width_px, target_width_px)
+                / min(endpoint.local_width_px, target_width_px)
+                > FAST_REGULARIZATION_WIDTH_RATIO_MAX
+            ):
+                continue
+            candidates.append(_FastRegularizationAttachment(
+                endpoint_id=endpoint.endpoint_id,
+                target_path_id=target_path_id,
+                segment_index=segment_index,
+                segment_fraction=fraction,
+                node=node.astype(np.float32),
+                score=float(distance + 4.0 * (1.0 - facing) - 2.0 * support_ratio),
+            ))
+    attachments: list[_FastRegularizationAttachment] = []
+    used = set(assignments)
+    for candidate in sorted(candidates, key=lambda item: item.score):
+        if candidate.endpoint_id in used:
+            continue
+        assignments[candidate.endpoint_id] = candidate.node.copy()
+        attachments.append(candidate)
+        used.add(candidate.endpoint_id)
+    return assignments, attachments
+
+
+def _build_paths_with_regularization_connections(
+    paths: list[FastRoadPath],
+    endpoint_ids: dict[tuple[int, bool], int],
+    assignments: dict[int, np.ndarray],
+    attachments: list[_FastRegularizationAttachment],
+) -> list[FastRoadPath]:
+    """Extend assigned endpoints and split receiving paths at T/Y nodes."""
+    by_target: dict[int, list[_FastRegularizationAttachment]] = {}
+    for attachment in attachments:
+        by_target.setdefault(attachment.target_path_id, []).append(attachment)
+    connected: list[FastRoadPath] = []
+    for path_id, path in enumerate(paths):
+        points = np.asarray(path.pixels, dtype=np.float32)
+        segment_attachments: dict[int, list[_FastRegularizationAttachment]] = {}
+        for attachment in by_target.get(path_id, []):
+            segment_attachments.setdefault(attachment.segment_index, []).append(attachment)
+        pieces: list[np.ndarray] = []
+        current = [points[0]]
+        for segment_index in range(points.shape[0] - 1):
+            for attachment in sorted(
+                segment_attachments.get(segment_index, []),
+                key=lambda item: item.segment_fraction,
+            ):
+                if float(np.linalg.norm(current[-1] - attachment.node)) > 0.25:
+                    current.append(attachment.node)
+                if len(current) >= 2:
+                    pieces.append(np.asarray(current, dtype=np.float32))
+                current = [attachment.node]
+            if float(np.linalg.norm(current[-1] - points[segment_index + 1])) > 0.0:
+                current.append(points[segment_index + 1])
+        if len(current) >= 2:
+            pieces.append(np.asarray(current, dtype=np.float32))
+        if not pieces:
+            pieces = [points.copy()]
+
+        start_id = endpoint_ids.get((path_id, True))
+        if start_id is not None and start_id in assignments:
+            node = assignments[start_id]
+            if float(np.linalg.norm(node - pieces[0][0])) > 0.25:
+                pieces[0] = np.vstack((node, pieces[0]))
+        end_id = endpoint_ids.get((path_id, False))
+        if end_id is not None and end_id in assignments:
+            node = assignments[end_id]
+            if float(np.linalg.norm(node - pieces[-1][-1])) > 0.25:
+                pieces[-1] = np.vstack((pieces[-1], node))
+        connected.extend(
+            _copy_fast_path_geometry(path, piece)
+            for piece in pieces if piece.shape[0] >= 2
+        )
+    return connected
+
+
+def _copy_fast_path_geometry(path: FastRoadPath, points: np.ndarray) -> FastRoadPath:
+    points = np.asarray(points, dtype=np.float32)
+    length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+    return FastRoadPath(
+        pixels=points,
+        length_px=length,
+        start_degree=path.start_degree,
+        end_degree=path.end_degree,
+        mean_relative_score=path.mean_relative_score,
+        low_relative_score=path.low_relative_score,
+        component_id=path.component_id,
+        component_length_px=max(path.component_length_px, length),
+    )
+
+
+def _regularization_node_key(point: np.ndarray) -> tuple[float, float]:
+    return tuple(float(value) for value in np.round(np.asarray(point), 3))
+
+
+def _group_continuous_road_chains(
+    paths: list[FastRoadPath],
+) -> tuple[list[FastRoadPath], int]:
+    """Merge vector edges through degree-2 nodes into canonical road chains."""
+    if not paths:
+        return [], 0
+    endpoint_keys = [
+        (_regularization_node_key(path.pixels[0]), _regularization_node_key(path.pixels[-1]))
+        for path in paths
+    ]
+    incident: dict[tuple[float, float], list[int]] = {}
+    for edge_id, (start, end) in enumerate(endpoint_keys):
+        incident.setdefault(start, []).append(edge_id)
+        incident.setdefault(end, []).append(edge_id)
+    visited: set[int] = set()
+    chains: list[FastRoadPath] = []
+    merged_edge_count = 0
+
+    def walk(start_node: tuple[float, float], first_edge: int) -> None:
+        nonlocal merged_edge_count
+        node = start_node
+        edge_id = first_edge
+        chain_points: list[np.ndarray] = []
+        members: list[FastRoadPath] = []
+        while edge_id not in visited:
+            visited.add(edge_id)
+            path = paths[edge_id]
+            start_key, end_key = endpoint_keys[edge_id]
+            if start_key == node:
+                oriented = np.asarray(path.pixels)
+                next_node = end_key
+            else:
+                oriented = np.asarray(path.pixels)[::-1]
+                next_node = start_key
+            chain_points.extend(oriented if not chain_points else oriented[1:])
+            members.append(path)
+            node = next_node
+            if len(incident[node]) != 2:
+                break
+            next_edges = [candidate for candidate in incident[node] if candidate not in visited]
+            if not next_edges:
+                break
+            edge_id = next_edges[0]
+        points = np.asarray(chain_points, dtype=np.float32)
+        length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        weights = np.asarray([max(member.length_px, 1e-6) for member in members])
+        mean_score = float(np.average(
+            [member.mean_relative_score for member in members], weights=weights,
+        ))
+        low_score = float(min(member.low_relative_score for member in members))
+        chains.append(FastRoadPath(
+            pixels=points,
+            length_px=length,
+            start_degree=len(incident[_regularization_node_key(points[0])]),
+            end_degree=len(incident[_regularization_node_key(points[-1])]),
+            mean_relative_score=mean_score,
+            low_relative_score=low_score,
+            component_id=min(member.component_id for member in members),
+            component_length_px=float(sum(member.component_length_px for member in members)),
+        ))
+        merged_edge_count += max(0, len(members) - 1)
+
+    for node, edge_ids in sorted(incident.items()):
+        if len(edge_ids) == 2:
+            continue
+        for edge_id in edge_ids:
+            if edge_id not in visited:
+                walk(node, edge_id)
+    for edge_id in range(len(paths)):
+        if edge_id not in visited:
+            walk(endpoint_keys[edge_id][0], edge_id)
+    return chains, merged_edge_count
+
+
+def _merge_fast_paths_through_junctions(
+    paths: list[FastRoadPath],
+    physical_pixel_size_m: float,
+) -> tuple[list[FastRoadPath], int]:
+    """Pair opposite arms at junctions and emit long canonical road features."""
+    if not paths:
+        return [], 0
+    endpoint_keys = [
+        (_regularization_node_key(path.pixels[0]), _regularization_node_key(path.pixels[-1]))
+        for path in paths
+    ]
+    incident: dict[tuple[float, float], list[tuple[int, bool]]] = {}
+    for edge_id, (start, end) in enumerate(endpoint_keys):
+        incident.setdefault(start, []).append((edge_id, True))
+        incident.setdefault(end, []).append((edge_id, False))
+
+    lookback_px = _fast_length_pixels(
+        FAST_REGULARIZATION_HEADING_LOOKBACK_M, physical_pixel_size_m,
+    )
+    continuation_cosine = float(np.cos(np.deg2rad(
+        FAST_REGULARIZATION_CONTINUATION_ANGLE_DEG,
+    )))
+    continuation: dict[
+        tuple[int, tuple[float, float]], tuple[int, tuple[float, float]]
+    ] = {}
+    paired_count = 0
+    for node, arms in incident.items():
+        if len(arms) < 3:
+            continue
+        candidates: list[tuple[float, int, int]] = []
+        headings = [
+            _estimate_regularization_endpoint_heading(
+                paths[edge_id], at_start, lookback_px,
+            )
+            for edge_id, at_start in arms
+        ]
+        for first, second in combinations(range(len(arms)), 2):
+            if arms[first][0] == arms[second][0]:
+                continue
+            alignment = float(np.dot(headings[first], headings[second]))
+            if alignment <= -continuation_cosine:
+                candidates.append((alignment, first, second))
+        used: set[int] = set()
+        for _alignment, first, second in sorted(candidates):
+            if first in used or second in used:
+                continue
+            first_edge = arms[first][0]
+            second_edge = arms[second][0]
+            first_end = (first_edge, node)
+            second_end = (second_edge, node)
+            continuation[first_end] = second_end
+            continuation[second_end] = first_end
+            used.update((first, second))
+            paired_count += 1
+
+    if not continuation:
+        return paths, 0
+
+    visited: set[int] = set()
+    merged: list[FastRoadPath] = []
+
+    def walk(first_edge: int, start_node: tuple[float, float]) -> None:
+        node = start_node
+        edge_id = first_edge
+        chain_points: list[np.ndarray] = []
+        members: list[FastRoadPath] = []
+        while edge_id not in visited:
+            visited.add(edge_id)
+            path = paths[edge_id]
+            start_key, end_key = endpoint_keys[edge_id]
+            if start_key == node:
+                oriented = np.asarray(path.pixels)
+                next_node = end_key
+            else:
+                oriented = np.asarray(path.pixels)[::-1]
+                next_node = start_key
+            chain_points.extend(oriented if not chain_points else oriented[1:])
+            members.append(path)
+            paired = continuation.get((edge_id, next_node))
+            if paired is None or paired[0] in visited:
+                node = next_node
+                break
+            edge_id, node = paired
+
+        points = np.asarray(chain_points, dtype=np.float32)
+        length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        weights = np.asarray([max(member.length_px, 1e-6) for member in members])
+        merged.append(FastRoadPath(
+            pixels=points,
+            length_px=length,
+            start_degree=len(incident[_regularization_node_key(points[0])]),
+            end_degree=len(incident[_regularization_node_key(points[-1])]),
+            mean_relative_score=float(np.average(
+                [member.mean_relative_score for member in members], weights=weights,
+            )),
+            low_relative_score=float(min(member.low_relative_score for member in members)),
+            component_id=min(member.component_id for member in members),
+            component_length_px=float(sum(member.component_length_px for member in members)),
+        ))
+
+    for edge_id, (start, end) in enumerate(endpoint_keys):
+        if edge_id in visited:
+            continue
+        start_paired = (edge_id, start) in continuation
+        end_paired = (edge_id, end) in continuation
+        if not start_paired:
+            walk(edge_id, start)
+        elif not end_paired:
+            walk(edge_id, end)
+    for edge_id, (start, _end) in enumerate(endpoint_keys):
+        if edge_id not in visited:
+            walk(edge_id, start)
+    return merged, int(len(paths) - len(merged))
+
+
+def _fit_straight_road_chain(
+    path: FastRoadPath,
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+) -> FastRoadPath | None:
+    points = np.asarray(path.pixels, dtype=np.float32)
+    if points.shape[0] < 3 or np.array_equal(points[0], points[-1]):
+        return None
+    chord = points[-1] - points[0]
+    chord_length = float(np.linalg.norm(chord))
+    if chord_length <= 0:
+        return None
+    direction = chord / chord_length
+    offsets = points - points[0]
+    residuals = np.abs(offsets[:, 0] * direction[1] - offsets[:, 1] * direction[0])
+    residual_limit = min(
+        _fast_length_pixels(FAST_REGULARIZATION_STRAIGHT_RESIDUAL_M, physical_pixel_size_m),
+        FAST_REGULARIZATION_STRAIGHT_RESIDUAL_RATIO * chord_length,
+    )
+    if (
+        float(np.percentile(residuals, 95)) > max(0.75, residual_limit)
+        or path.length_px > FAST_REGULARIZATION_STRAIGHT_MAX_LENGTH_RATIO * chord_length
+    ):
+        return None
+    fitted = np.asarray([points[0], points[-1]], dtype=np.float32)
+    if _sample_regularization_support(fitted, support) < FAST_REGULARIZATION_STRAIGHT_SUPPORT:
+        return None
+    return _copy_fast_path_geometry(path, fitted)
+
+
+def _smooth_curved_road_chain(
+    path: FastRoadPath,
+    support: np.ndarray,
+    physical_pixel_size_m: float,
+) -> FastRoadPath | None:
+    points = np.asarray(path.pixels, dtype=np.float32)
+    if points.shape[0] < 5 or np.array_equal(points[0], points[-1]):
+        return None
+    radius = max(1, min(4, int(round(_fast_length_pixels(
+        FAST_REGULARIZATION_CURVE_SMOOTHING_M, physical_pixel_size_m,
+    )))))
+    kernel = np.ones(2 * radius + 1, dtype=np.float32) / (2 * radius + 1)
+    padded = np.pad(points, ((radius, radius), (0, 0)), mode="edge")
+    smoothed = np.column_stack([
+        np.convolve(padded[:, axis], kernel, mode="valid") for axis in range(2)
+    ]).astype(np.float32)
+    smoothed[0] = points[0]
+    smoothed[-1] = points[-1]
+    max_shift_px = _fast_length_pixels(
+        FAST_REGULARIZATION_CURVE_MAX_SHIFT_M, physical_pixel_size_m,
+    )
+    if float(np.max(np.linalg.norm(smoothed - points, axis=1))) > max_shift_px:
+        return None
+    epsilon_px = _fast_length_pixels(
+        FAST_REGULARIZATION_SIMPLIFY_M, physical_pixel_size_m,
+    )
+    simplified = cv2.approxPolyDP(
+        smoothed.reshape(-1, 1, 2), float(epsilon_px), closed=False,
+    ).reshape(-1, 2)
+    if simplified.shape[0] < 2:
+        return None
+    simplified[0] = points[0]
+    simplified[-1] = points[-1]
+    candidate = _copy_fast_path_geometry(path, simplified)
+    if (
+        candidate.length_px < FAST_REGULARIZATION_CURVE_LENGTH_RETAIN_MIN * path.length_px
+        or candidate.length_px > FAST_REGULARIZATION_CURVE_LENGTH_RETAIN_MAX * path.length_px
+        or _sample_regularization_support(candidate.pixels, support) < FAST_REGULARIZATION_CURVE_SUPPORT
+    ):
+        return None
+    return candidate
+
+
+def regularize_fast_road_network(
+    paths: list[FastRoadPath],
+    road_surface: np.ndarray,
+    physical_pixel_size_m: float,
+) -> tuple[np.ndarray, list[FastRoadPath], dict]:
+    """Reconstruct one canonical vector network from cleaned Fast road evidence."""
+    started = time.perf_counter()
+    surface = (np.asarray(road_surface) > 0).astype(np.uint8)
+    support = _regularization_support_mask(surface, physical_pixel_size_m)
+    collapsed_paths, collapsed_junction_edges, consolidated_junctions = (
+        _collapse_fast_junction_clusters(paths, physical_pixel_size_m)
+    )
+    base_chains, base_chain_merges = _group_continuous_road_chains(
+        collapsed_paths,
+    )
+    endpoints = _collect_regularization_endpoints(
+        base_chains, surface, physical_pixel_size_m,
+    )
+    endpoint_ids = {
+        (endpoint.path_id, endpoint.at_start): endpoint.endpoint_id
+        for endpoint in endpoints
+    }
+    assignments, intersection_count, intersection_connections = (
+        _reconstruct_regularization_intersections(
+            endpoints, support, physical_pixel_size_m,
+        )
+    )
+    assignments, snapped_pair_count = _snap_regularization_endpoints(
+        endpoints, base_chains, support, physical_pixel_size_m, assignments,
+    )
+    assignments, path_attachments = _attach_endpoints_to_path_interiors(
+        endpoints,
+        base_chains,
+        surface,
+        support,
+        physical_pixel_size_m,
+        assignments,
+    )
+    connected_paths = _build_paths_with_regularization_connections(
+        base_chains, endpoint_ids, assignments, path_attachments,
+    )
+    connection_chains, connection_chain_merges = _group_continuous_road_chains(
+        connected_paths,
+    )
+    recollapsed_paths, recollapsed_junction_edges, recollapsed_junctions = (
+        _collapse_fast_junction_clusters(
+            connection_chains, physical_pixel_size_m,
+        )
+    )
+    chains, final_chain_merges = _group_continuous_road_chains(
+        recollapsed_paths,
+    )
+    merged_chain_count = (
+        collapsed_junction_edges + base_chain_merges + connection_chain_merges
+        + recollapsed_junction_edges + final_chain_merges
+    )
+    consolidated_junctions += recollapsed_junctions
+    regularized: list[FastRoadPath] = []
+    straightened_count = 0
+    smoothed_count = 0
+    for chain in chains:
+        straight = _fit_straight_road_chain(
+            chain, support, physical_pixel_size_m,
+        )
+        if straight is not None:
+            regularized.append(straight)
+            straightened_count += 1
+            continue
+        smoothed = _smooth_curved_road_chain(
+            chain, support, physical_pixel_size_m,
+        )
+        if smoothed is not None:
+            regularized.append(smoothed)
+            smoothed_count += 1
+        else:
+            regularized.append(chain)
+    regularized, through_junction_merges = _merge_fast_paths_through_junctions(
+        regularized, physical_pixel_size_m,
+    )
+    merged_chain_count += through_junction_merges
+    skeleton = _paths_to_skeleton(regularized, surface.shape)
+    diagnostics = {
+        "regularization_original_path_count": int(len(paths)),
+        "regularization_final_path_count": int(len(regularized)),
+        "regularization_merged_chain_count": int(merged_chain_count),
+        "regularization_snapped_endpoint_count": int(len(assignments)),
+        "regularization_generated_connection_count": int(
+            intersection_connections + snapped_pair_count + len(path_attachments)
+        ),
+        "regularization_intersection_count": int(
+            consolidated_junctions + intersection_count + len(path_attachments)
+        ),
+        "regularization_consolidated_junction_count": int(
+            consolidated_junctions
+        ),
+        "regularization_reconstructed_intersection_count": int(
+            intersection_count
+        ),
+        "regularization_collapsed_junction_edge_count": int(
+            collapsed_junction_edges + recollapsed_junction_edges
+        ),
+        "regularization_path_attachment_count": int(len(path_attachments)),
+        "regularization_intersection_through_merge_count": int(
+            through_junction_merges
+        ),
+        "regularization_straightened_chain_count": int(straightened_count),
+        "regularization_smoothed_chain_count": int(smoothed_count),
+        "regularization_seconds": float(time.perf_counter() - started),
+    }
+    return skeleton, regularized, diagnostics
 
 
 def _cleanup_fast_final_surface(
@@ -1527,6 +2593,16 @@ def measure_fast_widths(
                     support_score=molra_probability,
                 )
             )
+            regularization_surface = binary if molra_binary is None else (
+                binary | molra_binary
+            )
+            cleaned_centerline, final_paths, regularization_diagnostics = (
+                regularize_fast_road_network(
+                    final_paths,
+                    regularization_surface,
+                    pixel_size,
+                )
+            )
             cleaned_surface, surface_cleanup = _cleanup_fast_final_surface(
                 binary, cleaned_centerline, pixel_size,
             )
@@ -1554,7 +2630,7 @@ def measure_fast_widths(
                     "width_m": float(width), "width_src": width_source,
                     "exec_prof": "fast", "geometry": line,
                 }
-                layer_records["centerlines"].append({**common, "source": "native_toponet"})
+                layer_records["centerlines"].append({**common, "source": "final_centerline"})
                 layer_records["width_segments"].append(common)
                 layer_records["corridors"].append({
                     **common,
@@ -1612,6 +2688,7 @@ def measure_fast_widths(
             },
             **molra_diagnostics,
             **centerline_cleanup,
+            **regularization_diagnostics,
             **surface_cleanup,
             "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
             "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
@@ -1661,6 +2738,10 @@ def measure_fast_widths(
             f"/{tile_summary['removed_centerline_length_px']:.1f}px, "
             f"bridge={tile_summary['bridged_gap_count']}"
             f"/{tile_summary['bridged_gap_length_px']:.1f}px, "
+            f"regularization={tile_summary['regularization_original_path_count']}->"
+            f"{tile_summary['regularization_final_path_count']} paths/"
+            f"{tile_summary['regularization_intersection_count']} intersections/"
+            f"{tile_summary['regularization_seconds']:.3f}s, "
             f"surface-{tile_summary['removed_surface_component_count']}"
             f"/{tile_summary['removed_surface_pixel_count']}px, "
             f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
@@ -1692,6 +2773,27 @@ def measure_fast_widths(
         "enhanced_molra_width_count": int(sum(
             row.get("enhanced_molra_width_count", 0) for row in image_rows
         )),
+        **{
+            key: float(sum(float(row.get(key, 0.0)) for row in image_rows))
+            if key == "regularization_seconds" else int(sum(
+                int(row.get(key, 0)) for row in image_rows
+            ))
+            for key in (
+                "regularization_original_path_count",
+                "regularization_final_path_count",
+                "regularization_merged_chain_count",
+                "regularization_snapped_endpoint_count",
+                "regularization_generated_connection_count",
+                "regularization_intersection_count",
+                "regularization_consolidated_junction_count",
+                "regularization_reconstructed_intersection_count",
+                "regularization_collapsed_junction_edge_count",
+                "regularization_path_attachment_count",
+                "regularization_straightened_chain_count",
+                "regularization_smoothed_chain_count",
+                "regularization_seconds",
+            )
+        },
         "fast_mask_fallback_count": int(sum(
             row.get("fast_mask_fallback_count", 0) for row in image_rows
         )),
@@ -4526,7 +5628,7 @@ def _fast_tile_topology_frame(
     target_bounds: tuple[float, float, float, float],
     target_crs,
 ) -> gpd.GeoDataFrame:
-    """Load topology edges only for tiles crossing the current halo."""
+    """Load final canonical centerlines for tiles crossing the current halo."""
     target_geometry = box(*target_bounds)
     records = []
     for artifact in catalog.values():
@@ -4534,11 +5636,16 @@ def _fast_tile_topology_frame(
             raise ValueError("Fast change tiles must use one normalized CRS")
         if not target_geometry.intersects(box(*artifact.bounds)):
             continue
-        with np.load(artifact.topology, allow_pickle=False) as topology:
-            nodes = np.asarray(topology["nodes"], dtype=np.float32).reshape(-1, 2)
-            edges = _unique_topology_edges(nodes, topology["edges"])
-        for edge_id, (source, target) in enumerate(edges.tolist()):
-            line = _world_line(artifact.transform, nodes[source], nodes[target])
+        centerline = cv2.imread(str(artifact.centerline_mask), cv2.IMREAD_GRAYSCALE)
+        if centerline is None:
+            raise FileNotFoundError(
+                f"Cannot read final Fast centerline: {artifact.centerline_mask}"
+            )
+        paths = _trace_skeleton_paths((centerline > 0).astype(np.uint8))
+        for edge_id, path in enumerate(paths):
+            line = _world_path(
+                artifact.transform, _simplify_path_pixels(path),
+            )
             if not line.intersects(target_geometry):
                 continue
             clipped = make_valid(line.intersection(target_geometry))
@@ -4612,63 +5719,90 @@ def _bridge_fast_presence_gaps(
     return bridged.astype(np.uint8)
 
 
-def _suppress_fast_presence_spatial_jitter(
-    candidate_mask: np.ndarray,
-    reference_centerline: np.ndarray,
-    reference_surface: np.ndarray,
+def _fast_local_road_axis(
+    centerline: np.ndarray,
+    surface: np.ndarray,
+) -> np.ndarray:
+    """Keep the extracted centerline primary and fill its breaks from the surface."""
+    centerline = (np.asarray(centerline) > 0).astype(np.uint8)
+    surface_axis = _skeletonize_mask((np.asarray(surface) > 0).astype(np.uint8))
+    if not centerline.any():
+        return surface_axis
+    if not surface_axis.any():
+        return centerline
+    merged = cv2.dilate(
+        centerline | surface_axis,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    return _skeletonize_mask(merged)
+
+
+def _fast_surface_owned_by_axis(
+    surface: np.ndarray,
+    axis: np.ndarray,
+    selected_axis: np.ndarray,
+) -> np.ndarray:
+    """Assign each surface pixel to its nearest local axis pixel."""
+    surface = np.asarray(surface) > 0
+    axis = np.asarray(axis) > 0
+    selected_axis = np.asarray(selected_axis) > 0
+    if not surface.any() or not axis.any() or not selected_axis.any():
+        return np.zeros(surface.shape, dtype=np.uint8)
+    distance_source = np.ones(surface.shape, dtype=np.uint8)
+    distance_source[axis] = 0
+    _distance, nearest_axis = cv2.distanceTransformWithLabels(
+        distance_source,
+        cv2.DIST_L2,
+        cv2.DIST_MASK_5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    axis_points = np.argwhere(axis)
+    selected_by_label = np.zeros(axis_points.shape[0] + 1, dtype=bool)
+    selected_by_label[1:] = selected_axis[
+        axis_points[:, 0], axis_points[:, 1]
+    ]
+    return (surface & selected_by_label[nearest_axis]).astype(np.uint8)
+
+
+def _build_fast_local_road_correspondence(
+    before_centerline: np.ndarray,
+    after_centerline: np.ndarray,
+    before_surface: np.ndarray,
+    after_surface: np.ndarray,
     *,
     physical_pixel_size_m: float,
-) -> tuple[np.ndarray, dict[str, int]]:
-    """Suppress candidate components already explained by the other-period road."""
-    candidate = (np.asarray(candidate_mask) > 0).astype(np.uint8)
-    reference = (
-        (np.asarray(reference_centerline) > 0)
-        | (np.asarray(reference_surface) > 0)
-    ).astype(np.uint8)
-    if not candidate.any() or not reference.any():
-        return candidate, {
-            "spatial_suppressed_component_count": 0,
-            "spatial_suppressed_pixel_count": 0,
-            "spatial_trimmed_component_count": 0,
-            "spatial_trimmed_pixel_count": 0,
-        }
-    radius_px = max(1, int(np.ceil(
-        FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M
-        / max(float(physical_pixel_size_m), 1e-9)
+    match_distance_m: float = FAST_LOCAL_ROAD_MATCH_DISTANCE_M,
+) -> FastLocalRoadCorrespondence:
+    """Find shared road support locally without matching complete LineStrings."""
+    before_surface = (np.asarray(before_surface) > 0).astype(np.uint8)
+    after_surface = (np.asarray(after_surface) > 0).astype(np.uint8)
+    before_axis = _fast_local_road_axis(before_centerline, before_surface)
+    after_axis = _fast_local_road_axis(after_centerline, after_surface)
+    match_radius_px = max(1, int(np.ceil(
+        float(match_distance_m) / max(float(physical_pixel_size_m), 1e-9)
     )))
     kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius_px + 1,) * 2,
+        cv2.MORPH_ELLIPSE, (2 * match_radius_px + 1,) * 2,
     )
-    reference_neighborhood = cv2.dilate(reference, kernel) > 0
-    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-        candidate, connectivity=8,
+    before_neighborhood = cv2.dilate(before_surface | before_axis, kernel) > 0
+    after_neighborhood = cv2.dilate(after_surface | after_axis, kernel) > 0
+    before_common_axis = ((before_axis > 0) & after_neighborhood).astype(np.uint8)
+    after_common_axis = ((after_axis > 0) & before_neighborhood).astype(np.uint8)
+    before_common_surface = _fast_surface_owned_by_axis(
+        before_surface, before_axis, before_common_axis,
     )
-    component_areas = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
-    supported_areas = np.bincount(
-        labels[reference_neighborhood], minlength=component_count,
-    ).astype(np.float64)
-    overlap_ratio = np.divide(
-        supported_areas,
-        np.maximum(component_areas, 1.0),
-        out=np.zeros(component_count, dtype=np.float64),
+    after_common_surface = _fast_surface_owned_by_axis(
+        after_surface, after_axis, after_common_axis,
     )
-    suppress_labels = overlap_ratio >= FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO
-    suppress_labels[0] = False
-    partial_labels = (
-        (overlap_ratio >= FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO)
-        & ~suppress_labels
+    return FastLocalRoadCorrespondence(
+        before_axis=before_axis,
+        after_axis=after_axis,
+        before_common_axis=before_common_axis,
+        after_common_axis=after_common_axis,
+        before_common_surface=before_common_surface,
+        after_common_surface=after_common_surface,
+        match_radius_px=match_radius_px,
     )
-    partial_labels[0] = False
-    suppressed_pixels = suppress_labels[labels]
-    trimmed_pixels = partial_labels[labels] & reference_neighborhood
-    result = candidate.astype(bool)
-    result[suppressed_pixels | trimmed_pixels] = False
-    return result.astype(np.uint8), {
-        "spatial_suppressed_component_count": int(suppress_labels.sum()),
-        "spatial_suppressed_pixel_count": int(suppressed_pixels.sum()),
-        "spatial_trimmed_component_count": int(partial_labels.sum()),
-        "spatial_trimmed_pixel_count": int(trimmed_pixels.sum()),
-    }
 
 
 def _partition_fast_presence_components(
@@ -4677,82 +5811,13 @@ def _partition_fast_presence_components(
     *,
     physical_pixel_size_m: float = 1.0,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Keep normal mask components whole; split only large, spatially distinct roads."""
+    """Label final locally-unmatched road regions without path-level splitting."""
+    _ = path_labels, physical_pixel_size_m
     binary = (np.asarray(mask) > 0).astype(np.uint8)
-    component_count, components, stats, _centroids = cv2.connectedComponentsWithStats(
-        binary, connectivity=8,
-    )
-    regions = np.zeros(binary.shape, dtype=np.int32)
-    next_region = 1
-    split_component_count = 0
-    split_region_count = 0
-    min_path_seed_pixels = max(
-        FAST_PRESENCE_MIN_PATH_SEED_PIXEL_FLOOR,
-        int(np.ceil(_fast_length_pixels(
-            FAST_PRESENCE_MIN_PATH_SEED_LENGTH_M, physical_pixel_size_m,
-        ))),
-    )
-    abnormal_component_area_px2 = max(
-        FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_PIXEL_FLOOR,
-        _fast_area_pixels(
-            FAST_PRESENCE_ABNORMAL_COMPONENT_AREA_M2, physical_pixel_size_m,
-        ),
-    )
-    for component_id in range(1, component_count):
-        x = int(stats[component_id, cv2.CC_STAT_LEFT])
-        y = int(stats[component_id, cv2.CC_STAT_TOP])
-        width = int(stats[component_id, cv2.CC_STAT_WIDTH])
-        height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
-        component = components[y:y + height, x:x + width] == component_id
-        seed_mask = component & (path_labels[y:y + height, x:x + width] > 0)
-        grouped_seed_support = cv2.dilate(
-            seed_mask.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-        ).astype(bool) & component
-        seed_group_count, seed_groups = cv2.connectedComponents(
-            grouped_seed_support.astype(np.uint8), connectivity=8,
-        )
-        seed_counts = np.bincount(
-            seed_groups[seed_mask], minlength=seed_group_count,
-        )
-        valid_groups = np.flatnonzero(
-            seed_counts >= min_path_seed_pixels
-        )
-        valid_groups = valid_groups[valid_groups > 0]
-        component_area = int(stats[component_id, cv2.CC_STAT_AREA])
-        if (
-            component_area < abnormal_component_area_px2
-            or valid_groups.size <= 1
-        ):
-            region_crop = regions[y:y + height, x:x + width]
-            region_crop[component] = next_region
-            next_region += 1
-            continue
-
-        valid_seed_mask = seed_mask & np.isin(seed_groups, valid_groups)
-        distance_source = np.ones(component.shape, dtype=np.uint8)
-        distance_source[valid_seed_mask] = 0
-        _distance, nearest_seed = cv2.distanceTransformWithLabels(
-            distance_source,
-            cv2.DIST_L2,
-            cv2.DIST_MASK_5,
-            labelType=cv2.DIST_LABEL_PIXEL,
-        )
-        seed_owners = seed_groups[valid_seed_mask]
-        owner_by_label = np.zeros(seed_owners.size + 1, dtype=np.int32)
-        owner_by_label[1:] = seed_owners
-        nearest_group = owner_by_label[nearest_seed]
-        region_crop = regions[y:y + height, x:x + width]
-        for group_id in valid_groups:
-            owned = component & (nearest_group == group_id)
-            if owned.any():
-                region_crop[owned] = next_region
-                next_region += 1
-                split_region_count += 1
-        split_component_count += 1
+    _component_count, regions = cv2.connectedComponents(binary, connectivity=8)
     return regions, {
-        "split_component_count": int(split_component_count),
-        "split_region_count": int(split_region_count),
+        "split_component_count": 0,
+        "split_region_count": 0,
     }
 
 
@@ -4864,7 +5929,16 @@ def _detect_probability_presence_changes(
     before_period: str,
     after_period: str,
     min_area: float,
+    correspondence: FastLocalRoadCorrespondence | None = None,
 ) -> tuple[dict[str, list[dict]], dict]:
+    if correspondence is None:
+        correspondence = _build_fast_local_road_correspondence(
+            before_line_anchor,
+            after_line_anchor,
+            before_surface_mask,
+            after_surface_mask,
+            physical_pixel_size_m=grid.pixel_size,
+        )
     raw_before = grid.raw_before if grid.raw_before is not None else grid.before
     raw_after = grid.raw_after if grid.raw_after is not None else grid.after
     (
@@ -4935,29 +6009,43 @@ def _detect_probability_presence_changes(
             >= FAST_PRESENCE_ENHANCEMENT_IMBALANCE_MIN
         )
     )
-    added_raw = (added_normal | added_strong) & ~added_enhancement_only
-    removed_raw = (removed_normal | removed_strong) & ~removed_enhancement_only
-    added_stable, added_spatial = _suppress_fast_presence_spatial_jitter(
-        added_raw & (after_surface_mask > 0),
-        before_line_anchor,
-        before_surface_mask,
-        physical_pixel_size_m=grid.pixel_size,
+    added_probability = (added_normal | added_strong) & ~added_enhancement_only
+    removed_probability = (
+        (removed_normal | removed_strong) & ~removed_enhancement_only
     )
-    removed_stable, removed_spatial = _suppress_fast_presence_spatial_jitter(
-        removed_raw & (before_surface_mask > 0),
-        after_line_anchor,
-        after_surface_mask,
-        physical_pixel_size_m=grid.pixel_size,
+    after_unmatched_surface = (
+        (np.asarray(after_surface_mask) > 0)
+        & ~(correspondence.after_common_surface > 0)
     )
+    before_unmatched_surface = (
+        (np.asarray(before_surface_mask) > 0)
+        & ~(correspondence.before_common_surface > 0)
+    )
+    added_matched_excluded = added_probability & (
+        correspondence.after_common_surface > 0
+    )
+    removed_matched_excluded = removed_probability & (
+        correspondence.before_common_surface > 0
+    )
+    added_raw = added_probability & after_unmatched_surface
+    removed_raw = removed_probability & before_unmatched_surface
+    after_unmatched_axis = (
+        (correspondence.after_axis > 0)
+        & ~(correspondence.after_common_axis > 0)
+    ).astype(np.uint8)
+    before_unmatched_axis = (
+        (correspondence.before_axis > 0)
+        & ~(correspondence.before_common_axis > 0)
+    ).astype(np.uint8)
     added_mask = _clean_fast_presence_mask(
-        added_stable,
-        after_line_anchor,
+        added_raw,
+        after_unmatched_axis,
         after_surface_mask,
         physical_pixel_size_m=grid.pixel_size,
     )
     removed_mask = _clean_fast_presence_mask(
-        removed_stable,
-        before_line_anchor,
+        removed_raw,
+        before_unmatched_axis,
         before_surface_mask,
         physical_pixel_size_m=grid.pixel_size,
     )
@@ -4994,6 +6082,40 @@ def _detect_probability_presence_changes(
         "removed_enhancement_only_suppressed_pixel_count": int(
             ((removed_normal | removed_strong) & removed_enhancement_only).sum()
         ),
+        "added_matched_road_excluded_pixel_count": int(
+            added_matched_excluded.sum()
+        ),
+        "removed_matched_road_excluded_pixel_count": int(
+            removed_matched_excluded.sum()
+        ),
+        "added_spatial_suppressed_component_count": int(
+            cv2.connectedComponents(
+                added_matched_excluded.astype(np.uint8), connectivity=8,
+            )[0] - 1
+        ),
+        "added_spatial_suppressed_pixel_count": int(added_matched_excluded.sum()),
+        "added_spatial_trimmed_component_count": 0,
+        "added_spatial_trimmed_pixel_count": 0,
+        "removed_spatial_suppressed_component_count": int(
+            cv2.connectedComponents(
+                removed_matched_excluded.astype(np.uint8), connectivity=8,
+            )[0] - 1
+        ),
+        "removed_spatial_suppressed_pixel_count": int(removed_matched_excluded.sum()),
+        "removed_spatial_trimmed_component_count": 0,
+        "removed_spatial_trimmed_pixel_count": 0,
+        "before_common_axis_pixel_count": int(
+            correspondence.before_common_axis.sum()
+        ),
+        "after_common_axis_pixel_count": int(
+            correspondence.after_common_axis.sum()
+        ),
+        "before_common_surface_pixel_count": int(
+            correspondence.before_common_surface.sum()
+        ),
+        "after_common_surface_pixel_count": int(
+            correspondence.after_common_surface.sum()
+        ),
         "added_final_pixel_count": int(added_mask.sum()),
         "removed_final_pixel_count": int(removed_mask.sum()),
         "added_feature_count": int(len(records["added"])),
@@ -5002,8 +6124,6 @@ def _detect_probability_presence_changes(
         "added_split_region_count": added_split["split_region_count"],
         "removed_split_component_count": removed_split["split_component_count"],
         "removed_split_region_count": removed_split["split_region_count"],
-        **{f"added_{key}": value for key, value in added_spatial.items()},
-        **{f"removed_{key}": value for key, value in removed_spatial.items()},
         **calibration_diagnostics,
     }
     return records, diagnostics
@@ -5719,13 +6839,7 @@ def detect_fast_changes(
         "presence_strong_delta_threshold": FAST_PRESENCE_STRONG_DELTA_THRESHOLD,
         "presence_strong_ratio_threshold": FAST_PRESENCE_STRONG_RATIO_THRESHOLD,
         "presence_alignment_distance_m": FAST_PRESENCE_ALIGNMENT_DISTANCE_M,
-        "presence_spatial_consistency_distance_m": (
-            FAST_PRESENCE_SPATIAL_CONSISTENCY_DISTANCE_M
-        ),
-        "presence_spatial_suppress_ratio": FAST_PRESENCE_SPATIAL_SUPPRESS_RATIO,
-        "presence_spatial_partial_trim_ratio": (
-            FAST_PRESENCE_SPATIAL_PARTIAL_TRIM_RATIO
-        ),
+        "presence_spatial_consistency_distance_m": FAST_LOCAL_ROAD_MATCH_DISTANCE_M,
         "presence_min_blob_area_m2": FAST_PRESENCE_MIN_BLOB_AREA_M2,
         "presence_min_blob_area_pixel_floor": (
             FAST_PRESENCE_MIN_BLOB_AREA_PIXEL_FLOOR
