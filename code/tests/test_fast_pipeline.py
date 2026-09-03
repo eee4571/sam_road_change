@@ -701,6 +701,109 @@ class FastRoadNetworkRegularizationTests(unittest.TestCase):
         self.assertEqual(diagnostics["merged_road_entity_count"], 2)
         self.assertGreater(diagnostics["generated_connection_length_m"], 0.0)
 
+    def test_three_offset_collinear_fragments_reconstruct_one_whole_road(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [30.0, 0.0]]), 8.0, 0),
+            RegionalRoadObservation(np.asarray([[40.0, 1.0], [70.0, 1.0]]), 8.0, 1),
+            RegionalRoadObservation(np.asarray([[80.0, -1.0], [110.0, -1.0]]), 8.0, 2),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 1)
+        self.assertAlmostEqual(LineString(final_roads[0].points).length, 110.0, delta=2.0)
+        self.assertEqual(final_roads[0].source_ids, (0, 1, 2))
+        self.assertEqual(diagnostics["straight_fragment_group_count"], 1)
+        self.assertEqual(diagnostics["reconstructed_straight_road_count"], 1)
+        self.assertEqual(diagnostics["absorbed_fragment_count"], 3)
+
+    def test_five_fragments_with_high_axis_coverage_reconstruct_one_road(self) -> None:
+        roads = [
+            RegionalRoadObservation(
+                np.asarray([[float(start), 0.3 * ((index % 2) * 2 - 1)], [float(start + 16), 0.3 * ((index % 2) * 2 - 1)]]),
+                8.0,
+                index,
+            )
+            for index, start in enumerate((0, 20, 40, 60, 80))
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 1)
+        self.assertGreater(diagnostics["fragment_coverage_mean"], 0.75)
+        self.assertEqual(diagnostics["absorbed_fragment_count"], 5)
+
+    def test_two_fragments_with_huge_unsupported_gap_do_not_merge(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [20.0, 0.0]]), 8.0, 0),
+            RegionalRoadObservation(np.asarray([[120.0, 0.0], [140.0, 0.0]]), 8.0, 1),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 2)
+        self.assertEqual(diagnostics["reconstructed_straight_road_count"], 0)
+        self.assertEqual(diagnostics["absorbed_fragment_count"], 0)
+
+    def test_continuous_surface_supports_medium_fragment_coverage(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [25.0, 0.0]]), 8.0, 0),
+            RegionalRoadObservation(np.asarray([[75.0, 0.0], [100.0, 0.0]]), 8.0, 1),
+        ]
+        surface = box(-2.0, -4.0, 102.0, 4.0)
+
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=surface,
+        )
+
+        self.assertEqual(len(final_roads), 1)
+        self.assertGreater(diagnostics["surface_coverage_mean"], 0.95)
+        self.assertLessEqual(diagnostics["maximum_unsupported_gap_mean_m"], 12.0)
+
+    def test_fragmented_parallel_carriageways_reconstruct_two_whole_roads(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [40.0, 0.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[50.0, 0.2], [100.0, 0.2]]), 9.0, 1),
+            RegionalRoadObservation(np.asarray([[0.0, 12.0], [40.0, 12.0]]), 9.0, 2),
+            RegionalRoadObservation(np.asarray([[50.0, 11.8], [100.0, 11.8]]), 9.0, 3),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 2)
+        self.assertTrue(all(LineString(road.points).length > 98.0 for road in final_roads))
+        self.assertEqual(diagnostics["parallel_corridor_count"], 1)
+        self.assertGreater(diagnostics["rejected_cross_corridor_connection_count"], 0)
+
+    def test_nearest_endpoint_does_not_cross_connect_parallel_corridors(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [0.0, 40.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[0.0, 70.0], [0.0, 110.0]]), 9.0, 1),
+            RegionalRoadObservation(np.asarray([[12.0, 20.0], [12.0, 60.0]]), 9.0, 2),
+            RegionalRoadObservation(np.asarray([[12.0, 80.0], [12.0, 120.0]]), 9.0, 3),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 2)
+        means = sorted(float(np.mean(road.points[:, 0])) for road in final_roads)
+        self.assertGreater(means[1] - means[0], 10.0)
+        self.assertEqual(diagnostics["endpoint_to_endpoint_connection_count"], 0)
+        self.assertEqual(diagnostics["parallel_corridor_count"], 1)
+
+    def test_reconstructed_road_absorbs_overlapping_short_fragments(self) -> None:
+        roads = [
+            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 9.0, 0),
+            RegionalRoadObservation(np.asarray([[20.0, 0.5], [40.0, 0.5]]), 9.0, 1),
+            RegionalRoadObservation(np.asarray([[60.0, -0.5], [80.0, -0.5]]), 9.0, 2),
+        ]
+
+        final_roads, diagnostics = regularize_regional_road_network(roads)
+
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0, 1, 2))
+        self.assertEqual(diagnostics["absorbed_fragment_count"], 3)
+
     def test_regional_t_junction_attaches_to_complete_main_road(self) -> None:
         roads = [
             RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 10.0, 0),
@@ -716,6 +819,7 @@ class FastRoadNetworkRegularizationTests(unittest.TestCase):
         self.assertIn((50.0, 0.0), main_nodes & branch_nodes)
         self.assertEqual(diagnostics["endpoint_to_road_attachment_count"], 1)
         self.assertEqual(diagnostics["t_junction_count"], 1)
+        self.assertEqual(diagnostics["road_junction_count"], 1)
         self.assertLess(diagnostics["dangling_endpoint_count_after"], diagnostics["dangling_endpoint_count_before"])
         self.assertEqual(diagnostics["connected_component_count_after"], 1)
         self.assertLess(float(np.ptp(main.points[:, 1])), 0.1)

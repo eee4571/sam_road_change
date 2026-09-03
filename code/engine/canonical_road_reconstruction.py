@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points
+from shapely.prepared import prep
 from shapely.strtree import STRtree
 
 
@@ -58,15 +59,15 @@ class RegionalCanonicalRoad:
 
 
 @dataclass(frozen=True)
-class RoadCorridorCandidate:
-    first_road_id: int
-    second_road_id: int
-    dominant_heading: np.ndarray
-    lateral_distance: float
-    longitudinal_overlap: float
-    surface_support: float
-    different_source_tiles: bool
-    confidence: float
+class _StraightFragmentGroup:
+    fragment_ids: tuple[int, ...]
+    center: np.ndarray
+    direction: np.ndarray
+    minimum: float
+    maximum: float
+    fragment_coverage: float
+    surface_coverage: float
+    maximum_unsupported_gap_m: float
 
 
 @dataclass(frozen=True)
@@ -77,12 +78,6 @@ class CanonicalJunctionCandidate:
     score: float
     branch_endpoints: tuple[tuple[int, bool], ...] = ()
     inference_kind: str = "axis_intersection"
-
-
-@dataclass(frozen=True)
-class CanonicalRoadGraph:
-    roads: tuple[RegionalCanonicalRoad, ...]
-    junctions: tuple[CanonicalJunctionCandidate, ...]
 
 
 @dataclass(frozen=True)
@@ -151,6 +146,8 @@ def _robust_axis(samples: np.ndarray, lateral_outlier: float) -> tuple[np.ndarra
     center = np.median(active, axis=0)
     direction = np.asarray([1.0, 0.0])
     for _ in range(3):
+        if active.shape[0] < 2:
+            break
         covariance = np.cov((active - active.mean(axis=0)).T)
         values, vectors = np.linalg.eigh(covariance)
         direction = vectors[:, int(np.argmax(values))]
@@ -384,99 +381,121 @@ def _road_axis_summary(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, floa
     return center, direction, float(np.min(projections)), float(np.max(projections))
 
 
-def _find_road_corridor_candidates(
-    roads: list[RegionalRoadObservation],
+def _straight_fragment_summary(
+    road: RegionalRoadObservation,
     unit_size_m: float,
-    surface_geometry=None,
-) -> list[RoadCorridorCandidate]:
-    """Find overlapping observations of one corridor without merging carriageways."""
-    if not roads:
-        return []
-    metre = 1.0 / max(float(unit_size_m), 1e-9)
-    geometries = [LineString(_deduplicate_points(road.points)) for road in roads]
-    tree = STRtree(geometries)
-    summaries = [_road_axis_summary(road.points) for road in roads]
-    candidates: list[RoadCorridorCandidate] = []
-    heading_cosine = float(np.cos(np.deg2rad(12.0)))
-    for first_id, first in enumerate(roads):
-        first_line = geometries[first_id]
-        search_distance = max(3.0, 0.35 * first.width_m) * metre
-        for second_value in tree.query(first_line.buffer(search_distance)):
-            second_id = int(second_value)
-            if second_id <= first_id:
-                continue
-            second = roads[second_id]
-            width_ratio = max(first.width_m, second.width_m) / max(
-                min(first.width_m, second.width_m), 1e-6,
-            )
-            if width_ratio > 1.65:
-                continue
-            first_center, first_direction, _first_min, _first_max = summaries[first_id]
-            second_center, second_direction, _second_min, _second_max = summaries[second_id]
-            alignment = abs(float(np.dot(first_direction, second_direction)))
-            if alignment < heading_cosine:
-                continue
-            direction = first_direction
-            if float(np.dot(direction, second_direction)) < 0:
-                second_direction = -second_direction
-            direction = direction + second_direction
-            direction /= max(float(np.linalg.norm(direction)), 1e-9)
-            normal = np.asarray([-direction[1], direction[0]])
-            lateral = abs(float(np.dot(second_center - first_center, normal)))
-            lateral_limit = max(3.0, 0.35 * min(first.width_m, second.width_m)) * metre
-            if lateral > lateral_limit:
-                continue
-            intervals = []
-            for road in (first, second):
-                projections = (_deduplicate_points(road.points) - first_center) @ direction
-                intervals.append((float(np.min(projections)), float(np.max(projections))))
-            overlap = max(0.0, min(intervals[0][1], intervals[1][1]) - max(intervals[0][0], intervals[1][0]))
-            shorter_span = max(1e-9, min(
-                intervals[0][1] - intervals[0][0], intervals[1][1] - intervals[1][0],
-            ))
-            overlap_ratio = overlap / shorter_span
-            if overlap_ratio < 0.30:
-                continue
-            first_near, second_near = nearest_points(first_line, geometries[second_id])
-            lateral_connector = LineString([first_near.coords[0], second_near.coords[0]])
-            surface_support = _surface_line_support(
-                lateral_connector, surface_geometry,
-            ) if lateral_connector.length > 0 else 1.0
-            different_tiles = bool(
-                first.source_tile and second.source_tile
-                and first.source_tile != second.source_tile
-            )
-            confidence = (
-                0.32 * alignment
-                + 0.25 * min(1.0, overlap_ratio)
-                + 0.18 * max(0.0, 1.0 - lateral / max(lateral_limit, 1e-9))
-                + 0.10 * min(1.0, 1.0 / width_ratio)
-                + 0.10 * surface_support
-                + 0.05 * (1.0 if different_tiles else 0.5)
-            )
-            if confidence < 0.70:
-                continue
-            candidates.append(RoadCorridorCandidate(
-                first_road_id=first_id,
-                second_road_id=second_id,
-                dominant_heading=direction.astype(np.float32),
-                lateral_distance=float(lateral),
-                longitudinal_overlap=float(overlap),
-                surface_support=float(surface_support),
-                different_source_tiles=different_tiles,
-                confidence=float(confidence),
-            ))
-    return sorted(candidates, key=lambda candidate: -candidate.confidence)
-
-
-def _merge_corridor_observations(
-    roads: list[RegionalRoadObservation],
-    unit_size_m: float,
-    surface_geometry=None,
-) -> tuple[list[_RegionalRoadSeed], int]:
-    candidates = _find_road_corridor_candidates(
-        roads, unit_size_m, surface_geometry,
+) -> tuple[np.ndarray, np.ndarray, float, float] | None:
+    points = _deduplicate_points(road.points)
+    if points.shape[0] < 2:
+        return None
+    center, direction, minimum, maximum = _road_axis_summary(points)
+    span = maximum - minimum
+    if span <= 3.0 / max(float(unit_size_m), 1e-9):
+        return None
+    normal = np.asarray([-direction[1], direction[0]])
+    residual = np.abs((points - center) @ normal)
+    straight_limit = max(1.5, min(4.0, 0.06 * span * unit_size_m)) / max(
+        float(unit_size_m), 1e-9,
     )
+    if float(np.quantile(residual, 0.90)) > straight_limit:
+        return None
+    return center, direction, minimum, maximum
+
+
+def _fit_fragment_group_axis(
+    fragment_ids: list[int],
+    roads: list[RegionalRoadObservation],
+    unit_size_m: float,
+) -> tuple[np.ndarray, np.ndarray, float, float, list[tuple[float, float]]]:
+    spacing = 2.0 / max(float(unit_size_m), 1e-9)
+    samples = np.vstack([
+        _resample_polyline(roads[fragment_id].points, spacing)
+        for fragment_id in fragment_ids
+    ])
+    center, direction, _inliers = _robust_axis(
+        samples, lateral_outlier=3.5 / max(float(unit_size_m), 1e-9),
+    )
+    intervals: list[tuple[float, float]] = []
+    for fragment_id in fragment_ids:
+        projections = (_deduplicate_points(roads[fragment_id].points) - center) @ direction
+        intervals.append((float(np.min(projections)), float(np.max(projections))))
+    minimum = min(start for start, _end in intervals)
+    maximum = max(end for _start, end in intervals)
+    return center, direction, minimum, maximum, intervals
+
+
+def _measure_fragment_group_coverage(
+    center: np.ndarray,
+    direction: np.ndarray,
+    minimum: float,
+    maximum: float,
+    intervals: list[tuple[float, float]],
+    surface_geometry,
+    unit_size_m: float,
+) -> tuple[float, float, float]:
+    span = maximum - minimum
+    if span <= 1e-9:
+        return 0.0, 0.0, 0.0
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    fragment_length = sum(end - start for start, end in merged)
+    fragment_coverage = float(np.clip(fragment_length / span, 0.0, 1.0))
+    axis = LineString([
+        center + minimum * direction,
+        center + maximum * direction,
+    ])
+    surface_intervals: list[tuple[float, float]] = []
+    if surface_geometry is not None:
+        try:
+            for part in _surface_line_parts(axis.intersection(surface_geometry)):
+                coordinates = np.asarray(part.coords)
+                projection = (coordinates - center) @ direction
+                surface_intervals.append((float(np.min(projection)), float(np.max(projection))))
+        except Exception:
+            surface_intervals = []
+    surface_length = sum(end - start for start, end in surface_intervals)
+    surface_coverage = float(np.clip(surface_length / span, 0.0, 1.0))
+
+    bin_size = 12.0 / max(float(unit_size_m), 1e-9)
+    bin_count = max(1, int(np.ceil(span / bin_size)))
+    unsupported = 0.0
+    maximum_unsupported = 0.0
+    for bin_id in range(bin_count):
+        start = minimum + span * bin_id / bin_count
+        end = minimum + span * (bin_id + 1) / bin_count
+        length = end - start
+        fragment_overlap = sum(
+            max(0.0, min(end, interval_end) - max(start, interval_start))
+            for interval_start, interval_end in merged
+        )
+        surface_overlap = sum(
+            max(0.0, min(end, interval_end) - max(start, interval_start))
+            for interval_start, interval_end in surface_intervals
+        )
+        supported = fragment_overlap >= 0.25 * length or surface_overlap >= 0.60 * length
+        unsupported = 0.0 if supported else unsupported + length
+        maximum_unsupported = max(maximum_unsupported, unsupported)
+    return (
+        fragment_coverage,
+        float(surface_coverage),
+        float(maximum_unsupported * unit_size_m),
+    )
+
+
+def _find_straight_fragment_groups(
+    roads: list[RegionalRoadObservation],
+    unit_size_m: float,
+    surface_geometry=None,
+) -> tuple[list[_StraightFragmentGroup], set[int], int]:
+    """Group collinear observations first, then validate the whole outer-endpoint span."""
+    summaries = [_straight_fragment_summary(road, unit_size_m) for road in roads]
+    straight_ids = [index for index, summary in enumerate(summaries) if summary is not None]
+    if len(straight_ids) < 2:
+        return [], set(), 0
     parent = list(range(len(roads)))
 
     def find(index: int) -> int:
@@ -485,54 +504,158 @@ def _merge_corridor_observations(
             index = parent[index]
         return index
 
-    for candidate in candidates:
-        first = find(candidate.first_road_id)
-        second = find(candidate.second_road_id)
-        if first != second:
-            parent[second] = first
-    groups: dict[int, list[int]] = {}
-    for road_id in range(len(roads)):
-        groups.setdefault(find(road_id), []).append(road_id)
-
-    seeds: list[_RegionalRoadSeed] = []
-    spacing = 2.0 / max(float(unit_size_m), 1e-9)
-    for road_ids in groups.values():
-        if len(road_ids) == 1:
-            road = roads[road_ids[0]]
-            seeds.append(_RegionalRoadSeed(
-                _deduplicate_points(road.points), road.width_m, (road.source_id,),
-            ))
-            continue
-        samples = np.vstack([
-            _resample_polyline(roads[road_id].points, spacing) for road_id in road_ids
-        ])
-        center, direction, _inliers = _robust_axis(
-            samples, lateral_outlier=5.0 / max(float(unit_size_m), 1e-9),
+    metre = 1.0 / max(float(unit_size_m), 1e-9)
+    heading_cosine = float(np.cos(np.deg2rad(10.0)))
+    candidate_gap = 120.0 * metre
+    candidate_pairs: set[tuple[int, int]] = set()
+    summary_centers = np.asarray([summaries[index][0] for index in straight_ids])
+    summary_directions = np.asarray([summaries[index][1] for index in straight_ids])
+    summary_half_spans = np.asarray([
+        0.5 * (summaries[index][3] - summaries[index][2]) for index in straight_ids
+    ])
+    straight_id_array = np.asarray(straight_ids, dtype=int)
+    for local_id, first_id in enumerate(straight_ids):
+        first_center = summary_centers[local_id]
+        first_direction = summary_directions[local_id]
+        normal = np.asarray([-first_direction[1], first_direction[0]])
+        relative = summary_centers - first_center
+        aligned = np.abs(summary_directions @ first_direction) >= heading_cosine
+        laterally_near = np.abs(relative @ normal) <= 8.0 * metre
+        longitudinally_near = np.abs(relative @ first_direction) <= (
+            summary_half_spans[local_id] + summary_half_spans + candidate_gap
         )
-        longitudinal = (samples - center) @ direction
-        order = np.argsort(longitudinal)
-        ordered = samples[order]
-        positions = longitudinal[order]
-        bin_size = 3.0 / max(float(unit_size_m), 1e-9)
-        bins = np.floor((positions - positions[0]) / max(bin_size, 1e-9)).astype(int)
-        corridor_points = np.asarray([
-            np.median(ordered[bins == bin_id], axis=0)
-            for bin_id in np.unique(bins)
+        later_ids = straight_id_array > first_id
+        candidate_pairs.update(
+            (first_id, int(second_id))
+            for second_id in straight_id_array[
+                aligned & laterally_near & longitudinally_near & later_ids
+            ]
+        )
+
+    rejected_cross_corridor = 0
+    for first_id, second_id in sorted(candidate_pairs):
+        first_summary = summaries[first_id]
+        assert first_summary is not None
+        first_center, first_direction, _first_min, _first_max = first_summary
+        second_summary = summaries[second_id]
+        assert second_summary is not None
+        second_center, second_direction, _second_min, _second_max = second_summary
+        alignment = abs(float(np.dot(first_direction, second_direction)))
+        if alignment < heading_cosine:
+            continue
+        if float(np.dot(first_direction, second_direction)) < 0:
+            second_direction = -second_direction
+        direction = first_direction + second_direction
+        direction /= max(float(np.linalg.norm(direction)), 1e-9)
+        normal = np.asarray([-direction[1], direction[0]])
+        lateral = abs(float(np.dot(second_center - first_center, normal)))
+        lateral_limit = max(
+            3.0,
+            0.35 * min(roads[first_id].width_m, roads[second_id].width_m),
+        ) * metre
+        if lateral > lateral_limit:
+            if lateral <= 30.0 * metre:
+                rejected_cross_corridor += 1
+            continue
+        first_projection = (_deduplicate_points(roads[first_id].points) - first_center) @ direction
+        second_projection = (_deduplicate_points(roads[second_id].points) - first_center) @ direction
+        first_interval = (float(np.min(first_projection)), float(np.max(first_projection)))
+        second_interval = (float(np.min(second_projection)), float(np.max(second_projection)))
+        longitudinal_gap = max(
+            0.0,
+            max(first_interval[0], second_interval[0])
+            - min(first_interval[1], second_interval[1]),
+        )
+        if longitudinal_gap > candidate_gap:
+            continue
+        first_root, second_root = find(first_id), find(second_id)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    candidates: dict[int, list[int]] = {}
+    for fragment_id in straight_ids:
+        candidates.setdefault(find(fragment_id), []).append(fragment_id)
+    groups: list[_StraightFragmentGroup] = []
+    absorbed: set[int] = set()
+    maximum_gap_limit_m = 36.0
+    for fragment_ids in candidates.values():
+        if len(fragment_ids) < 2:
+            continue
+        center, direction, minimum, maximum, intervals = _fit_fragment_group_axis(
+            fragment_ids, roads, unit_size_m,
+        )
+        normal = np.asarray([-direction[1], direction[0]])
+        lateral_values = np.concatenate([
+            (_deduplicate_points(roads[fragment_id].points) - center) @ normal
+            for fragment_id in fragment_ids
         ])
-        if corridor_points.shape[0] < 2 or _polyline_length(corridor_points) <= 1e-8:
-            longest_id = max(
-                road_ids, key=lambda road_id: _polyline_length(roads[road_id].points),
-            )
-            corridor_points = _deduplicate_points(roads[longest_id].points)
-        lengths = np.asarray([
-            max(_polyline_length(roads[road_id].points), 1e-9) for road_id in road_ids
-        ])
-        seeds.append(_RegionalRoadSeed(
-            points=_deduplicate_points(corridor_points),
-            width_m=float(np.average([roads[road_id].width_m for road_id in road_ids], weights=lengths)),
-            source_ids=tuple(sorted(roads[road_id].source_id for road_id in road_ids)),
-        ))
-    return seeds, int(len(roads) - len(seeds))
+        lateral_limit = max(
+            3.5,
+            0.40 * float(np.median([roads[index].width_m for index in fragment_ids])),
+        ) / max(float(unit_size_m), 1e-9)
+        if float(np.quantile(np.abs(lateral_values), 0.90)) > lateral_limit:
+            continue
+        fragment_coverage, surface_coverage, maximum_gap_m = _measure_fragment_group_coverage(
+            center, direction, minimum, maximum, intervals, surface_geometry, unit_size_m,
+        )
+        enough_evidence = (
+            fragment_coverage >= 0.72
+            or (fragment_coverage >= 0.30 and surface_coverage >= 0.72)
+        )
+        if not enough_evidence or maximum_gap_m > maximum_gap_limit_m:
+            continue
+        group = _StraightFragmentGroup(
+            fragment_ids=tuple(sorted(fragment_ids)),
+            center=center,
+            direction=direction,
+            minimum=minimum,
+            maximum=maximum,
+            fragment_coverage=fragment_coverage,
+            surface_coverage=surface_coverage,
+            maximum_unsupported_gap_m=maximum_gap_m,
+        )
+        groups.append(group)
+        absorbed.update(fragment_ids)
+    return groups, absorbed, rejected_cross_corridor
+
+
+def _reconstruct_straight_road(
+    group: _StraightFragmentGroup,
+    roads: list[RegionalRoadObservation],
+) -> _RegionalRoadSeed:
+    lengths = np.asarray([
+        max(_polyline_length(roads[index].points), 1e-9)
+        for index in group.fragment_ids
+    ])
+    return _RegionalRoadSeed(
+        points=np.asarray([
+            group.center + group.minimum * group.direction,
+            group.center + group.maximum * group.direction,
+        ], dtype=np.float64),
+        width_m=float(np.average(
+            [roads[index].width_m for index in group.fragment_ids], weights=lengths,
+        )),
+        source_ids=tuple(sorted(roads[index].source_id for index in group.fragment_ids)),
+        geometry_kind="straight",
+    )
+
+
+def _absorb_reconstructed_fragments(
+    roads: list[RegionalRoadObservation],
+    groups: list[_StraightFragmentGroup],
+    absorbed: set[int],
+    unit_size_m: float,
+) -> list[_RegionalRoadSeed]:
+    seeds = [_reconstruct_straight_road(group, roads) for group in groups]
+    unmatched = [
+        _RegionalRoadSeed(
+            points=_deduplicate_points(road.points),
+            width_m=road.width_m,
+            source_ids=(road.source_id,),
+        )
+        for index, road in enumerate(roads) if index not in absorbed
+    ]
+    return [*seeds, *_fit_regional_seeds(unmatched, unit_size_m)]
 
 
 def _fit_regional_seeds(
@@ -542,165 +665,19 @@ def _fit_regional_seeds(
     canonical, _junctions, _diagnostics = fit_canonical_road_geometry(
         [seed.points for seed in seeds], unit_size_m,
     )
-    return [
-        _RegionalRoadSeed(
-            points=road.points,
-            width_m=seeds[road.road_id].width_m,
-            source_ids=seeds[road.road_id].source_ids,
+    fitted: list[_RegionalRoadSeed] = []
+    for road in canonical:
+        seed = seeds[road.road_id]
+        points = np.asarray(road.points, dtype=np.float64)
+        if points.shape[0] < 2 or _polyline_length(points) <= 1e-8:
+            points = np.asarray(seed.points, dtype=np.float64)
+        fitted.append(_RegionalRoadSeed(
+            points=points,
+            width_m=seed.width_m,
+            source_ids=seed.source_ids,
             geometry_kind=road.geometry_kind,
-        )
-        for road in canonical
-    ]
-
-
-def _regional_endpoint_assignments(
-    roads: list[_RegionalRoadSeed],
-    unit_size_m: float,
-) -> tuple[dict[tuple[int, bool], np.ndarray], float, int]:
-    max_gap = 18.0 / max(float(unit_size_m), 1e-9)
-    lookback = 25.0 / max(float(unit_size_m), 1e-9)
-    endpoints: list[tuple[int, bool, np.ndarray, np.ndarray]] = []
-    for road_id, road in enumerate(roads):
-        points = _deduplicate_points(road.points)
-        endpoints.extend((
-            (road_id, True, points[0], _endpoint_heading(points, True, lookback)),
-            (road_id, False, points[-1], _endpoint_heading(points, False, lookback)),
         ))
-    cell = max(max_gap, 1e-9)
-    buckets: dict[tuple[int, int], list[int]] = {}
-    for endpoint_id, (_road, _start, point, _heading) in enumerate(endpoints):
-        key = tuple(np.floor(point / cell).astype(int))
-        buckets.setdefault(key, []).append(endpoint_id)
-    direction_cosine = float(np.cos(np.deg2rad(32.0)))
-    facing_cosine = float(np.cos(np.deg2rad(38.0)))
-    candidates: list[tuple[float, int, int]] = []
-    for first_id, (first_road, _first_start, first_point, first_heading) in enumerate(endpoints):
-        key = tuple(np.floor(first_point / cell).astype(int))
-        for offset in ((a, b) for a in (-1, 0, 1) for b in (-1, 0, 1)):
-            nearby_key = (key[0] + offset[0], key[1] + offset[1])
-            for second_id in buckets.get(nearby_key, []):
-                if second_id <= first_id:
-                    continue
-                second_road, _second_start, second_point, second_heading = endpoints[second_id]
-                if first_road == second_road:
-                    continue
-                distance = float(np.linalg.norm(second_point - first_point))
-                if distance > max_gap:
-                    continue
-                direction_alignment = float(np.dot(first_heading, second_heading))
-                if direction_alignment > -direction_cosine:
-                    continue
-                if distance > 0.75:
-                    connector = (second_point - first_point) / distance
-                    if (
-                        float(np.dot(first_heading, connector)) < facing_cosine
-                        or float(np.dot(second_heading, -connector)) < facing_cosine
-                    ):
-                        continue
-                score = distance + max_gap * (1.0 + direction_alignment)
-                candidates.append((score, first_id, second_id))
-    assignments: dict[tuple[int, bool], np.ndarray] = {}
-    used: set[int] = set()
-    connection_length = 0.0
-    for _score, first_id, second_id in sorted(candidates):
-        if first_id in used or second_id in used:
-            continue
-        first = endpoints[first_id]
-        second = endpoints[second_id]
-        node = 0.5 * (first[2] + second[2])
-        assignments[(first[0], first[1])] = node
-        assignments[(second[0], second[1])] = node
-        connection_length += float(np.linalg.norm(first[2] - second[2]))
-        used.update((first_id, second_id))
-    return assignments, connection_length * float(unit_size_m), int(len(used) // 2)
-
-
-def _regional_entities(
-    roads: list[_RegionalRoadSeed],
-    assignments: dict[tuple[int, bool], np.ndarray],
-    unit_size_m: float,
-) -> tuple[list[np.ndarray], list[tuple[int, ...]]]:
-    points_by_road: list[np.ndarray] = []
-    endpoint_keys: list[tuple[tuple[float, float], tuple[float, float]]] = []
-    incident: dict[tuple[float, float], list[tuple[int, bool]]] = {}
-    for road_id, road in enumerate(roads):
-        points = _deduplicate_points(road.points)
-        start = assignments.get((road_id, True))
-        end = assignments.get((road_id, False))
-        if start is not None and np.linalg.norm(start - points[0]) > 1e-8:
-            points = np.vstack((start, points))
-        if end is not None and np.linalg.norm(end - points[-1]) > 1e-8:
-            points = np.vstack((points, end))
-        points_by_road.append(points)
-        start_key, end_key = _node_key(points[0]), _node_key(points[-1])
-        endpoint_keys.append((start_key, end_key))
-        incident.setdefault(start_key, []).append((road_id, True))
-        incident.setdefault(end_key, []).append((road_id, False))
-
-    continuation: dict[tuple[int, tuple[float, float]], tuple[int, tuple[float, float]]] = {}
-    lookback = 25.0 / max(float(unit_size_m), 1e-9)
-    cosine = float(np.cos(np.deg2rad(32.0)))
-    for node, arms in incident.items():
-        if len(arms) == 2:
-            first, second = arms
-            continuation[(first[0], node)] = (second[0], node)
-            continuation[(second[0], node)] = (first[0], node)
-            continue
-        headings = [
-            _endpoint_heading(points_by_road[road_id], at_start, lookback)
-            for road_id, at_start in arms
-        ]
-        candidates = sorted(
-            (float(np.dot(headings[a], headings[b])), a, b)
-            for a, b in combinations(range(len(arms)), 2)
-            if arms[a][0] != arms[b][0]
-            and float(np.dot(headings[a], headings[b])) <= -cosine
-        )
-        used: set[int] = set()
-        for _alignment, first_id, second_id in candidates:
-            if first_id in used or second_id in used:
-                continue
-            first, second = arms[first_id], arms[second_id]
-            continuation[(first[0], node)] = (second[0], node)
-            continuation[(second[0], node)] = (first[0], node)
-            used.update((first_id, second_id))
-
-    visited: set[int] = set()
-    entities: list[np.ndarray] = []
-    source_groups: list[tuple[int, ...]] = []
-
-    def walk(first_road: int, start_node: tuple[float, float]) -> None:
-        road_id, node = first_road, start_node
-        points: list[np.ndarray] = []
-        source_ids: list[int] = []
-        while road_id not in visited:
-            visited.add(road_id)
-            geometry = points_by_road[road_id]
-            start, end = endpoint_keys[road_id]
-            if start == node:
-                oriented, next_node = geometry, end
-            else:
-                oriented, next_node = geometry[::-1], start
-            points.extend(oriented if not points else oriented[1:])
-            source_ids.extend(roads[road_id].source_ids)
-            paired = continuation.get((road_id, next_node))
-            if paired is None or paired[0] in visited:
-                break
-            road_id, node = paired
-        entities.append(np.asarray(points, dtype=np.float64))
-        source_groups.append(tuple(sorted(set(source_ids))))
-
-    for road_id, (start, end) in enumerate(endpoint_keys):
-        if road_id in visited:
-            continue
-        if (road_id, start) not in continuation:
-            walk(road_id, start)
-        elif (road_id, end) not in continuation:
-            walk(road_id, end)
-    for road_id, (start, _end) in enumerate(endpoint_keys):
-        if road_id not in visited:
-            walk(road_id, start)
-    return entities, source_groups
+    return fitted
 
 
 def _surface_line_support(line: LineString, surface_geometry) -> float:
@@ -708,6 +685,17 @@ def _surface_line_support(line: LineString, surface_geometry) -> float:
         return 0.5
     try:
         return float(min(1.0, line.intersection(surface_geometry).length / line.length))
+    except Exception:
+        return 0.5
+
+
+def _sampled_surface_line_support(line: LineString, prepared_surface) -> float:
+    if prepared_surface is None or line.length <= 0:
+        return 0.5
+    sample_count = max(3, min(9, int(np.ceil(line.length / 3.0)) + 1))
+    samples = [line.interpolate(fraction, normalized=True) for fraction in np.linspace(0.0, 1.0, sample_count)]
+    try:
+        return float(np.mean([prepared_surface.covers(point) for point in samples]))
     except Exception:
         return 0.5
 
@@ -842,6 +830,7 @@ def _infer_endpoint_to_road_attachments(
     lookback = 30.0 * metre
     lines = [LineString(np.asarray(road.points)) for road in roads]
     tree = STRtree(lines)
+    prepared_surface = prep(surface_geometry) if surface_geometry is not None else None
     candidates: list[CanonicalJunctionCandidate] = []
     for branch_id, branch in enumerate(roads):
         points = np.asarray(branch.points, dtype=np.float64)
@@ -883,7 +872,7 @@ def _infer_endpoint_to_road_attachments(
                 if width_ratio > 2.5:
                     continue
                 connector = LineString([endpoint, node])
-                support = _surface_line_support(connector, surface_geometry)
+                support = _sampled_surface_line_support(connector, prepared_surface)
                 distance_score = max(0.0, 1.0 - forward / maximum)
                 score = (
                     0.30 * facing + 0.22 * min(1.0, axis_crossing / 0.50)
@@ -922,6 +911,7 @@ def _infer_axis_intersections(
     maximum = 18.0 * metre
     lines = [LineString(np.asarray(road.points)) for road in roads]
     tree = STRtree(lines)
+    prepared_surface = prep(surface_geometry) if surface_geometry is not None else None
     candidates: list[CanonicalJunctionCandidate] = []
     for first_id, first_line in enumerate(lines):
         for second_value in tree.query(first_line.buffer(maximum)):
@@ -960,7 +950,7 @@ def _infer_axis_intersections(
                 if np.linalg.norm(np.asarray(nearest.coords[0]) - node) > 1e-8
             ]
             support = float(np.mean([
-                _surface_line_support(connector, surface_geometry) for connector in connectors
+                _sampled_surface_line_support(connector, prepared_surface) for connector in connectors
             ])) if connectors else 1.0
             distance_score = max(0.0, 1.0 - (first_gap + second_gap) / (2.0 * maximum))
             score = 0.42 * min(1.0, crossing / 0.50) + 0.35 * distance_score + 0.23 * support
@@ -1094,8 +1084,12 @@ def _apply_junction_constraints(
                 fitted[-1] = node
             else:
                 fitted = _insert_junction(fitted, node, node, endpoint_snap=0.0)
+        cleaned = _deduplicate_points(fitted)
+        if cleaned.shape[0] < 2 or _polyline_length(cleaned) <= 1e-8:
+            cleaned = _deduplicate_points(evidence)
+            geometry_kind = road.geometry_kind
         output.append(_RegionalRoadSeed(
-            points=_deduplicate_points(fitted).astype(np.float32),
+            points=cleaned.astype(np.float64),
             width_m=road.width_m,
             source_ids=road.source_ids,
             geometry_kind=geometry_kind,
@@ -1136,45 +1130,60 @@ def _network_topology_metrics(roads: list[_RegionalRoadSeed]) -> tuple[int, int,
     return endpoint_count, components, headings
 
 
-def _count_connectable_dangling_endpoints(
+def _parallel_corridor_pairs(
+    roads: list[_RegionalRoadSeed],
+    unit_size_m: float,
+) -> set[tuple[int, int]]:
+    metre = 1.0 / max(float(unit_size_m), 1e-9)
+    pairs: set[tuple[int, int]] = set()
+    summaries = [_road_axis_summary(road.points) for road in roads]
+    cosine = float(np.cos(np.deg2rad(8.0)))
+    for first_id, second_id in combinations(range(len(roads)), 2):
+        if roads[first_id].geometry_kind != "straight" or roads[second_id].geometry_kind != "straight":
+            continue
+        first_center, first_direction, _minimum, _maximum = summaries[first_id]
+        second_center, second_direction, _minimum, _maximum = summaries[second_id]
+        if abs(float(np.dot(first_direction, second_direction))) < cosine:
+            continue
+        direction = first_direction
+        normal = np.asarray([-direction[1], direction[0]])
+        separation = abs(float(np.dot(second_center - first_center, normal)))
+        if not 5.0 * metre <= separation <= 30.0 * metre:
+            continue
+        intervals = []
+        for road in (roads[first_id], roads[second_id]):
+            projection = (np.asarray(road.points) - first_center) @ direction
+            intervals.append((float(np.min(projection)), float(np.max(projection))))
+        overlap = max(0.0, min(intervals[0][1], intervals[1][1]) - max(intervals[0][0], intervals[1][0]))
+        shorter = max(1e-9, min(
+            intervals[0][1] - intervals[0][0],
+            intervals[1][1] - intervals[1][0],
+        ))
+        if overlap / shorter >= 0.50:
+            pairs.add((first_id, second_id))
+    return pairs
+
+
+def _connect_complete_roads_at_intersections(
     roads: list[_RegionalRoadSeed],
     surface_geometry,
     unit_size_m: float,
-) -> int:
-    assignments, _length, _count = _regional_endpoint_assignments(roads, unit_size_m)
+    protected_parallel_pairs: set[tuple[int, int]],
+) -> tuple[list[_RegionalRoadSeed], list[CanonicalJunctionCandidate], int]:
     attachments = _infer_endpoint_to_road_attachments(roads, surface_geometry, unit_size_m)
-    candidates = set(assignments)
-    candidates.update(
-        endpoint for attachment in attachments for endpoint in attachment.branch_endpoints
-    )
-    return int(len(candidates))
-
-
-def _endpoint_connections_as_junctions(
-    roads: list[_RegionalRoadSeed],
-    unit_size_m: float,
-) -> tuple[list[CanonicalJunctionCandidate], float, int]:
-    assignments, length_m, pair_count = _regional_endpoint_assignments(
-        roads, unit_size_m,
-    )
-    grouped: dict[tuple[float, float], list[tuple[int, bool]]] = {}
-    points: dict[tuple[float, float], np.ndarray] = {}
-    for endpoint, node in assignments.items():
-        key = _node_key(node)
-        grouped.setdefault(key, []).append(endpoint)
-        points[key] = node
-    junctions = [
-        CanonicalJunctionCandidate(
-            road_ids=tuple(sorted({road_id for road_id, _at_start in endpoints})),
-            point=np.asarray(points[key], dtype=np.float32),
-            junction_type="continuation",
-            score=1.0,
-            branch_endpoints=tuple(sorted(endpoints)),
-            inference_kind="endpoint_to_endpoint",
+    intersections = _infer_axis_intersections(roads, surface_geometry, unit_size_m)
+    minimum_length = 5.0 / max(float(unit_size_m), 1e-9)
+    road_lengths = [_polyline_length(road.points) for road in roads]
+    candidates = [
+        candidate for candidate in [*attachments, *intersections]
+        if all(road_lengths[road_id] >= minimum_length for road_id in candidate.road_ids)
+        if not any(
+            tuple(sorted(pair)) in protected_parallel_pairs
+            for pair in combinations(candidate.road_ids, 2)
         )
-        for key, endpoints in grouped.items() if len(endpoints) >= 2
     ]
-    return junctions, length_m, pair_count
+    junctions = _cluster_junction_candidates(candidates, roads, unit_size_m)
+    return _apply_junction_constraints(roads, junctions, unit_size_m), junctions, len(attachments)
 
 
 def regularize_regional_road_network(
@@ -1183,7 +1192,7 @@ def regularize_regional_road_network(
     *,
     surface_geometry=None,
 ) -> tuple[list[RegionalCanonicalRoad], dict[str, float | int]]:
-    """Infer area-level corridors, continuations, junctions, and a canonical graph."""
+    """Reconstruct whole straight corridors before inferring conservative junctions."""
     started = time.perf_counter()
     if not roads:
         return [], {
@@ -1202,6 +1211,15 @@ def regularize_regional_road_network(
             "connected_component_count_before": 0,
             "connected_component_count_after": 0,
             "surface_center_correction_count": 0,
+            "straight_fragment_group_count": 0,
+            "reconstructed_straight_road_count": 0,
+            "absorbed_fragment_count": 0,
+            "fragment_coverage_mean": 0.0,
+            "surface_coverage_mean": 0.0,
+            "maximum_unsupported_gap_mean_m": 0.0,
+            "parallel_corridor_count": 0,
+            "rejected_cross_corridor_connection_count": 0,
+            "road_junction_count": 0,
             "regional_regularization_seconds": 0.0,
         }
     raw_seeds = [
@@ -1213,111 +1231,36 @@ def regularize_regional_road_network(
         for road in roads
     ]
     endpoint_count_before, component_count_before, _headings = _network_topology_metrics(raw_seeds)
-    dangling_before = _count_connectable_dangling_endpoints(
-        raw_seeds, surface_geometry, unit_size_m,
-    )
-
-    corridor_seeds, corridor_merge_count = _merge_corridor_observations(
+    groups, absorbed, rejected_cross_corridor = _find_straight_fragment_groups(
         roads, unit_size_m, surface_geometry,
     )
-    preliminary = _fit_regional_seeds(corridor_seeds, unit_size_m)
-    assignments, connection_length_m, endpoint_connection_count = (
-        _regional_endpoint_assignments(preliminary, unit_size_m)
+    complete_roads = _absorb_reconstructed_fragments(
+        roads, groups, absorbed, unit_size_m,
     )
-    entities, source_groups = _regional_entities(
-        preliminary, assignments, unit_size_m,
+    center_count = len(groups) if groups else min(1, len(complete_roads))
+    centered, surface_center_correction_count = _center_straight_roads_on_surface(
+        complete_roads[:center_count], surface_geometry, unit_size_m,
     )
-    entity_seeds: list[_RegionalRoadSeed] = []
-    for points, source_ids in zip(entities, source_groups):
-        source_roads = [roads[source_id] for source_id in source_ids]
-        lengths = np.asarray([
-            max(_polyline_length(source.points), 1e-9) for source in source_roads
-        ])
-        entity_seeds.append(_RegionalRoadSeed(
-            points=points,
-            width_m=float(np.average(
-                [source.width_m for source in source_roads], weights=lengths,
-            )),
-            source_ids=source_ids,
-        ))
-    fitted_entities = _fit_regional_seeds(entity_seeds, unit_size_m)
-    fitted_entities, surface_center_correction_count = _center_straight_roads_on_surface(
-        fitted_entities, surface_geometry, unit_size_m,
+    complete_roads = [*centered, *complete_roads[center_count:]]
+    protected_parallel_pairs = _parallel_corridor_pairs(complete_roads, unit_size_m)
+    final_seeds, junctions, attachment_count = _connect_complete_roads_at_intersections(
+        complete_roads,
+        surface_geometry,
+        unit_size_m,
+        protected_parallel_pairs,
     )
-    secondary_assignments, secondary_length_m, secondary_connection_count = (
-        _regional_endpoint_assignments(fitted_entities, unit_size_m)
-    )
-    if secondary_connection_count:
-        secondary_entities, secondary_source_groups = _regional_entities(
-            fitted_entities, secondary_assignments, unit_size_m,
-        )
-        secondary_seeds: list[_RegionalRoadSeed] = []
-        for points, source_ids in zip(secondary_entities, secondary_source_groups):
-            source_roads = [roads[source_id] for source_id in source_ids]
-            lengths = np.asarray([
-                max(_polyline_length(source.points), 1e-9) for source in source_roads
-            ])
-            secondary_seeds.append(_RegionalRoadSeed(
-                points=points,
-                width_m=float(np.average(
-                    [source.width_m for source in source_roads], weights=lengths,
-                )),
-                source_ids=source_ids,
-            ))
-        fitted_entities = _fit_regional_seeds(secondary_seeds, unit_size_m)
-        fitted_entities, secondary_center_count = _center_straight_roads_on_surface(
-            fitted_entities, surface_geometry, unit_size_m,
-        )
-        surface_center_correction_count += secondary_center_count
-        connection_length_m += secondary_length_m
-        endpoint_connection_count += secondary_connection_count
-    attachment_candidates = _infer_endpoint_to_road_attachments(
-        fitted_entities, surface_geometry, unit_size_m,
-    )
-    axis_candidates = _infer_axis_intersections(
-        fitted_entities, surface_geometry, unit_size_m,
-    )
-    junctions = _cluster_junction_candidates(
-        [*attachment_candidates, *axis_candidates], fitted_entities, unit_size_m,
-    )
-    final_seeds = _apply_junction_constraints(
-        fitted_entities, junctions, unit_size_m,
-    )
-    attachment_count = len(attachment_candidates)
-    for _iteration in range(2):
-        existing_endpoints = {
-            endpoint for junction in junctions for endpoint in junction.branch_endpoints
-        }
-        endpoint_junctions, _extra_length_m, extra_endpoint_count = (
-            _endpoint_connections_as_junctions(final_seeds, unit_size_m)
-        )
-        endpoint_junctions = [
-            candidate for candidate in endpoint_junctions
-            if any(endpoint not in existing_endpoints for endpoint in candidate.branch_endpoints)
-        ]
-        extra_attachments = [
-            candidate for candidate in _infer_endpoint_to_road_attachments(
-                final_seeds, surface_geometry, unit_size_m,
-            )
-            if any(endpoint not in existing_endpoints for endpoint in candidate.branch_endpoints)
-        ]
-        if not endpoint_junctions and not extra_attachments:
-            break
-        endpoint_connection_count += min(extra_endpoint_count, len(endpoint_junctions))
-        attachment_count += len(extra_attachments)
-        junctions = _cluster_junction_candidates(
-            [*junctions, *endpoint_junctions, *extra_attachments],
-            fitted_entities,
-            unit_size_m,
-        )
-        final_seeds = _apply_junction_constraints(
-            fitted_entities, junctions, unit_size_m,
-        )
     inferred_connection_length_m = float(sum(
-        LineString(fitted_entities[road_id].points).distance(Point(junction.point))
+        LineString(complete_roads[road_id].points).distance(Point(junction.point))
         for junction in junctions for road_id in junction.road_ids
     ) * unit_size_m)
-    connection_length_m += inferred_connection_length_m
+    reconstructed_gap_length_m = float(sum(
+        max(
+            0.0,
+            (group.maximum - group.minimum) * unit_size_m * (1.0 - group.fragment_coverage),
+        )
+        for group in groups
+    ))
+    connection_length_m = reconstructed_gap_length_m + inferred_connection_length_m
     outputs = [
         RegionalCanonicalRoad(
             points=seed.points,
@@ -1327,17 +1270,13 @@ def regularize_regional_road_network(
         )
         for seed in final_seeds
     ]
-    graph = CanonicalRoadGraph(tuple(outputs), tuple(junctions))
-    outputs = list(graph.roads)
     original_vertices = int(sum(np.asarray(road.points).shape[0] for road in roads))
     final_vertices = int(sum(road.points.shape[0] for road in outputs))
     endpoint_count_after, component_count_after, _headings = _network_topology_metrics(final_seeds)
-    dangling_after = _count_connectable_dangling_endpoints(
-        final_seeds, surface_geometry, unit_size_m,
-    )
     t_count = int(sum(junction.junction_type == "t" for junction in junctions))
     cross_count = int(sum(junction.junction_type == "cross" for junction in junctions))
     y_count = int(sum(junction.junction_type == "y" for junction in junctions))
+    corridor_merge_count = int(len(absorbed) - len(groups))
     diagnostics: dict[str, float | int] = {
         "original_feature_count": int(len(roads)),
         "final_feature_count": int(len(outputs)),
@@ -1352,21 +1291,38 @@ def regularize_regional_road_network(
         "generated_connection_length_m": float(connection_length_m),
         "endpoint_count_before": int(endpoint_count_before),
         "endpoint_count_after": int(endpoint_count_after),
-        "dangling_endpoint_count_before": int(dangling_before),
-        "dangling_endpoint_count_after": int(dangling_after),
+        "dangling_endpoint_count_before": int(endpoint_count_before),
+        "dangling_endpoint_count_after": int(endpoint_count_after),
         "t_junction_count": t_count,
         "cross_junction_count": cross_count,
         "y_junction_count": y_count,
-        "endpoint_to_endpoint_connection_count": int(endpoint_connection_count),
+        "endpoint_to_endpoint_connection_count": 0,
         "endpoint_to_road_attachment_count": int(attachment_count),
         "corridor_merge_count": int(corridor_merge_count),
         "axis_intersection_count": int(sum(
             "axis_intersection" in junction.inference_kind
-            for junction in graph.junctions
+            for junction in junctions
         )),
         "connected_component_count_before": int(component_count_before),
         "connected_component_count_after": int(component_count_after),
         "surface_center_correction_count": int(surface_center_correction_count),
+        "straight_fragment_group_count": int(len(groups)),
+        "reconstructed_straight_road_count": int(len(groups)),
+        "absorbed_fragment_count": int(len(absorbed)),
+        "fragment_coverage_mean": float(np.mean([
+            group.fragment_coverage for group in groups
+        ])) if groups else 0.0,
+        "surface_coverage_mean": float(np.mean([
+            group.surface_coverage for group in groups
+        ])) if groups else 0.0,
+        "maximum_unsupported_gap_mean_m": float(np.mean([
+            group.maximum_unsupported_gap_m for group in groups
+        ])) if groups else 0.0,
+        "parallel_corridor_count": int(len(protected_parallel_pairs)),
+        "rejected_cross_corridor_connection_count": int(
+            rejected_cross_corridor + 2 * len(protected_parallel_pairs)
+        ),
+        "road_junction_count": int(len(junctions)),
         "regional_regularization_seconds": float(time.perf_counter() - started),
     }
     return outputs, diagnostics

@@ -2496,7 +2496,7 @@ def extract(args: argparse.Namespace) -> dict:
     }
     stage_definitions = PERIOD_STAGE_DEFINITIONS
     if execution_profile == "fast":
-        fast_script = ROOT / "engine" / "fast_pipeline.py"
+        fast_module = [str(PYTHON), "-m", "engine.fast_pipeline"]
         probability_dir = inference_batch_dir / "mask"
         surface_mask_dir = surface_root / "masks" / image_txt.stem
         validation_value = str(getattr(args, "validation_area", "") or "").strip()
@@ -2509,11 +2509,11 @@ def extract(args: argparse.Namespace) -> dict:
                 "--execution-profile", "fast",
             ], SAMROAD),
             "surface": ([
-                str(PYTHON), str(fast_script), "surface", "--image-dir", str(images),
+                *fast_module, "surface", "--image-dir", str(images),
                 "--probability-dir", str(probability_dir), "--output-dir", str(surface_mask_dir),
             ], ROOT),
             "width": ([
-                str(PYTHON), str(fast_script), "width", "--image-dir", str(images),
+                *fast_module, "width", "--image-dir", str(images),
                 "--surface-dir", str(surface_mask_dir),
                 "--probability-dir", str(probability_dir), "--output-dir", str(width_dir),
                 "--pixel-size", str(args.pixel_size),
@@ -2522,7 +2522,7 @@ def extract(args: argparse.Namespace) -> dict:
                 "--device", device,
             ], ROOT),
             "export": ([
-                str(PYTHON), str(fast_script), "export", "--width-dir", str(width_dir),
+                *fast_module, "export", "--width-dir", str(width_dir),
                 "--output-dir", str(products), "--image-dir", str(images),
                 *(["--validation-area", validation_value] if validation_value else []),
             ], ROOT),

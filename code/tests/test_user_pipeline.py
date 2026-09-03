@@ -317,6 +317,27 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
             self.assertNotIn("--resume-existing-images", centerline_command)
             self.assertNotIn("--pipeline-state", centerline_command)
 
+    def test_fast_helper_stages_run_as_package_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            workspace, args = self._checkpoint_workspace(Path(raw))
+            args.execution_profile = "fast"
+            commands = {}
+
+            def fake_run(command, cwd, _env, label, _context=None):
+                commands[label] = (command, cwd)
+                return {"stage": label, "elapsed_seconds": 0.01}
+
+            with patch.object(user_pipeline, "run_command", side_effect=fake_run), \
+                    patch.object(user_pipeline, "_period_stage_output_complete", return_value=True), \
+                    patch.object(user_pipeline, "_write_valid_observation_area", return_value=None), \
+                    patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
+                user_pipeline.extract(args)
+
+            for label in ("Final Fast Mask", "快速道路宽度", "道路产品导出"):
+                command, cwd = commands[label]
+                self.assertEqual(command[1:3], ["-m", "engine.fast_pipeline"])
+                self.assertEqual(cwd, user_pipeline.ROOT)
+
     def test_completed_stage_with_missing_output_is_not_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             workspace, args = self._checkpoint_workspace(Path(raw))
