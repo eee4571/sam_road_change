@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-"""Final centerline cleanup with local, evidence-backed geometry edits.
+"""Canonical road-network reconstruction from line and road-surface evidence.
 
-Reliable input vertices are authoritative.  Cleanup may remove a true duplicate,
-insert a short connector, replace a short surface-disproved offset window, or
-insert a junction vertex.  It never globally refits or shifts an existing road.
+Fast production output uses one medial axis per detected surface ribbon.  The
+older line cleanup helpers remain available for focused geometry tests and for
+the no-surface fallback.
 """
 
 from dataclasses import dataclass
@@ -14,6 +14,8 @@ import time
 
 import cv2
 import numpy as np
+from rasterio.features import rasterize
+from rasterio.transform import from_origin
 from shapely.geometry import LineString, Point
 from shapely.ops import nearest_points, polygonize, substring, unary_union
 from shapely.prepared import prep
@@ -1172,9 +1174,42 @@ def _seed_axis_interval(
     return np.asarray(center), np.asarray(direction), float(np.min(projection)), float(np.max(projection))
 
 
+def _surface_separates_local_tracks(
+    first: LineString,
+    second: LineString,
+    surface_geometry,
+    unit_size_m: float,
+) -> bool:
+    """Confirm that two persistent lateral bands occupy separate road strips."""
+    if surface_geometry is None:
+        return True
+    sample_line, reference_line = (
+        (first, second) if first.length <= second.length else (second, first)
+    )
+    samples = _resample_polyline(
+        np.asarray(sample_line.coords, dtype=np.float64),
+        8.0 / max(unit_size_m, 1e-9),
+    )
+    prepared_surface = prep(surface_geometry)
+    separated = []
+    for point_array in samples:
+        point = Point(point_array)
+        projection = reference_line.interpolate(reference_line.project(point))
+        distance_m = point.distance(projection) * unit_size_m
+        if not 4.0 <= distance_m <= 30.0:
+            continue
+        midpoint = Point(
+            0.5 * (point.x + projection.x),
+            0.5 * (point.y + projection.y),
+        )
+        separated.append(not prepared_surface.covers(midpoint))
+    return len(separated) >= 3 and float(np.mean(separated)) >= 0.35
+
+
 def _parallel_track_pairs(
     roads: list[_RegionalRoadSeed],
     unit_size_m: float,
+    surface_geometry=None,
 ) -> set[tuple[int, int]]:
     """Find two lateral bands that persist across a shared longitudinal range."""
     metre = 1.0 / max(float(unit_size_m), 1e-9)
@@ -1206,7 +1241,13 @@ def _parallel_track_pairs(
         ))
         longer = max(1e-9, max(float(np.ptp(first_projection)), float(np.ptp(second_projection))))
         shorter = max(1e-9, min(float(np.ptp(first_projection)), float(np.ptp(second_projection))))
-        if shorter * unit_size_m >= 45.0 and overlap / longer >= 0.45:
+        if (
+            shorter * unit_size_m >= 45.0
+            and overlap / longer >= 0.45
+            and _surface_separates_local_tracks(
+                lines[first_id], lines[second_id], surface_geometry, unit_size_m,
+            )
+        ):
             pairs.add((first_id, second_id))
             continue
 
@@ -1253,6 +1294,9 @@ def _parallel_track_pairs(
             min(len(occupied[0]), len(occupied[1])) >= 3
             and len(common_bins) / max(1, min(len(occupied[0]), len(occupied[1]))) >= 0.45
             and min(len(occupied[0]), len(occupied[1])) / max(len(occupied[0]), len(occupied[1])) >= 0.45
+            and _surface_separates_local_tracks(
+                lines[first_id], lines[second_id], surface_geometry, unit_size_m,
+            )
         ):
             pairs.add((first_id, second_id))
     return pairs
@@ -1500,7 +1544,7 @@ def _repair_same_track_gaps(
             if (
                 connector is None
                 and gap.distance * unit_size_m <= 16.0
-                and gap.lateral * unit_size_m <= 1.5
+                and gap.lateral_offset * unit_size_m <= 1.5
             ):
                 # A small mask hole must not break an otherwise unambiguous
                 # collinear track.  The headings and lateral gate above provide
@@ -1837,7 +1881,7 @@ def _remove_short_self_loops(
     cleaned: list[_RegionalRoadSeed] = []
     removed_count = 0
     removed_length_m = 0.0
-    cosine = float(np.cos(np.deg2rad(25.0)))
+    cosine = float(np.cos(np.deg2rad(40.0)))
     for road in roads:
         points = np.asarray(road.points, dtype=np.float64)
         road_removed = 0
@@ -1892,7 +1936,7 @@ def _select_same_track_local_paths(
     unit_size_m: float,
     parallel_pairs: set[tuple[int, int]],
 ) -> tuple[list[_RegionalRoadSeed], int, float]:
-    """Remove a clearly inferior local alternative when a stable path already spans it."""
+    """Enforce one canonical path per non-junction lateral track."""
     if len(roads) < 2:
         return roads, 0, 0.0
     metre = 1.0 / max(float(unit_size_m), 1e-9)
@@ -1902,35 +1946,69 @@ def _select_same_track_local_paths(
     removed_length_m = 0.0
     cosine = float(np.cos(np.deg2rad(25.0)))
     prepared_surface = prep(surface_geometry) if surface_geometry is not None else None
-    for candidate_id, candidate_line in enumerate(lines):
+    axes = [_road_axis_summary(road.points) for road in roads]
+    quality = []
+    for road_id, (road, line) in enumerate(zip(roads, lines)):
+        length_m = line.length * unit_size_m
+        turning = _path_turning(road.points)
+        segment_lengths = np.linalg.norm(np.diff(road.points, axis=0), axis=1)
+        reversal = float(np.sum(segment_lengths[1:][
+            np.sum(
+                np.diff(road.points, axis=0)[:-1] * np.diff(road.points, axis=0)[1:], axis=1,
+            ) < 0.0
+        ])) if road.points.shape[0] > 2 else 0.0
+        density_scale = 50.0 / max(length_m, 20.0)
+        quality.append(
+            0.020 * min(length_m, 200.0)
+            - 1.20 * turning * density_scale
+            - 0.04 * reversal * density_scale
+            - 1e-8 * road_id
+        )
+
+    for candidate_id in sorted(range(len(roads)), key=lambda road_id: quality[road_id]):
+        candidate_line = lines[candidate_id]
         candidate_length_m = candidate_line.length * unit_size_m
-        if not 5.0 <= candidate_length_m <= 100.0:
+        if candidate_length_m < 2.0:
             continue
         candidate_points = np.asarray(roads[candidate_id].points)
-        candidate_direction = candidate_points[-1] - candidate_points[0]
-        candidate_direction /= max(float(np.linalg.norm(candidate_direction)), 1e-9)
-        bundle_radius_m = min(8.0, max(3.0, 0.55 * max(roads[candidate_id].width_m, 1.0)))
-        reference_ids = tree.query(candidate_line.buffer(bundle_radius_m * metre))
-        for reference_id_value in reference_ids:
-            reference_id = int(reference_id_value)
-            if reference_id == candidate_id or tuple(sorted((candidate_id, reference_id))) in parallel_pairs:
+        _candidate_center, candidate_direction, _minimum, _maximum = axes[candidate_id]
+        bundle_radius_m = min(30.0, max(12.0, 1.50 * max(roads[candidate_id].width_m, 1.0)))
+        reference_ids = sorted(
+            (int(value) for value in tree.query(candidate_line.buffer(bundle_radius_m * metre))),
+            key=lambda road_id: quality[road_id], reverse=True,
+        )
+        for reference_id in reference_ids:
+            if (
+                reference_id == candidate_id
+                or reference_id in removed
+                or tuple(sorted((candidate_id, reference_id))) in parallel_pairs
+            ):
+                continue
+            if (
+                quality[reference_id] < quality[candidate_id] - 0.05
+                or (
+                    abs(quality[reference_id] - quality[candidate_id]) <= 0.05
+                    and reference_id > candidate_id
+                )
+            ):
                 continue
             reference_line = lines[reference_id]
-            if reference_line.length * unit_size_m < max(45.0, 1.35 * candidate_length_m):
+            reference_length_m = reference_line.length * unit_size_m
+            if reference_length_m < 35.0:
+                continue
+            _reference_center, reference_direction, _a, _b = axes[reference_id]
+            if abs(float(np.dot(candidate_direction, reference_direction))) < cosine:
                 continue
             start_projection = reference_line.project(Point(candidate_points[0]))
             end_projection = reference_line.project(Point(candidate_points[-1]))
-            if (
-                min(start_projection, end_projection) * unit_size_m < 6.0
-                or (reference_line.length - max(start_projection, end_projection)) * unit_size_m < 6.0
-                or abs(end_projection - start_projection) * unit_size_m < 5.0
-            ):
+            projected_span_m = abs(end_projection - start_projection) * unit_size_m
+            if projected_span_m < max(2.0, 0.30 * candidate_length_m):
                 continue
-            endpoint_limit = min(6.0, bundle_radius_m) * metre
-            if (
-                reference_line.distance(Point(candidate_points[0])) > endpoint_limit
-                or reference_line.distance(Point(candidate_points[-1])) > endpoint_limit
-            ):
+            endpoint_distances_m = (
+                reference_line.distance(Point(candidate_points[0])) * unit_size_m,
+                reference_line.distance(Point(candidate_points[-1])) * unit_size_m,
+            )
+            if max(endpoint_distances_m) > bundle_radius_m:
                 continue
             reference_part = substring(
                 reference_line, min(start_projection, end_projection), max(start_projection, end_projection),
@@ -1948,6 +2026,9 @@ def _select_same_track_local_paths(
             ])
             if float(np.quantile(lateral_distances, 0.90)) > bundle_radius_m:
                 continue
+            # A genuine companion track has already been validated using
+            # longitudinal coverage and a surface gap.  Everything else in the
+            # same local strip competes for the single permitted path.
             candidate_support = (
                 _sampled_surface_line_support(candidate_line, prepared_surface)
                 if prepared_surface is not None else 1.0
@@ -1956,32 +2037,23 @@ def _select_same_track_local_paths(
                 _sampled_surface_line_support(reference_part, prepared_surface)
                 if prepared_surface is not None else 1.0
             )
-            if reference_support < 0.85 or reference_support + 0.03 < candidate_support:
-                continue
-            candidate_clearance, _candidate_lower = _line_surface_clearance(
-                candidate_points, surface_geometry, unit_size_m,
-            )
-            reference_clearance, _reference_lower = _line_surface_clearance(
-                reference_points, surface_geometry, unit_size_m,
-            )
-            if reference_clearance + 0.25 < candidate_clearance:
+            if reference_support < 0.65:
                 continue
             candidate_turn = _path_turning(candidate_points)
             reference_turn = _path_turning(reference_points)
             length_ratio = candidate_line.length / max(reference_part.length, 1e-9)
             mean_lateral = float(np.mean(lateral_distances))
             candidate_score = (
-                2.0 * candidate_support + 0.12 * candidate_clearance
-                - 0.85 * max(0.0, length_ratio - 1.0)
-                - 0.30 * candidate_turn - 0.12 * mean_lateral
+                2.20 * abs(float(np.dot(candidate_direction, reference_direction)))
+                - 0.20 * mean_lateral
+                - 0.90 * max(0.0, length_ratio - 1.0)
+                - 0.55 * candidate_turn
+                + 0.15 * candidate_support
             )
-            reference_score = 2.0 * reference_support + 0.12 * reference_clearance - 0.30 * reference_turn
-            clearly_inferior = (
-                length_ratio >= 1.05
-                or candidate_turn >= reference_turn + np.deg2rad(20.0)
-                or mean_lateral >= 1.5
+            reference_score = (
+                2.20 - 0.55 * reference_turn + 0.15 * reference_support
             )
-            if clearly_inferior and reference_score >= candidate_score + 0.18:
+            if reference_score >= candidate_score + 0.05:
                 removed.add(candidate_id)
                 removed_length_m += candidate_length_m
                 break
@@ -2122,6 +2194,291 @@ def _empty_cleanup_diagnostics() -> dict[str, float | int]:
     }
 
 
+def _surface_polygon_components(surface_geometry) -> list:
+    if surface_geometry is None or surface_geometry.is_empty:
+        return []
+    if surface_geometry.geom_type == "Polygon":
+        return [surface_geometry]
+    components = []
+    for geometry in getattr(surface_geometry, "geoms", ()):
+        if geometry.geom_type == "Polygon" and not geometry.is_empty:
+            components.append(geometry)
+        elif hasattr(geometry, "geoms"):
+            components.extend(_surface_polygon_components(geometry))
+    return components
+
+
+def _surface_skeleton_adjacency(skeleton: np.ndarray) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    points = [tuple(int(value) for value in point) for point in np.argwhere(skeleton)]
+    point_set = set(points)
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for row, column in points:
+        neighbors = []
+        for row_step in (-1, 0, 1):
+            for column_step in (-1, 0, 1):
+                if not (row_step or column_step):
+                    continue
+                neighbor = (row + row_step, column + column_step)
+                if neighbor not in point_set:
+                    continue
+                if row_step and column_step and (
+                    (row + row_step, column) in point_set
+                    or (row, column + column_step) in point_set
+                ):
+                    continue
+                neighbors.append(neighbor)
+        adjacency[(row, column)] = sorted(neighbors)
+    return adjacency
+
+
+def _prune_surface_skeleton_spurs(skeleton: np.ndarray, maximum_length_px: float) -> np.ndarray:
+    active = (np.asarray(skeleton) > 0).astype(np.uint8)
+    for _round in range(8):
+        adjacency = _surface_skeleton_adjacency(active)
+        endpoints = [point for point, neighbors in adjacency.items() if len(neighbors) <= 1]
+        remove: set[tuple[int, int]] = set()
+        for endpoint in endpoints:
+            path = [endpoint]
+            previous = None
+            current = endpoint
+            length = 0.0
+            while True:
+                following = [neighbor for neighbor in adjacency[current] if neighbor != previous]
+                if len(following) != 1:
+                    break
+                neighbor = following[0]
+                length += float(np.hypot(neighbor[0] - current[0], neighbor[1] - current[1]))
+                previous, current = current, neighbor
+                path.append(current)
+                if len(adjacency[current]) != 2:
+                    break
+            if len(adjacency.get(current, ())) >= 3 and length <= maximum_length_px:
+                remove.update(path[:-1])
+        if not remove:
+            break
+        rows, columns = zip(*remove)
+        active[np.asarray(rows), np.asarray(columns)] = 0
+    return active
+
+
+def _trace_surface_skeleton(skeleton: np.ndarray) -> list[tuple[np.ndarray, int, int]]:
+    adjacency = _surface_skeleton_adjacency(skeleton)
+    if not adjacency:
+        return []
+    junction_mask = np.zeros_like(skeleton, dtype=np.uint8)
+    endpoints = []
+    for point, neighbors in adjacency.items():
+        if len(neighbors) >= 3:
+            junction_mask[point] = 1
+        elif len(neighbors) <= 1:
+            endpoints.append(point)
+    junction_count, junction_labels = cv2.connectedComponents(junction_mask, connectivity=8)
+    group_pixels: dict[int, list[tuple[int, int]]] = {}
+    point_group: dict[tuple[int, int], int] = {}
+    for point in adjacency:
+        group_id = int(junction_labels[point])
+        if group_id > 0:
+            group_pixels.setdefault(group_id, []).append(point)
+            point_group[point] = group_id
+    next_group = junction_count
+    for point in endpoints:
+        group_pixels[next_group] = [point]
+        point_group[point] = next_group
+        next_group += 1
+    representatives = {
+        group_id: np.mean(np.asarray(points, dtype=np.float64), axis=0)
+        for group_id, points in group_pixels.items()
+    }
+    external: dict[int, list[tuple[tuple[int, int], tuple[int, int]]]] = {
+        group_id: [] for group_id in group_pixels
+    }
+    for group_id, points in group_pixels.items():
+        for point in points:
+            for neighbor in adjacency[point]:
+                if point_group.get(neighbor) != group_id:
+                    external[group_id].append((point, neighbor))
+    degrees = {group_id: len(links) for group_id, links in external.items()}
+    visited: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+
+    def edge(first, second):
+        return tuple(sorted((first, second)))
+
+    paths: list[tuple[np.ndarray, int, int]] = []
+    for start_group in sorted(external):
+        for start_pixel, first in external[start_group]:
+            if edge(start_pixel, first) in visited:
+                continue
+            pixels = [representatives[start_group], np.asarray(start_pixel), np.asarray(first)]
+            visited.add(edge(start_pixel, first))
+            previous, current = start_pixel, first
+            end_group = point_group.get(current)
+            while end_group is None:
+                following = next((
+                    neighbor for neighbor in adjacency[current]
+                    if neighbor != previous and edge(current, neighbor) not in visited
+                ), None)
+                if following is None:
+                    break
+                visited.add(edge(current, following))
+                pixels.append(np.asarray(following))
+                previous, current = current, following
+                end_group = point_group.get(current)
+            if end_group is None:
+                continue
+            pixels.append(representatives[end_group])
+            points = _deduplicate_points(np.asarray(pixels, dtype=np.float64))
+            if points.shape[0] >= 2:
+                paths.append((points, degrees[start_group], degrees[end_group]))
+    for start in sorted(adjacency):
+        for first in adjacency[start]:
+            if edge(start, first) in visited or start in point_group or first in point_group:
+                continue
+            pixels = [np.asarray(start), np.asarray(first)]
+            visited.add(edge(start, first))
+            previous, current = start, first
+            while current != start:
+                following = next((
+                    neighbor for neighbor in adjacency[current]
+                    if neighbor != previous and edge(current, neighbor) not in visited
+                ), None)
+                if following is None:
+                    break
+                visited.add(edge(current, following))
+                pixels.append(np.asarray(following))
+                previous, current = current, following
+            points = _deduplicate_points(np.asarray(pixels, dtype=np.float64))
+            if points.shape[0] >= 2:
+                paths.append((points, 2, 2))
+    return paths
+
+
+def reconstruct_regional_road_network_from_surface(
+    roads: list[RegionalRoadObservation],
+    surface_geometry,
+    unit_size_m: float = 1.0,
+) -> tuple[list[RegionalCanonicalRoad], dict[str, float | int]]:
+    """Generate one medial path per road-surface ribbon.
+
+    The extracted lines supply identity, width and coarse directional evidence.
+    Their duplicate geometry is discarded; the surface strip determines track
+    cardinality and its medial axis supplies the canonical geometry.
+    """
+    started = time.perf_counter()
+    if not roads or surface_geometry is None or surface_geometry.is_empty:
+        return regularize_regional_road_network(
+            roads, unit_size_m=unit_size_m, surface_geometry=surface_geometry,
+        )
+    original_lines = [LineString(_deduplicate_points(road.points)) for road in roads]
+    original_tree = STRtree(original_lines)
+    axis_seeds: list[_RegionalRoadSeed] = []
+    rasterized_components = 0
+    pruned_spurs = 0
+    for component in _surface_polygon_components(surface_geometry):
+        if component.area * unit_size_m * unit_size_m < 20.0:
+            continue
+        minimum_x, minimum_y, maximum_x, maximum_y = component.bounds
+        resolution_m = 1.0
+        width_px = max(1, int(np.ceil((maximum_x - minimum_x) * unit_size_m / resolution_m)) + 6)
+        height_px = max(1, int(np.ceil((maximum_y - minimum_y) * unit_size_m / resolution_m)) + 6)
+        pixel_count = width_px * height_px
+        if pixel_count > 8_000_000:
+            resolution_m *= float(np.sqrt(pixel_count / 8_000_000.0))
+            width_px = max(1, int(np.ceil((maximum_x - minimum_x) * unit_size_m / resolution_m)) + 6)
+            height_px = max(1, int(np.ceil((maximum_y - minimum_y) * unit_size_m / resolution_m)) + 6)
+        resolution = resolution_m / max(unit_size_m, 1e-9)
+        origin_x = minimum_x - 3.0 * resolution
+        origin_y = maximum_y + 3.0 * resolution
+        transform = from_origin(origin_x, origin_y, resolution, resolution)
+        mask = rasterize(
+            [(component, 1)], out_shape=(height_px, width_px), transform=transform,
+            fill=0, dtype=np.uint8,
+        )
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        try:
+            from skimage.morphology import skeletonize
+            skeleton = skeletonize(mask > 0).astype(np.uint8)
+        except ImportError:
+            skeleton = np.zeros_like(mask)
+            working = mask.copy()
+            element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+            while working.any():
+                opened = cv2.morphologyEx(working, cv2.MORPH_OPEN, element)
+                skeleton |= working & (1 - opened)
+                working = cv2.erode(working, element)
+        before_pixels = int(np.count_nonzero(skeleton))
+        skeleton = _prune_surface_skeleton_spurs(skeleton, 12.0 / resolution_m)
+        pruned_spurs += max(0, before_pixels - int(np.count_nonzero(skeleton)))
+        rasterized_components += 1
+        for pixels, start_degree, end_degree in _trace_surface_skeleton(skeleton):
+            coordinates = np.column_stack((
+                origin_x + (pixels[:, 1] + 0.5) * resolution,
+                origin_y - (pixels[:, 0] + 0.5) * resolution,
+            ))
+            line = LineString(coordinates).simplify(1.25 / max(unit_size_m, 1e-9))
+            if line.length * unit_size_m < 3.0:
+                continue
+            nearby = [int(value) for value in original_tree.query(line.buffer(12.0 / max(unit_size_m, 1e-9)))]
+            nearby = [road_id for road_id in nearby if original_lines[road_id].distance(line) * unit_size_m <= 12.0]
+            if not nearby:
+                nearest_id = min(range(len(original_lines)), key=lambda road_id: original_lines[road_id].distance(line))
+                nearby = [nearest_id]
+            source_ids = tuple(sorted({int(roads[road_id].source_id) for road_id in nearby}))
+            width_m = float(np.median([roads[road_id].width_m for road_id in nearby]))
+            axis_seeds.append(_RegionalRoadSeed(
+                points=np.asarray(line.coords, dtype=np.float64), width_m=width_m,
+                source_ids=source_ids, geometry_kind="surface_strip_medial_axis",
+            ))
+    repaired_seeds, gap_count, gap_length_m, cross_rejected = _repair_same_track_gaps(
+        axis_seeds, surface_geometry, unit_size_m,
+    )
+    repaired_seeds = _merge_exact_degree_two_chains(repaired_seeds, unit_size_m)
+    outputs = [
+        RegionalCanonicalRoad(
+            points=seed.points, width_m=seed.width_m, source_ids=seed.source_ids,
+            geometry_kind="surface_strip_medial_axis",
+        )
+        for seed in repaired_seeds
+    ]
+    raw_seeds = [
+        _RegionalRoadSeed(
+            points=_deduplicate_points(road.points), width_m=float(road.width_m),
+            source_ids=(int(road.source_id),), geometry_kind="extracted",
+        )
+        for road in roads
+    ]
+    endpoint_count_before, component_count_before, _ = _network_topology_metrics(raw_seeds)
+    endpoint_count_after, component_count_after, headings_after = _network_topology_metrics(repaired_seeds)
+    original_vertices = int(sum(seed.points.shape[0] for seed in raw_seeds))
+    final_vertices = int(sum(seed.points.shape[0] for seed in repaired_seeds))
+    junction_count = int(sum(len(vectors) >= 3 for vectors in headings_after.values()))
+    diagnostics = _empty_cleanup_diagnostics()
+    diagnostics.update({
+        "original_feature_count": int(len(roads)),
+        "final_feature_count": int(len(outputs)),
+        "original_vertex_count": original_vertices,
+        "final_vertex_count": final_vertices,
+        "merged_road_entity_count": int(len(roads) - len(outputs)),
+        "surface_center_correction_count": int(rasterized_components),
+        "same_track_local_path_removed_count": int(max(0, len(roads) - len(outputs))),
+        "same_track_gap_repair_count": int(gap_count),
+        "same_track_gap_repair_length_m": float(gap_length_m),
+        "generated_connection_length_m": float(gap_length_m),
+        "cross_track_connection_rejected_count": int(cross_rejected),
+        "generated_junction_count": junction_count,
+        "mean_vertices_per_road_before": float(original_vertices / max(len(raw_seeds), 1)),
+        "mean_vertices_per_road_after": float(final_vertices / max(len(repaired_seeds), 1)),
+        "endpoint_count_before": int(endpoint_count_before),
+        "endpoint_count_after": int(endpoint_count_after),
+        "connected_component_count_before": int(component_count_before),
+        "connected_component_count_after": int(component_count_after),
+        "surface_axis_pruned_spur_pixel_count": int(pruned_spurs),
+        "regional_regularization_seconds": float(time.perf_counter() - started),
+    })
+    return outputs, diagnostics
+
+
 def regularize_regional_road_network(
     roads: list[RegionalRoadObservation],
     unit_size_m: float = 1.0,
@@ -2168,7 +2525,9 @@ def regularize_regional_road_network(
             locally_repaired, surface_geometry, unit_size_m,
         )
     )
-    protected_parallel_pairs = _parallel_track_pairs(corridor_selected, unit_size_m)
+    protected_parallel_pairs = _parallel_track_pairs(
+        corridor_selected, unit_size_m, surface_geometry,
+    )
     selected, feature_path_count, feature_path_length_m = _select_same_track_local_paths(
         corridor_selected, surface_geometry, unit_size_m, protected_parallel_pairs,
     )
@@ -2180,7 +2539,7 @@ def regularize_regional_road_network(
     )
     selected = _merge_exact_degree_two_chains(selected, unit_size_m)
     duplicate_count += final_duplicate_count
-    parallel_pairs = _parallel_track_pairs(selected, unit_size_m)
+    parallel_pairs = _parallel_track_pairs(selected, unit_size_m, surface_geometry)
     final_seeds, junction_count, junction_length_m = _conservative_junction_touchup(
         selected, surface_geometry, unit_size_m,
     )

@@ -64,6 +64,7 @@ from engine.fast_pipeline import (
 )
 from engine.canonical_road_reconstruction import (
     RegionalRoadObservation,
+    reconstruct_regional_road_network_from_surface,
     regularize_regional_road_network,
 )
 from engine.samroad.image_resume import required_image_outputs
@@ -695,6 +696,67 @@ class FastCenterlineCleanupTests(unittest.TestCase):
         self.assertEqual(len(final_roads), 1)
         self.assertEqual(final_roads[0].source_ids, (0,))
         self.assertEqual(diagnostics["same_track_local_path_removed_count"], 1)
+
+    def test_two_long_paths_in_one_surface_strip_collapse_to_one_track(self) -> None:
+        main = [[0.0, 0.0], [50.0, 0.0], [100.0, 0.0]]
+        alternative = [[0.0, 6.0], [50.0, 6.0], [100.0, 6.0]]
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([main, alternative]),
+            surface_geometry=LineString([(0.0, 3.0), (100.0, 3.0)]).buffer(8.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0,))
+        self.assertGreaterEqual(diagnostics["same_track_local_path_removed_count"], 1)
+
+    def test_surface_strip_reconstruction_outputs_one_medial_axis(self) -> None:
+        roads = self._roads([
+            [[0.0, -4.0], [50.0, -4.0], [100.0, -4.0]],
+            [[0.0, 4.0], [50.0, 4.0], [100.0, 4.0]],
+        ])
+        final_roads, diagnostics = reconstruct_regional_road_network_from_surface(
+            roads, LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(7.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertLess(float(np.max(np.abs(final_roads[0].points[:, 1]))), 1.1)
+        self.assertEqual(final_roads[0].geometry_kind, "surface_strip_medial_axis")
+        self.assertEqual(diagnostics["final_feature_count"], 1)
+
+    def test_separated_surface_strips_output_two_medial_axes(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [100.0, 0.0]],
+            [[0.0, 16.0], [100.0, 16.0]],
+        ])
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(5.0),
+            LineString([(0.0, 16.0), (100.0, 16.0)]).buffer(5.0),
+        ])
+        final_roads, _diagnostics = reconstruct_regional_road_network_from_surface(roads, surface)
+        self.assertEqual(len(final_roads), 2)
+        lateral_centres = sorted(float(np.median(road.points[:, 1])) for road in final_roads)
+        np.testing.assert_allclose(lateral_centres, [0.0, 16.0], atol=1.1)
+
+    def test_surface_strip_reconstruction_preserves_a_roundabout_axis(self) -> None:
+        angles = np.linspace(0.0, 2.0 * np.pi, 33)
+        ring_points = np.column_stack((15.0 * np.cos(angles), 15.0 * np.sin(angles)))
+        roads = self._roads([ring_points])
+        surface = Point(0.0, 0.0).buffer(20.0).difference(Point(0.0, 0.0).buffer(10.0))
+        final_roads, _diagnostics = reconstruct_regional_road_network_from_surface(roads, surface)
+        self.assertTrue(final_roads)
+        self.assertTrue(any(
+            np.linalg.norm(road.points[0] - road.points[-1]) <= 2.0
+            for road in final_roads
+        ))
+
+    def test_open_same_strip_branch_is_removed_outside_a_junction(self) -> None:
+        main = [[0.0, 0.0], [40.0, 0.0], [80.0, 0.0], [120.0, 0.0]]
+        alternative = [[25.0, 0.0], [48.0, 6.0], [78.0, 6.0]]
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([main, alternative]),
+            surface_geometry=LineString([(0.0, 3.0), (120.0, 3.0)]).buffer(8.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0,))
+        self.assertGreaterEqual(diagnostics["same_track_local_path_removed_count"], 1)
 
     def test_divided_carriageways_keep_identity_across_wide_intersection(self) -> None:
         roads = self._roads([

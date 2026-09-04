@@ -28,7 +28,7 @@ from shapely.strtree import STRtree
 
 from .canonical_road_reconstruction import (
     RegionalRoadObservation,
-    regularize_regional_road_network,
+    reconstruct_regional_road_network_from_surface,
     write_before_after_visualization,
 )
 
@@ -2756,10 +2756,8 @@ def measure_fast_widths(
             )
             for source_id, points in enumerate(before_geometries)
         ]
-        regional_roads, regional_diagnostics = regularize_regional_road_network(
-            regional_inputs,
-            unit_size_m=target_unit_m,
-            surface_geometry=metric_surface,
+        regional_roads, regional_diagnostics = reconstruct_regional_road_network_from_surface(
+            regional_inputs, metric_surface, unit_size_m=target_unit_m,
         )
         write_before_after_visualization(
             before_geometries,
