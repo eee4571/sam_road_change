@@ -28,7 +28,6 @@ from shapely.strtree import STRtree
 
 from .canonical_road_reconstruction import (
     RegionalRoadObservation,
-    fit_canonical_road_geometry,
     regularize_regional_road_network,
     write_before_after_visualization,
 )
@@ -1664,129 +1663,47 @@ def regularize_fast_road_network(
     road_surface: np.ndarray,
     physical_pixel_size_m: float,
 ) -> tuple[np.ndarray, list[FastRoadPath], dict]:
-    """Reconstruct one canonical vector network from cleaned Fast road evidence."""
+    """Preserve tile geometry and merge only edges already sharing an exact node.
+
+    Metric same-track gap repair and duplicate cleanup run once after tile export.
+    Keeping the tile step lossless prevents early snapping, axis intersections, and
+    whole-road fitting from destroying parallel-track identity.
+    """
     started = time.perf_counter()
     surface = (np.asarray(road_surface) > 0).astype(np.uint8)
-    support = _regularization_support_mask(surface, physical_pixel_size_m)
-    collapsed_paths, collapsed_junction_edges, consolidated_junctions = (
-        _collapse_fast_junction_clusters(paths, physical_pixel_size_m)
-    )
-    base_chains, base_chain_merges = _group_continuous_road_chains(
-        collapsed_paths,
-    )
-    endpoints = _collect_regularization_endpoints(
-        base_chains, surface, physical_pixel_size_m,
-    )
-    endpoint_ids = {
-        (endpoint.path_id, endpoint.at_start): endpoint.endpoint_id
-        for endpoint in endpoints
-    }
-    assignments, intersection_count, intersection_connections = (
-        _reconstruct_regularization_intersections(
-            endpoints, support, physical_pixel_size_m,
-        )
-    )
-    assignments, snapped_pair_count = _snap_regularization_endpoints(
-        endpoints, base_chains, support, physical_pixel_size_m, assignments,
-    )
-    assignments, path_attachments = _attach_endpoints_to_path_interiors(
-        endpoints,
-        base_chains,
-        surface,
-        support,
-        physical_pixel_size_m,
-        assignments,
-    )
-    connected_paths = _build_paths_with_regularization_connections(
-        base_chains, endpoint_ids, assignments, path_attachments,
-    )
-    connection_chains, connection_chain_merges = _group_continuous_road_chains(
-        connected_paths,
-    )
-    recollapsed_paths, recollapsed_junction_edges, recollapsed_junctions = (
-        _collapse_fast_junction_clusters(
-            connection_chains, physical_pixel_size_m,
-        )
-    )
-    chains, final_chain_merges = _group_continuous_road_chains(
-        recollapsed_paths,
-    )
-    merged_chain_count = (
-        collapsed_junction_edges + base_chain_merges + connection_chain_merges
-        + recollapsed_junction_edges + final_chain_merges
-    )
-    consolidated_junctions += recollapsed_junctions
-    road_entities, through_junction_merges = _merge_fast_paths_through_junctions(
-        chains, physical_pixel_size_m,
-    )
-    merged_chain_count += through_junction_merges
-    canonical_roads, _canonical_junctions, canonical_diagnostics = (
-        fit_canonical_road_geometry(
-            [path.pixels for path in road_entities], physical_pixel_size_m,
-        )
-    )
-    regularized = [
-        _copy_fast_path_geometry(road_entities[road.road_id], road.points)
-        for road in canonical_roads
-    ]
+    regularized, merged_chain_count = _group_continuous_road_chains(paths)
     original_vertex_count = int(sum(path.pixels.shape[0] for path in paths))
     final_vertex_count = int(sum(path.pixels.shape[0] for path in regularized))
-    generated_connection_length_m = float(sum(
-        np.linalg.norm(node - endpoints[endpoint_id].point)
-        for endpoint_id, node in assignments.items()
-    ) * physical_pixel_size_m)
     skeleton = _paths_to_skeleton(regularized, surface.shape)
     diagnostics = {
         "regularization_original_path_count": int(len(paths)),
         "regularization_final_path_count": int(len(regularized)),
         "regularization_merged_chain_count": int(merged_chain_count),
-        "regularization_snapped_endpoint_count": int(len(assignments)),
-        "regularization_generated_connection_count": int(
-            intersection_connections + snapped_pair_count + len(path_attachments)
-        ),
-        "regularization_intersection_count": int(
-            consolidated_junctions + intersection_count + len(path_attachments)
-        ),
-        "regularization_consolidated_junction_count": int(
-            consolidated_junctions
-        ),
-        "regularization_reconstructed_intersection_count": int(
-            intersection_count
-        ),
-        "regularization_collapsed_junction_edge_count": int(
-            collapsed_junction_edges + recollapsed_junction_edges
-        ),
-        "regularization_path_attachment_count": int(len(path_attachments)),
-        "regularization_intersection_through_merge_count": int(
-            through_junction_merges
-        ),
-        "regularization_straightened_chain_count": int(
-            canonical_diagnostics["canonical_straight_road_count"]
-        ),
-        "regularization_smoothed_chain_count": int(
-            canonical_diagnostics["canonical_curved_road_count"]
-        ),
+        "regularization_snapped_endpoint_count": 0,
+        "regularization_generated_connection_count": 0,
+        "regularization_intersection_count": 0,
+        "regularization_consolidated_junction_count": 0,
+        "regularization_reconstructed_intersection_count": 0,
+        "regularization_collapsed_junction_edge_count": 0,
+        "regularization_path_attachment_count": 0,
+        "regularization_intersection_through_merge_count": 0,
+        "regularization_straightened_chain_count": 0,
+        "regularization_smoothed_chain_count": 0,
         "original_feature_count": int(len(paths)),
         "final_feature_count": int(len(regularized)),
         "original_vertex_count": original_vertex_count,
         "final_vertex_count": final_vertex_count,
-        "generated_junction_count": int(
-            canonical_diagnostics["generated_junction_count"]
-        ),
+        "generated_junction_count": 0,
         "merged_road_entity_count": int(merged_chain_count),
-        "canonical_straight_road_count": int(
-            canonical_diagnostics["canonical_straight_road_count"]
-        ),
-        "canonical_curved_road_count": int(
-            canonical_diagnostics["canonical_curved_road_count"]
-        ),
+        "canonical_straight_road_count": 0,
+        "canonical_curved_road_count": 0,
         "mean_vertices_per_road_before": float(
             original_vertex_count / max(len(paths), 1)
         ),
         "mean_vertices_per_road_after": float(
             final_vertex_count / max(len(regularized), 1)
         ),
-        "generated_connection_length_m": generated_connection_length_m,
+        "generated_connection_length_m": 0.0,
         "regularization_seconds": float(time.perf_counter() - started),
     }
     return skeleton, regularized, diagnostics
@@ -2781,6 +2698,15 @@ def measure_fast_widths(
     if target_crs is None:
         raise RuntimeError("Fast width received no georeferenced images")
     regional_diagnostics: dict[str, float | int] = {
+        "anchor_line_count": 0,
+        "parallel_track_count": 0,
+        "same_track_gap_repair_count": 0,
+        "same_track_gap_repair_length_m": 0.0,
+        "duplicate_fragment_removed_count": 0,
+        "cross_track_connection_rejected_count": 0,
+        "anchor_max_displacement_m": 0.0,
+        "anchor_mean_displacement_m": 0.0,
+        "junction_touchup_count": 0,
         "original_feature_count": 0,
         "final_feature_count": 0,
         "original_vertex_count": 0,

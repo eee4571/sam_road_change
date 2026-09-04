@@ -417,559 +417,219 @@ class FastSkeletonCleanupTests(unittest.TestCase):
         self.assertEqual(diagnostics["toponet_edge_count"], 1)
 
 
-class FastRoadNetworkRegularizationTests(unittest.TestCase):
+class FastCenterlineCleanupTests(unittest.TestCase):
     @staticmethod
-    def _path(
-        points, component_id: int, start_degree: int = 1, end_degree: int = 1,
-    ) -> FastRoadPath:
+    def _path(points, component_id: int) -> FastRoadPath:
         pixels = np.asarray(points, dtype=np.float32)
         length = float(np.linalg.norm(np.diff(pixels, axis=0), axis=1).sum())
         return FastRoadPath(
-            pixels=pixels,
-            length_px=length,
-            start_degree=start_degree,
-            end_degree=end_degree,
-            mean_relative_score=1.0,
-            low_relative_score=1.0,
-            component_id=component_id,
-            component_length_px=length,
+            pixels=pixels, length_px=length, start_degree=1, end_degree=1,
+            mean_relative_score=1.0, low_relative_score=1.0,
+            component_id=component_id, component_length_px=length,
         )
 
     @staticmethod
-    def _surface(shape_, polylines, thickness: int = 7) -> np.ndarray:
-        surface = np.zeros(shape_, dtype=np.uint8)
-        for points in polylines:
-            coordinates = np.asarray(points, dtype=np.int32)[:, ::-1]
-            cv2.polylines(surface, [coordinates], False, 1, thickness)
-        return surface
-
-    def test_three_collinear_fragments_become_one_canonical_chain(self) -> None:
-        paths = [
-            self._path([[40, 10], [40, 30]], 1),
-            self._path([[40, 35], [40, 55]], 2),
-            self._path([[40, 60], [40, 80]], 3),
+    def _roads(specifications, width_m: float = 9.0):
+        return [
+            RegionalRoadObservation(np.asarray(points, dtype=np.float64), width_m, source_id)
+            for source_id, points in enumerate(specifications)
         ]
-        surface = self._surface((90, 100), [[[40, 8], [40, 82]]])
 
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
+    @staticmethod
+    def _line_with_source(final_roads, source_id: int):
+        return next(road for road in final_roads if source_id in road.source_ids)
 
-        self.assertEqual(len(final_paths), 1)
-        self.assertEqual(diagnostics["regularization_final_path_count"], 1)
-        self.assertGreaterEqual(diagnostics["regularization_merged_chain_count"], 2)
-        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 4)
-        self.assertTrue(np.all(network[40, 10:81] == 1))
-
-    def test_laterally_shifted_fragments_regenerate_one_axis(self) -> None:
-        paths = [
-            self._path([[50, 10], [50, 40]], 1),
-            self._path([[52, 47], [52, 75]], 2),
-            self._path([[49, 82], [49, 112]], 3),
-        ]
-        surface = self._surface((130, 130), [[[50, 8], [50, 116]]], thickness=13)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 1)
-        self.assertEqual(final_paths[0].pixels.shape[0], 2)
-        self.assertGreater(float(np.ptp(final_paths[0].pixels[:, 1])), 95.0)
-        self.assertLess(float(np.ptp(final_paths[0].pixels[:, 0])), 2.0)
-        self.assertLess(diagnostics["final_vertex_count"], diagnostics["original_vertex_count"])
-
-    def test_close_parallel_roads_remain_independent(self) -> None:
-        paths = [
-            self._path([[30, 10], [30, 80]], 1),
-            self._path([[38, 10], [38, 80]], 2),
-        ]
-        surface = self._surface(
-            (90, 100), [path.pixels for path in paths], thickness=3,
-        )
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 0)
-        self.assertEqual(diagnostics["regularization_intersection_count"], 0)
-
-    def test_cross_intersection_is_reconstructed_from_four_arms(self) -> None:
-        paths = [
-            self._path([[50, 15], [50, 43]], 1),
-            self._path([[50, 57], [50, 85]], 2),
-            self._path([[15, 50], [43, 50]], 3),
-            self._path([[57, 50], [85, 50]], 4),
-        ]
-        surface = self._surface(
-            (100, 100), [
-                [[50, 12], [50, 88]], [[12, 50], [88, 50]],
-            ],
-        )
-
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(diagnostics["regularization_intersection_count"], 1)
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 2)
-        self.assertEqual(int(network[50, 50]), 1)
-        spans = sorted(
-            (float(np.ptp(path.pixels[:, 0])), float(np.ptp(path.pixels[:, 1])))
-            for path in final_paths
-        )
-        self.assertGreater(spans[0][1], 65.0)
-        self.assertGreater(spans[1][0], 65.0)
-
-    def test_t_intersection_is_reconstructed_from_three_arms(self) -> None:
-        paths = [
-            self._path([[45, 12], [45, 42]], 1),
-            self._path([[45, 58], [45, 88]], 2),
-            self._path([[82, 50], [53, 50]], 3),
-        ]
-        surface = self._surface(
-            (100, 100), [
-                [[45, 10], [45, 90]], [[85, 50], [45, 50]],
-            ],
-        )
-
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(diagnostics["regularization_intersection_count"], 1)
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 1)
-        self.assertEqual(int(network[45, 50]), 1)
-        self.assertTrue(any(float(np.ptp(path.pixels[:, 1])) > 70.0 for path in final_paths))
-
-    def test_connected_junction_cluster_collapses_to_one_stable_node(self) -> None:
-        paths = [
-            self._path([[50, 15], [50, 49]], 1, 1, 3),
-            self._path([[15, 49], [50, 49]], 1, 1, 3),
-            self._path([[50, 49], [50, 51]], 1, 3, 3),
-            self._path([[50, 51], [50, 85]], 1, 3, 1),
-            self._path([[50, 51], [85, 51]], 1, 3, 1),
-        ]
-        surface = self._surface(
-            (100, 100), [
-                [[50, 12], [50, 88]],
-                [[12, 49], [88, 51]],
-            ],
-        )
-
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_collapsed_junction_edge_count"], 1)
-        self.assertEqual(diagnostics["regularization_consolidated_junction_count"], 1)
-        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 2)
-        self.assertEqual(int(network[50, 50]), 1)
-
-    def test_dangling_branch_attaches_to_continuous_main_road(self) -> None:
-        paths = [
-            self._path([[45, 12], [45, 88]], 1),
-            self._path([[82, 50], [54, 50]], 2),
-        ]
-        surface = self._surface(
-            (100, 100), [
-                [[45, 10], [45, 90]], [[85, 50], [45, 50]],
-            ],
-        )
-
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(diagnostics["regularization_path_attachment_count"], 1)
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_intersection_through_merge_count"], 1)
-        self.assertEqual(int(network[45, 50]), 1)
-        self.assertTrue(any(float(np.ptp(path.pixels[:, 1])) > 70.0 for path in final_paths))
-
-    def test_slightly_wavy_straight_road_is_straightened(self) -> None:
-        cols = np.arange(10, 91, dtype=np.float32)
-        rows = 50.0 + np.sin(cols / 4.0)
-        path = self._path(np.column_stack((rows, cols)), 1)
-        surface = self._surface((110, 110), [path.pixels], thickness=9)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            [path], surface, 1.0,
-        )
-
-        self.assertEqual(diagnostics["regularization_straightened_chain_count"], 1)
-        self.assertEqual(final_paths[0].pixels.shape[0], 2)
-        self.assertLess(abs(float(final_paths[0].pixels[0, 0] - final_paths[0].pixels[-1, 0])), 2.0)
-
-    def test_two_hundred_metre_jittered_road_is_regenerated_from_all_observations(self) -> None:
-        cols = np.linspace(10.0, 210.0, 301, dtype=np.float32)
-        rows = 60.0 + 3.0 * np.sin(cols / 3.5) + 0.8 * np.sin(cols / 0.9)
-        path = self._path(np.column_stack((rows, cols)), 1)
-        surface = self._surface((130, 230), [[[60, 8], [60, 214]]], thickness=17)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            [path], surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 1)
-        self.assertLessEqual(final_paths[0].pixels.shape[0], 5)
-        self.assertEqual(diagnostics["canonical_straight_road_count"], 1)
-        self.assertLess(diagnostics["final_vertex_count"], 0.05 * diagnostics["original_vertex_count"])
-
-    def test_real_curve_is_smoothed_without_being_forced_straight(self) -> None:
-        vertical = np.column_stack((np.arange(10, 51), np.full(41, 30)))
-        horizontal = np.column_stack((np.full(50, 50), np.arange(31, 81)))
-        points = np.vstack((vertical, horizontal)).astype(np.float32)
+    def test_tile_step_preserves_existing_geometry(self) -> None:
+        points = np.asarray([[20.0, 10.0], [21.0, 30.0], [19.5, 50.0], [20.0, 80.0]])
         path = self._path(points, 1)
-        surface = self._surface((100, 100), [points], thickness=9)
-
         _network, final_paths, diagnostics = regularize_fast_road_network(
-            [path], surface, 1.0,
+            [path], np.ones((100, 100), dtype=np.uint8), 1.0,
         )
-
+        np.testing.assert_array_equal(final_paths[0].pixels, points.astype(np.float32))
         self.assertEqual(diagnostics["regularization_straightened_chain_count"], 0)
-        self.assertGreater(final_paths[0].pixels.shape[0], 2)
-        chord = LineString(final_paths[0].pixels[[0, -1], ::-1])
-        bend = max(
-            chord.distance(Point(point[::-1]))
-            for point in final_paths[0].pixels[1:-1]
+        self.assertEqual(diagnostics["regularization_generated_connection_count"], 0)
+
+    def test_same_track_duplicate_is_removed_and_anchor_unchanged(self) -> None:
+        anchor = np.asarray([[0.0, 0.0], [45.0, 0.0], [100.0, 0.0]])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([anchor, [[30.0, 0.8], [50.0, 0.8]]]),
         )
-        self.assertGreater(bend, 10.0)
-
-    def test_six_curve_fragments_become_one_regenerated_curve(self) -> None:
-        angles = np.linspace(np.pi, np.pi / 2.0, 73)
-        curve = np.column_stack((
-            70.0 + 45.0 * np.sin(angles),
-            70.0 + 45.0 * np.cos(angles),
-        ))
-        paths = []
-        for index, chunk in enumerate(np.array_split(curve, 6)):
-            trimmed = chunk[1:-1] if index not in (0, 5) else (
-                chunk[:-1] if index == 0 else chunk[1:]
-            )
-            paths.append(self._path(trimmed, index + 1))
-        surface = self._surface((130, 130), [curve], thickness=13)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 1)
-        self.assertEqual(diagnostics["canonical_curved_road_count"], 1)
-        self.assertGreater(final_paths[0].pixels.shape[0], 2)
-        self.assertLess(final_paths[0].pixels.shape[0], 20)
-
-    def test_asymmetric_four_arm_intersection_is_reconstructed(self) -> None:
-        paths = [
-            self._path([[55, 10], [53, 43]], 1),
-            self._path([[51, 59], [50, 92]], 2),
-            self._path([[10, 57], [43, 53]], 3),
-            self._path([[61, 51], [96, 49]], 4),
-        ]
-        surface = self._surface(
-            (110, 110), [
-                [[55, 8], [52, 96]], [[8, 58], [100, 49]],
-            ], thickness=11,
-        )
-
-        network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
-        )
-
-        self.assertEqual(len(final_paths), 2)
-        self.assertGreaterEqual(diagnostics["regularization_intersection_count"], 1)
-        self.assertGreaterEqual(diagnostics["generated_junction_count"], 1)
-        self.assertGreater(int(network[45:62, 45:62].sum()), 0)
-
-    def test_regional_reconstruction_merges_one_road_across_three_tiles(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 1.0]]), 8.0, 0),
-            RegionalRoadObservation(np.asarray([[100.5, 0.9], [200.0, -1.0]]), 8.5, 1),
-            RegionalRoadObservation(np.asarray([[200.4, -0.9], [300.0, 0.5]]), 8.0, 2),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
         self.assertEqual(len(final_roads), 1)
-        self.assertLessEqual(final_roads[0].points.shape[0], 5)
-        self.assertGreater(float(np.ptp(final_roads[0].points[:, 0])), 295.0)
-        self.assertEqual(diagnostics["merged_road_entity_count"], 2)
-        self.assertGreater(diagnostics["generated_connection_length_m"], 0.0)
+        np.testing.assert_array_equal(final_roads[0].points, anchor)
+        self.assertEqual(diagnostics["duplicate_fragment_removed_count"], 1)
+        self.assertAlmostEqual(diagnostics["anchor_max_displacement_m"], 0.0, places=8)
 
-    def test_three_offset_collinear_fragments_reconstruct_one_whole_road(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [30.0, 0.0]]), 8.0, 0),
-            RegionalRoadObservation(np.asarray([[40.0, 1.0], [70.0, 1.0]]), 8.0, 1),
-            RegionalRoadObservation(np.asarray([[80.0, -1.0], [110.0, -1.0]]), 8.0, 2),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 1)
-        self.assertAlmostEqual(LineString(final_roads[0].points).length, 110.0, delta=2.0)
-        self.assertEqual(final_roads[0].source_ids, (0, 1, 2))
-        self.assertEqual(diagnostics["straight_fragment_group_count"], 1)
-        self.assertEqual(diagnostics["reconstructed_straight_road_count"], 1)
-        self.assertEqual(diagnostics["absorbed_fragment_count"], 3)
-
-    def test_five_fragments_with_high_axis_coverage_reconstruct_one_road(self) -> None:
-        roads = [
-            RegionalRoadObservation(
-                np.asarray([[float(start), 0.3 * ((index % 2) * 2 - 1)], [float(start + 16), 0.3 * ((index % 2) * 2 - 1)]]),
-                8.0,
-                index,
-            )
-            for index, start in enumerate((0, 20, 40, 60, 80))
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 1)
-        self.assertGreater(diagnostics["fragment_coverage_mean"], 0.75)
-        self.assertEqual(diagnostics["absorbed_fragment_count"], 5)
-
-    def test_two_fragments_with_huge_unsupported_gap_do_not_merge(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [20.0, 0.0]]), 8.0, 0),
-            RegionalRoadObservation(np.asarray([[120.0, 0.0], [140.0, 0.0]]), 8.0, 1),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
+    def test_two_stable_parallel_tracks_are_preserved(self) -> None:
+        final_roads, diagnostics = regularize_regional_road_network(self._roads([
+            [[0.0, 0.0], [100.0, 0.0]], [[0.0, 12.0], [100.0, 12.0]],
+        ]))
         self.assertEqual(len(final_roads), 2)
-        self.assertEqual(diagnostics["reconstructed_straight_road_count"], 0)
-        self.assertEqual(diagnostics["absorbed_fragment_count"], 0)
+        self.assertEqual(diagnostics["anchor_line_count"], 2)
+        self.assertEqual(diagnostics["parallel_track_count"], 1)
+        self.assertAlmostEqual(diagnostics["anchor_max_displacement_m"], 0.0, places=8)
 
-    def test_continuous_surface_supports_medium_fragment_coverage(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [25.0, 0.0]]), 8.0, 0),
-            RegionalRoadObservation(np.asarray([[75.0, 0.0], [100.0, 0.0]]), 8.0, 1),
+    def test_fragmented_second_carriageway_repairs_only_its_track(self) -> None:
+        specifications = [
+            [[0.0, 0.0], [100.0, 0.0]],
+            [[0.0, 12.0], [30.0, 12.0]],
+            [[38.0, 12.0], [65.0, 12.0]],
+            [[73.0, 12.0], [100.0, 12.0]],
         ]
-        surface = box(-2.0, -4.0, 102.0, 4.0)
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(4.0),
+            LineString([(0.0, 12.0), (100.0, 12.0)]).buffer(4.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads(specifications), surface_geometry=surface,
+        )
+        self.assertEqual(len(final_roads), 2)
+        np.testing.assert_array_equal(self._line_with_source(final_roads, 0).points, specifications[0])
+        second = self._line_with_source(final_roads, 1)
+        self.assertEqual(second.source_ids, (1, 2, 3))
+        self.assertLess(float(np.ptp(second.points[:, 1])), 1e-6)
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 2)
+        self.assertEqual(diagnostics["parallel_track_count"], 1)
 
+    def test_nearest_endpoint_does_not_cross_connect_parallel_tracks(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [40.0, 0.0]], [[58.0, 0.0], [100.0, 0.0]],
+            [[0.0, 12.0], [45.0, 12.0]], [[50.0, 12.0], [100.0, 12.0]],
+        ], width_m=14.0)
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(4.0),
+            LineString([(0.0, 12.0), (100.0, 12.0)]).buffer(4.0),
+        ])
         final_roads, diagnostics = regularize_regional_road_network(
             roads, surface_geometry=surface,
         )
-
-        self.assertEqual(len(final_roads), 1)
-        self.assertGreater(diagnostics["surface_coverage_mean"], 0.95)
-        self.assertLessEqual(diagnostics["maximum_unsupported_gap_mean_m"], 12.0)
-
-    def test_fragmented_parallel_carriageways_reconstruct_two_whole_roads(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [40.0, 0.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[50.0, 0.2], [100.0, 0.2]]), 9.0, 1),
-            RegionalRoadObservation(np.asarray([[0.0, 12.0], [40.0, 12.0]]), 9.0, 2),
-            RegionalRoadObservation(np.asarray([[50.0, 11.8], [100.0, 11.8]]), 9.0, 3),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
         self.assertEqual(len(final_roads), 2)
-        self.assertTrue(all(LineString(road.points).length > 98.0 for road in final_roads))
-        self.assertEqual(diagnostics["parallel_corridor_count"], 1)
-        self.assertGreater(diagnostics["rejected_cross_corridor_connection_count"], 0)
+        self.assertTrue(all(float(np.ptp(road.points[:, 1])) < 0.01 for road in final_roads))
+        self.assertGreater(diagnostics["cross_track_connection_rejected_count"], 0)
 
-    def test_nearest_endpoint_does_not_cross_connect_parallel_corridors(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [0.0, 40.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[0.0, 70.0], [0.0, 110.0]]), 9.0, 1),
-            RegionalRoadObservation(np.asarray([[12.0, 20.0], [12.0, 60.0]]), 9.0, 2),
-            RegionalRoadObservation(np.asarray([[12.0, 80.0], [12.0, 120.0]]), 9.0, 3),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
+    def test_duplicate_and_true_second_track_are_distinguished(self) -> None:
+        final_roads, diagnostics = regularize_regional_road_network(self._roads([
+            [[0.0, 0.0], [100.0, 0.0]], [[30.0, 0.8], [50.0, 0.8]],
+            [[0.0, 12.0], [100.0, 12.0]],
+        ]))
         self.assertEqual(len(final_roads), 2)
-        means = sorted(float(np.mean(road.points[:, 0])) for road in final_roads)
-        self.assertGreater(means[1] - means[0], 10.0)
-        self.assertEqual(diagnostics["endpoint_to_endpoint_connection_count"], 0)
-        self.assertEqual(diagnostics["parallel_corridor_count"], 1)
+        self.assertFalse(any(1 in road.source_ids for road in final_roads))
+        self.assertTrue(any(2 in road.source_ids for road in final_roads))
+        self.assertEqual(diagnostics["duplicate_fragment_removed_count"], 1)
+        self.assertEqual(diagnostics["parallel_track_count"], 1)
 
-    def test_reconstructed_road_absorbs_overlapping_short_fragments(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[20.0, 0.5], [40.0, 0.5]]), 9.0, 1),
-            RegionalRoadObservation(np.asarray([[60.0, -0.5], [80.0, -0.5]]), 9.0, 2),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 1)
-        self.assertEqual(final_roads[0].source_ids, (0, 1, 2))
-        self.assertEqual(diagnostics["absorbed_fragment_count"], 3)
-
-    def test_regional_t_junction_attaches_to_complete_main_road(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 10.0, 0),
-            RegionalRoadObservation(np.asarray([[50.0, 30.0], [50.0, 8.0]]), 8.0, 1),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        main = max(final_roads, key=lambda road: np.ptp(road.points[:, 0]))
-        branch = max(final_roads, key=lambda road: np.ptp(road.points[:, 1]))
-        main_nodes = {tuple(np.round(point, 3)) for point in main.points}
-        branch_nodes = {tuple(np.round(point, 3)) for point in branch.points}
-        self.assertIn((50.0, 0.0), main_nodes & branch_nodes)
-        self.assertEqual(diagnostics["endpoint_to_road_attachment_count"], 1)
-        self.assertEqual(diagnostics["t_junction_count"], 1)
-        self.assertEqual(diagnostics["road_junction_count"], 1)
-        self.assertLess(diagnostics["dangling_endpoint_count_after"], diagnostics["dangling_endpoint_count_before"])
-        self.assertEqual(diagnostics["connected_component_count_after"], 1)
-        self.assertLess(float(np.ptp(main.points[:, 1])), 0.1)
-
-    def test_overlapping_observations_merge_as_one_corridor(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [100.0, 0.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[40.0, 1.5], [150.0, 1.5]]), 8.5, 1),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 1)
-        self.assertEqual(diagnostics["corridor_merge_count"], 1)
-        self.assertGreater(float(np.ptp(final_roads[0].points[:, 0])), 145.0)
-
-    def test_parallel_carriageways_twelve_metres_apart_remain_independent(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 0.0], [150.0, 0.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[0.0, 12.0], [150.0, 12.0]]), 9.0, 1),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 2)
-        self.assertEqual(diagnostics["corridor_merge_count"], 0)
-        means = sorted(float(np.mean(road.points[:, 1])) for road in final_roads)
-        self.assertGreater(means[1] - means[0], 10.0)
-
-    def test_regional_cross_axes_create_one_shared_graph_node(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[-80.0, 0.0], [-6.0, 0.0]]), 9.0, 0),
-            RegionalRoadObservation(np.asarray([[7.0, 0.0], [80.0, 0.0]]), 9.0, 1),
-            RegionalRoadObservation(np.asarray([[0.0, -75.0], [0.0, -8.0]]), 9.0, 2),
-            RegionalRoadObservation(np.asarray([[0.0, 6.0], [0.0, 75.0]]), 9.0, 3),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        self.assertEqual(len(final_roads), 2)
-        shared = set.intersection(*(
-            {tuple(np.round(point, 3)) for point in road.points}
-            for road in final_roads
-        ))
-        self.assertIn((0.0, 0.0), shared)
-        self.assertEqual(diagnostics["cross_junction_count"], 1)
-        self.assertGreaterEqual(diagnostics["axis_intersection_count"], 1)
-
-    def test_regional_y_axes_share_one_inferred_node(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[-90.0, 0.0], [-8.0, 0.0]]), 8.0, 0),
-            RegionalRoadObservation(np.asarray([[65.0, 72.0], [6.0, 7.0]]), 8.0, 1),
-            RegionalRoadObservation(np.asarray([[65.0, -72.0], [6.0, -7.0]]), 8.0, 2),
-        ]
-
-        final_roads, diagnostics = regularize_regional_road_network(roads)
-
-        node_sets = [{tuple(np.round(point, 2)) for point in road.points} for road in final_roads]
-        shared = node_sets[0] & node_sets[1] & node_sets[2]
-        self.assertTrue(shared)
-        self.assertGreaterEqual(diagnostics["y_junction_count"], 1)
-        self.assertEqual(diagnostics["connected_component_count_after"], 1)
-
-    def test_road_surface_recenters_a_biased_straight_observation(self) -> None:
-        roads = [
-            RegionalRoadObservation(np.asarray([[0.0, 3.0], [100.0, 3.0]]), 10.0, 0),
-        ]
-        surface = box(-5.0, -5.0, 105.0, 5.0)
-
+    def test_gap_repaired_track_becomes_anchor_for_duplicate_cleanup(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [35.0, 0.0]],
+            [[43.0, 0.0], [80.0, 0.0]],
+            [[18.0, 0.7], [30.0, 0.7]],
+            [[0.0, 12.0], [80.0, 12.0]],
+        ])
+        surface = unary_union([
+            LineString([(0.0, 0.0), (80.0, 0.0)]).buffer(4.0),
+            LineString([(0.0, 12.0), (80.0, 12.0)]).buffer(4.0),
+        ])
         final_roads, diagnostics = regularize_regional_road_network(
             roads, surface_geometry=surface,
         )
+        self.assertEqual(len(final_roads), 2)
+        self.assertFalse(any(2 in road.source_ids for road in final_roads))
+        self.assertTrue(any(3 in road.source_ids for road in final_roads))
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 1)
+        self.assertEqual(diagnostics["duplicate_fragment_removed_count"], 1)
 
-        final_offset = abs(float(np.mean(final_roads[0].points[:, 1])))
-        self.assertLess(final_offset, 1.0)
-        self.assertEqual(diagnostics["surface_center_correction_count"], 1)
-
-    def test_near_endpoints_with_incompatible_headings_are_not_joined(self) -> None:
-        paths = [
-            self._path([[40, 10], [40, 40]], 1),
-            self._path([[44, 44], [75, 44]], 2),
-        ]
-        surface = self._surface((90, 90), [path.pixels for path in paths], thickness=9)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
+    def test_local_gap_preserves_both_fragment_geometries(self) -> None:
+        first = np.asarray([[0.0, 0.0], [20.0, 0.0], [40.0, 0.0]])
+        second = np.asarray([[48.0, 0.5], [75.0, 0.5], [100.0, 0.5]])
+        surface = LineString([(0.0, 0.0), (100.0, 0.5)]).buffer(5.0)
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([first, second]), surface_geometry=surface,
         )
+        self.assertEqual(len(final_roads), 1)
+        for point in np.vstack((first, second)):
+            self.assertTrue(any(np.allclose(point, result) for result in final_roads[0].points))
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 1)
+        self.assertAlmostEqual(diagnostics["same_track_gap_repair_length_m"], 8.0, delta=0.5)
+        self.assertAlmostEqual(diagnostics["anchor_max_displacement_m"], 0.0, places=8)
 
-        self.assertEqual(len(final_paths), 2)
-        self.assertEqual(diagnostics["regularization_snapped_endpoint_count"], 0)
-
-    def test_generated_connection_stays_near_road_surface(self) -> None:
-        paths = [
-            self._path([[30, 10], [30, 35]], 1),
-            self._path([[30, 44], [30, 70]], 2),
-        ]
-        surface = self._surface((70, 80), [[[30, 8], [30, 72]]], thickness=5)
-
-        network, _final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
+    def test_curved_local_gap_follows_surface(self) -> None:
+        first = np.asarray([[0.0, 0.0], [32.0, -2.0], [36.0, 0.0]])
+        second = np.asarray([[52.0, 8.0], [56.0, 10.0], [80.0, 10.0]])
+        centre = LineString([
+            (0.0, 0.0), (32.0, -2.0), (36.0, 0.0), (42.0, 1.0),
+            (46.0, 7.0), (52.0, 8.0), (56.0, 10.0), (80.0, 10.0),
+        ])
+        surface = centre.buffer(1.6)
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([first, second], width_m=8.0), surface_geometry=surface,
         )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 1)
+        line = LineString(final_roads[0].points)
+        self.assertTrue(all(
+            surface.buffer(1e-6).covers(line.interpolate(value))
+            for value in np.linspace(0.0, line.length, 30)
+        ))
+        self.assertGreater(final_roads[0].points.shape[0], first.shape[0] + second.shape[0])
 
-        nearby_surface = cv2.dilate(surface, np.ones((7, 7), dtype=np.uint8))
-        self.assertGreater(diagnostics["regularization_generated_connection_count"], 0)
-        self.assertTrue(np.all(nearby_surface[network > 0] > 0))
-
-    def test_fragment_reduction_does_not_change_total_length_abnormally(self) -> None:
-        paths = [
-            self._path([[60, 10], [60, 32]], 1),
-            self._path([[60, 36], [60, 58]], 2),
-            self._path([[60, 62], [60, 84]], 3),
-        ]
-        surface = self._surface((100, 100), [[[60, 8], [60, 86]]])
-        original_length = sum(path.length_px for path in paths)
-
-        _network, final_paths, diagnostics = regularize_fast_road_network(
-            paths, surface, 1.0,
+    def test_anchor_non_gap_coordinates_have_zero_displacement(self) -> None:
+        anchor = np.asarray([
+            [0.0, 0.0], [20.0, 1.0], [40.0, 1.5], [60.0, 1.0], [100.0, 0.0],
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([anchor]), surface_geometry=LineString(anchor).buffer(5.0),
         )
+        np.testing.assert_array_equal(final_roads[0].points, anchor)
+        self.assertAlmostEqual(diagnostics["anchor_max_displacement_m"], 0.0, places=9)
+        self.assertAlmostEqual(diagnostics["anchor_mean_displacement_m"], 0.0, places=9)
 
-        final_length = sum(path.length_px for path in final_paths)
-        self.assertLess(diagnostics["regularization_final_path_count"], len(paths))
-        self.assertGreater(final_length, 0.90 * original_length)
-        self.assertLess(final_length, 1.25 * original_length)
+    def test_local_offset_jump_replaces_only_the_anomalous_window(self) -> None:
+        original = np.asarray([
+            [0.0, 0.0], [20.0, 0.0], [25.0, 5.0],
+            [35.0, 5.0], [40.0, 0.0], [70.0, 0.0],
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([original]),
+            surface_geometry=LineString([(0.0, 0.0), (70.0, 0.0)]).buffer(5.0),
+        )
+        repaired = final_roads[0].points
+        self.assertEqual(diagnostics["local_offset_jump_repair_count"], 1)
+        self.assertLess(float(np.max(np.abs(repaired[:, 1]))), 1e-6)
+        for stable_point in (original[0], original[1], original[4], original[5]):
+            self.assertTrue(any(np.allclose(stable_point, point) for point in repaired))
 
-    def test_endpoint_snap_distance_is_resolution_invariant(self) -> None:
-        for pixel_size_m in (0.5, 1.0, 2.0):
-            with self.subTest(pixel_size_m=pixel_size_m):
-                segment_px = int(round(24.0 / pixel_size_m))
-                gap_px = int(round(10.0 / pixel_size_m))
-                first_start = 10
-                first_end = first_start + segment_px
-                second_start = first_end + gap_px
-                second_end = second_start + segment_px
-                paths = [
-                    self._path([[30, first_start], [30, first_end]], 1),
-                    self._path([[30, second_start], [30, second_end]], 2),
-                ]
-                surface = self._surface(
-                    (70, second_end + 12),
-                    [[[30, first_start - 2], [30, second_end + 2]]],
-                )
+    def test_divided_carriageways_keep_identity_across_wide_intersection(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [42.0, 0.0]], [[60.0, 0.0], [100.0, 0.0]],
+            [[0.0, 12.0], [45.0, 12.0]], [[63.0, 12.0], [100.0, 12.0]],
+        ], width_m=14.0)
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(4.0),
+            LineString([(0.0, 12.0), (100.0, 12.0)]).buffer(4.0),
+            box(38.0, -8.0, 67.0, 20.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=surface,
+        )
+        self.assertEqual({road.source_ids for road in final_roads}, {(0, 1), (2, 3)})
+        self.assertTrue(all(float(np.ptp(road.points[:, 1])) < 0.01 for road in final_roads))
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 2)
+        self.assertGreater(diagnostics["cross_track_connection_rejected_count"], 0)
 
-                _network, final_paths, diagnostics = regularize_fast_road_network(
-                    paths, surface, pixel_size_m,
-                )
-
-                self.assertEqual(len(final_paths), 1)
-                self.assertEqual(
-                    diagnostics["regularization_snapped_endpoint_count"], 2,
-                )
+    def test_only_close_supported_perpendicular_branch_gets_touchup(self) -> None:
+        main = [[0.0, 0.0], [100.0, 0.0]]
+        branch = [[50.0, 30.0], [50.0, 6.0]]
+        surface = unary_union([
+            LineString(main).buffer(5.0),
+            LineString([[50.0, 30.0], [50.0, 0.0]]).buffer(4.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([main, branch]), surface_geometry=surface,
+        )
+        self.assertEqual(diagnostics["junction_touchup_count"], 1)
+        main_nodes = {tuple(np.round(point, 6)) for point in self._line_with_source(final_roads, 0).points}
+        branch_nodes = {tuple(np.round(point, 6)) for point in self._line_with_source(final_roads, 1).points}
+        self.assertEqual(main_nodes & branch_nodes, {(50.0, 0.0)})
+        self.assertAlmostEqual(diagnostics["anchor_max_displacement_m"], 0.0, places=8)
 
 
 class FastWidthTests(unittest.TestCase):
