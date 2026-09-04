@@ -747,6 +747,49 @@ class FastCenterlineCleanupTests(unittest.TestCase):
             for road in final_roads
         ))
 
+    def test_surface_axis_smoothing_removes_high_frequency_wobble(self) -> None:
+        wobble = np.asarray([
+            [0.0, 0.0], [10.0, 2.0], [20.0, -2.0], [30.0, 2.0],
+            [40.0, -2.0], [50.0, 2.0], [60.0, 0.0],
+        ])
+        final_roads, _diagnostics = reconstruct_regional_road_network_from_surface(
+            self._roads([wobble]), LineString(wobble).buffer(5.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertLess(float(np.max(np.abs(final_roads[0].points[1:-1, 1]))), 1.7)
+        self.assertLessEqual(final_roads[0].points.shape[0], 5)
+
+    def test_broken_surface_corridor_recovers_one_continuous_track(self) -> None:
+        fragments = [
+            LineString([(0.0, 0.0), (32.0, 0.0)]),
+            LineString([(54.0, 0.4), (83.0, 0.4)]),
+            LineString([(107.0, -0.2), (140.0, -0.2)]),
+        ]
+        surface = unary_union([fragment.buffer(4.0) for fragment in fragments])
+        final_roads, diagnostics = reconstruct_regional_road_network_from_surface(
+            self._roads([np.asarray(fragment.coords) for fragment in fragments]), surface,
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertGreaterEqual(diagnostics["broken_corridor_recovery_count"], 2)
+        self.assertGreater(LineString(final_roads[0].points).length, 130.0)
+
+    def test_broken_dual_surface_corridors_preserve_two_tracks(self) -> None:
+        fragments = [
+            LineString([(0.0, 0.0), (32.0, 0.0)]),
+            LineString([(54.0, 0.0), (83.0, 0.0)]),
+            LineString([(107.0, 0.0), (140.0, 0.0)]),
+            LineString([(0.0, 14.0), (29.0, 14.0)]),
+            LineString([(51.0, 14.0), (86.0, 14.0)]),
+            LineString([(110.0, 14.0), (140.0, 14.0)]),
+        ]
+        surface = unary_union([fragment.buffer(4.0) for fragment in fragments])
+        final_roads, _diagnostics = reconstruct_regional_road_network_from_surface(
+            self._roads([np.asarray(fragment.coords) for fragment in fragments]), surface,
+        )
+        self.assertEqual(len(final_roads), 2)
+        lateral_centres = sorted(float(np.median(road.points[:, 1])) for road in final_roads)
+        np.testing.assert_allclose(lateral_centres, [0.0, 14.0], atol=1.25)
+
     def test_open_same_strip_branch_is_removed_outside_a_junction(self) -> None:
         main = [[0.0, 0.0], [40.0, 0.0], [80.0, 0.0], [120.0, 0.0]]
         alternative = [[25.0, 0.0], [48.0, 6.0], [78.0, 6.0]]
