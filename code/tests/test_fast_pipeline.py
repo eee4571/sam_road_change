@@ -597,6 +597,61 @@ class FastCenterlineCleanupTests(unittest.TestCase):
         for stable_point in (original[0], original[1], original[4], original[5]):
             self.assertTrue(any(np.allclose(stable_point, point) for point in repaired))
 
+    def test_local_diamond_keeps_only_the_stable_path(self) -> None:
+        main = [[0.0, 0.0], [40.0, 0.0], [80.0, 0.0]]
+        alternative = [[25.0, 0.0], [35.0, 4.0], [45.0, 0.0]]
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([main, alternative]),
+            surface_geometry=LineString(main).buffer(5.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0,))
+        self.assertEqual(diagnostics["same_track_local_path_removed_count"], 1)
+
+    def test_short_self_loop_is_removed_without_moving_stable_sides(self) -> None:
+        road = np.asarray([
+            [0.0, 0.0], [20.0, 0.0], [25.0, 0.0], [30.0, 4.0],
+            [25.0, 0.2], [40.0, 0.0], [60.0, 0.0],
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([road]),
+            surface_geometry=LineString([(0.0, 0.0), (60.0, 0.0)]).buffer(5.0),
+        )
+        self.assertEqual(diagnostics["local_loop_removed_count"], 1)
+        repaired = final_roads[0].points
+        for stable_point in (road[0], road[1], road[-2], road[-1]):
+            self.assertTrue(any(np.allclose(stable_point, point) for point in repaired))
+        self.assertFalse(any(np.allclose([30.0, 4.0], point) for point in repaired))
+
+    def test_two_fragmented_parallel_bands_are_both_preserved(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [27.0, 0.0]], [[35.0, 0.0], [62.0, 0.0]],
+            [[70.0, 0.0], [100.0, 0.0]], [[0.0, 12.0], [30.0, 12.0]],
+            [[38.0, 12.0], [65.0, 12.0]], [[73.0, 12.0], [100.0, 12.0]],
+        ])
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(4.0),
+            LineString([(0.0, 12.0), (100.0, 12.0)]).buffer(4.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=surface,
+        )
+        self.assertEqual(len(final_roads), 2)
+        self.assertEqual({road.source_ids for road in final_roads}, {(0, 1, 2), (3, 4, 5)})
+        self.assertEqual(diagnostics["same_track_local_path_removed_count"], 0)
+        self.assertGreaterEqual(diagnostics["parallel_track_count"], 1)
+
+    def test_short_local_parallel_candidate_is_not_a_second_track(self) -> None:
+        main = [[0.0, 0.0], [100.0, 0.0]]
+        local_candidate = [[25.0, 4.0], [40.0, 4.0], [55.0, 4.0]]
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([main, local_candidate]),
+            surface_geometry=LineString(main).buffer(5.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0,))
+        self.assertEqual(diagnostics["same_track_local_path_removed_count"], 1)
+
     def test_divided_carriageways_keep_identity_across_wide_intersection(self) -> None:
         roads = self._roads([
             [[0.0, 0.0], [42.0, 0.0]], [[60.0, 0.0], [100.0, 0.0]],
