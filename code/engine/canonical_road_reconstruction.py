@@ -1735,6 +1735,9 @@ def _select_single_path_through_local_corridor_loops(
     roads: list[_RegionalRoadSeed],
     surface_geometry,
     unit_size_m: float,
+    *,
+    maximum_loop_width_m: float = 12.0,
+    minimum_elongation: float = 1.5,
 ) -> tuple[list[_RegionalRoadSeed], int, float]:
     """Resolve a narrow non-junction loop as two competing paths through one track."""
     if len(roads) < 2:
@@ -1761,7 +1764,11 @@ def _select_single_path_through_local_corridor_loops(
         lateral = (ring - center) @ normal
         span_m = float(np.ptp(longitudinal) * unit_size_m)
         width_m = float(np.ptp(lateral) * unit_size_m)
-        if not 8.0 <= span_m <= 120.0 or not 0.5 <= width_m <= 12.0 or span_m < 1.5 * width_m:
+        if (
+            not 8.0 <= span_m <= 140.0
+            or not 0.5 <= width_m <= maximum_loop_width_m
+            or span_m < minimum_elongation * width_m
+        ):
             continue
 
         # Road blocks and true intersections contain substantial transverse
@@ -2162,6 +2169,13 @@ def _empty_cleanup_diagnostics() -> dict[str, float | int]:
         "parallel_track_count": 0,
         "same_track_gap_repair_count": 0,
         "same_track_gap_repair_length_m": 0.0,
+        "broken_corridor_group_count": 0,
+        "broken_corridor_recovery_count": 0,
+        "broken_corridor_recovery_length_m": 0.0,
+        "junction_track_continuity_count": 0,
+        "junction_track_continuity_length_m": 0.0,
+        "surface_axis_loop_selection_count": 0,
+        "surface_axis_loop_removed_length_m": 0.0,
         "local_offset_jump_repair_count": 0,
         "local_offset_jump_repair_length_m": 0.0,
         "local_loop_removed_count": 0,
@@ -2413,15 +2427,16 @@ def _broken_corridor_gap_candidate(
     second_id: int,
     second_at_start: bool,
     unit_size_m: float,
+    prepared_surface,
 ) -> _SameTrackGap | None:
-    """Match a long missing interval only when both stable track ends predict it."""
+    """Link fragments in one missing-surface longitudinal/lateral band."""
     first, second = roads[first_id], roads[second_id]
     first_point = np.asarray(first.points[0 if first_at_start else -1], dtype=np.float64)
     second_point = np.asarray(second.points[0 if second_at_start else -1], dtype=np.float64)
     delta = second_point - first_point
     distance = float(np.linalg.norm(delta))
     distance_m = distance * unit_size_m
-    if not 18.0 < distance_m <= 70.0:
+    if not 18.0 < distance_m <= 90.0:
         return None
     lookback = min(15.0, max(8.0, 0.25 * distance_m)) / max(unit_size_m, 1e-9)
     first_heading = _endpoint_heading(first.points, first_at_start, lookback)
@@ -2444,6 +2459,15 @@ def _broken_corridor_gap_candidate(
     )
     if lateral > lateral_limit:
         return None
+    # A continuously supported wide area is handled as a junction.  Broken
+    # corridor grouping is reserved for genuinely fragmented surface evidence.
+    if prepared_surface is not None:
+        middle = LineString([
+            first_point + 0.20 * delta,
+            first_point + 0.80 * delta,
+        ])
+        if _sampled_surface_line_support(middle, prepared_surface) >= 0.78:
+            return None
     observed_length_m = (
         _polyline_length(first.points) + _polyline_length(second.points)
     ) * unit_size_m
@@ -2462,75 +2486,348 @@ def _broken_corridor_gap_candidate(
     )
 
 
+def _tangent_continuous_connector(
+    start: np.ndarray,
+    start_heading: np.ndarray,
+    end: np.ndarray,
+    end_heading: np.ndarray,
+    unit_size_m: float,
+) -> np.ndarray | None:
+    """Generate a monotone cubic Hermite connector from two outward headings."""
+    start = np.asarray(start, dtype=np.float64)
+    end = np.asarray(end, dtype=np.float64)
+    delta = end - start
+    distance = float(np.linalg.norm(delta))
+    if distance <= 1e-8:
+        return None
+    chord = delta / distance
+    first = np.asarray(start_heading, dtype=np.float64)
+    second = -np.asarray(end_heading, dtype=np.float64)
+    first /= max(float(np.linalg.norm(first)), 1e-9)
+    second /= max(float(np.linalg.norm(second)), 1e-9)
+    if min(float(np.dot(first, chord)), float(np.dot(second, chord))) <= 0.35:
+        return None
+    tangent_scale = distance * min(
+        1.0,
+        0.70 + 0.30 * min(float(np.dot(first, chord)), float(np.dot(second, chord))),
+    )
+    sample_count = max(5, min(31, int(np.ceil(distance * unit_size_m / 3.0)) + 1))
+    parameter = np.linspace(0.0, 1.0, sample_count)
+    h00 = 2.0 * parameter ** 3 - 3.0 * parameter ** 2 + 1.0
+    h10 = parameter ** 3 - 2.0 * parameter ** 2 + parameter
+    h01 = -2.0 * parameter ** 3 + 3.0 * parameter ** 2
+    h11 = parameter ** 3 - parameter ** 2
+    connector = (
+        h00[:, None] * start
+        + h10[:, None] * tangent_scale * first
+        + h01[:, None] * end
+        + h11[:, None] * tangent_scale * second
+    )
+    segments = np.diff(connector, axis=0)
+    lengths = np.linalg.norm(segments, axis=1)
+    if np.any(lengths <= 1e-8):
+        return None
+    if np.any((segments @ chord) < -0.02 * lengths):
+        return None
+    if float(np.sum(lengths)) > 1.28 * distance:
+        return None
+    directions = segments / lengths[:, None]
+    turns = np.arccos(np.clip(np.sum(directions[:-1] * directions[1:], axis=1), -1.0, 1.0))
+    if turns.size and float(np.max(turns)) > np.deg2rad(22.0):
+        return None
+    return connector
+
+
+def _candidate_endpoint_flag(candidate: _SameTrackGap, road_id: int) -> bool:
+    return candidate.first_at_start if candidate.first_id == road_id else candidate.second_at_start
+
+
+def _corridor_group_seed(
+    roads: list[_RegionalRoadSeed],
+    road_ids: set[int],
+    links: list[_SameTrackGap],
+    unit_size_m: float,
+) -> _RegionalRoadSeed | None:
+    """Traverse a fragment group once and rebuild one continuous low-frequency axis."""
+    adjacency: dict[int, list[tuple[int, _SameTrackGap]]] = {road_id: [] for road_id in road_ids}
+    for link in links:
+        adjacency[link.first_id].append((link.second_id, link))
+        adjacency[link.second_id].append((link.first_id, link))
+    starts = [road_id for road_id in road_ids if len(adjacency[road_id]) == 1]
+    if len(starts) != 2 or any(len(entries) > 2 for entries in adjacency.values()):
+        return None
+    ordered_ids: list[int] = []
+    ordered_links: list[_SameTrackGap] = []
+    previous: int | None = None
+    current = starts[0]
+    while True:
+        ordered_ids.append(current)
+        following = [(road_id, link) for road_id, link in adjacency[current] if road_id != previous]
+        if not following:
+            break
+        next_id, link = following[0]
+        ordered_links.append(link)
+        previous, current = current, next_id
+    if set(ordered_ids) != road_ids:
+        return None
+
+    first_link = ordered_links[0]
+    first_flag = _candidate_endpoint_flag(first_link, ordered_ids[0])
+    points = np.asarray(
+        roads[ordered_ids[0]].points[::-1] if first_flag else roads[ordered_ids[0]].points,
+        dtype=np.float64,
+    )
+    total_weight = max(_polyline_length(points), 1e-9)
+    weighted_width = roads[ordered_ids[0]].width_m * total_weight
+    sources = set(roads[ordered_ids[0]].source_ids)
+    for position, link in enumerate(ordered_links):
+        next_id = ordered_ids[position + 1]
+        next_flag = _candidate_endpoint_flag(link, next_id)
+        following = np.asarray(
+            roads[next_id].points if next_flag else roads[next_id].points[::-1],
+            dtype=np.float64,
+        )
+        start_heading = _endpoint_heading(points, False, 15.0 / max(unit_size_m, 1e-9))
+        end_heading = _endpoint_heading(following, True, 15.0 / max(unit_size_m, 1e-9))
+        connector = _tangent_continuous_connector(
+            points[-1], start_heading, following[0], end_heading, unit_size_m,
+        )
+        if connector is None:
+            return None
+        points = _deduplicate_points(np.vstack((points, connector[1:-1], following)))
+        length = max(_polyline_length(following), 1e-9)
+        weighted_width += roads[next_id].width_m * length
+        total_weight += length
+        sources.update(roads[next_id].source_ids)
+    return _smooth_low_frequency_track(_RegionalRoadSeed(
+        points=points,
+        width_m=float(weighted_width / total_weight),
+        source_ids=tuple(sorted(sources)),
+        geometry_kind="recovered_broken_corridor_axis",
+    ), unit_size_m)
+
+
 def _recover_broken_corridors(
     roads: list[_RegionalRoadSeed],
+    surface_geometry,
+    unit_size_m: float,
+) -> tuple[list[_RegionalRoadSeed], int, int, float]:
+    """Group all compatible fragments, then recover one axis for each group."""
+    if len(roads) < 2:
+        return roads, 0, 0, 0.0
+    endpoints = [
+        (road_id, at_start, np.asarray(road.points[0 if at_start else -1], dtype=np.float64))
+        for road_id, road in enumerate(roads) for at_start in (True, False)
+    ]
+    candidates: list[_SameTrackGap] = []
+    prepared_surface = prep(surface_geometry) if surface_geometry is not None else None
+    cell_size = 90.0 / max(unit_size_m, 1e-9)
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for endpoint_id, (_road_id, _at_start, point) in enumerate(endpoints):
+        key = tuple(np.floor(point / cell_size).astype(int))
+        buckets.setdefault(key, []).append(endpoint_id)
+    for first_endpoint_id, (first_id, first_at_start, first_point) in enumerate(endpoints):
+        key = tuple(np.floor(first_point / cell_size).astype(int))
+        for offset_x in (-1, 0, 1):
+            for offset_y in (-1, 0, 1):
+                for second_endpoint_id in buckets.get((key[0] + offset_x, key[1] + offset_y), ()):
+                    if second_endpoint_id <= first_endpoint_id:
+                        continue
+                    second_id, second_at_start, _point = endpoints[second_endpoint_id]
+                    if first_id == second_id:
+                        continue
+                    candidate = _broken_corridor_gap_candidate(
+                        roads, first_id, first_at_start, second_id, second_at_start,
+                        unit_size_m, prepared_surface,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+    best_by_endpoint: dict[tuple[int, bool], _SameTrackGap] = {}
+    for candidate in sorted(candidates, key=lambda item: item.score):
+        for endpoint in (
+            (candidate.first_id, candidate.first_at_start),
+            (candidate.second_id, candidate.second_at_start),
+        ):
+            best_by_endpoint.setdefault(endpoint, candidate)
+    mutual = [
+        candidate for candidate in candidates
+        if best_by_endpoint.get((candidate.first_id, candidate.first_at_start)) is candidate
+        and best_by_endpoint.get((candidate.second_id, candidate.second_at_start)) is candidate
+    ]
+
+    parent = list(range(len(roads)))
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+    accepted: list[_SameTrackGap] = []
+    for candidate in sorted(mutual, key=lambda item: item.score):
+        first_root, second_root = find(candidate.first_id), find(candidate.second_id)
+        if first_root == second_root:
+            continue
+        parent[second_root] = first_root
+        accepted.append(candidate)
+    links_by_root: dict[int, list[_SameTrackGap]] = {}
+    roads_by_root: dict[int, set[int]] = {}
+    for candidate in accepted:
+        root = find(candidate.first_id)
+        links_by_root.setdefault(root, []).append(candidate)
+        roads_by_root.setdefault(root, set()).update((candidate.first_id, candidate.second_id))
+
+    used: set[int] = set()
+    recovered: list[_RegionalRoadSeed] = []
+    recovered_links = 0
+    recovered_length_m = 0.0
+    for root, road_ids in roads_by_root.items():
+        links = links_by_root[root]
+        seed = _corridor_group_seed(roads, road_ids, links, unit_size_m)
+        if seed is None:
+            continue
+        recovered.append(seed)
+        used.update(road_ids)
+        recovered_links += len(links)
+        recovered_length_m += sum(link.distance for link in links) * unit_size_m
+    output = [road for road_id, road in enumerate(roads) if road_id not in used] + recovered
+    return output, len(recovered), recovered_links, recovered_length_m
+
+
+def _junction_track_candidate(
+    roads: list[_RegionalRoadSeed],
+    first_id: int,
+    first_at_start: bool,
+    second_id: int,
+    second_at_start: bool,
+    prepared_surface,
+    unit_size_m: float,
+) -> _SameTrackGap | None:
+    first, second = roads[first_id], roads[second_id]
+    minimum_approach_m = max(
+        28.0,
+        2.5 * min(float(first.width_m), float(second.width_m)),
+    )
+    if min(
+        _polyline_length(first.points) * unit_size_m,
+        _polyline_length(second.points) * unit_size_m,
+    ) < minimum_approach_m:
+        return None
+    start = np.asarray(first.points[0 if first_at_start else -1], dtype=np.float64)
+    end = np.asarray(second.points[0 if second_at_start else -1], dtype=np.float64)
+    delta = end - start
+    distance = float(np.linalg.norm(delta))
+    distance_m = distance * unit_size_m
+    if not 18.0 < distance_m <= 90.0:
+        return None
+    first_heading = _endpoint_heading(first.points, first_at_start, 15.0 / max(unit_size_m, 1e-9))
+    second_heading = _endpoint_heading(second.points, second_at_start, 15.0 / max(unit_size_m, 1e-9))
+    first_long_heading = _endpoint_heading(first.points, first_at_start, 26.0 / max(unit_size_m, 1e-9))
+    second_long_heading = _endpoint_heading(second.points, second_at_start, 26.0 / max(unit_size_m, 1e-9))
+    stable_cosine = float(np.cos(np.deg2rad(20.0)))
+    if (
+        float(np.dot(first_heading, first_long_heading)) < stable_cosine
+        or float(np.dot(second_heading, second_long_heading)) < stable_cosine
+    ):
+        return None
+    chord = delta / max(distance, 1e-9)
+    if (
+        float(np.dot(first_heading, chord)) < np.cos(np.deg2rad(48.0))
+        or float(np.dot(second_heading, -chord)) < np.cos(np.deg2rad(48.0))
+        or float(np.dot(first_heading, second_heading)) > -np.cos(np.deg2rad(55.0))
+    ):
+        return None
+    interior = LineString([start + 0.12 * delta, start + 0.88 * delta])
+    if _sampled_surface_line_support(interior, prepared_surface) < 0.88:
+        return None
+    direction = first_heading - second_heading
+    direction /= max(float(np.linalg.norm(direction)), 1e-9)
+    normal = np.asarray([-direction[1], direction[0]])
+    lateral = abs(float(np.dot(delta, normal)))
+    lateral_limit = min(6.0, max(2.5, 0.30 * min(first.width_m, second.width_m))) / max(
+        unit_size_m, 1e-9,
+    )
+    if lateral > lateral_limit:
+        return None
+    score = distance + 6.0 * lateral + distance * (
+        2.0 - float(np.dot(first_heading, chord)) - float(np.dot(second_heading, -chord))
+    )
+    return _SameTrackGap(
+        first_id, first_at_start, second_id, second_at_start, distance, lateral, score,
+    )
+
+
+def _connect_tracks_through_junction_zones(
+    roads: list[_RegionalRoadSeed],
+    surface_geometry,
     unit_size_m: float,
 ) -> tuple[list[_RegionalRoadSeed], int, float]:
-    """Recover long fragmented tracks from mutually consistent endpoint bands."""
-    active = list(roads)
-    recovered = 0
-    recovered_length_m = 0.0
-    for _round in range(6):
-        endpoints = [
-            (road_id, at_start, np.asarray(road.points[0 if at_start else -1], dtype=np.float64))
-            for road_id, road in enumerate(active) for at_start in (True, False)
-        ]
-        candidates: list[_SameTrackGap] = []
-        cell_size = 70.0 / max(unit_size_m, 1e-9)
-        buckets: dict[tuple[int, int], list[int]] = {}
-        for endpoint_id, (_road_id, _at_start, point) in enumerate(endpoints):
-            key = tuple(np.floor(point / cell_size).astype(int))
-            buckets.setdefault(key, []).append(endpoint_id)
-        for first_endpoint_id, (first_id, first_at_start, first_point) in enumerate(endpoints):
-            key = tuple(np.floor(first_point / cell_size).astype(int))
-            nearby = (
-                endpoint_id
-                for offset_x in (-1, 0, 1) for offset_y in (-1, 0, 1)
-                for endpoint_id in buckets.get((key[0] + offset_x, key[1] + offset_y), ())
-                if endpoint_id > first_endpoint_id
-            )
-            for second_endpoint_id in nearby:
-                second_id, second_at_start, _second_point = endpoints[second_endpoint_id]
-                if first_id == second_id:
-                    continue
-                candidate = _broken_corridor_gap_candidate(
-                    active, first_id, first_at_start, second_id, second_at_start, unit_size_m,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
-        if not candidates:
-            break
-        best_by_endpoint: dict[tuple[int, bool], _SameTrackGap] = {}
-        for candidate in sorted(candidates, key=lambda item: item.score):
-            for endpoint in (
-                (candidate.first_id, candidate.first_at_start),
-                (candidate.second_id, candidate.second_at_start),
-            ):
-                best_by_endpoint.setdefault(endpoint, candidate)
-        accepted = [
-            candidate for candidate in candidates
-            if best_by_endpoint.get((candidate.first_id, candidate.first_at_start)) is candidate
-            and best_by_endpoint.get((candidate.second_id, candidate.second_at_start)) is candidate
-        ]
-        if not accepted:
-            break
-        used: set[int] = set()
-        merged: list[_RegionalRoadSeed] = []
-        for candidate in sorted(accepted, key=lambda item: item.score):
-            if candidate.first_id in used or candidate.second_id in used:
-                continue
-            first, second = active[candidate.first_id], active[candidate.second_id]
-            start = first.points[0 if candidate.first_at_start else -1]
-            end = second.points[0 if candidate.second_at_start else -1]
-            connector = np.asarray([start, end], dtype=np.float64)
-            merged.append(_merge_same_track_gap(first, second, candidate, connector))
-            used.update((candidate.first_id, candidate.second_id))
-            recovered += 1
-            recovered_length_m += candidate.distance * unit_size_m
-        if not merged:
-            break
-        active = [road for road_id, road in enumerate(active) if road_id not in used] + merged
-    return active, recovered, recovered_length_m
+    """Match stable approach tracks across continuously supported wide junctions."""
+    if len(roads) < 2 or surface_geometry is None:
+        return roads, 0, 0.0
+    prepared_surface = prep(surface_geometry)
+    candidates: list[_SameTrackGap] = []
+    endpoints = [
+        (road_id, at_start, np.asarray(road.points[0 if at_start else -1], dtype=np.float64))
+        for road_id, road in enumerate(roads) for at_start in (True, False)
+    ]
+    cell_size = 90.0 / max(unit_size_m, 1e-9)
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for endpoint_id, (_road_id, _at_start, point) in enumerate(endpoints):
+        key = tuple(np.floor(point / cell_size).astype(int))
+        buckets.setdefault(key, []).append(endpoint_id)
+    for first_endpoint_id, (first_id, first_at_start, first_point) in enumerate(endpoints):
+        key = tuple(np.floor(first_point / cell_size).astype(int))
+        for offset_x in (-1, 0, 1):
+            for offset_y in (-1, 0, 1):
+                for second_endpoint_id in buckets.get((key[0] + offset_x, key[1] + offset_y), ()):
+                    if second_endpoint_id <= first_endpoint_id:
+                        continue
+                    second_id, second_at_start, _point = endpoints[second_endpoint_id]
+                    if first_id == second_id:
+                        continue
+                    candidate = _junction_track_candidate(
+                        roads, first_id, first_at_start, second_id, second_at_start,
+                        prepared_surface, unit_size_m,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+    best_by_endpoint: dict[tuple[int, bool], _SameTrackGap] = {}
+    for candidate in sorted(candidates, key=lambda item: item.score):
+        for endpoint in (
+            (candidate.first_id, candidate.first_at_start),
+            (candidate.second_id, candidate.second_at_start),
+        ):
+            best_by_endpoint.setdefault(endpoint, candidate)
+    used: set[int] = set()
+    connected: list[_RegionalRoadSeed] = []
+    count = 0
+    length_m = 0.0
+    for candidate in sorted(candidates, key=lambda item: item.score):
+        if (
+            best_by_endpoint.get((candidate.first_id, candidate.first_at_start)) is not candidate
+            or best_by_endpoint.get((candidate.second_id, candidate.second_at_start)) is not candidate
+            or candidate.first_id in used or candidate.second_id in used
+        ):
+            continue
+        first, second = roads[candidate.first_id], roads[candidate.second_id]
+        start = first.points[0 if candidate.first_at_start else -1]
+        end = second.points[0 if candidate.second_at_start else -1]
+        connector = _tangent_continuous_connector(
+            start,
+            _endpoint_heading(first.points, candidate.first_at_start, 15.0 / max(unit_size_m, 1e-9)),
+            end,
+            _endpoint_heading(second.points, candidate.second_at_start, 15.0 / max(unit_size_m, 1e-9)),
+            unit_size_m,
+        )
+        if connector is None or _sampled_surface_line_support(
+            LineString(connector), prepared_surface,
+        ) < 0.86:
+            continue
+        connected.append(_merge_same_track_gap(first, second, candidate, connector))
+        used.update((candidate.first_id, candidate.second_id))
+        count += 1
+        length_m += _polyline_length(connector) * unit_size_m
+    output = [road for road_id, road in enumerate(roads) if road_id not in used] + connected
+    return output, count, length_m
 
 
 def reconstruct_regional_road_network_from_surface(
@@ -2611,11 +2908,24 @@ def reconstruct_regional_road_network_from_surface(
                 points=np.asarray(line.coords, dtype=np.float64), width_m=width_m,
                 source_ids=source_ids, geometry_kind="surface_strip_medial_axis",
             ))
+    axis_seeds, axis_loop_count, axis_loop_length_m = (
+        _select_single_path_through_local_corridor_loops(
+            axis_seeds, surface_geometry, unit_size_m,
+            maximum_loop_width_m=24.0,
+            minimum_elongation=1.15,
+        )
+    )
     repaired_seeds, gap_count, gap_length_m, cross_rejected = _repair_same_track_gaps(
         axis_seeds, surface_geometry, unit_size_m,
     )
-    repaired_seeds, broken_count, broken_length_m = _recover_broken_corridors(
-        repaired_seeds, unit_size_m,
+    repaired_seeds, broken_group_count, broken_count, broken_length_m = _recover_broken_corridors(
+        repaired_seeds, surface_geometry, unit_size_m,
+    )
+    repaired_seeds = _merge_exact_degree_two_chains(repaired_seeds, unit_size_m)
+    repaired_seeds, junction_track_count, junction_track_length_m = (
+        _connect_tracks_through_junction_zones(
+            repaired_seeds, surface_geometry, unit_size_m,
+        )
     )
     repaired_seeds = _merge_exact_degree_two_chains(repaired_seeds, unit_size_m)
     repaired_seeds = [
@@ -2652,8 +2962,15 @@ def reconstruct_regional_road_network_from_surface(
         "same_track_gap_repair_count": int(gap_count),
         "same_track_gap_repair_length_m": float(gap_length_m),
         "broken_corridor_recovery_count": int(broken_count),
+        "broken_corridor_group_count": int(broken_group_count),
         "broken_corridor_recovery_length_m": float(broken_length_m),
-        "generated_connection_length_m": float(gap_length_m + broken_length_m),
+        "junction_track_continuity_count": int(junction_track_count),
+        "junction_track_continuity_length_m": float(junction_track_length_m),
+        "surface_axis_loop_selection_count": int(axis_loop_count),
+        "surface_axis_loop_removed_length_m": float(axis_loop_length_m),
+        "generated_connection_length_m": float(
+            gap_length_m + broken_length_m + junction_track_length_m
+        ),
         "cross_track_connection_rejected_count": int(cross_rejected),
         "generated_junction_count": junction_count,
         "mean_vertices_per_road_before": float(original_vertices / max(len(raw_seeds), 1)),

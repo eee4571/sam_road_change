@@ -64,6 +64,9 @@ from engine.fast_pipeline import (
 )
 from engine.canonical_road_reconstruction import (
     RegionalRoadObservation,
+    _RegionalRoadSeed,
+    _connect_tracks_through_junction_zones,
+    _tangent_continuous_connector,
     reconstruct_regional_road_network_from_surface,
     regularize_regional_road_network,
 )
@@ -771,7 +774,57 @@ class FastCenterlineCleanupTests(unittest.TestCase):
         )
         self.assertEqual(len(final_roads), 1)
         self.assertGreaterEqual(diagnostics["broken_corridor_recovery_count"], 2)
+        self.assertEqual(diagnostics["broken_corridor_group_count"], 1)
         self.assertGreater(LineString(final_roads[0].points).length, 130.0)
+
+    def test_long_connector_respects_both_endpoint_tangents(self) -> None:
+        start_heading = np.asarray([1.0, 0.0])
+        end_heading = np.asarray([-0.8, -0.6])
+        connector = _tangent_continuous_connector(
+            np.asarray([0.0, 0.0]), start_heading,
+            np.asarray([42.0, 14.0]), end_heading, 1.0,
+        )
+        self.assertIsNotNone(connector)
+        self.assertGreater(connector.shape[0], 5)
+        first_direction = connector[1] - connector[0]
+        first_direction /= np.linalg.norm(first_direction)
+        last_direction = connector[-1] - connector[-2]
+        last_direction /= np.linalg.norm(last_direction)
+        self.assertGreater(float(np.dot(first_direction, start_heading)), 0.98)
+        self.assertGreater(float(np.dot(last_direction, -end_heading)), 0.98)
+        chord = connector[-1] - connector[0]
+        relative = connector[1:-1] - connector[0]
+        offsets = chord[0] * relative[:, 1] - chord[1] * relative[:, 0]
+        self.assertGreater(float(np.max(np.abs(offsets))), 1.0)
+
+    def test_wide_junction_matches_stable_approaches_with_a_curve(self) -> None:
+        roads = [
+            _RegionalRoadSeed(
+                np.asarray([[-60.0, 0.0], [-40.0, 0.0], [-24.0, 1.0]]),
+                10.0, (0,), "surface_strip_medial_axis",
+            ),
+            _RegionalRoadSeed(
+                np.asarray([[24.0, 10.0], [42.0, 16.0], [60.0, 22.0]]),
+                10.0, (1,), "surface_strip_medial_axis",
+            ),
+        ]
+        surface = unary_union([
+            LineString(roads[0].points).buffer(5.0),
+            LineString(roads[1].points).buffer(5.0),
+            box(-28.0, -12.0, 28.0, 20.0),
+        ])
+        connected, count, _length = _connect_tracks_through_junction_zones(
+            roads, surface, 1.0,
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(len(connected), 1)
+        points = connected[0].points
+        segment_directions = np.diff(points, axis=0)
+        segment_directions /= np.linalg.norm(segment_directions, axis=1)[:, None]
+        turns = np.arccos(np.clip(np.sum(
+            segment_directions[:-1] * segment_directions[1:], axis=1,
+        ), -1.0, 1.0))
+        self.assertLess(float(np.max(turns)), np.deg2rad(24.0))
 
     def test_broken_dual_surface_corridors_preserve_two_tracks(self) -> None:
         fragments = [
