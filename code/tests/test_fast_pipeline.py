@@ -608,6 +608,50 @@ class FastCenterlineCleanupTests(unittest.TestCase):
         self.assertEqual(final_roads[0].source_ids, (0,))
         self.assertEqual(diagnostics["same_track_local_path_removed_count"], 1)
 
+    def test_multifeature_diamond_is_selected_as_one_local_corridor(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [20.0, 0.0]],
+            [[20.0, 0.0], [50.0, 0.0]],
+            [[50.0, 0.0], [80.0, 0.0]],
+            [[20.0, 0.0], [35.0, 5.0]],
+            [[35.0, 5.0], [50.0, 0.0]],
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=LineString([(0.0, 0.0), (80.0, 0.0)]).buffer(6.0),
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertLess(float(np.max(np.abs(final_roads[0].points[:, 1]))), 1e-6)
+        self.assertFalse(any({3, 4}.intersection(road.source_ids) for road in final_roads))
+        self.assertGreaterEqual(diagnostics["same_track_local_path_removed_count"], 1)
+
+    def test_broken_surface_does_not_break_a_collinear_track(self) -> None:
+        roads = self._roads([
+            [[0.0, 0.0], [32.0, 0.0]], [[44.0, 0.0], [80.0, 0.0]],
+        ])
+        surface = unary_union([
+            LineString([(0.0, 0.0), (32.0, 0.0)]).buffer(4.0),
+            LineString([(44.0, 0.0), (80.0, 0.0)]).buffer(4.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            roads, surface_geometry=surface,
+        )
+        self.assertEqual(len(final_roads), 1)
+        self.assertEqual(final_roads[0].source_ids, (0, 1))
+        self.assertEqual(diagnostics["same_track_gap_repair_count"], 1)
+        self.assertLess(float(np.max(np.abs(final_roads[0].points[:, 1]))), 1e-6)
+
+    def test_local_surface_widening_does_not_bend_an_existing_centerline(self) -> None:
+        road = np.asarray([[0.0, 0.0], [25.0, 0.0], [50.0, 0.0], [75.0, 0.0], [100.0, 0.0]])
+        surface = unary_union([
+            LineString([(0.0, 0.0), (100.0, 0.0)]).buffer(4.0),
+            Point(50.0, 5.0).buffer(11.0),
+        ])
+        final_roads, diagnostics = regularize_regional_road_network(
+            self._roads([road]), surface_geometry=surface,
+        )
+        np.testing.assert_array_equal(final_roads[0].points, road)
+        self.assertEqual(diagnostics["local_offset_jump_repair_count"], 0)
+
     def test_short_self_loop_is_removed_without_moving_stable_sides(self) -> None:
         road = np.asarray([
             [0.0, 0.0], [20.0, 0.0], [25.0, 0.0], [30.0, 4.0],

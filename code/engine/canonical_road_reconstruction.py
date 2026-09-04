@@ -15,7 +15,7 @@ import time
 import cv2
 import numpy as np
 from shapely.geometry import LineString, Point
-from shapely.ops import nearest_points, substring
+from shapely.ops import nearest_points, polygonize, substring, unary_union
 from shapely.prepared import prep
 from shapely.strtree import STRtree
 
@@ -1497,6 +1497,15 @@ def _repair_same_track_gaps(
             connector = _surface_guided_gap_connector(
                 start, end, min(first.width_m, second.width_m), surface_geometry, unit_size_m,
             )
+            if (
+                connector is None
+                and gap.distance * unit_size_m <= 16.0
+                and gap.lateral * unit_size_m <= 1.5
+            ):
+                # A small mask hole must not break an otherwise unambiguous
+                # collinear track.  The headings and lateral gate above provide
+                # the evidence; the missing surface is not treated as geometry.
+                connector = np.asarray([start, end], dtype=np.float64)
             if connector is None:
                 continue
             merged_roads.append(_merge_same_track_gap(first, second, gap, connector))
@@ -1629,6 +1638,194 @@ def _path_turning(points: np.ndarray) -> float:
         return 0.0
     directions = segments / np.linalg.norm(segments, axis=1)[:, None]
     return float(np.sum(np.arccos(np.clip(np.sum(directions[:-1] * directions[1:], axis=1), -1.0, 1.0))))
+
+
+def _merge_exact_degree_two_chains(
+    roads: list[_RegionalRoadSeed],
+    unit_size_m: float,
+) -> list[_RegionalRoadSeed]:
+    """Join fragments only where exactly two collinear chain ends share a node."""
+    active = list(roads)
+    cosine = float(np.cos(np.deg2rad(35.0)))
+    while True:
+        endpoints: dict[tuple[float, float], list[tuple[int, bool]]] = {}
+        for road_id, road in enumerate(active):
+            endpoints.setdefault(_node_key(road.points[0]), []).append((road_id, True))
+            endpoints.setdefault(_node_key(road.points[-1]), []).append((road_id, False))
+        merge = None
+        for entries in endpoints.values():
+            if len(entries) != 2 or entries[0][0] == entries[1][0]:
+                continue
+            first_id, first_at_start = entries[0]
+            second_id, second_at_start = entries[1]
+            first_heading = _endpoint_heading(
+                active[first_id].points, first_at_start, 10.0 / max(unit_size_m, 1e-9),
+            )
+            second_heading = _endpoint_heading(
+                active[second_id].points, second_at_start, 10.0 / max(unit_size_m, 1e-9),
+            )
+            if float(np.dot(first_heading, second_heading)) > -cosine:
+                continue
+            merge = (first_id, first_at_start, second_id, second_at_start)
+            break
+        if merge is None:
+            return active
+        first_id, first_at_start, second_id, second_at_start = merge
+        first, second = active[first_id], active[second_id]
+        first_points = first.points[::-1] if first_at_start else first.points
+        second_points = second.points if second_at_start else second.points[::-1]
+        first_length = max(_polyline_length(first.points), 1e-9)
+        second_length = max(_polyline_length(second.points), 1e-9)
+        joined = _RegionalRoadSeed(
+            _deduplicate_points(np.vstack((first_points, second_points[1:]))),
+            float((first.width_m * first_length + second.width_m * second_length) / (first_length + second_length)),
+            tuple(sorted(set(first.source_ids + second.source_ids))),
+            "preserved_with_local_path_selection",
+        )
+        active = [
+            road for road_id, road in enumerate(active) if road_id not in (first_id, second_id)
+        ] + [joined]
+
+
+def _select_single_path_through_local_corridor_loops(
+    roads: list[_RegionalRoadSeed],
+    surface_geometry,
+    unit_size_m: float,
+) -> tuple[list[_RegionalRoadSeed], int, float]:
+    """Resolve a narrow non-junction loop as two competing paths through one track."""
+    if len(roads) < 2:
+        return roads, 0, 0.0
+    lines = [LineString(road.points) for road in roads]
+    linework = unary_union(lines)
+    prepared_surface = prep(surface_geometry) if surface_geometry is not None else None
+    selections: list[tuple[LineString, LineString]] = []
+    selected_count = 0
+    removed_length_m = 0.0
+    for polygon in polygonize(linework):
+        ring = np.asarray(polygon.exterior.coords[:-1], dtype=np.float64)
+        if ring.shape[0] < 3:
+            continue
+        perimeter_m = float(polygon.length * unit_size_m)
+        if not 10.0 <= perimeter_m <= 220.0:
+            continue
+        center = np.mean(ring, axis=0)
+        covariance = np.cov((ring - center).T)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+        normal = np.asarray([-direction[1], direction[0]])
+        longitudinal = (ring - center) @ direction
+        lateral = (ring - center) @ normal
+        span_m = float(np.ptp(longitudinal) * unit_size_m)
+        width_m = float(np.ptp(lateral) * unit_size_m)
+        if not 8.0 <= span_m <= 120.0 or not 0.5 <= width_m <= 12.0 or span_m < 1.5 * width_m:
+            continue
+
+        # Road blocks and true intersections contain substantial transverse
+        # geometry.  A same-track diamond is dominated by one local direction.
+        segment_vectors = np.diff(np.vstack((ring, ring[0])), axis=0)
+        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+        valid = segment_lengths > 1e-8
+        alignment = np.zeros_like(segment_lengths)
+        alignment[valid] = np.abs(segment_vectors[valid] @ direction) / segment_lengths[valid]
+        aligned_length = float(np.sum(segment_lengths[alignment >= np.cos(np.deg2rad(35.0))]))
+        if aligned_length / max(float(np.sum(segment_lengths)), 1e-9) < 0.62:
+            continue
+
+        start = int(np.argmin(longitudinal))
+        end = int(np.argmax(longitudinal))
+        if start > end:
+            start, end = end, start
+        first = ring[start:end + 1]
+        second = np.vstack((ring[end:], ring[:start + 1]))[::-1]
+        if min(first.shape[0], second.shape[0]) < 2:
+            continue
+        first_line, second_line = LineString(first), LineString(second)
+        first_support = (
+            _sampled_surface_line_support(first_line, prepared_surface)
+            if prepared_surface is not None else 1.0
+        )
+        second_support = (
+            _sampled_surface_line_support(second_line, prepared_surface)
+            if prepared_surface is not None else 1.0
+        )
+        if max(first_support, second_support) < 0.80:
+            continue
+        first_clearance, _ = _line_surface_clearance(first, surface_geometry, unit_size_m)
+        second_clearance, _ = _line_surface_clearance(second, surface_geometry, unit_size_m)
+        first_turn = _path_turning(first)
+        second_turn = _path_turning(second)
+        first_length_m = first_line.length * unit_size_m
+        second_length_m = second_line.length * unit_size_m
+        first_score = 2.0 * first_support + 0.12 * first_clearance - 0.012 * first_length_m - 0.30 * first_turn
+        second_score = 2.0 * second_support + 0.12 * second_clearance - 0.012 * second_length_m - 0.30 * second_turn
+        better, worse = (first_line, second_line) if first_score >= second_score else (second_line, first_line)
+        if prepared_surface is not None and _sampled_surface_line_support(better, prepared_surface) < 0.80:
+            continue
+        selections.append((better, worse))
+        selected_count += 1
+        removed_length_m += worse.length * unit_size_m
+
+    if not selections:
+        return roads, 0, 0.0
+    selected: list[_RegionalRoadSeed] = []
+    for road, line in zip(roads, lines):
+        replacements: list[tuple[float, float, LineString, int]] = []
+        for selection_id, (better, worse) in enumerate(selections):
+            if line.intersection(worse).length * unit_size_m <= 0.20:
+                continue
+            better_start = Point(better.coords[0])
+            better_end = Point(better.coords[-1])
+            tolerance = 0.10 / max(unit_size_m, 1e-9)
+            if line.distance(better_start) > tolerance or line.distance(better_end) > tolerance:
+                continue
+            first_distance = line.project(better_start)
+            second_distance = line.project(better_end)
+            lower, upper = sorted((first_distance, second_distance))
+            if (upper - lower) * unit_size_m <= 0.20:
+                continue
+            replacement = better
+            lower_point = line.interpolate(lower)
+            if lower_point.distance(better_end) < lower_point.distance(better_start):
+                replacement = LineString(list(better.coords)[::-1])
+            replacements.append((lower, upper, replacement, selection_id))
+
+        replacements.sort(key=lambda item: (item[0], item[1]))
+        accepted: list[tuple[float, float, LineString, int]] = []
+        for replacement in replacements:
+            if accepted and replacement[0] < accepted[-1][1] - 1e-8:
+                continue
+            accepted.append(replacement)
+        handled = {selection_id for _lower, _upper, _replacement, selection_id in accepted}
+        coordinates: list[np.ndarray] = []
+        cursor = 0.0
+        for lower, upper, replacement, _selection_id in accepted:
+            if lower > cursor + 1e-8:
+                prefix = substring(line, cursor, lower)
+                coordinates.extend(np.asarray(prefix.coords, dtype=np.float64))
+            coordinates.extend(np.asarray(replacement.coords, dtype=np.float64))
+            cursor = upper
+        if cursor < line.length - 1e-8:
+            suffix = substring(line, cursor, line.length)
+            coordinates.extend(np.asarray(suffix.coords, dtype=np.float64))
+        rebuilt = (
+            LineString(_deduplicate_points(np.asarray(coordinates, dtype=np.float64)))
+            if len(coordinates) >= 2 else line
+        )
+        unhandled = [
+            worse for selection_id, (_better, worse) in enumerate(selections)
+            if selection_id not in handled
+            and line.intersection(worse).length * unit_size_m > 0.20
+        ]
+        remainder = rebuilt.difference(unary_union(unhandled)) if unhandled else rebuilt
+        parts = _surface_line_parts(remainder)
+        for part in parts:
+            if part.length * unit_size_m < 0.25:
+                continue
+            selected.append(_RegionalRoadSeed(
+                np.asarray(part.coords, dtype=np.float64), road.width_m, road.source_ids,
+                "preserved_with_local_path_selection",
+            ))
+    return _merge_exact_degree_two_chains(selected, unit_size_m), selected_count, removed_length_m
 
 
 def _remove_short_self_loops(
@@ -1966,14 +2163,22 @@ def regularize_regional_road_network(
     locally_repaired, offset_count, offset_length_m = _repair_local_offset_jumps(
         loop_cleaned, surface_geometry, unit_size_m,
     )
-    protected_parallel_pairs = _parallel_track_pairs(locally_repaired, unit_size_m)
-    selected, local_path_count, local_path_length_m = _select_same_track_local_paths(
-        locally_repaired, surface_geometry, unit_size_m, protected_parallel_pairs,
+    corridor_selected, corridor_path_count, corridor_path_length_m = (
+        _select_single_path_through_local_corridor_loops(
+            locally_repaired, surface_geometry, unit_size_m,
+        )
     )
+    protected_parallel_pairs = _parallel_track_pairs(corridor_selected, unit_size_m)
+    selected, feature_path_count, feature_path_length_m = _select_same_track_local_paths(
+        corridor_selected, surface_geometry, unit_size_m, protected_parallel_pairs,
+    )
+    local_path_count = corridor_path_count + feature_path_count
+    local_path_length_m = corridor_path_length_m + feature_path_length_m
     selected_anchor_ids = _detect_anchor_centerlines(selected, surface_geometry, unit_size_m)
     selected, final_duplicate_count = _remove_same_track_duplicate_fragments(
         selected, selected_anchor_ids, unit_size_m,
     )
+    selected = _merge_exact_degree_two_chains(selected, unit_size_m)
     duplicate_count += final_duplicate_count
     parallel_pairs = _parallel_track_pairs(selected, unit_size_m)
     final_seeds, junction_count, junction_length_m = _conservative_junction_touchup(
