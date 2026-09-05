@@ -40,6 +40,7 @@ from app.project_relocation import (
     relocate_state_files,
 )
 from engine.samroad.image_resume import relocate_task_image_markers
+from engine.road_network_products import network_products_current
 from dependency_identity import (
     dependency_identity_equal,
     effective_config_identity,
@@ -1122,7 +1123,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     emit("pipeline", stage="项目期次扫描", status="complete", area_id=args.area_id, period=args.period, completed=0, total=6)
     try:
         result_path = workspace / "latest_result.json"
-        if resume and _period_result_ready({"result": str(result_path)}):
+        if resume and _period_result_ready({"result": str(result_path)}, require_current_network=True):
             result = read_json(result_path)
             emit("pipeline", stage="道路提取", status="skipped", reason="续跑复用已完成且完整的正式成果", completed=6, total=6)
         else:
@@ -1245,7 +1246,7 @@ def extract_project_all(args: argparse.Namespace) -> dict:
         if not unit_state_path.is_file():
             return False, {}
         unit_state = read_json(unit_state_path)
-        if unit_state.get("status") != "completed" or not _period_result_ready(unit_state):
+        if unit_state.get("status") != "completed" or not _period_result_ready(unit_state, require_current_network=True):
             return False, {}
         return True, unit_state
 
@@ -2191,6 +2192,7 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
             _shapefile_complete(context["centerline"])
             and _shapefile_complete(context["surface"])
             and context["gpkg"].is_file()
+            and network_products_current(context["centerline"].parent)
         )
     return False
 
@@ -2533,6 +2535,7 @@ def extract(args: argparse.Namespace) -> dict:
         if pipeline_state_path is not None:
             stage_commands["centerline"][0].extend(("--pipeline-state", str(pipeline_state_path.resolve())))
     try:
+        upstream_reexecuted = False
         for stage_index, (stage_key, stage_label) in enumerate(stage_definitions, start=1):
             event_context = {
                 "grid": grid, "period": period,
@@ -2541,11 +2544,13 @@ def extract(args: argparse.Namespace) -> dict:
             }
             if (
                 resume
+                and not upstream_reexecuted
                 and period_state["stages"].get(stage_key) == "completed"
                 and _period_stage_output_complete(stage_key, stage_context)
             ):
                 emit("stage", stage=stage_label, status="skipped", reason="续跑复用已完成且完整的阶段成果", **event_context)
                 continue
+            upstream_reexecuted = True
             period_state.update({
                 "status": "running", "current_stage": stage_key,
                 "current_stage_label": stage_label, "updated_at": now_text(),
@@ -3581,7 +3586,7 @@ def apply_centerline_edits(args: argparse.Namespace) -> dict:
     return result
 
 
-def _period_result_ready(entry: dict) -> bool:
+def _period_result_ready(entry: dict, *, require_current_network: bool = False) -> bool:
     """Return whether a prior period result is complete enough to resume from."""
     status = str(entry.get("status") or "").casefold()
     if status and status != "completed":
@@ -3591,6 +3596,8 @@ def _period_result_ready(entry: dict) -> bool:
         if not result_path.is_file():
             return False
         result = read_json(result_path)
+        if require_current_network and not network_products_current(Path(str(result.get('centerlines') or '')).parent):
+            return False
         return all(
             Path(str(result.get(key) or "")).expanduser().is_file()
             for key in ("centerlines", "surfaces", "gpkg")
@@ -4978,7 +4985,7 @@ def run_all(args: argparse.Namespace) -> dict:
         for entry in prior.get("period_results", []) if isinstance(entry, dict)
     }
     frozen_periods = {
-        key for key, entry in raw_prior_periods.items() if _period_result_ready(entry)
+        key for key, entry in raw_prior_periods.items() if _period_result_ready(entry, require_current_network=True)
     }
     invalid_periods = {
         tuple(value) for value in invalidation["periods"]
@@ -5024,7 +5031,7 @@ def run_all(args: argparse.Namespace) -> dict:
     }
     periods_ready = (
         set(prior_periods) == expected_periods
-        and all(_period_result_ready(entry) for entry in prior_periods.values())
+        and all(_period_result_ready(entry, require_current_network=True) for entry in prior_periods.values())
     )
     changes_ready = (
         set(prior_changes) == expected_changes
@@ -5177,6 +5184,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     analysis_sources[f"{area_id}\0{period}"] = source
 
         result_by_period: dict[tuple[str, str], dict] = {}
+        refreshed_periods = set()
         for grid_index, (grid_name, periods) in enumerate(grids.items(), start=1):
             safe_grid = clean_name(grid_name)
             for period_index, (period, source) in enumerate(periods.items(), start=1):
@@ -5184,7 +5192,7 @@ def run_all(args: argparse.Namespace) -> dict:
                 safe_period = clean_name(period)
                 workspace = job_root / "grids" / safe_grid / "periods" / safe_period
                 prior_entry = prior_periods.get((grid_name, period))
-                if resume and prior_entry and _period_result_ready(prior_entry):
+                if resume and prior_entry and _period_result_ready(prior_entry, require_current_network=True):
                     entry = dict(prior_entry)
                     entry_provenance = dict(entry.get("provenance") or {})
                     entry_provenance.update({
@@ -5217,6 +5225,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     grid_index=grid_index, grid_total=len(grids),
                     period_index=period_index, period_total=len(periods),
                 )
+                refreshed_periods.add((grid_name, period))
                 analysis_source = analysis_sources.get(f"{grid_name}\0{period}", source)
                 try:
                     internal_resume = resume and (grid_name, period) not in invalid_periods
@@ -5273,7 +5282,9 @@ def run_all(args: argparse.Namespace) -> dict:
             for before_period, after_period in zip(period_names, period_names[1:]):
                 unit_started = time.monotonic()
                 prior_entry = prior_changes.get((grid_name, before_period, after_period))
-                if resume and prior_entry and _change_result_ready(prior_entry):
+                if (resume and prior_entry and _change_result_ready(prior_entry)
+                        and (grid_name, before_period) not in refreshed_periods
+                        and (grid_name, after_period) not in refreshed_periods):
                     manifest["change_results"].append(prior_entry)
                     manifest["processed_work"] += 1
                     progress(

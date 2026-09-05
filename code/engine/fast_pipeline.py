@@ -2959,6 +2959,10 @@ def export_fast_products(
     if not working.is_file():
         raise FileNotFoundError(f"Fast width products missing: {working}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    from .road_network_products import (
+        NETWORK_REPORT, recover_centerline_frame, write_network_report, rebuild_network_width_products,
+    )
+    (output_dir / NETWORK_REPORT).unlink(missing_ok=True)
     mapping = {
         "centerlines": "road_centerlines.shp", "surfaces": "road_surfaces.shp",
         "width_segments": "road_width_segments.shp", "corridors": "road_corridors.shp",
@@ -2966,9 +2970,17 @@ def export_fast_products(
     gpkg = output_dir / "roads.gpkg"
     gpkg.unlink(missing_ok=True)
     outputs = {}
-    frames = {}
+    frames = {layer: _clip_frame(gpd.read_file(working, layer=layer), validation_area)
+              for layer in mapping}
+    frames['centerlines'], connection_stats, connection_audits = recover_centerline_frame(
+        frames['centerlines'], frames['surfaces'],
+    )
+    frames['width_segments'], frames['corridors'] = rebuild_network_width_products(
+        frames['centerlines'], frames['width_segments'],
+        connection_input=connection_audits['connection_input'],
+    )
     for index, (layer, filename) in enumerate(mapping.items()):
-        frame = _clip_frame(gpd.read_file(working, layer=layer), validation_area)
+        frame = frames[layer]
         target = output_dir / filename
         frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
         frame.to_file(gpkg, layer=layer, driver="GPKG", mode="w" if index == 0 else "a")
@@ -2979,6 +2991,7 @@ def export_fast_products(
     outputs["road_extraction"] = outputs["previews"]["fusion"]
     outputs["road_width"] = outputs["previews"]["width"]
     outputs["execution_profile"] = "fast"
+    write_network_report(output_dir, connection_stats, connection_audits)
     return outputs
 
 

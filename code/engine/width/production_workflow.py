@@ -33,12 +33,17 @@ FINAL_CENTERLINE_GEOMETRY_POLICY = (
 TOOL_DIR = Path(__file__).resolve().parent
 if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
+if str(TOOL_DIR.parents[1]) not in sys.path:
+    sys.path.insert(0, str(TOOL_DIR.parents[1]))
+
+from engine.road_network_products import (
+    NETWORK_REPORT, recover_centerline_frame, write_network_report, rebuild_network_width_products,
+)
 
 from finalize_review_results import load_graph, save_graph  # noqa: E402
 from global_edit_utils import _graph_from_world_lines, _project_manual_widths  # noqa: E402
 from review_geometry import accepted_surface_region_polylines  # noqa: E402
 from surface_reconstruction import SurfaceReconstructionConfig, reconstruct_surface  # noqa: E402
-from road_pair_matcher import build_corridors, build_width_segments  # noqa: E402
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -1691,6 +1696,13 @@ def export_final_products(
     stitched_centerlines: Path | None = None,
 ) -> dict:
     export_started = time.perf_counter()
+    product_dir = (centerline_shp.parent if centerline_shp is not None else
+                   surface_shp.parent if surface_shp is not None else
+                   shp_dir if shp_dir is not None else output.parent if output is not None else None)
+    if product_dir is None:
+        raise ValueError('At least one product output is required')
+    product_dir.mkdir(parents=True, exist_ok=True)
+    (product_dir / NETWORK_REPORT).unlink(missing_ok=True)
     graph_csv_read_seconds = 0.0
     surface_raster_read_seconds = 0.0
     road_chain_conversion_seconds = 0.0
@@ -2034,18 +2046,23 @@ def export_final_products(
             geometry=[], crs=crs,
         )
     )
+    fused_centerline_frame, connection_stats, connection_audits = recover_centerline_frame(
+        fused_centerline_frame,
+        gpd.GeoDataFrame(fused_surfaces,geometry='geometry',crs=crs) if fused_surfaces else None,
+        authoritative=canonical_is_authoritative,
+    )
+    exported_centerlines = fused_centerline_frame.to_dict('records')
     width_conversion_started = time.perf_counter()
     measured_segment_frame = (
         gpd.GeoDataFrame(width_segments, geometry="geometry", crs=crs)
         if width_segments else None
     )
-    standardized_width_segments = build_width_segments(
+    standardized_width_segments, standardized_corridors = rebuild_network_width_products(
         fused_centerline_frame,
         measured_segment_frame,
-        target_length=15.0,
         source_tolerance=max(match_tolerance, 0.5),
+        connection_input=connection_audits['connection_input'],
     )
-    standardized_corridors = build_corridors(standardized_width_segments)
     standardized_width_rows = standardized_width_segments.to_dict("records")
     standardized_corridor_rows = standardized_corridors.to_dict("records")
     width_sampling_segment_conversion_seconds += (
@@ -2182,6 +2199,7 @@ def export_final_products(
         **{f"{key}_count": len(value) for key, value in layers.items()},
     }
     (report_dir / "final_quality_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    write_network_report(report_dir, connection_stats, connection_audits)
     return report
 
 

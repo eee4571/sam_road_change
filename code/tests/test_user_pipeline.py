@@ -12,6 +12,14 @@ import user_pipeline
 from dev_tools import generate_mock_change_truth
 
 
+def _mark_network_export_complete(products):
+    from engine.road_network_products import NETWORK_CONNECTION_VERSION, NETWORK_REPORT
+    products = Path(products)
+    (products / 'road_network_audit.gpkg').touch()
+    user_pipeline.write_json(products / NETWORK_REPORT,
+                             {'version': NETWORK_CONNECTION_VERSION, 'status': 'completed'})
+
+
 class GridDiscoveryTests(unittest.TestCase):
     def test_write_json_retries_a_brief_windows_file_lock(self) -> None:
         real_replace = os.replace
@@ -200,6 +208,7 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                 for suffix in (".shp", ".shx", ".dbf"):
                     (root / f"{stem}{suffix}").touch()
             (root / "roads.gpkg").touch()
+            _mark_network_export_complete(root)
         return {"stage": label, "elapsed_seconds": 0.01}
 
     def test_resume_after_centerline_does_not_run_centerline_again(self) -> None:
@@ -247,6 +256,32 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
             self.assertNotIn("道路提取", resumed_calls)
             self.assertEqual(resumed_calls[0], "道路面提取")
             self.assertEqual(user_pipeline.read_json(Path(result["period_state"]))["status"], "completed")
+
+    def test_network_upgrade_reexports_only_and_rerun_width_invalidates_export(self):
+        from engine.road_network_products import NETWORK_REPORT
+        for stale_width in (False, True):
+            with self.subTest(stale_width=stale_width), tempfile.TemporaryDirectory() as raw:
+                workspace,args = self._checkpoint_workspace(Path(raw))
+                for label in ('道路提取','道路面提取','道路宽度计算','结果固化','道路产品导出'):
+                    self._complete_fake_stage(workspace,label)
+                run=workspace/'runs'/'roads'
+                if stale_width:
+                    (run/'width_review'/'batch_width_summary.json').unlink()
+                else:
+                    (run/'products'/NETWORK_REPORT).unlink()
+                state=user_pipeline._period_state_template('area_03','2021')
+                state['stages']={key:'completed' for key in state['stages']}
+                user_pipeline.write_json(workspace/'period_state.json',state)
+                args.resume=True
+                calls=[]
+                def execute(_command,_cwd,_env,label,_context=None):
+                    calls.append(label)
+                    return self._complete_fake_stage(workspace,label)
+                with patch.object(user_pipeline,'run_command',side_effect=execute), \
+                     patch.object(user_pipeline,'_write_valid_observation_area',return_value=None), \
+                     patch.object(user_pipeline,'_write_probability_mosaic',return_value=None):
+                    user_pipeline.extract(args)
+                self.assertEqual(calls,['道路宽度计算','结果固化','道路产品导出'] if stale_width else ['道路产品导出'])
 
     def test_running_stage_is_reexecuted_from_that_stage(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -385,6 +420,7 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                 workspace = Path(call_args.workspace); products = workspace / "products"; products.mkdir()
                 result = {"run_root": str(workspace / "runs" / call_args.run_id), "centerlines": str(products / "center.shp"), "surfaces": str(products / "surface.shp"), "gpkg": str(products / "roads.gpkg"), "final_dir": str(workspace / "final")}
                 for key in ("centerlines", "surfaces", "gpkg"): Path(result[key]).touch()
+                _mark_network_export_complete(products)
                 user_pipeline.write_json(workspace / "latest_result.json", result)
                 return result
 
@@ -438,6 +474,7 @@ class ProjectBatchExtractionTests(unittest.TestCase):
                 product_dir = state_path.parent / "products"; product_dir.mkdir(parents=True, exist_ok=True)
                 result = {"centerlines": str(product_dir / "center.shp"), "surfaces": str(product_dir / "surface.shp"), "gpkg": str(product_dir / "roads.gpkg")}
                 for value in result.values(): Path(value).touch()
+                _mark_network_export_complete(product_dir)
                 result_path = state_path.parent / "latest_result.json"; user_pipeline.write_json(result_path, result)
                 state = {"status": "completed", "result": str(result_path), "result_manifest": result}; user_pipeline.write_json(state_path, state)
                 return state
@@ -1028,6 +1065,7 @@ class OneClickPipelineTests(unittest.TestCase):
             gpkg = products / "roads.gpkg"
             for path in (center, surface, gpkg):
                 path.touch()
+            _mark_network_export_complete(products)
             result_path = workspace / "latest_result.json"
             result = {
                 "centerlines": str(center), "surfaces": str(surface), "gpkg": str(gpkg),
@@ -1371,6 +1409,7 @@ class OneClickPipelineTests(unittest.TestCase):
                 workspace = Path(extract_args.workspace); products = workspace / "products"; products.mkdir(parents=True)
                 center = products / "center.shp"; surface = products / "surface.shp"; gpkg = products / "roads.gpkg"
                 for path in (center, surface, gpkg): path.touch()
+                _mark_network_export_complete(products)
                 result = {"workspace": str(workspace), "run_root": str(workspace / "run"), "centerlines": str(center), "surfaces": str(surface), "gpkg": str(gpkg)}
                 user_pipeline.write_json(workspace / "latest_result.json", result)
                 return result
