@@ -65,7 +65,10 @@ from engine.fast_pipeline import (
 from engine.canonical_road_reconstruction import (
     RegionalRoadObservation,
     _RegionalRoadSeed,
+    _complete_remaining_short_gaps,
     _connect_tracks_through_junction_zones,
+    _network_node_degrees,
+    _recover_weak_companion_tracks,
     _tangent_continuous_connector,
     reconstruct_regional_road_network_from_surface,
     regularize_regional_road_network,
@@ -764,9 +767,9 @@ class FastCenterlineCleanupTests(unittest.TestCase):
 
     def test_broken_surface_corridor_recovers_one_continuous_track(self) -> None:
         fragments = [
-            LineString([(0.0, 0.0), (32.0, 0.0)]),
-            LineString([(54.0, 0.4), (83.0, 0.4)]),
-            LineString([(107.0, -0.2), (140.0, -0.2)]),
+            LineString([(0.0, 0.0), (40.0, 0.0)]),
+            LineString([(78.0, 0.4), (118.0, 0.4)]),
+            LineString([(156.0, -0.2), (196.0, -0.2)]),
         ]
         surface = unary_union([fragment.buffer(4.0) for fragment in fragments])
         final_roads, diagnostics = reconstruct_regional_road_network_from_surface(
@@ -775,7 +778,38 @@ class FastCenterlineCleanupTests(unittest.TestCase):
         self.assertEqual(len(final_roads), 1)
         self.assertGreaterEqual(diagnostics["broken_corridor_recovery_count"], 2)
         self.assertEqual(diagnostics["broken_corridor_group_count"], 1)
-        self.assertGreater(LineString(final_roads[0].points).length, 130.0)
+        self.assertGreater(LineString(final_roads[0].points).length, 186.0)
+
+    def test_connectivity_completion_closes_a_remaining_28m_gap(self) -> None:
+        roads = [
+            _RegionalRoadSeed(np.asarray([[0.0, 0.0], [40.0, 0.0]]), 10.0, (0,)),
+            _RegionalRoadSeed(np.asarray([[68.0, 0.3], [110.0, 0.3]]), 10.0, (1,)),
+        ]
+        completed, count, _length, maximum, reverted = _complete_remaining_short_gaps(
+            roads, None, 1.0,
+        )
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(count, 1)
+        self.assertGreater(maximum, 27.0)
+        self.assertEqual(reverted, 0)
+        self.assertLessEqual(max(_network_node_degrees(completed).values()), 2)
+
+    def test_strong_track_guides_multiple_observed_companion_fragments(self) -> None:
+        roads = [
+            _RegionalRoadSeed(np.asarray([[0.0, 0.0], [200.0, 0.0]]), 10.0, (0,)),
+            _RegionalRoadSeed(np.asarray([[0.0, 12.0], [30.0, 12.0]]), 10.0, (1,)),
+            _RegionalRoadSeed(np.asarray([[65.0, 12.2], [95.0, 12.2]]), 10.0, (2,)),
+            _RegionalRoadSeed(np.asarray([[130.0, 11.8], [170.0, 11.8]]), 10.0, (3,)),
+        ]
+        completed, groups, links, _length, maximum = _recover_weak_companion_tracks(
+            roads, 1.0,
+        )
+        self.assertEqual(len(completed), 2)
+        self.assertEqual(groups, 1)
+        self.assertEqual(links, 2)
+        self.assertGreater(maximum, 34.0)
+        weak = min(completed, key=lambda road: abs(float(np.median(road.points[:, 1])) - 12.0))
+        self.assertGreater(LineString(weak.points).length, 160.0)
 
     def test_long_connector_respects_both_endpoint_tangents(self) -> None:
         start_heading = np.asarray([1.0, 0.0])
@@ -813,7 +847,7 @@ class FastCenterlineCleanupTests(unittest.TestCase):
             LineString(roads[1].points).buffer(5.0),
             box(-28.0, -12.0, 28.0, 20.0),
         ])
-        connected, count, _length = _connect_tracks_through_junction_zones(
+        connected, count, _length, _pairs, _reverted, _maximum = _connect_tracks_through_junction_zones(
             roads, surface, 1.0,
         )
         self.assertEqual(count, 1)
@@ -825,6 +859,56 @@ class FastCenterlineCleanupTests(unittest.TestCase):
             segment_directions[:-1] * segment_directions[1:], axis=1,
         ), -1.0, 1.0))
         self.assertLess(float(np.max(turns)), np.deg2rad(24.0))
+
+    def test_divided_tracks_cross_a_wide_junction_without_swapping(self) -> None:
+        roads = [
+            _RegionalRoadSeed(np.asarray([[-80.0, 0.0], [-25.0, 0.0]]), 10.0, (0,)),
+            _RegionalRoadSeed(np.asarray([[-80.0, 12.0], [-25.0, 12.0]]), 10.0, (1,)),
+            _RegionalRoadSeed(np.asarray([[25.0, 0.0], [80.0, 0.0]]), 10.0, (2,)),
+            _RegionalRoadSeed(np.asarray([[25.0, 12.0], [80.0, 12.0]]), 10.0, (3,)),
+        ]
+        surface = unary_union([
+            *(LineString(road.points).buffer(5.0) for road in roads),
+            box(-30.0, -10.0, 30.0, 22.0),
+        ])
+        connected, count, _length, pairs, _reverted, _maximum = (
+            _connect_tracks_through_junction_zones(roads, surface, 1.0)
+        )
+        self.assertEqual(len(connected), 2)
+        self.assertEqual(count, 2)
+        self.assertEqual(pairs, 1)
+        source_groups = {road.source_ids for road in connected}
+        self.assertEqual(source_groups, {(0, 2), (1, 3)})
+
+    def test_divided_tracks_replace_existing_junction_detours_without_loops(self) -> None:
+        roads = [
+            _RegionalRoadSeed(np.asarray([[-80.0, 0.0], [-25.0, 0.0]]), 10.0, (0,)),
+            _RegionalRoadSeed(np.asarray([[-80.0, 12.0], [-25.0, 12.0]]), 10.0, (1,)),
+            _RegionalRoadSeed(np.asarray([[25.0, 0.0], [80.0, 0.0]]), 10.0, (2,)),
+            _RegionalRoadSeed(np.asarray([[25.0, 12.0], [80.0, 12.0]]), 10.0, (3,)),
+            _RegionalRoadSeed(
+                np.asarray([[-25.0, 0.0], [-5.0, -5.0], [5.0, -5.0], [25.0, 0.0]]),
+                10.0, (4,),
+            ),
+            _RegionalRoadSeed(
+                np.asarray([[-25.0, 12.0], [-5.0, 17.0], [5.0, 17.0], [25.0, 12.0]]),
+                10.0, (5,),
+            ),
+        ]
+        surface = unary_union([
+            *(LineString(road.points).buffer(5.0) for road in roads),
+            box(-30.0, -10.0, 30.0, 22.0),
+        ])
+        connected, count, _length, pairs, reverted, _maximum = (
+            _connect_tracks_through_junction_zones(roads, surface, 1.0)
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(pairs, 1)
+        self.assertEqual(reverted, 0)
+        self.assertEqual({road.source_ids for road in connected}, {(0, 2), (1, 3)})
+        self.assertEqual(len(connected), 2)
+        self.assertLessEqual(max(_network_node_degrees(connected).values()), 2)
+        self.assertTrue(all(not LineString(road.points).is_ring for road in connected))
 
     def test_broken_dual_surface_corridors_preserve_two_tracks(self) -> None:
         fragments = [
