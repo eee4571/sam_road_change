@@ -222,31 +222,10 @@ class RoadScene:
                 **probability}
 
 
-def _runs(labels, eligible, spacing, gap_m=4.0):
-    result = list(labels)
-    index = 0
-    while index < len(result):
-        if result[index]:
-            index += 1
-            continue
-        start = index
-        while index < len(result) and not result[index]:
-            index += 1
-        if (start > 0 and index < len(result) and result[start-1] == result[index]
-                and (index-start)*spacing <= gap_m and all(eligible[start:index])):
-            result[start:index] = [result[index]]*(index-start)
-    index = 0
-    while index < len(result):
-        start, label = index, result[index]
-        while index+1 < len(result) and result[index+1] == label:
-            index += 1
-        if label:
-            yield start, index, label
-        index += 1
-
-
-def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, minimum_length=24., minimum_area=4.):
-    """All audit rows refer to 4 m station cells, final counts refer to runs."""
+def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, minimum_length=24., minimum_area=4.,
+                   presence_audit=None):
+    """Presence uses longitudinal coverage; width retains its paired station path."""
+    from .auto_presence_candidates import LongitudinalCoverage, presence_seeds
     records, audit, width_audit = [], [], []
     counts = Counter()
     width_config = PairedWidthConfig(sample_spacing=4, absolute_change=absolute,
@@ -254,10 +233,11 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                                     maximum_gap_samples=1, maximum_gap_length=8.)
     for side, source, target, change_type in (("before", before, after, "removed"),
                                                ("after", after, before, "added")):
+        coverage = LongitudinalCoverage(target.lines, tolerance)
         for line_id, axis in enumerate(source.lines):
             count = max(1, int(np.ceil(axis.length/4)))
             spacing = axis.length/count
-            labels, eligible, samples, station_rows = [], [], [], []
+            samples, station_rows = [], []
             source_surface, target_surface = source.surface(axis), target.surface(axis)
             source_support, target_support = source_surface.buffer(tolerance), target_surface.buffer(tolerance)
             width_surfaces = ((source_surface, source_surface.buffer(.1)),
@@ -273,17 +253,13 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 bef, aft = (source_evidence, target_evidence) if side == "before" else (target_evidence, source_evidence)
                 junction = source.junction.intersects(cell) or target.junction.intersects(cell)
                 accepted = bef["valid"] and aft["valid"] and not junction
-                requested = (bef["state"], aft["state"]) == (("present", "absent") if side == "before" else ("absent", "present"))
-                labels.append(change_type if accepted and requested else "")
-                # Never bridge invalid, ambiguous, junction, or present-present evidence.
-                eligible.append(accepted and "uncertain" in {bef["state"], aft["state"]})
                 row = {"side": side, "axis_id": line_id, "station_m": station,
                        "candidate_type": change_type, "matched": match is not None,
                        "match_reliable": bool(match and match["reliable"]),
                        "offset_m": match["distance"] if match else None,
                        "target_axis": match["target"] if match else None,
-                       "junction": junction, "existence_pass": bool(accepted and requested),
-                       "reason": "existence_pass" if accepted and requested else "junction" if junction else f'{bef["reason"]}->{aft["reason"]}',
+                       "junction": junction, "existence_pass": False,
+                       "reason": f'{bef["reason"]}->{aft["reason"]}',
                        "geometry": cell,
                        **{f"before_{k}": v for k, v in bef.items()},
                        **{f"after_{k}": v for k, v in aft.items()}}
@@ -326,19 +302,12 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                                                 before_width, after_width,
                                                 after_width-before_width if valid_width else None,
                                                 bool(valid_width), reason))
-            for first, last, kind in _runs(labels, eligible, spacing):
-                run_axis = substring(axis, first*spacing, (last+1)*spacing)
-                passed = run_axis.length >= minimum_length
-                for row in station_rows[first:last+1]:
-                    row["continuity_pass"] = passed
-                counts[f"{kind}_existence_runs"] += 1
-                if passed:
-                    width = float(np.median([source.width(axis.interpolate((i+.5)*spacing)) for i in range(first, last+1)]))
-                    geometry = run_axis.buffer(width/2, cap_style="flat").intersection(source.surface(run_axis))
-                    if geometry.area >= minimum_area:
-                        records.append({"change_typ": kind, "width_bef": width if kind == "removed" else 0.,
-                                        "width_aft": width if kind == "added" else 0., "width_diff": 0.,
-                                        "length_m": run_axis.length, "axis_wkt": run_axis.wkt, "geometry": geometry})
+            local, intervals, presence_counts = presence_seeds(
+                axis, station_rows, source, coverage, change_type, minimum_length, minimum_area)
+            records.extend(local)
+            counts.update(presence_counts)
+            if presence_audit is not None:
+                presence_audit.extend(intervals)
             audit.extend(station_rows)
             if side == "before" and len(samples) >= 2:
                 # Stations follow the before road; paired points define a shared local axis.
@@ -387,7 +356,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
 def detect_final_road_changes(before_result, after_result, output_dir, *, before_period, after_period,
                               position_tolerance, width_change_absolute, width_change_ratio,
                               min_change_area, min_change_length, internal_outputs):
-    from .fast_pipeline import _fast_polygon_parts, _load_fast_period_result, _read_fast_change_layer, _write_fast_public_changes
+    from .fast_pipeline import _load_fast_period_result, _read_fast_change_layer
     started = time.perf_counter()
     payloads = [_load_fast_period_result(value) for value in (before_result, after_result)]
     centerlines = [_read_fast_change_layer(p, "centerlines") for p in payloads]
@@ -404,19 +373,47 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                                        for key in ("surfaces", "width_segments", "valid_observation")]
             probability = WindowedProbability(p["road_probability"], metric_crs)
             scenes.append(RoadScene(lines.to_crs(metric_crs), surfaces, widths, valid, probability, metric_crs))
+        presence_audit = []
         records, audit, width_audit, counts = analyze_scenes(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
             relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
-            minimum_area=float(min_change_area))
+            minimum_area=float(min_change_area), presence_audit=presence_audit)
     finally:
         for scene in scenes:
             scene.probability.close()
+    return finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
+                                    scenes=dict(zip(("before", "after"), scenes)), centerlines=centerlines,
+                                    output_dir=output_dir, before_period=before_period, after_period=after_period,
+                                    position_tolerance=position_tolerance, min_change_area=min_change_area,
+                                    min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started)
+
+
+def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_audit, scenes, centerlines,
+                             output_dir, before_period, after_period, position_tolerance=3.,
+                             min_change_area=4., min_change_length=None, elapsed_seconds=0.):
+    """Qualify, assemble and publish; also reusable with saved observation evidence."""
+    from .fast_pipeline import _fast_polygon_parts, _write_fast_public_changes
+    started = time.perf_counter()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metric_crs, output_crs = scenes["before"].crs, centerlines[0].crs
+    counts = dict(counts)
     def frame(rows):
         return (gpd.GeoDataFrame(rows, geometry="geometry", crs=metric_crs) if rows else
                 gpd.GeoDataFrame({"change_typ": pd.Series(dtype=str)}, geometry=[], crs=metric_crs))
     from .auto_change_assembly import assemble_change_objects, write_assembly_audit
-    seeds = frame(records)
+    from .auto_presence_candidates import annotate_objects, qualify_presence_candidates
+    raw_candidates = frame(records)
+    for key, default in (("qa_state", "confirmed"), ("confidence", .9), ("audit_reason", "paired_width_accepted")):
+        raw_candidates[key] = raw_candidates[key].fillna(default) if key in raw_candidates else default
+    raw_candidates["candidate_id"] = np.arange(len(raw_candidates))
+    observation = frame(audit)
+    seeds, candidate_audit = qualify_presence_candidates(raw_candidates, scenes, observation,
+                                minimum_length=24. if min_change_length is None else float(min_change_length),
+                                minimum_area=float(min_change_area))
     changes, assembly = assemble_change_objects(seeds, centerlines[0], centerlines[1])
+    changes = annotate_objects(changes, seeds, assembly["membership"])
+    assembly["change_objects"] = changes
     write_assembly_audit(output_dir, seeds, assembly)
     changes = changes.to_crs(output_crs)
     # Reprojection of touching width ribbons can create sub-pixel ring
@@ -426,7 +423,12 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     _, public_path = _write_fast_public_changes(changes, output_dir)
     gpkg = output_dir / "auto_diagnostics.gpkg"
     changes.to_file(gpkg, layer="changes", driver="GPKG")
-    frame(audit).to_file(gpkg, layer="existence_candidates", driver="GPKG")
+    observation.to_file(gpkg, layer="existence_candidates", driver="GPKG")
+    raw_candidates.to_file(gpkg, layer="input_candidates", driver="GPKG")
+    candidate_audit.to_file(gpkg, layer="candidate_audit", driver="GPKG")
+    candidate_audit.loc[candidate_audit.publication_state == "review"].to_file(gpkg, layer="review_candidates", driver="GPKG")
+    frame(presence_audit).to_file(gpkg, layer="presence_intervals", driver="GPKG")
+    seeds.to_file(gpkg, layer="local_seeds", driver="GPKG")
     frame(width_audit).to_file(gpkg, layer="width_candidates", driver="GPKG")
     layers = {"changes": str(public_path)}
     names = {"added": "added_roads.shp", "removed": "removed_roads.shp",
@@ -440,7 +442,7 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     evidence.to_csv(output_dir/"existence_candidates.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in width_audit]).to_csv(
         output_dir/"width_candidates.csv", index=False, encoding="utf-8-sig")
-    funnel = {"count_units": "matching/existence: 4 m station cells; width: axes and local runs; final: continuous road runs",
+    funnel = {"count_units": "evidence: 4 m station cells; presence candidates: longitudinal intervals; final: network objects",
               "road_matching": {k: v for k, v in counts.items() if "matched" in k and not k.startswith("width")},
               "width": {k: v for k, v in counts.items() if k.startswith("width")},
               "final": {k: v for k, v in counts.items() if k.startswith("final")}}
@@ -458,11 +460,24 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
             funnel[kind]["existence_pass"] = int(candidates.existence_pass.sum())
             funnel[kind]["continuity_pass"] = int(candidates.get("continuity_pass", pd.Series(dtype=bool)).eq(True).sum())
         funnel[kind]["final_auto_count"] = counts[f"final_{kind}"]
+        funnel[kind]["longitudinal"] = {k.removeprefix(kind+"_"): v for k, v in counts.items() if k.startswith(kind+"_")}
+        local = seeds.loc[seeds.change_typ == kind]
+        final = changes.loc[changes.change_typ == kind]
+        funnel[kind]["local_seed_count"] = len(local)
+        funnel[kind]["local_seed_length_m"] = float(local.length_m.sum()) if len(local) else 0.
+        funnel[kind]["seed_qa_counts"] = {state: int((local.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
+        funnel[kind]["object_qa_counts"] = {state: int((final.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
+        qa = candidate_audit.loc[candidate_audit.change_typ == kind]
+        funnel[kind]["recall_candidate_count"] = len(qa)
+        funnel[kind]["review_candidate_count"] = int((qa.publication_state == "review").sum())
+        funnel[kind]["precision_reason_counts"] = dict(Counter(reason for reasons in qa.precision_reason for reason in reasons.split(";")))
     funnel["network_assembly"] = assembly["summary"]
+    funnel["assembly_rejection_counts"] = (assembly["decisions"].loc[~assembly["decisions"].accepted, "reason"].value_counts().to_dict()
+                                             if len(assembly["decisions"]) else {})
     funnel["count_units"] += "; assembled final: network objects"
     (output_dir/"candidate_funnel.json").write_text(json.dumps(funnel, indent=2, ensure_ascii=False), encoding="utf-8")
     return complete_written_auto_result(output_dir, before_period=before_period, after_period=after_period,
-                                        min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started)
+                                        min_change_length=min_change_length, elapsed_seconds=elapsed_seconds+time.perf_counter()-started)
 
 
 def complete_written_auto_result(output_dir, *, before_period, after_period, min_change_length=None,
@@ -479,11 +494,11 @@ def complete_written_auto_result(output_dir, *, before_period, after_period, min
     layers = {"changes": str(public_path), **{kind: str(output_dir/name) for kind, name in names.items()}}
     preview = output_dir/"change_preview.png"
     render_change_preview(preview, changes, changes.iloc[:0], title=f"Auto {before_period} to {after_period}",
-                          empty_message="No confirmed Auto changes")
+                          empty_message="No Auto change candidates")
     summary = {"execution_profile": "fast", "change_source": "fast_automatic", "change_output_mode": "fast_automatic",
                "automatic_result": True, "ground_truth_derived": False, "ground_truth_used": False,
                "before_period": before_period, "after_period": after_period,
-               "presence_change_source": "final_axis_symmetric_existence", "width_change_source": "paired_local_profile",
+               "presence_change_source": "final_axis_symmetric_qualified_candidates", "width_change_source": "paired_local_profile",
                "min_change_length_m": 24. if min_change_length is None else float(min_change_length),
                "changes_feature_count": len(changes), **{f"{k}_feature_count": int((changes.change_typ == k).sum()) for k in names},
                "candidate_funnel": str(output_dir/"candidate_funnel.json"), "diagnostics": str(gpkg),

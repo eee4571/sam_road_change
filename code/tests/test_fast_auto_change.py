@@ -11,7 +11,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import LineString, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from engine.fast_auto_change import RoadScene, WindowedProbability, analyze_scenes, _runs
+from engine.fast_auto_change import RoadScene, WindowedProbability, analyze_scenes
 
 
 class FastFinalAutoTests(unittest.TestCase):
@@ -94,11 +94,13 @@ class FastFinalAutoTests(unittest.TestCase):
         self.assertGreater(changes[0]["geometry"].bounds[0], 145)
         self.assertLess(changes[0]["length_m"], 125)
 
-    def test_nodata_prevents_presence_and_width(self):
+    def test_nodata_retains_probable_presence_but_prevents_width(self):
         before = self.scene([self.road(70, 8)], valid=box(0, 90, 300, 250))
         after = self.scene([self.road(70, 14), self.road(30)])
         changes, audit, _, _ = analyze_scenes(before, after)
-        self.assertFalse(changes)
+        self.assertEqual([r["change_typ"] for r in changes], ["added"])
+        self.assertEqual(changes[0]["qa_state"], "probable")
+        self.assertIn("invalid_or_boundary", changes[0]["audit_reason"])
         self.assertTrue(any(row["before_state"] == "uncertain" for row in audit))
 
     def test_parallel_tracks_do_not_swap(self):
@@ -115,8 +117,6 @@ class FastFinalAutoTests(unittest.TestCase):
         after = self.scene([self.road(100)], surfaces=surface)
         changes, _, _, _ = analyze_scenes(before, after)
         self.assertFalse(changes)
-        self.assertEqual(list(_runs(["added", "", "added"], [True, False, True], 4)),
-                         [(0, 0, "added"), (2, 2, "added")])
 
     def test_junction_small_change_is_suppressed(self):
         roads = [self.road(100), (LineString([(150, 30), (150, 190)]), 8)]
@@ -150,7 +150,22 @@ class FastFinalAutoTests(unittest.TestCase):
         for key in ("road_changes", "candidate_funnel", "summary", "road_change"):
             self.assertTrue(Path(result[key]).is_file(), key)
         self.assertEqual(len(gpd.read_file(result["diagnostics"], layer="changes")), 1)
+        local = gpd.read_file(result["diagnostics"], layer="local_seeds")
+        assembled = gpd.read_file(result["diagnostics"], layer="changes")
+        self.assertEqual(local.qa_state.tolist(), assembled.qa_state.tolist())
+        self.assertTrue({"confidence", "qa_state", "audit_reason"}.issubset(local.columns))
         self.assertTrue(gpd.read_file(result["road_changes"]).is_valid.all())
+
+    def test_empty_formal_result_still_publishes_funnel_and_audits(self):
+        from engine.fast_auto_change import finalize_auto_candidates
+        scenes = {period: self.scene([self.road(100)]) for period in ("before", "after")}
+        output = Path(self.tmp.name)/"empty_auto"
+        result = finalize_auto_candidates([], [], [], {}, presence_audit=[], scenes=scenes,
+                    centerlines=[scene.widths for scene in scenes.values()], output_dir=output,
+                    before_period="before", after_period="after")
+        self.assertEqual(result['changes_feature_count'], 0)
+        self.assertTrue(Path(result['candidate_funnel']).is_file())
+        self.assertTrue(gpd.read_file(result['diagnostics'],layer='candidate_audit').empty)
 
 
 if __name__ == "__main__":
