@@ -417,6 +417,9 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     seeds = candidate_audit.loc[candidate_audit.publication_state == 'accepted'].copy().reset_index(drop=True)
     changes, assembly = assemble_change_objects(seeds, centerlines[0], centerlines[1])
     changes = annotate_objects(changes, seeds, assembly["membership"])
+    from .auto_change_geometry import render_change_geometry
+    changes, geometry_audit = render_change_geometry(
+        changes, seeds, assembly, {side: scene.widths for side, scene in scenes.items()}, width_samples)
     assembly["change_objects"] = changes
     write_assembly_audit(output_dir, seeds, assembly)
     changes = changes.to_crs(output_crs)
@@ -427,6 +430,8 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     _, public_path = _write_fast_public_changes(changes, output_dir)
     gpkg = output_dir / "auto_diagnostics.gpkg"
     changes.to_file(gpkg, layer="changes", driver="GPKG")
+    for name, geometry_frame in geometry_audit.items():
+        geometry_frame.to_file(gpkg, layer=name, driver="GPKG")
     observation.to_file(gpkg, layer="existence_candidates", driver="GPKG")
     raw_candidates.to_file(gpkg, layer="input_candidates", driver="GPKG")
     candidate_audit.to_file(gpkg, layer="candidate_audit", driver="GPKG")

@@ -51,7 +51,7 @@ Road Probability 和 Valid Observation。没有变化真值参数，也不读取
 - 对期 absent 比例至少 90%，并存在至少 24 m 的连续明确负证据。
 - 源期路面支持要求局部覆盖至少 55%，且概率达到现有绝对阈值或场景百分位至少 75%。
 - 30 m 内同向 added／removed 候选覆盖超过本段 50% 且不少于 24 m 时，标为跨期轨迹歧义，进入待审。
-- 正式候选面裁到源期 Final Surface 和两期有效区内。证据不足、短小、边界及轨迹歧义候选保留原几何于待审层。
+- 候选审核仍计算与源期 Final Surface、两期有效区的交集，并保留原有面积判据；该交集只留在审核/组装输入诊断中，不作为正式 polygon。证据不足、短小、边界及轨迹歧义候选保留原几何于待审层。
 - 在 12 m 邻域中检查对期轴的方向、纵向重叠、侧向偏移稳定性及反向对应关系。
   稳定同路漂移进入 `same_road_displacement_rescue`；有更近源期平行轨道则记为 `cross_track_presence_ambiguity`。
   路口内变化若缺乏路口外至少 24 m 的连续支撑，进入 `junction_only_presence_change`。
@@ -92,6 +92,36 @@ runtime/env/samroad_env/python.exe code/tests/run_auto_precision_v2_review.py pr
 道路提取后处理保持原样，本轮不处理提取乱连；Auto 变化组装器也保持冻结。
 
 公共变化字段保持不变；增加辅助审计文件，不改项目 manifest 格式。
+
+### 正式变化几何
+
+`auto_change_geometry` 在 precision qualification 和冻结组装完成后生成正式 polygon。
+输入只有已批准对象/seed、原组装 axis/membership/bridge、最终宽度段和已保存的 paired width 剖面；
+不接收 Raw Surface、mask、probability 或真值，不重新执行变化判断和连接选择。
+
+- Added 使用 After Final Centerline 与同轨 Final Width；Removed 完全对称使用 Before。
+  宽度只从轴线附近 0.75 m 内方向一致的最终宽度段读取，防止取到另一车道。
+  无局部宽度的位置沿已有剖面插值；整段缺失时使用该 seed 已记录的宽度，覆盖率写入诊断。
+- Widened/Narrowed 沿原 canonical axis，使用保存的有效同符号 paired widths 平滑插值，
+  分别生成 After corridor − Before corridor、Before corridor − After corridor。
+  无可用剖面时使用原批准 run 的 before/after width，整个变化区间和审核状态保持不变。
+- 宽度采用约 4 m 采样、3 点中值与非超调高斯平滑；保留中心线原始折点、平端头和受限转角。
+  不用 polygon 平滑移动道路轴，不再与像素路面求交。
+- Bridge 沿冻结路径插值相邻 seed 两端宽度；零长度连接不另加方形鼓包。
+  组成面只 union 规则走廊，清理不超过 0.01 m² 的数值叠加残片/孔洞，保留真实道路环内部空间。
+
+`published_geometry_parts` 记录正式 seed/bridge 组成面及宽度来源，`published_width_profiles`
+记录渲染剖面。原 `local_seeds`、`candidate_audit`、`review_candidates` 和
+`network_assembly.gpkg` 中原 `assembly_bridges` 继续用于核对旧证据/连接；正式面为 `changes` / `change_objects`。
+
+只复跑已有真实区域的正式几何（输出目录必须是新目录）：
+
+```powershell
+runtime/env/samroad_env/python.exe code/tests/run_auto_geometry_review.py project/test_area/auto_precision_v2_20260906 project/test_area/auto_geometry_20260906_release
+```
+
+该脚本逐项比较候选、审核字段及组装连接，输出四类与 junction 对比图。
+本区域没有通过审核的 Narrowed 对象，因此其示例明确标为 review-only，不发布为正式变化。
 
 - `road_changes.shp` 和四类变化 shapefile：正式 Auto 结果。
 - `auto_diagnostics.gpkg`：正式变化、存在性证据单元、连续未覆盖区间、local seeds、宽度候选段。
