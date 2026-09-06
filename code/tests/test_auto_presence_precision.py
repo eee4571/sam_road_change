@@ -17,8 +17,9 @@ class PresencePrecisionTests(unittest.TestCase):
     crs = "EPSG:32650"
 
     def scene(self, lines):
+        from shapely.strtree import STRtree
         surface = union_all([line.buffer(4, cap_style="flat") for line in lines])
-        return SimpleNamespace(lines=lines, valid=box(-200, -200, 200, 200), surface=lambda axis: surface)
+        return SimpleNamespace(lines=lines,tree=STRtree(lines), valid=box(-200, -200, 200, 200), surface=lambda axis: surface)
 
     def fixture(self, entries):
         period_lines = {"before": [], "after": []}
@@ -113,6 +114,20 @@ class PresencePrecisionTests(unittest.TestCase):
         result = annotate_objects(objects, objects, pd.DataFrame())
         self.assertTrue(result.empty)
         self.assertTrue({'qa_state', 'confidence', 'audit_reason'}.issubset(result.columns))
+
+    def test_junction_only_and_short_nonjunction_have_distinct_reasons(self):
+        for junction in (False,True):
+            candidates,scenes,evidence=self.fixture([('added',LineString([(0,0),(12,0)]))])
+            evidence['junction']=junction
+            _,audit=qualify_presence_candidates(candidates,scenes,evidence)
+            self.assertEqual('junction_only_presence_change' in audit.precision_reason.iloc[0],junction)
+
+    def test_absence_needs_a_contiguous_negative_run(self):
+        candidates,scenes,evidence=self.fixture([('added',LineString([(0,0),(100,0)]))])
+        evidence.loc[evidence.index%5==4,'before_state']='uncertain'
+        _,audit=qualify_presence_candidates(candidates,scenes,evidence)
+        self.assertEqual(audit.publication_state.iloc[0],'review')
+        self.assertIn('opposite_absence_not_sustained',audit.precision_reason.iloc[0])
 
 
 if __name__ == "__main__":

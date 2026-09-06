@@ -155,7 +155,7 @@ def presence_seeds(axis, rows, source, coverage, kind, minimum_length, minimum_a
 class PresenceAcceptance:
     minimum_valid_ratio: float = .95
     minimum_source_support: float = .60
-    minimum_absent_ratio: float = .65
+    minimum_absent_ratio: float = .90
     opposing_corridor_ratio: float = .50
     opposing_corridor_distance_m: float = 30.
 
@@ -173,6 +173,7 @@ def qualify_presence_candidates(candidates, scenes, evidence, *, minimum_length=
     result["candidate_qa_state"] = result.qa_state
     result["publication_state"] = "accepted"
     result["precision_reason"] = "paired_width_unchanged"
+    from .auto_track_evidence import displacement_rescue, longest_run, nearby_opposite_support
     grouped = {(side, int(axis_id)): rows.sort_values("station_m")
                for (side, axis_id), rows in evidence.groupby(["side", "axis_id"])} if len(evidence) else {}
     axes = {}
@@ -186,7 +187,7 @@ def qualify_presence_candidates(candidates, scenes, evidence, *, minimum_length=
         reasons = []
         if rows is None or rows.empty:
             reasons.append("missing_source_evidence")
-            valid = support = absent = 0.
+            valid = support = absent = absence_run = nonjunction_run = junction_ratio = 0.
         else:
             spacing = source.lines[int(row.source_axis)].length/len(rows)
             weight = np.maximum(0., np.minimum(float(row.end_m), rows.station_m.to_numpy()+spacing/2)
@@ -200,15 +201,29 @@ def qualify_presence_candidates(candidates, scenes, evidence, *, minimum_length=
                          & ((rows[f"{side}_scene_percentile_rank"] >= .75) | rows[f"{side}_probability"].astype(bool)))
             support = mean(supported)
             absent = mean(rows[f"{other}_state"] == "absent")
+            absence_run = longest_run(rows[f"{other}_state"].eq('absent').to_numpy(),weight)
+            nonjunction_run = longest_run(~rows.junction.to_numpy(bool),weight)
+            junction_ratio = mean(rows.junction.to_numpy(bool))
         result.loc[index, "source_support_ratio"] = support
         result.loc[index, "opposite_absent_ratio"] = absent
         result.loc[index, "paired_valid_ratio"] = valid
+        result.loc[index, "opposite_absence_run_m"] = absence_run
+        result.loc[index, "nonjunction_run_m"] = nonjunction_run
         if valid < config.minimum_valid_ratio:
             reasons.append("incomplete_paired_observation")
         if support < config.minimum_source_support:
             reasons.append("source_road_not_corroborated")
-        if absent < config.minimum_absent_ratio:
+        if absent < config.minimum_absent_ratio or absence_run < minimum_length:
             reasons.append("opposite_absence_not_sustained")
+        if junction_ratio > 0. and nonjunction_run < minimum_length:
+            reasons.append("junction_only_presence_change")
+        displacement = displacement_rescue(axis,source,scenes[other])
+        for key,value in displacement.items():
+            result.loc[index,key] = value
+        if displacement['displacement_rescue']:
+            reasons.append('same_road_displacement_rescue')
+        elif displacement['displacement_track_ambiguous']:
+            reasons.append('cross_track_presence_ambiguity')
         if row.length_m < minimum_length or row.geometry.area < minimum_area:
             reasons.append("short_or_small_candidate")
         # The original uncut candidate remains in the review layer. Publication
@@ -217,6 +232,10 @@ def qualify_presence_candidates(candidates, scenes, evidence, *, minimum_length=
         clipped = clipped.intersection(source.valid).intersection(scenes[other].valid)
         if clipped.area < minimum_area:
             reasons.append("no_publishable_source_surface")
+        if not reasons:
+            nearby=nearby_opposite_support(axis,scenes[other],float(row.width_aft if side=='after' else row.width_bef))
+            for key,value in nearby.items(): result.loc[index,key]=value
+            if nearby['nearby_opposite_reason']: reasons.append(nearby['nearby_opposite_reason'])
         if reasons:
             result.loc[index, "publication_state"] = "review"
         else:

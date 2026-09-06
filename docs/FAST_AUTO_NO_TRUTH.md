@@ -48,16 +48,46 @@ Road Probability 和 Valid Observation。没有变化真值参数，也不读取
 纵向未覆盖区间仍作为原始候选保留。新增／灭失进入正式组装前，增加两期严格对称的审核：
 
 - 两期有效观测比例至少 95%，源期路面和概率共同支持比例至少 60%。
-- 对期 absent 比例至少 65%，连续长度满足默认 24 m 门限。
+- 对期 absent 比例至少 90%，并存在至少 24 m 的连续明确负证据。
 - 源期路面支持要求局部覆盖至少 55%，且概率达到现有绝对阈值或场景百分位至少 75%。
 - 30 m 内同向 added／removed 候选覆盖超过本段 50% 且不少于 24 m 时，标为跨期轨迹歧义，进入待审。
 - 正式候选面裁到源期 Final Surface 和两期有效区内。证据不足、短小、边界及轨迹歧义候选保留原几何于待审层。
+- 在 12 m 邻域中检查对期轴的方向、纵向重叠、侧向偏移稳定性及反向对应关系。
+  稳定同路漂移进入 `same_road_displacement_rescue`；有更近源期平行轨道则记为 `cross_track_presence_ambiguity`。
+  路口内变化若缺乏路口外至少 24 m 的连续支撑，进入 `junction_only_presence_change`。
+- 对仍可能发布的候选，沿同方向检查 ±3／6／9／12 m 的邻近走廊。即使对期缺少轴，
+  纵向持续 surface 或 probability 支持也会送入 review，不将轴位置上的低概率直接当作整条道路不存在。
 
 这些是保守发布规则，confidence 为规则评分，不是校准后的正确概率。待审不等于假变化，
 尤其是真实迁移道路及靠近原道路的新建道路可能被分入待审。未使用变化参考真值调参。
 
 `auto_diagnostics.gpkg` 新增 `input_candidates`、`candidate_audit`、`review_candidates`；
-`local_seeds` 为通过发布审核并进入冻结组装器的候选。宽度判定和 GT-assisted 不变。
+`local_seeds` 为通过发布审核并进入冻结组装器的候选。GT-assisted 不变。
+
+宽度候选使用独立的 `auto_width_precision`，不套用上述存在性审核：
+
+- 原 paired width 候选及其几何不变；复用同一个宽度测量函数复核约 4 m 间距的剖面。
+- 检查互相对应、方向、横截面内平行轨道冲突以及两期中心位置互换时的测量稳定性。
+- 正负号至少 90% 一致；有效样本至少 90%；至少 85% 样本持续超过 2 m／20% 的宽差，
+  且路口和端部以外存在至少 32 m 的连续变化。
+- 宽差须超过 `2.5 × max(pixel uncertainty, measurement uncertainty, local width variation) + 0.25 m`。
+  局部波动使用宽度及宽差的稳健 MAD，不能通过增加采样数量使其人为缩小。
+- 法线 ±5°、互换中心位置、surface/probability 差异提示几何或测量敏感时进入 review。
+- 同一 before track 上相距不超过 24 m、至少一个不长于 80 m 的异号变化段，进入交替宽差审核。
+
+`width_precision_candidates` 保存独立 `width_qa_state=accepted/review`；
+`width_precision_samples` 保存逐站配对、偏移、置信度与几何检查结果。
+全部宽度候选继续保留在原始 diagnostics 和新的 review 图层。道路 Width 主流程未修改。
+
+本轮真实区域对照：
+
+```powershell
+runtime/env/samroad_env/python.exe code/tests/run_auto_precision_v2_review.py project/test_area/auto_precision_20260906 project/test_area/auto_precision_v2_20260906
+```
+
+此命令只复用缓存候选、存在性观测和两期原 Final 产品，不重新提取道路或读取真值。
+报告包括四类前后正式结果、review 原因、典型转待审候选和宽度剖面。宽度审核较保守，
+应先检查真实结果再决定是否调松；review 并不是对道路真假或宽度变化真假的最终结论。
 
 道路提取后处理保持原样，本轮不处理提取乱连；Auto 变化组装器也保持冻结。
 

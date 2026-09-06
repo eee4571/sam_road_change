@@ -378,14 +378,14 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
             relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
             minimum_area=float(min_change_area), presence_audit=presence_audit)
+        return finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
+                                        scenes=dict(zip(("before", "after"), scenes)), centerlines=centerlines,
+                                        output_dir=output_dir, before_period=before_period, after_period=after_period,
+                                        position_tolerance=position_tolerance, min_change_area=min_change_area,
+                                        min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started)
     finally:
         for scene in scenes:
             scene.probability.close()
-    return finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
-                                    scenes=dict(zip(("before", "after"), scenes)), centerlines=centerlines,
-                                    output_dir=output_dir, before_period=before_period, after_period=after_period,
-                                    position_tolerance=position_tolerance, min_change_area=min_change_area,
-                                    min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started)
 
 
 def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_audit, scenes, centerlines,
@@ -411,6 +411,10 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     seeds, candidate_audit = qualify_presence_candidates(raw_candidates, scenes, observation,
                                 minimum_length=24. if min_change_length is None else float(min_change_length),
                                 minimum_area=float(min_change_area))
+    from .auto_width_precision import qualify_width_candidates
+    candidate_audit, width_samples = qualify_width_candidates(candidate_audit, scenes,
+                                minimum_length=24. if min_change_length is None else float(min_change_length))
+    seeds = candidate_audit.loc[candidate_audit.publication_state == 'accepted'].copy().reset_index(drop=True)
     changes, assembly = assemble_change_objects(seeds, centerlines[0], centerlines[1])
     changes = annotate_objects(changes, seeds, assembly["membership"])
     assembly["change_objects"] = changes
@@ -430,6 +434,9 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     frame(presence_audit).to_file(gpkg, layer="presence_intervals", driver="GPKG")
     seeds.to_file(gpkg, layer="local_seeds", driver="GPKG")
     frame(width_audit).to_file(gpkg, layer="width_candidates", driver="GPKG")
+    frame(width_samples).to_file(gpkg, layer="width_precision_samples", driver="GPKG")
+    candidate_audit.loc[candidate_audit.change_typ.isin(['widened','narrowed'])].to_file(
+        gpkg, layer="width_precision_candidates", driver="GPKG")
     layers = {"changes": str(public_path)}
     names = {"added": "added_roads.shp", "removed": "removed_roads.shp",
              "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp"}
@@ -472,6 +479,19 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
         funnel[kind]["review_candidate_count"] = int((qa.publication_state == "review").sum())
         funnel[kind]["precision_reason_counts"] = dict(Counter(reason for reasons in qa.precision_reason for reason in reasons.split(";")))
     funnel["network_assembly"] = assembly["summary"]
+    funnel['publication_review'] = {}
+    for kind in ('added','removed','widened','narrowed'):
+        rows = candidate_audit.loc[candidate_audit.change_typ == kind]
+        review = rows.loc[rows.publication_state == 'review']
+        funnel['publication_review'][kind] = dict(raw_candidates=len(rows),
+            accepted_seeds=int(rows.publication_state.eq('accepted').sum()),review_candidates=len(review),
+            review_reason_counts=dict(Counter(reason for reasons in review.precision_reason for reason in reasons.split(';')
+                                              if reason not in ('stable_paired_width_profile','corroborated_source_and_sustained_absence'))))
+        if kind in ('widened','narrowed'):
+            for reason in ('cross_track_width_match','unstable_width_profile','insufficient_sustained_width_change',
+                           'junction_width_instability','road_end_width_instability','centerline_offset_measurement_bias',
+                           'surface_geometry_disagreement','uncertainty_not_clearly_exceeded','alternating_width_change_signs'):
+                funnel['publication_review'][kind]['review_reason_counts'].setdefault(reason,0)
     funnel["assembly_rejection_counts"] = (assembly["decisions"].loc[~assembly["decisions"].accepted, "reason"].value_counts().to_dict()
                                              if len(assembly["decisions"]) else {})
     funnel["count_units"] += "; assembled final: network objects"
