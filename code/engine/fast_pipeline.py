@@ -6607,6 +6607,35 @@ def detect_fast_changes(
     min_change_length: float | None = None,
     internal_outputs: bool = False,
 ) -> dict:
+    """No-truth Auto, using final products and symmetric road evidence."""
+    from .fast_auto_change import detect_final_road_changes
+
+    return detect_final_road_changes(
+        before_result, after_result, output_dir,
+        before_period=before_period, after_period=after_period,
+        position_tolerance=position_tolerance,
+        width_change_absolute=width_change_absolute,
+        width_change_ratio=width_change_ratio,
+        min_change_area=min_change_area,
+        min_change_length=min_change_length,
+        internal_outputs=internal_outputs,
+    )
+
+
+def detect_fast_changes_gt_baseline(
+    before_result: Path | dict,
+    after_result: Path | dict,
+    output_dir: Path,
+    *,
+    before_period: str = "before",
+    after_period: str = "after",
+    position_tolerance: float = 3.0,
+    width_change_absolute: float = 2.0,
+    width_change_ratio: float = 0.2,
+    min_change_area: float = FAST_CHANGE_MIN_AREA_M2,
+    min_change_length: float | None = None,
+    internal_outputs: bool = False,
+) -> dict:
     """Detect no-truth Fast changes tile by tile from extraction intermediates."""
     total_started = time.perf_counter()
     before_payload = _load_fast_period_result(before_result)

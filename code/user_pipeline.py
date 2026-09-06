@@ -393,14 +393,16 @@ def _run_fast_change_result(
     truth_type_field: str = "BHBM",
     evaluation_tolerance: float = 5.0,
 ) -> dict:
-    """Run the sole Fast auto detector, then optionally publish Auto∪GT."""
+    """Run no-truth Auto or the preserved GT-assisted baseline and augmentation."""
     from engine.fast_pipeline import (
         augment_fast_changes_with_truth,
         detect_fast_changes,
+        detect_fast_changes_gt_baseline,
     )
 
     automatic_output = output / "_automatic" if truth_path is not None else output
-    automatic = detect_fast_changes(
+    detector = detect_fast_changes if truth_path is None else detect_fast_changes_gt_baseline
+    automatic = detector(
         before_result,
         after_result,
         automatic_output,

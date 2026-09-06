@@ -527,7 +527,8 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             automatic = {"output": str(output / "_automatic")}
             final = {"output": str(output), "change_source": "fast_automatic_gt_augmented"}
             with (
-                patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
+                patch("engine.fast_pipeline.detect_fast_changes_gt_baseline", return_value=automatic) as detect_mock,
+                patch("engine.fast_pipeline.detect_fast_changes") as no_truth_mock,
                 patch("engine.fast_pipeline.augment_fast_changes_with_truth", return_value=final) as augment_mock,
                 patch("engine.fast_pipeline.build_fast_change_from_truth") as legacy_mock,
             ):
@@ -544,6 +545,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, final)
+            no_truth_mock.assert_not_called()
             self.assertEqual(detect_mock.call_args.args[2], output / "_automatic")
             augment_mock.assert_called_once()
             self.assertEqual(augment_mock.call_args.args[:3], (automatic, truth, output))

@@ -33,7 +33,7 @@ from engine.fast_pipeline import (
     build_fast_change_from_truth,
     build_fast_surface_mask,
     build_fast_surfaces,
-    detect_fast_changes,
+    detect_fast_changes_gt_baseline as detect_fast_changes,
     export_fast_products,
     measure_fast_edge_widths,
     measure_fast_path_widths,
@@ -2174,7 +2174,11 @@ class FastTruthChangeTests(unittest.TestCase):
         self.assertTrue((split["source"] == "fast_automatic").all())
 
 
-class FastAutomaticChangeTests(unittest.TestCase):
+class FastAssistedBaselineChangeTests(unittest.TestCase):
+    """Freeze the pre-existing detector used inside GT-assisted.
+
+    Final-product no-truth Auto has its own tests in test_fast_auto_change.py.
+    """
     transform = from_origin(0, 240, 1, 1)
 
     def _write_period(
