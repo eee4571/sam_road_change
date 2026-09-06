@@ -338,7 +338,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                     if geometry.area >= minimum_area:
                         records.append({"change_typ": kind, "width_bef": width if kind == "removed" else 0.,
                                         "width_aft": width if kind == "added" else 0., "width_diff": 0.,
-                                        "length_m": run_axis.length, "geometry": geometry})
+                                        "length_m": run_axis.length, "axis_wkt": run_axis.wkt, "geometry": geometry})
             audit.extend(station_rows)
             if side == "before" and len(samples) >= 2:
                 # Stations follow the before road; paired points define a shared local axis.
@@ -371,7 +371,8 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                         if geometry.area >= minimum_area:
                             records.append({"change_typ": "widened" if run.sign > 0 else "narrowed",
                                             "width_bef": run.before_width, "width_aft": run.after_width,
-                                            "width_diff": run.width_diff, "length_m": run.axis.length, "geometry": geometry})
+                                            "width_diff": run.width_diff, "length_m": run.axis.length,
+                                            "axis_wkt": canonical.wkt, "geometry": geometry})
                 # Include profiles with no threshold run so rejection is visible.
                 if not runs:
                     width_audit.append({"axis_id": line_id, "accepted": False,
@@ -413,7 +414,11 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     def frame(rows):
         return (gpd.GeoDataFrame(rows, geometry="geometry", crs=metric_crs) if rows else
                 gpd.GeoDataFrame({"change_typ": pd.Series(dtype=str)}, geometry=[], crs=metric_crs))
-    changes = frame(records).to_crs(output_crs)
+    from .auto_change_assembly import assemble_change_objects, write_assembly_audit
+    seeds = frame(records)
+    changes, assembly = assemble_change_objects(seeds, centerlines[0], centerlines[1])
+    write_assembly_audit(output_dir, seeds, assembly)
+    changes = changes.to_crs(output_crs)
     # Reprojection of touching width ribbons can create sub-pixel ring
     # intersections. Keep only valid polygon components for GIS publication.
     changes.geometry = changes.geometry.map(lambda g: union_all(_fast_polygon_parts(g, min_area=0.)))
@@ -453,6 +458,8 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
             funnel[kind]["existence_pass"] = int(candidates.existence_pass.sum())
             funnel[kind]["continuity_pass"] = int(candidates.get("continuity_pass", pd.Series(dtype=bool)).eq(True).sum())
         funnel[kind]["final_auto_count"] = counts[f"final_{kind}"]
+    funnel["network_assembly"] = assembly["summary"]
+    funnel["count_units"] += "; assembled final: network objects"
     (output_dir/"candidate_funnel.json").write_text(json.dumps(funnel, indent=2, ensure_ascii=False), encoding="utf-8")
     return complete_written_auto_result(output_dir, before_period=before_period, after_period=after_period,
                                         min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started)
@@ -481,6 +488,8 @@ def complete_written_auto_result(output_dir, *, before_period, after_period, min
                "changes_feature_count": len(changes), **{f"{k}_feature_count": int((changes.change_typ == k).sum()) for k in names},
                "candidate_funnel": str(output_dir/"candidate_funnel.json"), "diagnostics": str(gpkg),
                "auto_change_total_seconds": elapsed_seconds+time.perf_counter()-started if elapsed_seconds is not None else None}
+    if (output_dir/"assembly_summary.json").is_file():
+        summary["network_assembly"] = str(output_dir/"assembly_summary.json")
     summary_path = output_dir/"change_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"output": str(output_dir), "summary": str(summary_path), "road_changes": str(public_path),
