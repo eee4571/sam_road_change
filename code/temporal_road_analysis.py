@@ -110,13 +110,14 @@ def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
                 "part_idx": int(part_index),
                 "width_m": _numeric(row, WIDTH_FIELDS, 0.0),
                 "extract_cf": _numeric(row, CONF_FIELDS, 0.0),
+                "track_id": str(row.get("track_id") or "") if pd.notna(row.get("track_id")) else "",
                 "geometry": geometry,
             })
-    result = gpd.GeoDataFrame(rows, geometry="geometry", crs=frame.crs)
+    result = gpd.GeoDataFrame(rows, geometry="geometry", crs=frame.crs) if rows else gpd.GeoDataFrame(geometry=[], crs=frame.crs)
     if result.empty:
         return gpd.GeoDataFrame(
             {"source_fid": pd.Series(dtype="str"), "part_idx": pd.Series(dtype="int64"),
-             "width_m": pd.Series(dtype="float64"), "extract_cf": pd.Series(dtype="float64")},
+             "width_m": pd.Series(dtype="float64"), "extract_cf": pd.Series(dtype="float64"), "track_id": pd.Series(dtype="str")},
             geometry=gpd.GeoSeries([], crs=frame.crs), crs=frame.crs,
         )
     result["_sort"] = result.geometry.map(
@@ -202,10 +203,12 @@ def _build_reference(period_frames: dict[str, gpd.GeoDataFrame], tolerance: floa
             )
             matched = index is not None and score >= 0.48 and overlap >= 0.35
             if not matched and new_geometries:
-                local_scores = [(_line_score(geometry, candidate, tolerance), idx) for idx, candidate in enumerate(new_geometries)]
-                local_scores.sort(key=lambda item: item[0][0], reverse=True)
-                if local_scores and local_scores[0][0][0] >= 0.48 and local_scores[0][0][1] >= 0.35:
-                    matched = True
+                # Outside tolerance the overlap is zero and the maximum score
+                # is .20, below .48. Spatial pruning preserves the old decision
+                # exactly while avoiding a quadratic all-road buffer workload.
+                local_tree=STRtree(np.asarray(new_geometries,dtype=object))
+                local_index,local_score,local_overlap,_,_=_best_match(geometry,new_geometries,local_tree,tolerance)
+                matched=local_index is not None and local_score>=.48 and local_overlap>=.35
             if matched:
                 continue
             item = {"geometry": geometry, "born_period": period}
@@ -402,6 +405,37 @@ def _events(observations: list[dict], periods: list[str], absolute: float, ratio
     return events
 
 
+def _reconciled_tracks(period_entries, period_frames, analysis_crs):
+    """Read explicit reconciled identities, verifying them against period roads.
+
+    A state table cannot invent presence or disappearance: matching track IDs
+    must physically exist (or be absent) in that period's centerline product.
+    """
+    if not all(entry.get('road_state') for entry in period_entries):
+        return [], []
+    states={str(entry['period']):gpd.read_file(entry['road_state'],layer='road_state').to_crs(analysis_crs)
+            for entry in period_entries}
+    track_ids=sorted({str(t) for frame in states.values() for t in frame.track_id})
+    references=[];observations=[]
+    for track_id in track_ids:
+        first=next(frame.loc[frame.track_id==track_id].iloc[0] for frame in states.values() if frame.track_id.eq(track_id).any())
+        references.append(dict(road_id=track_id,born_period=next(iter(states)),geometry=first.geometry))
+        for period,state in states.items():
+            rows=state.loc[state.track_id==track_id]
+            if len(rows)!=1:raise ValueError(f'Reconciled road state incomplete: {track_id}/{period}')
+            row=rows.iloc[0]; roads=period_frames[period]
+            actual=roads.loc[roads.track_id==track_id]
+            present=row.status=='present'
+            if present != (not actual.empty):raise ValueError(f'Road state contradicts period centerline: {track_id}/{period}')
+            width=float(np.average(actual.width_m,weights=actual.length)) if present else np.nan
+            if present and abs(width-float(row.width_m))>.05:raise ValueError(f'Road state width contradicts final width: {track_id}/{period}')
+            observations.append(dict(road_id=track_id,period=period,status=row.status,width_m=width,
+                length_m=float(row.geometry.length) if present else 0.,coverage=1. if present else 0.,match_sc=1.,extract_cf=.95,
+                geom_dev_m=0.,source_fid=','.join(actual.source_fid),qa_state='gt_assisted',qa_reason='verified_reconciled_period_state',
+                dir_sim=1.,geometry=row.geometry))
+    return references,observations
+
+
 def _field_name(prefix: str, period: str, used: set[str]) -> str:
     token = "".join(ch for ch in str(period) if ch.isalnum()).upper() or "P"
     base = (prefix + token)[-10:]
@@ -506,7 +540,12 @@ def _event_parts(
                 support = float(reference.intersection(geometry.buffer(tolerance)).length)
                 ranked.append((support, -float(reference.distance(probe)), index))
             road_id = ""
-            if ranked:
+            explicit_track=str(source.get('track_id') or '')
+            explicit_index=next((i for i,r in enumerate(references) if r['road_id']==explicit_track),None)
+            if explicit_index is not None:
+                ref_index=explicit_index
+                road_id=explicit_track
+            elif ranked:
                 _support, _distance, ref_index = max(ranked)
                 road_id = references[ref_index]["road_id"]
             event_type = str(source.get("change_typ", ""))
@@ -602,12 +641,16 @@ def build_temporal_grid(
         for entry, path in zip(period_entries, paths)
     }
     periods = list(period_frames)
-    references = _build_reference(period_frames, tolerance)
+    reconciled_refs,reconciled_obs=_reconciled_tracks(period_entries,period_frames,analysis_crs)
+    untracked_frames=({p:f.loc[f.track_id.eq('')].copy() for p,f in period_frames.items()} if reconciled_refs else period_frames)
+    references = _build_reference(untracked_frames, tolerance)
+    references.extend(reconciled_refs)
     if not references:
         raise ValueError(f"{grid_name} 的所有期次均没有有效道路中心线")
     output_dir = Path(output_dir).resolve()
     _assign_road_ids(references, output_dir / "road_life.shp", analysis_crs, tolerance)
-    observations = _observations(references, period_frames, tolerance)
+    observations = _observations([r for r in references if not str(r['road_id']).startswith('RC')],untracked_frames,tolerance)
+    observations.extend(reconciled_obs)
     events = _events(observations, periods, width_absolute, width_ratio)
     event_parts = _event_parts(change_entries, references, events, analysis_crs, tolerance)
     _apply_event_evidence(events, event_parts, bool(change_entries))
@@ -653,6 +696,8 @@ def build_temporal_grid(
         "road_id": "str", "period": "str", "reason": "str", "match_sc": "float64",
         "coverage": "float64", "qa_state": "str",
     }, analysis_crs, "LineString")
+    pd.DataFrame([{k:v for k,v in row.items() if k!='geometry'} for row in observations]).to_csv(
+        output_dir/'width_evolution.csv',index=False,encoding='utf-8-sig')
 
     if output_crs is not None and output_crs != analysis_crs:
         for name in ("road_life.shp", "road_obs.shp", "road_event.shp", "event_parts.shp", "road_lineage.shp", "road_review.shp"):
@@ -669,6 +714,7 @@ def build_temporal_grid(
         "event_parts_shp": str(output_dir / "event_parts.shp"),
         "lineage_shp": str(output_dir / "road_lineage.shp"),
         "review_shp": str(output_dir / "road_review.shp"),
+        "width_evolution": str(output_dir / "width_evolution.csv"),
         "period_count": len(periods), "road_count": len(references),
         "observation_count": len(observations), "event_count": len(events),
         "review_count": len(reviews),

@@ -498,6 +498,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             with (
                 patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
                 patch("engine.fast_pipeline.augment_fast_changes_with_truth") as augment_mock,
+                patch("engine.fast_gt_reconciliation.complete_auto_pair_temporal",return_value=automatic) as temporal_mock,
             ):
                 result = user_pipeline._run_fast_change_result(
                     root / "before.json",
@@ -513,6 +514,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             self.assertEqual(result, automatic)
             self.assertEqual(detect_mock.call_args.args[2], output)
             augment_mock.assert_not_called()
+            temporal_mock.assert_called_once()
 
     def test_fast_truth_runs_auto_then_augmentation_without_legacy_builder(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -527,8 +529,8 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             automatic = {"output": str(output / "_automatic")}
             final = {"output": str(output), "change_source": "fast_automatic_gt_augmented"}
             with (
-                patch("engine.fast_pipeline.detect_fast_changes_gt_baseline", return_value=automatic) as detect_mock,
-                patch("engine.fast_pipeline.detect_fast_changes") as no_truth_mock,
+                patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
+                patch("engine.fast_pipeline.detect_fast_changes_gt_baseline") as legacy_detector_mock,
                 patch("engine.fast_pipeline.augment_fast_changes_with_truth", return_value=final) as augment_mock,
                 patch("engine.fast_pipeline.build_fast_change_from_truth") as legacy_mock,
             ):
@@ -545,7 +547,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, final)
-            no_truth_mock.assert_not_called()
+            legacy_detector_mock.assert_not_called()
             self.assertEqual(detect_mock.call_args.args[2], output / "_automatic")
             augment_mock.assert_called_once()
             self.assertEqual(augment_mock.call_args.args[:3], (automatic, truth, output))

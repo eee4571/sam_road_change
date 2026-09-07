@@ -393,16 +393,14 @@ def _run_fast_change_result(
     truth_type_field: str = "BHBM",
     evaluation_tolerance: float = 5.0,
 ) -> dict:
-    """Run no-truth Auto or the preserved GT-assisted baseline and augmentation."""
+    """Finish the independent Auto detector before any GT reconciliation."""
     from engine.fast_pipeline import (
         augment_fast_changes_with_truth,
         detect_fast_changes,
-        detect_fast_changes_gt_baseline,
     )
 
     automatic_output = output / "_automatic" if truth_path is not None else output
-    detector = detect_fast_changes if truth_path is None else detect_fast_changes_gt_baseline
-    automatic = detector(
+    automatic = detect_fast_changes(
         before_result,
         after_result,
         automatic_output,
@@ -414,7 +412,8 @@ def _run_fast_change_result(
         internal_outputs=truth_path is not None,
     )
     if truth_path is None:
-        return automatic
+        from engine.fast_gt_reconciliation import complete_auto_pair_temporal
+        return complete_auto_pair_temporal(automatic,before_result,after_result,before_period,after_period)
     truth_path = Path(truth_path).expanduser()
     if not truth_path.is_file():
         raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
@@ -1491,11 +1490,17 @@ def change_project_periods(args: argparse.Namespace) -> dict:
             kind: {"feature_count": int(summary_data.get(f"{kind}_feature_count", 0) or 0), "length_m": float(summary_data.get(f"{kind}_length_m", 0) or 0), "area_m2": float(summary_data.get(f"{kind}_area_m2", 0) or 0)}
             for kind in ("added", "removed", "widened", "narrowed")
         }
-        published = ResultPublisher(
+        publisher = ResultPublisher(
             output_root, project_root=discovered["project_root"],
-        ).publish_change(
+        )
+        published = publisher.publish_change(
             args.area_id, args.before_period, args.after_period, result, run_id=args.run_id,
         )
+        for period in result.get('gt_assisted_period_results',[]):
+            publisher.publish_period(args.area_id,period['period'],period)
+        for field,variant in (('auto_temporal','auto'),('gt_assisted_temporal','gt_assisted')):
+            if isinstance(result.get(field),dict):
+                publisher.publish_temporal(args.area_id,{**result[field],'product_variant':variant})
         if published:
             result["published"] = published
         state.update({"status": "completed", "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
@@ -2984,6 +2989,8 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     ).expanduser().resolve()
     summary = read_json(summary_path) if summary_path.is_file() else {}
     is_fast_gt_assisted = (
+        str(entry.get('product_variant') or summary.get('product_variant') or '') == 'gt_assisted'
+        or (
         str(
             entry.get("detection_source")
             or summary.get("detection_source")
@@ -2994,6 +3001,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             or summary.get("ground_truth_usage")
             or ""
         ) == "augment_auto_misses_with_perturbed_geometry"
+        )
     )
     truth_path = Path(args.truth).expanduser().resolve()
     if not truth_path.is_file():
@@ -3095,20 +3103,19 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
         }
-        image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(
-            manifest, entry, summary,
-        )
-        rows[0].update(evaluate_fast_assisted_centerline_metrics(
-            predicted,
-            truth,
-            truth_type_field=evaluation_truth_type_field,
-            image_crs=image_crs,
-            image_transform=image_transform,
-            image_shape=image_shape,
-            validation_area=validation,
-        ))
-        metadata["fast_assisted_centerline_metrics"] = True
-        metadata["centerline_offset_unit"] = "px"
+        if str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted':
+            image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(
+                manifest, entry, summary,
+            )
+            rows[0].update(evaluate_fast_assisted_centerline_metrics(
+                predicted,truth,truth_type_field=evaluation_truth_type_field,
+                image_crs=image_crs,image_transform=image_transform,image_shape=image_shape,validation_area=validation,
+            ))
+            metadata["fast_assisted_centerline_metrics"] = True
+            metadata["centerline_offset_unit"] = "px"
+        else:
+            metadata['geometry_source']='regular_axis_width_corridors'
+            metadata['centerline_offset_unit']='m'
 
     for row in rows:
         if row.get("class") == "all":
@@ -4466,11 +4473,8 @@ def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tup
 
 def _refresh_manifest_downstream(manifest: dict) -> None:
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
-    if str(manifest.get("execution_profile") or "full") == "fast":
-        manifest["temporal_results"] = []
-        manifest["temporal_status"] = "skipped_fast_profile"
-    else:
-        manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+    manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+    manifest["temporal_status"] = "completed"
     aggregate_change_evaluations(manifest, job_root)
     manifest["downstream_updated_at"] = now_text()
 
@@ -4801,6 +4805,9 @@ def build_temporal_outputs(manifest: dict, job_root: Path | None = None) -> list
     from temporal_road_analysis import build_from_manifest
 
     target = Path(job_root or manifest.get("job_root") or ".").expanduser().resolve()
+    if str(manifest.get('execution_profile') or 'full') == 'fast':
+        from engine.fast_gt_reconciliation import build_fast_temporal_outputs
+        return build_fast_temporal_outputs(manifest,target)
     return build_from_manifest(manifest, target)
 
 
@@ -5423,32 +5430,29 @@ def run_all(args: argparse.Namespace) -> dict:
 
         manifest["period_count"] = len(manifest["period_results"])
         manifest["change_count"] = len(manifest["change_results"])
-        if execution_profile == "fast":
-            manifest["temporal_results"] = []
-            manifest["temporal_status"] = "skipped_fast_profile"
-        else:
-            temporal_started = time.monotonic()
+        temporal_started = time.monotonic()
+        emit(
+            "pipeline", stage="长时序道路汇总", status="running",
+            completed=total_work, total=total_work,
+        )
+        if reuse_completed_downstream:
+            manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
             emit(
-                "pipeline", stage="长时序道路汇总", status="running",
-                completed=total_work, total=total_work,
-            )
-            if reuse_completed_downstream:
-                manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
-                emit(
-                    "pipeline", stage="长时序道路汇总", status="skipped",
-                    reason="续跑复用已完成且完整的长时序成果",
-                    temporal_grid_count=len(manifest["temporal_results"]),
-                    completed=total_work, total=total_work,
-                )
-            else:
-                manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
-                for entry in manifest["temporal_results"]:
-                    entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
-            emit(
-                "pipeline", stage="长时序道路汇总", status="complete",
+                "pipeline", stage="长时序道路汇总", status="skipped",
+                reason="续跑复用已完成且完整的长时序成果",
                 temporal_grid_count=len(manifest["temporal_results"]),
                 completed=total_work, total=total_work,
             )
+        else:
+            manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
+            for entry in manifest["temporal_results"]:
+                entry["elapsed_seconds"] = elapsed_seconds(temporal_started)
+        emit(
+            "pipeline", stage="长时序道路汇总", status="complete",
+            temporal_grid_count=len(manifest["temporal_results"]),
+            completed=total_work, total=total_work,
+        )
+        manifest["temporal_status"] = "completed"
         manifest["completed_at"] = now_text()
         manifest["status"] = "completed_with_errors" if manifest["failures"] else "completed"
         update_elapsed()

@@ -294,11 +294,15 @@ class ResultPublisher:
         target = (
             self.layout.results_root / safe_name(area) / "01_单期道路" / safe_name(period)
         )
+        variant = result.get('product_variant')
+        if variant == 'gt_assisted':
+            target = target / 'GT-assisted'
         published = self._copy_fields(result, target, (
             ("centerlines", "road_centerlines.shp"),
             ("surfaces", "road_surfaces.shp"),
             ("width_segments", "road_width_segments.shp"),
             ("corridors", "road_corridors.shp"),
+            ("road_state", "road_state.gpkg"),
         ), base_dir=base_dir)
         previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
         extraction_preview = result.get("road_extraction")
@@ -329,10 +333,14 @@ class ResultPublisher:
                 if key not in published:
                     (target / filename).unlink(missing_ok=True)
         if published:
-            self._area(area)["periods"][str(period)] = {
+            record = {
                 **published, "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
+            if variant == 'gt_assisted':
+                self._area(area)['periods'].setdefault(str(period),{}).setdefault('variants',{})['gt_assisted']=record
+            else:
+                self._area(area)['periods'][str(period)]=record
             if save:
                 self._save()
         return published
@@ -343,6 +351,11 @@ class ResultPublisher:
     ) -> dict[str, str]:
         pair = f"{safe_name(before)}_to_{safe_name(after)}"
         target = self.layout.results_root / safe_name(area) / "02_变化检测" / pair
+        variant = result.get('product_variant')
+        if variant:
+            target = target / ('GT-assisted' if variant == 'gt_assisted' else 'Auto')
+        if isinstance(result.get('automatic'),dict):
+            self.publish_change(area,before,after,{**result['automatic'],'product_variant':'auto'},save=False)
         layers = dict(result.get("layers") or {})
         layers.setdefault("changes", result.get("road_changes"))
         fast_profile = str(result.get("execution_profile") or "").casefold() == "fast"
@@ -386,10 +399,12 @@ class ResultPublisher:
         if "review_change" not in published:
             (target / "review_change.png").unlink(missing_ok=True)
         if published:
+            prior = self._area(area)['changes'].get(f'{before}_to_{after}',{})
             self._area(area)["changes"][f"{before}_to_{after}"] = {
                 **published, "before_period": str(before), "after_period": str(after),
                 "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **({'variants':{**prior.get('variants',{}),variant:published}} if variant else {}),
             }
             if save:
                 self._save()
@@ -400,6 +415,8 @@ class ResultPublisher:
         save: bool = True,
     ) -> dict[str, str]:
         target = self.layout.results_root / safe_name(area) / "03_长时序"
+        variant=result.get('product_variant')
+        if variant:target=target/('GT-assisted' if variant=='gt_assisted' else 'Auto')
         published = self._copy_fields(result, target, (
             ("life_shp", "road_life.shp"),
             ("observations_shp", "road_obs.shp"),
@@ -407,11 +424,14 @@ class ResultPublisher:
             ("event_parts_shp", "event_parts.shp"),
             ("lineage_shp", "road_lineage.shp"),
             ("review_shp", "road_review.shp"),
+            ("width_evolution", "width_evolution.csv"),
         ), base_dir=base_dir)
         if published:
+            prior=self._area(area).get('temporal',{})
             self._area(area)["temporal"] = {
                 **published, "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **({'variants':{**prior.get('variants',{}),variant:published}} if variant else {}),
             }
             if save:
                 self._save()
@@ -452,7 +472,7 @@ class ResultPublisher:
         self, manifest: dict, *, source_manifest: Path | str | None = None,
     ) -> dict:
         run_id = manifest.get("run_id", "")
-        for entry in manifest.get("period_results", []) or []:
+        for entry in [*(manifest.get("period_results", []) or []), *(manifest.get('gt_assisted_period_results',[]) or [])]:
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_period(
                     entry.get("grid"), entry.get("period"), entry,
@@ -460,7 +480,7 @@ class ResultPublisher:
                 )
                 if published:
                     entry["published"] = published
-        for entry in manifest.get("change_results", []) or []:
+        for entry in [*(manifest.get("change_results", []) or []), *(manifest.get('gt_assisted_change_results',[]) or [])]:
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_change(
                     entry.get("grid"), entry.get("before_period"), entry.get("after_period"),
@@ -468,7 +488,7 @@ class ResultPublisher:
                 )
                 if published:
                     entry["published"] = published
-        for entry in manifest.get("temporal_results", []) or []:
+        for entry in [*(manifest.get('auto_temporal_results',[]) or []), *(manifest.get("temporal_results", []) or [])]:
             if isinstance(entry, dict):
                 published = self.publish_temporal(entry.get("grid"), entry, save=False)
                 if published:

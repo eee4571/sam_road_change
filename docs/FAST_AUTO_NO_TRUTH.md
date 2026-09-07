@@ -7,11 +7,10 @@
 Road Probability 和 Valid Observation。没有变化真值参数，也不读取真值文件。
 不重跑或改变道路提取、连接、平滑、道路面生成和测宽。
 
-有真值的 Fast GT-assisted 入口继续使用原检测函数
-`detect_fast_changes_gt_baseline`，随后执行原 `augment_fast_changes_with_truth`。
-原检测函数只改名，函数体和被调用函数不变。
-`GT_ASSISTED_RESULT_MODE`、`gt_assisted_result.py` 和 standard 检测链不变。
-两条路线分别保留回归测试，避免优化 Auto 时影响 GT-assisted。
+Fast GT-assisted 也先执行上述独立 Auto 检测，完成后才读取 GT。
+随后生成独立修正变化、协调两期期次道路，并重建 GT-assisted 长时序；
+原 Auto 道路和变化保留。完整流程见 [Fast GT-assisted 依赖链](FAST_GT_ASSISTED_CHAIN.md)。
+本文件下述内容描述 Auto 检测，不把 GT 作为候选或审核证据。
 
 ## 本轮 Auto 行为
 
