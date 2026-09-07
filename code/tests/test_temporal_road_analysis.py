@@ -72,7 +72,7 @@ class TemporalRoadAnalysisTests(unittest.TestCase):
             second_ids = gpd.read_file(output / "road_life.shp").sort_values("road_id")["road_id"].tolist()
             self.assertEqual(first_ids, second_ids)
 
-    def test_single_period_dropout_is_marked_uncertain(self) -> None:
+    def test_single_period_dropout_keeps_state_and_records_internal_qa(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             road_a = LineString([(0, 0), (100, 0)])
@@ -90,11 +90,15 @@ class TemporalRoadAnalysisTests(unittest.TestCase):
             output = root / "temporal"
             temporal_road_analysis.build_temporal_grid("g", entries, [], output)
             observations = gpd.read_file(output / "road_obs.shp")
-            uncertain = observations.loc[observations["status"] == "uncertain"]
+            uncertain = observations.loc[observations["qa_state"] == "low_confidence"]
             self.assertEqual(len(uncertain), 1)
             self.assertEqual(uncertain.iloc[0]["period"], "2022")
+            self.assertEqual(uncertain.iloc[0]["status"], "absent")
             review = gpd.read_file(output / "road_review.shp")
-            self.assertEqual(len(review), 1)
+            self.assertEqual(len(review), 0)
+            events=gpd.read_file(output/'road_event.shp')
+            self.assertEqual(set(events.event_typ),{'added','removed'})
+            self.assertFalse(events.qa_state.eq('review').any())
 
     def test_perpendicular_crossing_roads_do_not_share_one_stable_id(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

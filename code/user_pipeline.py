@@ -392,6 +392,7 @@ def _run_fast_change_result(
     validation_area: Path | None = None,
     truth_type_field: str = "BHBM",
     evaluation_tolerance: float = 5.0,
+    defer_finalization: bool = False,
 ) -> dict:
     """Finish the independent Auto detector before any GT reconciliation."""
     from engine.fast_pipeline import (
@@ -412,6 +413,7 @@ def _run_fast_change_result(
         internal_outputs=truth_path is not None,
     )
     if truth_path is None:
+        if defer_finalization:return automatic
         from engine.fast_gt_reconciliation import complete_auto_pair_temporal
         return complete_auto_pair_temporal(automatic,before_result,after_result,before_period,after_period)
     truth_path = Path(truth_path).expanduser()
@@ -429,6 +431,7 @@ def _run_fast_change_result(
         validation_area=validation_area,
         position_tolerance=float(position_tolerance),
         evaluation_tolerance=float(evaluation_tolerance),
+        defer_finalization=defer_finalization,
     )
 
 
@@ -1496,11 +1499,11 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         published = publisher.publish_change(
             args.area_id, args.before_period, args.after_period, result, run_id=args.run_id,
         )
-        for period in result.get('gt_assisted_period_results',[]):
+        for period in result.get('final_period_results',[]):
             publisher.publish_period(args.area_id,period['period'],period)
-        for field,variant in (('auto_temporal','auto'),('gt_assisted_temporal','gt_assisted')):
+        for field in ('final_temporal',):
             if isinstance(result.get(field),dict):
-                publisher.publish_temporal(args.area_id,{**result[field],'product_variant':variant})
+                publisher.publish_temporal(args.area_id,result[field])
         if published:
             result["published"] = published
         state.update({"status": "completed", "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
@@ -4316,6 +4319,9 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
     else:
         entries[index] = updated
     manifest["period_results"] = entries
+    if 'auto_period_results' in manifest:
+        manifest['auto_period_results']=[e for e in manifest['auto_period_results']
+            if (str(e.get('grid')),str(e.get('period')))!=(str(grid),str(period))]+[updated]
     return updated
 
 
@@ -4388,7 +4394,7 @@ def _mark_change_rerun_failed(
 def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
     periods = {
         (str(entry.get("grid")), str(entry.get("period"))): entry
-        for entry in (manifest.get("period_results", []) or []) if isinstance(entry, dict)
+        for entry in (manifest.get('auto_period_results',manifest.get("period_results", [])) or []) if isinstance(entry, dict)
     }
     before_entry, after_entry = periods.get((grid, before)), periods.get((grid, after))
     if before_entry is None or after_entry is None:
@@ -4412,6 +4418,7 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
             Path(str(before_entry["result"])),
             Path(str(after_entry["result"])),
             output,
+            defer_finalization=True,
             before_period=before,
             after_period=after,
             position_tolerance=float(
@@ -4991,7 +4998,7 @@ def run_all(args: argparse.Namespace) -> dict:
 
     raw_prior_periods = {
         (str(entry.get("grid")), str(entry.get("period"))): entry
-        for entry in prior.get("period_results", []) if isinstance(entry, dict)
+        for entry in prior.get('auto_period_results',prior.get("period_results", [])) if isinstance(entry, dict)
     }
     frozen_periods = {
         key for key, entry in raw_prior_periods.items() if _period_result_ready(entry, require_current_network=True)
@@ -5348,6 +5355,7 @@ def run_all(args: argparse.Namespace) -> dict:
                             Path(str(before_entry["result"])),
                             Path(str(after_entry["result"])),
                             change_output,
+                            defer_finalization=True,
                             before_period=before_period,
                             after_period=after_period,
                             position_tolerance=float(args.tolerance),

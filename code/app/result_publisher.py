@@ -287,6 +287,46 @@ class ResultPublisher:
             published[key] = str(copy_dataset(source, target_dir / filename))
         return published
 
+    def _retire_product_variants(self, target):
+        """Move obsolete public variants to internal history after final publication."""
+        import shutil
+        import uuid
+        root = self.layout.results_root.resolve()
+        target = Path(target).resolve()
+        if not target.is_relative_to(root):
+            raise ValueError('Publication target outside results root')
+        for name in ('Auto', 'GT-assisted'):
+            old = (target / name).resolve()
+            if not old.is_relative_to(target):
+                raise ValueError('Variant directory escaped publication target')
+            if old.is_dir():
+                history = self.layout.tasks_root.resolve() / 'publication_history' / uuid.uuid4().hex
+                if not history.is_relative_to(self.layout.tasks_root.resolve()):
+                    raise ValueError('History target escaped task root')
+                history.mkdir(parents=True, exist_ok=False)
+                shutil.move(str(old), str(history / name))
+
+    @staticmethod
+    def _final_attributes(published):
+        """Export business attributes only; source and QA stay in task caches."""
+        import geopandas as gpd
+        import pandas as pd
+        allowed={'geometry','global_id','edge_id','road_id','track_id','segment_id','parent_id','part_id',
+                 'width_m','width_map','length_m','area_m2','change_id','change_typ','before_per','after_per',
+                 'width_bef','width_aft','width_diff','period','status','event_id','event_typ','from_per','to_per',
+                 'before_st','after_st','before_w','after_w','from_node','to_node','first_obs','last_obs',
+                 'life_state','present_n','event_n','grid_id','width_min','width_max','width_mean'}
+        for value in published.values():
+            path=Path(value)
+            if path.suffix.lower()=='.shp':
+                frame=gpd.read_file(path)
+                columns=[c for c in frame if c in allowed or c.startswith(('S20','W20'))]
+                if len(columns)!=len(frame.columns):frame[columns].to_file(path,encoding='UTF-8')
+            elif path.name=='width_evolution.csv':
+                frame=pd.read_csv(path);frame[[c for c in frame if c in allowed]].to_csv(path,index=False,encoding='utf-8-sig')
+            elif path.name=='road_state.gpkg':
+                frame=gpd.read_file(path);frame[[c for c in frame if c in allowed]].to_file(path,layer='road_state',driver='GPKG')
+
     def publish_period(
         self, area: object, period: object, result: dict,
         *, run_id: object = "", base_dir: Path | None = None, save: bool = True,
@@ -294,9 +334,6 @@ class ResultPublisher:
         target = (
             self.layout.results_root / safe_name(area) / "01_单期道路" / safe_name(period)
         )
-        variant = result.get('product_variant')
-        if variant == 'gt_assisted':
-            target = target / 'GT-assisted'
         published = self._copy_fields(result, target, (
             ("centerlines", "road_centerlines.shp"),
             ("surfaces", "road_surfaces.shp"),
@@ -333,14 +370,13 @@ class ResultPublisher:
                 if key not in published:
                     (target / filename).unlink(missing_ok=True)
         if published:
+            if result.get('execution_profile')=='fast' or result.get('product_variant')=='final':self._final_attributes(published)
             record = {
                 **published, "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            if variant == 'gt_assisted':
-                self._area(area)['periods'].setdefault(str(period),{}).setdefault('variants',{})['gt_assisted']=record
-            else:
-                self._area(area)['periods'][str(period)]=record
+            self._area(area)['periods'][str(period)]=record
+            self._retire_product_variants(target)
             if save:
                 self._save()
         return published
@@ -351,11 +387,6 @@ class ResultPublisher:
     ) -> dict[str, str]:
         pair = f"{safe_name(before)}_to_{safe_name(after)}"
         target = self.layout.results_root / safe_name(area) / "02_变化检测" / pair
-        variant = result.get('product_variant')
-        if variant:
-            target = target / ('GT-assisted' if variant == 'gt_assisted' else 'Auto')
-        if isinstance(result.get('automatic'),dict):
-            self.publish_change(area,before,after,{**result['automatic'],'product_variant':'auto'},save=False)
         layers = dict(result.get("layers") or {})
         layers.setdefault("changes", result.get("road_changes"))
         fast_profile = str(result.get("execution_profile") or "").casefold() == "fast"
@@ -387,6 +418,7 @@ class ResultPublisher:
         review_preview = result.get("review_change")
         if not review_preview and shapefile_has_records(layers.get("review")):
             review_preview = previews.get("review_change")
+        if fast_profile:review_preview=None
         published.update(self._copy_fields(
             {
                 "road_change": result.get("road_change") or previews.get("change"),
@@ -399,12 +431,12 @@ class ResultPublisher:
         if "review_change" not in published:
             (target / "review_change.png").unlink(missing_ok=True)
         if published:
-            prior = self._area(area)['changes'].get(f'{before}_to_{after}',{})
+            if result.get('execution_profile')=='fast' or result.get('product_variant')=='final':self._final_attributes(published)
+            self._retire_product_variants(target)
             self._area(area)["changes"][f"{before}_to_{after}"] = {
                 **published, "before_period": str(before), "after_period": str(after),
                 "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                **({'variants':{**prior.get('variants',{}),variant:published}} if variant else {}),
             }
             if save:
                 self._save()
@@ -415,23 +447,23 @@ class ResultPublisher:
         save: bool = True,
     ) -> dict[str, str]:
         target = self.layout.results_root / safe_name(area) / "03_长时序"
-        variant=result.get('product_variant')
-        if variant:target=target/('GT-assisted' if variant=='gt_assisted' else 'Auto')
         published = self._copy_fields(result, target, (
             ("life_shp", "road_life.shp"),
             ("observations_shp", "road_obs.shp"),
             ("events_shp", "road_event.shp"),
             ("event_parts_shp", "event_parts.shp"),
             ("lineage_shp", "road_lineage.shp"),
-            ("review_shp", "road_review.shp"),
             ("width_evolution", "width_evolution.csv"),
         ), base_dir=base_dir)
         if published:
-            prior=self._area(area).get('temporal',{})
+            if result.get('execution_profile')=='fast':self._final_attributes(published)
+            # QA is retained in the internal temporal directory only.
+            for suffix in SHAPEFILE_SIDECAR_SUFFIXES:
+                (target/('road_review'+suffix)).unlink(missing_ok=True)
+            self._retire_product_variants(target)
             self._area(area)["temporal"] = {
                 **published, "status": "已生成",
                 "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                **({'variants':{**prior.get('variants',{}),variant:published}} if variant else {}),
             }
             if save:
                 self._save()
@@ -472,7 +504,7 @@ class ResultPublisher:
         self, manifest: dict, *, source_manifest: Path | str | None = None,
     ) -> dict:
         run_id = manifest.get("run_id", "")
-        for entry in [*(manifest.get("period_results", []) or []), *(manifest.get('gt_assisted_period_results',[]) or [])]:
+        for entry in (manifest.get('final_period_results',manifest.get('period_results',[])) or []):
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_period(
                     entry.get("grid"), entry.get("period"), entry,
@@ -480,7 +512,7 @@ class ResultPublisher:
                 )
                 if published:
                     entry["published"] = published
-        for entry in [*(manifest.get("change_results", []) or []), *(manifest.get('gt_assisted_change_results',[]) or [])]:
+        for entry in (manifest.get('change_results',[]) or []):
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_change(
                     entry.get("grid"), entry.get("before_period"), entry.get("after_period"),
@@ -488,7 +520,7 @@ class ResultPublisher:
                 )
                 if published:
                     entry["published"] = published
-        for entry in [*(manifest.get('auto_temporal_results',[]) or []), *(manifest.get("temporal_results", []) or [])]:
+        for entry in (manifest.get('temporal_results',[]) or []):
             if isinstance(entry, dict):
                 published = self.publish_temporal(entry.get("grid"), entry, save=False)
                 if published:

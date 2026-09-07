@@ -81,7 +81,7 @@ class FinalWidths:
 def corridor(axis, stations, widths):
     """Flat-ended variable-width corridor on the exact final/canonical axis.
 
-    Original axis vertices are retained. Bounded mitres avoid spikes at bends;
+    Original axis vertices are retained. Exterior arcs avoid spikes at bends;
     no polygon smoothing can move the axis, merge tracks or copy mask defects.
     """
     if axis.geom_type != 'LineString' or axis.length <= 0:
@@ -97,12 +97,25 @@ def corridor(axis, stations, widths):
     directions = np.diff(coords, axis=0)
     directions /= np.linalg.norm(directions, axis=1)[:, None]
     normals = np.column_stack([-directions[:, 1], directions[:, 0]])
-    offsets = np.vstack([normals[0], normals[:-1] + normals[1:], normals[-1]])
-    offsets /= np.maximum(np.linalg.norm(offsets, axis=1)[:, None], 1e-12)
-    denominator = np.r_[1., np.sum(offsets[1:-1] * normals[1:], axis=1), 1.]
-    offsets /= np.maximum(denominator[:, None], .5)
-    offsets *= np.interp(sample_stations, stations, widths)[:, None]/2
-    return _clean_overlay(make_valid(Polygon(np.vstack([coords + offsets, (coords - offsets)[::-1]]))))
+    radii=np.interp(sample_stations,stations,widths)/2
+    sides=[]
+    for side in (1.,-1.):
+        boundary=[coords[0]+side*normals[0]*radii[0]]
+        for i in range(1,len(coords)-1):
+            turn=np.arctan2(directions[i-1,0]*directions[i,1]-directions[i-1,1]*directions[i,0],directions[i-1]@directions[i])
+            if side*turn < -1e-8:
+                # Follow the exterior offset arc, rather than creating a mitre
+                # triangle. End caps remain straight; these are internal bends.
+                angle=np.arctan2(side*normals[i-1,1],side*normals[i-1,0])
+                angles=angle+np.linspace(0.,turn,max(2,int(np.ceil(abs(turn)/(.5*np.pi/16)))+1))
+                boundary.extend(coords[i]+radii[i]*np.column_stack([np.cos(angles),np.sin(angles)]))
+            else:
+                bisector=normals[i-1]+normals[i]
+                bisector/=max(np.linalg.norm(bisector),1e-12)
+                boundary.append(coords[i]+side*radii[i]*bisector/max(float(bisector@normals[i]),.5))
+        boundary.append(coords[-1]+side*normals[-1]*radii[-1])
+        sides.append(boundary)
+    return _clean_overlay(make_valid(Polygon(np.vstack([sides[0],sides[1][::-1]]))))
 
 
 def _paired_profile(row, axis, samples):
@@ -140,11 +153,15 @@ def render_change_geometry(objects, seeds, assembly, final_widths, width_samples
     widths = {side: FinalWidths(frame.to_crs(metric)) for side, frame in final_widths.items()}
     samples = pd.DataFrame() if width_samples is None else pd.DataFrame(width_samples)
     profiles, pieces, profile_rows = {}, [], []
+    network_profiles={}
+    network_kinds={}
     seed_axes = {int(row.seed_id): row.geometry for row in axes.itertuples() if row.role == 'seed'}
     if set(seed_axes) != set(range(len(seeds))):
         raise ValueError('Cannot render a published seed without its saved final/canonical axis')
 
     def add_piece(axis, stations, before, after, kind, role, object_id, seed_id, origin, coverage):
+        network_profiles.setdefault(object_id,[]).append((axis,stations,before,after))
+        network_kinds.setdefault(object_id,kind)
         if kind in ('added', 'removed'):
             geometry = corridor(axis, stations, after if kind == 'added' else before)
         else:
@@ -206,7 +223,13 @@ def render_change_geometry(objects, seeds, assembly, final_widths, width_samples
                 gpd.GeoDataFrame(geometry=[], crs=metric))
     parts = frame(pieces)
     result = objects.to_crs(metric).copy()
+    from .continuous_road_geometry import network_surface
     for index, row in result.iterrows():
-        result.at[index, 'geometry'] = _clean_overlay(union_all(parts.loc[parts.object_id == row.object_id].geometry.values))
+        local=network_profiles.get(row.object_id,[])
+        before=network_surface([(a,s,b) for a,s,b,c in local if np.any(b>0)])
+        after=network_surface([(a,s,c) for a,s,b,c in local if np.any(c>0)])
+        kind=network_kinds.get(row.object_id,row.change_typ)
+        result.at[index,'geometry']=_clean_overlay(after if kind=='added' else before if kind=='removed'
+            else after.difference(before) if kind=='widened' else before.difference(after))
     result = result.to_crs(objects.crs)
     return result, {'published_geometry_parts': parts, 'published_width_profiles': frame(profile_rows)}

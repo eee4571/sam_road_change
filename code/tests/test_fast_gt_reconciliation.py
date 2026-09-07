@@ -25,6 +25,10 @@ class FastGTReconciliationTests(unittest.TestCase):
         f=frame([dict(width_m=w,geometry=g) for g,w in roads]);result=dict(period=name,grid='region')
         for key in ('centerlines','width_segments'):
             path=directory/f'{key}.shp';f.to_file(path);result[key]=str(path)
+        for key in ('surfaces','corridors'):
+            path=directory/f'{key}.shp'
+            frame([dict(geometry=g.buffer(w/2,cap_style='flat')) for g,w in roads]).to_file(path)
+            result[key]=str(path)
         return result
 
     def test_track_edits_exclude_crossing_and_nearby_carriageway(self):
@@ -33,7 +37,8 @@ class FastGTReconciliationTests(unittest.TestCase):
         self.assertEqual({h['target'] for h in hits},{0})
         self.assertAlmostEqual(hits[0]['start'],20)
         self.assertAlmostEqual(hits[0]['end'],80)
-        self.assertFalse(track_intervals(line(1),[line(0),line(2)]))
+        ambiguous=track_intervals(line(1),[line(0),line(2)])
+        self.assertEqual({h['target'] for h in ambiguous},{0})
 
     def test_reconcile_added_removed_width_and_temporal_consistency(self):
         from temporal_road_analysis import build_temporal_grid
@@ -84,17 +89,20 @@ class FastGTReconciliationTests(unittest.TestCase):
         self.assertEqual(len(result.loc[result.change_typ=='removed']),2)
         self.assertTrue(any(g.equals(auto.geometry.iloc[1]) for g in result.geometry))
 
-    def test_shared_period_conflict_is_not_silently_overwritten(self):
+    def test_shared_period_conflict_is_automatically_resolved_and_audited(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw);periods=[self.period(root,p,[(line(0),8)]) for p in ('1','2','3')]
             axis=line(0);row=dict(change_id='x',change_typ='added',width_bef=0,width_aft=8,axis_wkt=axis.wkt,
                 match_axis_wkt=axis.wkt,geometry=axis.buffer(4))
             pairs=[dict(frame=frame([row]),before_period='1',after_period='2'),
                    dict(frame=frame([row]),before_period='2',after_period='3')]
-            with self.assertRaisesRegex(ValueError,'Conflicting adjacent'):
-                reconcile_periods(periods,pairs,root/'out')
+            outputs=reconcile_periods(periods,pairs,root/'out')
+            state=gpd.read_file(outputs[1]['road_state'])
+            self.assertTrue(state.status.eq('present').all())
+            self.assertTrue(pairs[1]['frame'].empty)
+            self.assertIn('adjacent_state_conflict_resolved',(root/'out/change_track_assignments.csv').read_text())
 
-    def test_end_to_end_keeps_auto_files_and_builds_both_temporals(self):
+    def test_end_to_end_keeps_auto_cache_and_builds_one_final_temporal(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw);periods=[self.period(root,'T1',[(line(30),6)]),self.period(root,'T2',[(line(0),8),(line(30),6)])]
             seed=frame([dict(change_typ='added',width_bef=0.,width_aft=8.,length_m=40.,axis_wkt=line(0,30,70).wkt,geometry=line(0,30,70).buffer(4))])
@@ -106,12 +114,12 @@ class FastGTReconciliationTests(unittest.TestCase):
             truth=root/'truth.shp';frame([dict(BHBM='2',DLKD=8,geometry=box(0,-4,100,4))]).to_file(truth)
             result=augment_fast_changes_with_truth(automatic,truth,root/'assisted',before_result=periods[0],after_result=periods[1],
                 before_period='T1',after_period='T2',profile=GTProfile(omission_probability=0,type_error_probability=0))
-            self.assertTrue(result['ground_truth_used']);self.assertTrue(Path(result['auto_temporal']['life_shp']).exists())
-            self.assertTrue(Path(result['gt_assisted_temporal']['life_shp']).exists())
+            self.assertTrue(result['ground_truth_used']);self.assertTrue(Path(result['final_temporal']['life_shp']).exists())
+            self.assertEqual(len(list((root/'assisted').rglob('road_life.shp'))),1)
             self.assertEqual(hashes,{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in auto.iterdir() if p.is_file()})
             from engine.fast_gt_reconciliation import complete_auto_pair_temporal
             standalone=complete_auto_pair_temporal(automatic,periods[0],periods[1],'T1','T2')
-            self.assertTrue(Path(standalone['auto_temporal']['width_evolution']).is_file())
+            self.assertTrue(Path(standalone['final_temporal']['width_evolution']).is_file())
             self.assertFalse(standalone.get('ground_truth_used',False))
             self.assertEqual(hashes['road_changes.shp'],hashlib.sha256((auto/'road_changes.shp').read_bytes()).hexdigest())
 
@@ -168,6 +176,32 @@ class FastGTReconciliationTests(unittest.TestCase):
         from shapely import from_wkt
         endpoints=[tuple(c) for wkt in result.axis_wkt for c in (from_wkt(wkt).coords[0],from_wkt(wkt).coords[-1])]
         self.assertEqual(endpoints.count((50.,0.)),3)
+
+    def test_final_rebuild_preserves_curve_and_connects_supported_junction(self):
+        from engine.road_network_products import rebuild_corrected_road_axes
+        from shapely import union_all
+        curve=LineString([(0,0),(0,30),(10,50),(30,60),(70,60)])
+        main=line(0);branch=LineString([(50,7),(50,45)])
+        evidence=union_all([main.buffer(5),LineString([(50,0),(50,45)]).buffer(5)])
+        result=rebuild_corrected_road_axes([main,branch],[10,10],evidence)
+        self.assertLess(result[0].distance(result[1]),1e-6)
+        fitted=rebuild_corrected_road_axes([curve])[0]
+        self.assertLess(fitted.hausdorff_distance(curve),3.1)
+        self.assertGreater(fitted.length,90.)
+
+    def test_flat_road_ends_and_no_raw_surface_noise_in_final_products(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);periods=[self.period(root,p,[(line(0),8)]) for p in ('1','2')]
+            # The evidence surface deliberately contains a detached noisy patch.
+            for p in periods:
+                frame([dict(geometry=box(-2,-6,102,6)),dict(geometry=box(40,20,41,21))]).to_file(p['surfaces'])
+            from engine.fast_gt_reconciliation import _write_final_period
+            original=gpd.read_file(periods[0]['centerlines']);directory=root/'final';directory.mkdir()
+            rows=[{**r,'track_id':'','_original_row':i} for i,r in enumerate(original.to_dict('records'))]
+            result=_write_final_period(periods[0],original,{},rows,[],directory,3857,3857)
+            geometry=gpd.read_file(result['surfaces']).geometry.union_all()
+            self.assertTrue(geometry.equals(box(0,-4,100,4)))
+            self.assertEqual(_change_polygon(line(0),'added',0,8).bounds,(0.,-4.,100.,4.))
 
 
 if __name__=='__main__':unittest.main()

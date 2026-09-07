@@ -8,8 +8,8 @@ Road Probability 和 Valid Observation。没有变化真值参数，也不读取
 不重跑或改变道路提取、连接、平滑、道路面生成和测宽。
 
 Fast GT-assisted 也先执行上述独立 Auto 检测，完成后才读取 GT。
-随后生成独立修正变化、协调两期期次道路，并重建 GT-assisted 长时序；
-原 Auto 道路和变化保留。完整流程见 [Fast GT-assisted 依赖链](FAST_GT_ASSISTED_CHAIN.md)。
+随后仅校正 GT 涉及区间、更新期次道路，写出一套最终变化和长时序；
+原 Auto 缓存留在内部。完整流程见 [Fast 最终成果链](FAST_GT_ASSISTED_CHAIN.md)。
 本文件下述内容描述 Auto 检测，不把 GT 作为候选或审核证据。
 
 ## 本轮 Auto 行为

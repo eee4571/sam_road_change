@@ -36,6 +36,24 @@ class ProjectLayoutTests(unittest.TestCase):
 
 
 class ResultPublisherTests(unittest.TestCase):
+    def test_final_publication_retires_variants_and_hides_audit_attributes(self):
+        import geopandas as gpd
+        from shapely.geometry import LineString
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);source=root/'internal.shp'
+            gpd.GeoDataFrame({'width_m':[8.],'source':['GT_ASSISTED'],'qa_state':['low_confidence']},
+                geometry=[LineString([(0,0),(50,0)])],crs=3857).to_file(source)
+            publisher=ResultPublisher(root/'成果输出')
+            target=root/'成果输出/g/01_单期道路/2022'
+            for variant in ('Auto','GT-assisted'):
+                (target/variant).mkdir(parents=True);(target/variant/'old.txt').write_text(variant)
+            publisher.publish_period('g','2022',dict(centerlines=str(source),execution_profile='fast',product_variant='final'))
+            public=gpd.read_file(target/'road_centerlines.shp')
+            self.assertEqual(set(public.columns),{'width_m','geometry'})
+            self.assertFalse((target/'Auto').exists());self.assertFalse((target/'GT-assisted').exists())
+            self.assertEqual(len(list((root/'_work/tasks/publication_history').rglob('old.txt'))),2)
+            self.assertIn('source',gpd.read_file(source))
+
     def test_period_publish_copies_all_shapefile_components_and_rerun_overwrites_current(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             project = Path(raw) / "project"
@@ -83,6 +101,11 @@ class ResultPublisherTests(unittest.TestCase):
             output = project / "成果输出"
             work = project / "_work"
             changes = make_shapefile(work, "road_changes", "combined")
+            import geopandas as gpd
+            from shapely.geometry import box
+            for path in work.glob('road_changes.*'):path.unlink()
+            gpd.GeoDataFrame({'change_typ':['added'],'change_src':['GT_ASSISTED'],'qa_state':['low_confidence']},
+                geometry=[box(0,0,10,4)],crs=3857).to_file(changes)
             added = make_shapefile(work, "added_roads", "classified")
             publisher = ResultPublisher(output, project_root=project)
             publisher.publish_change("区域A", "2021", "2022", {
@@ -99,6 +122,7 @@ class ResultPublisherTests(unittest.TestCase):
             self.assertEqual(set(published), {"changes"})
             self.assertTrue((target / "road_changes.shp").is_file())
             self.assertFalse((target / "added_roads.shp").exists())
+            self.assertNotIn('change_src',gpd.read_file(target/'road_changes.shp'))
 
     def test_only_whole_area_png_files_are_published(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

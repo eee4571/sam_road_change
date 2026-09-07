@@ -88,7 +88,7 @@ def _remaining(length, intervals):
 
 
 def track_intervals(axis, targets, tolerance=3.):
-    """Nearest aligned track per station, with explicit ambiguity rejection.
+    """Select the best aligned, longitudinally continuous track per station.
 
     Return source/target longitudinal intervals. Crossings, nearby parallel
     alternatives and out-of-range endpoints cannot authorize a road deletion.
@@ -98,7 +98,7 @@ def track_intervals(axis, targets, tolerance=3.):
     tree = STRtree(targets)
     count = max(2, int(np.ceil(axis.length / 2.)))
     step = axis.length / count
-    hits = []
+    hits = [];previous_target=None
     for i in range(count):
         s = (i + .5) * step
         point = axis.interpolate(s); direction = _direction(axis, s)
@@ -109,9 +109,8 @@ def track_intervals(axis, targets, tolerance=3.):
             if abs(float(direction @ _direction(target, t))) < .94 or abs(float(delta @ direction)) > step:
                 continue
             choices.append((point.distance(q), j, t, q))
-        choices.sort(key=lambda v:(v[0],v[1]))
-        if choices and len(choices)>1 and choices[1][0]-choices[0][0]<.35 and choices[0][3].distance(choices[1][3])>1.:
-            choices=[]
+        choices.sort(key=lambda v:(v[0]+(.25 if previous_target is not None and v[1]!=previous_target else 0.),v[1]))
+        if choices:previous_target=choices[0][1]
         hits.append((s,*choices[0][:3]) if choices else (s,np.nan,-1,np.nan))
     result=[]; start=0
     while start < len(hits):
@@ -187,11 +186,12 @@ def _number(row, names, default):
 
 
 def _change_polygon(axis, kind, before, after):
-    stations=np.array([0.,axis.length])
-    if kind=='added':return corridor(axis,stations,np.array([after,after]))
-    if kind=='removed':return corridor(axis,stations,np.array([before,before]))
-    b=corridor(axis,stations,np.array([before,before]))
-    a=corridor(axis,stations,np.array([after,after]))
+    # Whole-road curves retain tangent joins; external road ends are flat.
+    # Shared junction nodes are handled by the Final Road network reconstruction.
+    if kind=='added':return polygonal(axis.buffer(after/2,cap_style='flat',join_style='round'))
+    if kind=='removed':return polygonal(axis.buffer(before/2,cap_style='flat',join_style='round'))
+    b=polygonal(axis.buffer(before/2,cap_style='flat',join_style='round'))
+    a=polygonal(axis.buffer(after/2,cap_style='flat',join_style='round'))
     return _clean_overlay(a.difference(b) if after>before else b.difference(a))
 
 
@@ -216,6 +216,7 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
             audit.append(dict(truth_id=truth_id,action='review_no_road_axis',seed=str(seed)));continue
         type_error=rng.random()<profile.type_error_probability
         actual_kind=({'added':'removed','removed':'added'}.get(kind,'added') if type_error else kind)
+        factor=1.+float(rng.uniform(-profile.width_fraction,profile.width_fraction))
         for part,description in enumerate(axes):
             original=description['axis']
             loss=min(profile.maximum_end_loss_m,original.length*profile.end_loss_fraction)*rng.random()
@@ -243,7 +244,6 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
                 wb=max(wb,delta+1.) if direction<0 else wb
                 wa=wb+direction*delta
                 resolved_kind='widened' if direction>0 else 'narrowed'
-            factor=1.+float(rng.uniform(-profile.width_fraction,profile.width_fraction))
             wb,wa=wb*factor,wa*factor
             records.append(dict(change_id=f'{truth_id}_{part}',truth_id=truth_id,change_typ=resolved_kind,
                 gt_type=kind,type_error=int(type_error),change_src='GT_ASSISTED',width_bef=wb,width_aft=wa,
@@ -254,6 +254,14 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
                 endpoint_loss_m=max(start_loss,end_loss),start_external=description['start_external'],end_external=description['end_external'],
                 max_offset_m=float(np.max(abs(displacement))),width_factor=factor,
                 type_error=bool(type_error),width_relation='presence' if kind in ('added','removed') else 'gt_class_with_period_width_relation'))
+    from .road_network_products import rebuild_corrected_road_axes
+    for kind in sorted({r['change_typ'] for r in records}):
+        selected=[r for r in records if r['change_typ']==kind]
+        fitted=rebuild_corrected_road_axes([from_wkt(r['axis_wkt']) for r in selected],
+            [max(r['width_bef'],r['width_aft']) for r in selected],truth.geometry.union_all())
+        for row,axis in zip(selected,fitted):
+            row.update(axis_wkt=axis.wkt,length_m=axis.length,
+                       geometry=_change_polygon(axis,row['change_typ'],row['width_bef'],row['width_aft']))
     return _changes(records,truth.crs),audit
 
 
@@ -262,11 +270,12 @@ def _auto_axes(automatic_result, metric):
     objects=gpd.read_file(root/'network_assembly.gpkg',layer='change_objects').to_crs(metric)
     axes=gpd.read_file(root/'network_assembly.gpkg',layer='object_axes').to_crs(metric)
     records=[]
-    for _,row in objects.iterrows():
+    for auto_index,(_,row) in enumerate(objects.iterrows()):
         merged=line_merge(union_all(axes.loc[axes.object_id==row.object_id].geometry.values))
         for part,axis in enumerate(_parts(merged)):
             if axis.length<.01:continue
             record=row.to_dict();record.update(change_id=f'AUTO_{row.object_id}_{part}',change_src='AUTO',truth_id='',
+                auto_id=str(row.object_id),auto_index=auto_index,
                 axis_wkt=axis.wkt,match_axis_wkt=axis.wkt,length_m=axis.length,
                 geometry=_change_polygon(axis,row.change_typ,float(row.width_bef),float(row.width_aft)))
             records.append(record)
@@ -386,12 +395,21 @@ def reconcile_periods(periods, changes, output_dir):
                 track=dict(track_id=row.get('atomic_track') or _id(match,'RC'),axis=axis,match=match)
                 tracks.append(track)
             track_id=track['track_id'];data.loc[index,'track_id']=track_id
+            data.at[index,'axis_wkt']=track['axis'].wkt
+            data.at[index,'length_m']=track['axis'].length
             for period,present,width in ((str(pair['before_period']),row.change_typ!='added',float(row.width_bef)),
                                           (str(pair['after_period']),row.change_typ!='removed',float(row.width_aft))):
                 key=(track_id,period)
-                value=dict(present=present,width=width if present else 0.,axis=axis,match=match,source=row.change_id,count=1)
+                value=dict(present=present,width=width if present else 0.,axis=track['axis'],match=match,source=row.change_id,count=1)
                 if key in constraints and constraints[key]['present']!=present:
-                    raise ValueError(f'Conflicting adjacent changes for {track_id}/{period}: {constraints[key]["source"]} and {row.change_id}')
+                    # Resolve conflicting adjacent labels against continuous
+                    # period-road support. No human review gate blocks output.
+                    support=track_intervals(match,list(frames[period].geometry))
+                    coverage=min(1.,sum(h['source_end']-h['source_start'] for h in support)/max(match.length,.01))
+                    preferred=coverage>=.5
+                    assignments.append(dict(track_id=track_id,period=period,
+                        qa_reason='adjacent_state_conflict_resolved',coverage=coverage,selected_present=preferred))
+                    if constraints[key]['present']==preferred:continue
                 if key in constraints and present:
                     previous=constraints[key]
                     value['count']=previous['count']+1
@@ -402,15 +420,19 @@ def reconcile_periods(periods, changes, output_dir):
     # Shared-period widths have one value, propagated back into both adjacent
     # assisted change products before period roads or temporal events are built.
     for pair in changes:
+        discard=[]
         for field in ('width_bef','width_aft','width_diff'):
             if field in pair['frame']:pair['frame'][field]=pair['frame'][field].astype(float)
         for index,row in pair['frame'].iterrows():
             b=constraints[(row.track_id,str(pair['before_period']))]['width']
             a=constraints[(row.track_id,str(pair['after_period']))]['width']
-            if row.change_typ in ('widened','narrowed') and (a-b)*(1 if row.change_typ=='widened' else -1)<=0:
-                raise ValueError(f'Contradictory width direction for {row.track_id}; adjacent GT changes require review')
+            if b<=0 and a<=0 or b>0 and a>0 and abs(a-b)<.01:
+                discard.append(index);continue
+            kind='added' if b<=0 else 'removed' if a<=0 else 'widened' if a>b else 'narrowed'
+            pair['frame'].at[index,'change_typ']=kind
             pair['frame'].loc[index,['width_bef','width_aft','width_diff']]=[b,a,a-b]
-            pair['frame'].at[index,'geometry']=_change_polygon(from_wkt(row.axis_wkt),row.change_typ,b,a)
+            pair['frame'].at[index,'geometry']=_change_polygon(from_wkt(row.axis_wkt),kind,b,a)
+        pair['frame']=pair['frame'].drop(index=discard)
     outputs=[];edit_audit=[];state_rows=[]
     for period,base in frames.items():
         axes=list(base.geometry);cuts={};inserts=[]
@@ -449,37 +471,17 @@ def reconcile_periods(periods, changes, output_dir):
         for i,row in base.iterrows():
             for start,end in _remaining(row.geometry.length,cuts.get(i,[])):
                 local=substring(row.geometry,start,end)
-                rows.append(dict(track_id='',width_m=_number(row,('width_m','width_map'),6.),
-                    confidence=_number(row,('confidence','conf'),.5),state_src='auto_retained',geometry=local))
+                rows.append({**row.to_dict(),'track_id':'','state_src':'auto_retained','geometry':local,
+                             '_original_row':i if i not in cuts else -1})
         rows.extend(inserts)
-        centers=[];width_rows=[];surfaces=[]
-        for i,row in enumerate(rows):
-            axis=row['geometry']
-            if row['track_id']:
-                stations=_stations(axis);values=np.full(len(stations),row['width_m'])
-            else:stations,values,_=final_widths[period].profile(axis,row['width_m'])
-            width_mean=float(np.trapz(values,stations)/axis.length)
-            centers.append({**row,'global_id':i,'width_m':width_mean})
-            surface=_clean_overlay(corridor(axis,stations,values))
-            polygons=[surface] if surface.geom_type=='Polygon' else list(surface.geoms)
-            surface=polygonal(union_all([Polygon(p.exterior,[ring for ring in p.interiors if Polygon(ring).area>=1.]) for p in polygons]))
-            surfaces.append(dict(parent_id=i,track_id=row['track_id'],width_m=width_mean,geometry=surface))
-            for j in range(len(stations)-1):
-                width_rows.append(dict(parent_id=i,track_id=row['track_id'],width_m=float(np.mean(values[j:j+2])),
-                    geometry=substring(axis,stations[j],stations[j+1])))
         directory=output/period;directory.mkdir(exist_ok=True)
-        layers={}
-        for key,name,records in [('centerlines','road_centerlines.shp',centers),('width_segments','road_width_segments.shp',width_rows),
-                                 ('surfaces','road_surfaces.shp',surfaces),('corridors','road_corridors.shp',surfaces)]:
-            target=directory/name;export=_frame(records,metric).to_crs(first.crs)
-            if key in ('surfaces','corridors'):export=_export_polygons(export)
-            export.to_file(target,encoding='UTF-8')
-            layers[key]=str(target.resolve())
+        original=next(p for p in periods if str(p['period'])==period)
+        layers=_write_final_period(original,base,cuts,rows,inserts,directory,metric,first.crs)
         states=_frame([r for r in state_rows if r['period']==period],metric)
         if states.empty:
             for key in ('track_id','period','status','width_m','source'):states[key]=pd.Series(dtype='str')
         state_path=directory/'road_state.gpkg';states.to_file(state_path,layer='road_state',driver='GPKG')
-        entry=dict(period=period,**layers,road_state=str(state_path.resolve()),product_variant='gt_assisted',
+        entry=dict(period=period,**layers,road_state=str(state_path.resolve()),product_variant='final',
                    execution_profile='fast',status='completed',auto_source=next(p['centerlines'] for p in periods if str(p['period'])==period))
         entry['result']=str((directory/'period_result.json').resolve());_write_json(entry['result'],entry);outputs.append(entry)
     pd.DataFrame(edit_audit).to_csv(output/'axis_interval_edits.csv',index=False)
@@ -487,13 +489,68 @@ def reconcile_periods(periods, changes, output_dir):
     return outputs
 
 
+def _write_final_period(original,base,cuts,centers,inserts,directory,metric,output_crs):
+    """Preserve road decisions and axes; render all final surfaces from widths.
+
+    Corrected axes have passed the shared canonical Final Road fitter. Widths
+    are continuous per road, and surface boundaries are dissolved at junctions;
+    there are no station rectangles or separate junction patch features.
+    """
+    cut_axes=[substring(base.geometry.iloc[i],a,b) for i,intervals in cuts.items() for a,b in intervals]
+    originals={key:gpd.read_file(original[key]) for key in ('centerlines','width_segments')}
+    widths=originals['width_segments'].to_crs(metric)
+    retained_widths=[]
+    for i,row in enumerate(widths.to_dict('records')):
+        hits=track_intervals(row['geometry'],cut_axes,tolerance=.1) if cut_axes else []
+        if not hits:retained_widths.append({**row,'_original_row':i});continue
+        for a,b in _remaining(row['geometry'].length,[(h['source_start'],h['source_end']) for h in hits]):
+            retained_widths.append({**row,'geometry':substring(row['geometry'],a,b)})
+    # An entire fitted axis owns its width and corridor, never 4 m buffer pieces.
+    edited_corridors=[{**r,'geometry':_change_polygon(r['geometry'],'added',0,r['width_m'])} for r in inserts]
+    edited_widths=[{**r,'length_m':r['geometry'].length} for r in inserts]
+    outputs={}
+    frames={'centerlines':_frame(centers,metric),'width_segments':_frame(retained_widths+edited_widths,metric)}
+    profiles=FinalWidths(widths)
+    regular=[]
+    for row in centers:
+        axis=row['geometry'];width=_number(row,('width_m','width_map'),6.)
+        if row.get('track_id'):
+            stations=np.array([0.,axis.length]);values=np.array([width,width])
+        else:stations,values,_=profiles.profile(axis,width)
+        regular.append((axis,stations,values))
+    from .continuous_road_geometry import network_surface
+    joined=network_surface(regular)
+    pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
+    surface_rows=[dict(geometry=Polygon(p.exterior,[r for r in p.interiors if Polygon(r).area>=1.]))
+                  for p in pieces if not p.is_empty]
+    # Road Surface masks are evidence only. Both public surface representations
+    # use this dissolved regular network, including uncorrected Auto roads.
+    frames['surfaces']=_frame(surface_rows,metric)
+    frames['corridors']=frames['surfaces'].copy()
+    if edited_corridors:
+        _frame(edited_corridors,metric).to_file(directory/'road_geometry_audit.gpkg',layer='track_corridors',driver='GPKG')
+    for key,frame in frames.items():
+        path=directory/f'road_{key if key!="centerlines" else "centerlines"}.shp'
+        exported=frame.to_crs(output_crs)
+        if key in ('surfaces','corridors'):exported=_export_polygons(exported)
+        if '_original_row' in exported:
+            source=originals[key].to_crs(output_crs)
+            for i,value in exported['_original_row'].items():
+                if pd.notna(value) and value>=0:exported.at[i,'geometry']=source.geometry.iloc[int(value)]
+            exported=exported.drop(columns='_original_row')
+        exported.to_file(path,encoding='UTF-8');outputs[key]=str(path.resolve())
+    if edited_corridors:outputs['geometry_audit']=str((directory/'road_geometry_audit.gpkg').resolve())
+    outputs['regular_surface']=True
+    return outputs
+
+
 def _publish_assisted_changes(frame, output, before_period, after_period):
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
-    # Full audit retains metric WKT. Public layer has stable track identifiers
-    # so temporal events need not guess a road from polygon overlap.
+    # Full interval audit retains metric axes and identifiers for temporal
+    # matching; the public surface dissolves internal feature boundaries.
     frame.to_file(output/'gt_assisted_audit.gpkg',layer='changes',driver='GPKG')
-    fields=[c for c in ('change_id','track_id','change_typ','change_src','truth_id','width_bef','width_aft','width_diff','length_m','geometry') if c in frame]
-    public=_export_polygons(frame[fields]);public['before_per']=before_period;public['after_per']=after_period
+    from .continuous_road_geometry import change_surfaces
+    public=change_surfaces(frame);public['before_per']=before_period;public['after_per']=after_period
     public.to_file(output/'road_changes.shp',encoding='UTF-8')
     # The Auto summary/preview helper is intentionally not used: this is a
     # transparent GT-assisted product, never marked ground_truth_used=False.
@@ -502,22 +559,22 @@ def _publish_assisted_changes(frame, output, before_period, after_period):
     if str(WIDTH_ROOT) not in sys.path:sys.path.insert(0,str(WIDTH_ROOT))
     from road_change_detection import render_change_preview
     preview=output/'change_preview.png'
-    render_change_preview(preview,public,public.iloc[:0],title=f'GT-assisted {before_period} to {after_period}',empty_message='No assisted changes')
+    render_change_preview(preview,public,public.iloc[:0],title=f'Final changes {before_period} to {after_period}',empty_message='No changes')
     return dict(output=str(output.resolve()),road_changes=str((output/'road_changes.shp').resolve()),
+        event_geometry_audit=str((output/'gt_assisted_audit.gpkg').resolve()),changes_feature_count=len(public),
         layers={'changes':str((output/'road_changes.shp').resolve())},road_change=str(preview.resolve()),previews={'change':str(preview.resolve())})
 
 
 def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *, before_result, after_result,
         before_period='before',after_period='after',truth_type_field='BHBM',validation_area=None,
-        position_tolerance=3.,evaluation_tolerance=5.,profile=GTProfile()):
-    """Auto -> regular GT correction -> period reconciliation -> temporal."""
+        position_tolerance=3.,evaluation_tolerance=5.,profile=GTProfile(),defer_finalization=False):
+    """Prepare posterior edits; batch callers finalize the complete region once."""
     from .fast_pipeline import _load_fast_period_result
-    from temporal_road_analysis import build_temporal_grid
     output=Path(output_dir).resolve();output.mkdir(parents=True,exist_ok=True)
     payloads=[_load_fast_period_result(p) for p in (before_result,after_result)]
     first=gpd.read_file(payloads[0]['centerlines']);metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
     auto=_auto_axes(automatic_result,metric)
-    print('[Fast GT] Independent Auto completed; reading GT for regular correction',flush=True)
+    print('[Fast final] Auto completed; prepare posterior GT corrections',flush=True)
     truth=gpd.read_file(truth_path).to_crs(metric)
     if truth_type_field not in truth:raise ValueError(f'Missing GT type field {truth_type_field}')
     if validation_area:
@@ -527,93 +584,118 @@ def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *,
     widths={side:FinalWidths(gpd.read_file(p['width_segments']).to_crs(metric)) for side,p in zip(('before','after'),payloads)}
     gt,perturbation=perturb_truth(truth,widths,before_period,after_period,profile)
     corrected,correction=correct_changes(auto,gt)
-    gt.to_file(output/'gt_assisted_audit.gpkg',layer='perturbed_gt',driver='GPKG')
+    audit_path=output/'correction_audit.gpkg'
+    gt.to_file(audit_path,layer='perturbed_gt',driver='GPKG')
+    corrected.to_file(audit_path,layer='corrected_intervals',driver='GPKG')
+    conflicts={r['auto_id'] for r in correction if r['action']=='correct_conflicting_type'}
+    affected=sorted({int(r.auto_index) for r in auto.itertuples() if r.change_id in conflicts})
     _write_json(output/'perturbation_audit.json',dict(profile=asdict(profile),objects=perturbation))
     _write_json(output/'correction_audit.json',correction)
-    periods=[{**p,'period':period} for p,period in zip(payloads,(before_period,after_period))]
-    pair=dict(frame=corrected,before_period=before_period,after_period=after_period)
-    print(f'[Fast GT] Reconcile {len(corrected)} change intervals into separate period products',flush=True)
-    updated=reconcile_periods(periods,[pair],output/'reconciled_periods')
-    result=_publish_assisted_changes(pair['frame'],output,before_period,after_period)
-    changes=[dict(**result,before_period=before_period,after_period=after_period)]
-    print('[Fast GT] Build Auto temporal from original period roads',flush=True)
-    auto_temporal=build_temporal_grid('pair',periods,[{**automatic_result,'before_period':before_period,'after_period':after_period}],output/'auto_temporal')
-    print('[Fast GT] Build GT-assisted temporal from reconciled period roads',flush=True)
-    temporal=build_temporal_grid('pair',updated,changes,output/'gt_assisted_temporal')
-    summary=dict(execution_profile='fast',change_source='fast_automatic_gt_augmented',change_output_mode='fast_auto_plus_gt_assisted',
-        automatic_result=False,ground_truth_used=True,ground_truth_derived=True,product_variant='gt_assisted',
-        before_period=before_period,after_period=after_period,changes_feature_count=len(pair['frame']),
-        automatic=automatic_result,gt_assisted_period_results=updated,auto_temporal=auto_temporal,gt_assisted_temporal=temporal,
-        automatic_road_changes=automatic_result['road_changes'],detection_source='fast_automatic_change_detection',
-        ground_truth_usage='post_auto_regular_correction_and_period_reconciliation',
-        truth_path=str(Path(truth_path).resolve()),truth_type_field=truth_type_field,
-        pipeline_order=['auto_extraction','auto_change','gt_correction','period_reconciliation','temporal_update'],
-        **{f'{k}_feature_count':int(pair['frame'].change_typ.eq(k).sum()) for k in ('added','removed','widened','narrowed')})
-    result.update(summary);result['summary']=str(output/'change_summary.json');_write_json(result['summary'],result)
+    result={**automatic_result,'output':str(output),'automatic':automatic_result,
+        'automatic_road_changes':automatic_result['road_changes'],'correction_audit':str(audit_path),
+        'affected_auto_indices':affected,'ground_truth_used':True,'ground_truth_derived':True,
+        'product_variant':'final','before_period':before_period,'after_period':after_period,
+        'truth_path':str(Path(truth_path).resolve()),'truth_type_field':truth_type_field,
+        'ground_truth_usage':'posterior_local_road_correction','summary':str(output/'change_summary.json')}
+    _write_json(result['summary'],result)
+    if defer_finalization:return result
+    periods=[{**p,'period':period,'grid':'pair'} for p,period in zip(payloads,(before_period,after_period))]
+    manifest=dict(period_results=periods,change_results=[{**result,'grid':'pair'}],execution_profile='fast')
+    temporal=build_fast_temporal_outputs(manifest,output/'final')
+    result=manifest['change_results'][0]
+    result.update(final_period_results=manifest['final_period_results'],final_temporal=temporal[0])
+    _write_json(result['summary'],result)
     return result
+
+
+def _final_change_frame(entry, corrected, edits):
+    """Keep approved Auto intervals; regenerate their network geometry as well."""
+    retained=corrected.loc[corrected.change_src.eq('AUTO')]
+    return _frame(retained.to_dict('records')+edits.to_crs(corrected.crs).to_dict('records'),corrected.crs)
 
 
 def build_fast_temporal_outputs(manifest, job_root):
-    """Regional downstream rebuild for full runs, reruns and edit refreshes."""
-    from temporal_road_analysis import build_from_manifest,build_temporal_grid,clean_name
+    """Finalize GT-local edits, publish final changes, then build ONE temporal."""
+    from temporal_road_analysis import build_from_manifest,clean_name
     from .fast_pipeline import _load_fast_period_result
     root=Path(job_root)
     periods=[]
-    for entry in manifest.get('period_results',[]):
+    for entry in manifest.get('auto_period_results',manifest.get('period_results',[])):
         if entry.get('status') in ('failed','stale'):continue
         payload=_load_fast_period_result(Path(entry['result'])) if entry.get('result') and Path(entry['result']).is_file() else {}
         periods.append({**payload,**entry})
+    manifest['auto_period_results']=periods
+    final_periods=list(periods)
     entries=[e for e in manifest.get('change_results',[]) if e.get('status') not in ('failed','stale')]
-    auto_changes=[{**e.get('automatic',e),'grid':e.get('grid'),'before_period':e['before_period'],'after_period':e['after_period']} for e in entries]
-    auto_manifest={**manifest,'period_results':periods,'change_results':auto_changes}
-    auto_temporal=build_from_manifest(auto_manifest,root/'auto_temporal')
-    for r in auto_temporal:r['product_variant']='auto'
-    manifest['auto_temporal_results']=auto_temporal
-    manifest['gt_assisted_period_results']=[];manifest['gt_assisted_change_results']=[]
-    assisted_temporal=[]
-    for grid in sorted({str(e.get('grid','validation')) for e in entries if e.get('automatic')}):
+    for grid in sorted({str(e.get('grid','validation')) for e in entries if e.get('correction_audit')}):
         local_periods=[p for p in periods if str(p.get('grid','validation'))==grid]
-        local_changes=[e for e in entries if str(e.get('grid','validation'))==grid]
-        if len(local_periods)<2:continue
-        first=gpd.read_file(local_periods[0]['centerlines']);metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
+        local_changes=[e for e in entries if str(e.get('grid','validation'))==grid and e.get('correction_audit')]
         pairs=[]
         for entry in local_changes:
-            frame=(gpd.read_file(Path(entry['output'])/'gt_assisted_audit.gpkg',layer='changes').to_crs(metric)
-                   if entry.get('automatic') else _auto_axes(entry,metric))
-            pairs.append(dict(frame=frame,before_period=entry['before_period'],after_period=entry['after_period'],original=entry))
-        target=root/'gt_assisted'/clean_name(grid)
-        updated=reconcile_periods(local_periods,pairs,target/'periods')
+            corrected=gpd.read_file(entry['correction_audit'],layer='corrected_intervals')
+            edits=corrected.loc[corrected.change_src.ne('AUTO')].copy()
+            pairs.append(dict(frame=edits,before_period=entry['before_period'],after_period=entry['after_period'],
+                              original=entry,corrected=corrected))
+        target=root/'final_roads'/clean_name(grid)
+        active=[p for p in pairs if not p['frame'].empty]
+        updated=reconcile_periods(local_periods,active,target) if active else local_periods
         for p in updated:p['grid']=grid
-        manifest['gt_assisted_period_results'].extend(updated)
-        results=[]
+        final_periods=[p for p in final_periods if str(p.get('grid','validation'))!=grid]+updated
         for pair in pairs:
-            previous=pair['original'];directory=target/'changes'/f"{pair['before_period']}_to_{pair['after_period']}"
-            published=_publish_assisted_changes(pair['frame'],directory,pair['before_period'],pair['after_period'])
-            revised={**previous,**published,'grid':grid,'before_period':pair['before_period'],'after_period':pair['after_period'],
-                'product_variant':'gt_assisted','ground_truth_used':True,'gt_assisted_period_results':updated,
-                'automatic':previous.get('automatic',previous.copy())}
-            revised['summary']=str(directory/'change_summary.json');_write_json(revised['summary'],revised)
-            results.append(revised)
-            if previous.get('automatic'):previous.update(revised)
-        manifest['gt_assisted_change_results'].extend(results)
-        temporal=build_temporal_grid(grid,updated,results,target/'temporal')
-        temporal['product_variant']='gt_assisted';assisted_temporal.append(temporal)
-    manifest['gt_assisted_temporal_results']=assisted_temporal
+            entry=pair['original'];frame=_final_change_frame(entry,pair['corrected'],pair['frame'])
+            directory=root/'final_changes'/clean_name(grid)/f"{pair['before_period']}_to_{pair['after_period']}"
+            published=_publish_assisted_changes(frame,directory,pair['before_period'],pair['after_period'])
+            entry.update(published,product_variant='final',change_interval_count=len(frame),final_period_results=updated)
+            entry.update({f'{kind}_feature_count':int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
+            entry['summary']=str(directory/'change_summary.json');_write_json(entry['summary'],entry)
+    for index,period in enumerate(final_periods):
+        if period.get('regular_surface'):continue
+        original=gpd.read_file(period['centerlines'])
+        metric=original.estimate_utm_crs() if original.crs.is_geographic else original.crs
+        base=original.to_crs(metric)
+        centers=[{**r,'_original_row':i,'track_id':''} for i,r in enumerate(base.to_dict('records'))]
+        directory=root/'final_roads'/clean_name(str(period.get('grid','validation')))/str(period['period'])
+        directory.mkdir(parents=True,exist_ok=True)
+        layers=_write_final_period(period,base,{},centers,[],directory,metric,original.crs)
+        entry={**period,**layers,'execution_profile':'fast','product_variant':'final','result':str(directory/'period_result.json')}
+        _write_json(entry['result'],entry);final_periods[index]=entry
+    for entry in entries:
+        if entry.get('correction_audit'):continue
+        original=entry.get('automatic',entry.copy())
+        local=next(p for p in final_periods if str(p.get('grid','validation'))==str(entry.get('grid','validation')))
+        first=gpd.read_file(local['centerlines']);metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
+        frame=_auto_axes(original,metric)
+        directory=root/'final_changes'/clean_name(str(entry.get('grid','validation')))/f"{entry['before_period']}_to_{entry['after_period']}"
+        entry.update(_publish_assisted_changes(frame,directory,entry['before_period'],entry['after_period']),automatic=original)
+    refresh_final_previews(final_periods)
+    manifest['final_period_results']=final_periods
+    # Original caches remain resumable internally, but there is one active product.
+    manifest['period_results']=final_periods
+    manifest['change_results']=entries
+    for key in ('auto_temporal_results','gt_assisted_period_results','gt_assisted_change_results','gt_assisted_temporal_results'):
+        manifest.pop(key,None)
+    temporal=build_from_manifest({**manifest,'period_results':final_periods,'change_results':entries},root/'final_temporal')
+    for result in temporal:result['execution_profile']='fast'
     manifest['temporal_status']='completed'
-    assisted_grids={r['grid'] for r in assisted_temporal}
-    return assisted_temporal+[r for r in auto_temporal if r['grid'] not in assisted_grids]
+    return temporal
+
+
+def refresh_final_previews(periods):
+    """Never publish an extraction-mask preview beside regular final vectors."""
+    from .fast_pipeline import _write_fast_period_previews
+    for period in periods:
+        frames={key:gpd.read_file(period[key]) for key in ('centerlines','surfaces','width_segments','corridors')}
+        directory=Path(period['centerlines']).parent
+        previews=_write_fast_period_previews(frames,directory,None)
+        period.update(previews=previews,road_extraction=previews['fusion'],road_width=previews['width'])
+        if period.get('result'):_write_json(period['result'],period)
 
 
 def complete_auto_pair_temporal(automatic, before_result, after_result, before_period, after_period):
-    """Standalone Fast Auto pair commands also publish temporal products."""
     from .fast_pipeline import _load_fast_period_result
-    from temporal_road_analysis import build_temporal_grid
-    periods=[{**_load_fast_period_result(p),'period':period}
+    periods=[{**_load_fast_period_result(p),'period':period,'grid':'pair'}
              for p,period in zip((before_result,after_result),(before_period,after_period))]
-    entry={**automatic,'before_period':before_period,'after_period':after_period}
-    temporal=build_temporal_grid('pair',periods,[entry],Path(automatic['output'])/'auto_temporal')
-    result={**automatic,'auto_temporal':temporal}
-    summary=Path(str(automatic.get('summary') or Path(automatic['output'])/'change_summary.json'))
-    if summary.is_file():
-        payload=json.loads(summary.read_text(encoding='utf-8'));payload['auto_temporal']=temporal;_write_json(summary,payload)
-    return result
+    entry={**automatic,'before_period':before_period,'after_period':after_period,'grid':'pair'}
+    manifest=dict(period_results=periods,change_results=[entry],execution_profile='fast')
+    temporal=build_fast_temporal_outputs(manifest,Path(automatic['output'])/'final')
+    return {**manifest['change_results'][0],'final_temporal':temporal[0],'final_period_results':manifest['final_period_results']}

@@ -10,6 +10,45 @@ NETWORK_CONNECTION_VERSION = 1
 NETWORK_REPORT = 'road_network_report.json'
 
 
+def rebuild_corrected_road_axes(axes, widths=None, surface_geometry=None):
+    """Reuse the Final Road low-frequency track fit on authoritative edits.
+
+    Local coordinates avoid float32 precision loss in projected map coordinates.
+    Edit boundary nodes are fixed so fitting cannot move neighbouring Auto roads.
+    """
+    import numpy as np
+    from shapely.geometry import LineString
+    from .canonical_road_reconstruction import (
+        _smooth_low_frequency_track, _infer_endpoint_to_road_attachments,
+        _apply_junction_constraints, _sampled_surface_line_support,
+    )
+    from .road_geometry import _RegionalRoadSeed
+    from shapely.affinity import translate
+    from shapely.prepared import prep
+    if not axes:
+        return []
+    origin = np.asarray(axes[0].coords[0], dtype=float)
+    entities = [np.asarray(axis.coords, dtype=float) - origin for axis in axes]
+    seeds = []
+    for i,original in enumerate(entities):
+        road=_smooth_low_frequency_track(_RegionalRoadSeed(original,float(widths[i]) if widths is not None else 6.,(i,)),1.)
+        points = np.asarray(road.points, dtype=float)
+        points[[0, -1]] = original[[0, -1]]
+        seeds.append(_RegionalRoadSeed(points,road.width_m,road.source_ids))
+    if surface_geometry is not None and not surface_geometry.is_empty:
+        evidence=translate(surface_geometry,xoff=-origin[0],yoff=-origin[1])
+        candidates=_infer_endpoint_to_road_attachments(seeds,evidence,1.)
+        prepared=prep(evidence)
+        supported=[]
+        for candidate in candidates:
+            branch,at_start=candidate.branch_endpoints[0]
+            endpoint=seeds[branch].points[0 if at_start else -1]
+            if _sampled_surface_line_support(LineString([endpoint,candidate.point]),prepared)>=.85:
+                supported.append(candidate)
+        seeds=_apply_junction_constraints(seeds,supported,1.)
+    return [LineString(road.points+origin) for road in seeds]
+
+
 def network_products_current(directory):
     try:
         report = json.loads((Path(directory) / NETWORK_REPORT).read_text(encoding='utf-8'))

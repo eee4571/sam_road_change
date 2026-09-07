@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import pyogrio
 from shapely import STRtree, make_valid
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
 
 
@@ -180,7 +180,15 @@ def _best_match(
     for raw_index in indices:
         index = int(raw_index)
         score, overlap, distance = _line_score(geometry, targets[index], tolerance)
-        ranked.append((score, overlap, -distance, index))
+        direction = _direction_similarity(geometry, targets[index])
+        if direction < .5:
+            continue
+        # A continuous counterpart must explain the longitudinal axis, including
+        # its endpoints. Direction alone cannot select an adjacent branch.
+        ends = [Point(geometry.coords[i]).distance(targets[index]) for i in (0,-1)]
+        continuity = float(np.mean(np.exp(-np.asarray(ends)/max(tolerance, .1))))
+        total = .85*score + .15*continuity
+        ranked.append((total, overlap, -distance, index))
     if not ranked:
         return None, 0.0, 0.0, float("inf"), False
     ranked.sort(reverse=True)
@@ -300,10 +308,8 @@ def _observations(
                 row = None
             else:
                 row = frame.iloc[index]
-                if overlap >= 0.35 and score >= 0.48 and not ambiguous:
+                if overlap >= 0.10 and score >= 0.25:
                     status = "present"
-                elif overlap >= 0.10 or distance <= tolerance:
-                    status = "uncertain"
                 else:
                     status = "absent"
             direction = _direction_similarity(geometry, source_geometries[index]) if index is not None else 0.0
@@ -315,8 +321,8 @@ def _observations(
                 "extract_cf": float(row["extract_cf"]) if row is not None else 0.0,
                 "geom_dev_m": float(distance) if math.isfinite(distance) else np.nan,
                 "source_fid": str(row["source_fid"]) if row is not None else "",
-                "qa_state": "review" if status == "uncertain" else "auto",
-                "qa_reason": "ambiguous_or_weak_match" if status == "uncertain" else "",
+                "qa_state": "low_confidence" if ambiguous or (index is not None and score < .48) else "auto",
+                "qa_reason": "best_continuous_match_selected" if ambiguous else "low_match_score" if index is not None and score < .48 else "",
                 "dir_sim": direction,
                 "_source_idx": int(index) if index is not None else -1,
                 "_reference_idx": reference_index,
@@ -340,8 +346,8 @@ def _observations(
                     for other in accepted
                 )
                 if duplicate:
-                    item["status"] = "uncertain"
-                    item["qa_state"] = "review"
+                    item["status"] = "absent"
+                    item["qa_state"] = "low_confidence"
                     item["qa_reason"] = "duplicate_source_ownership"
                 else:
                     accepted.append(item)
@@ -354,8 +360,7 @@ def _observations(
         rows.sort(key=lambda row: period_order[row["period"]])
         for index in range(1, len(rows) - 1):
             if rows[index - 1]["status"] == "present" and rows[index]["status"] == "absent" and rows[index + 1]["status"] == "present":
-                rows[index]["status"] = "uncertain"
-                rows[index]["qa_state"] = "review"
+                rows[index]["qa_state"] = "low_confidence"
                 rows[index]["qa_reason"] = "single_period_dropout"
     for row in observations:
         row.pop("_source_idx", None)
@@ -399,7 +404,7 @@ def _events(observations: list[dict], periods: list[str], absolute: float, ratio
                 "before_w": before_width, "after_w": after_width, "width_diff": width_diff,
                 "event_cf": min(float(before["match_sc"]), float(after["match_sc"])),
                 "evidence": "temporal_state_and_centerline_match",
-                "qa_state": "review" if event_type == "uncertain" else "auto",
+                "qa_state": "low_confidence" if before.get('qa_state')=='low_confidence' or after.get('qa_state')=='low_confidence' else "auto",
                 "geometry": after["geometry"] if after["status"] == "present" else before["geometry"],
             })
     return events
@@ -507,6 +512,7 @@ def _event_parts(
     events: list[dict],
     analysis_crs,
     tolerance: float,
+    observations: list[dict] | None = None,
 ) -> list[dict]:
     reference_geometries = [item["geometry"] for item in references]
     tree = STRtree(np.asarray(reference_geometries, dtype=object)) if reference_geometries else None
@@ -515,13 +521,15 @@ def _event_parts(
         for item in events
     }
     rows = []
+    observed={(r['road_id'],r['period']):r for r in (observations or [])}
     for entry in change_entries:
         path = Path(str(entry.get("output", ""))) / "road_changes.shp"
         required = [path, path.with_suffix(".dbf"), path.with_suffix(".shx")]
         missing = [str(item) for item in required if not item.is_file()]
         if missing:
             raise FileNotFoundError("变化检测成果不完整，缺少：" + "；".join(missing))
-        frame = gpd.read_file(path)
+        frame = (gpd.read_file(entry['event_geometry_audit'],layer='changes')
+                 if entry.get('event_geometry_audit') else gpd.read_file(path))
         if frame.crs is None:
             raise ValueError(f"变化检测成果缺少 CRS：{path}")
         if frame.crs != analysis_crs:
@@ -546,7 +554,10 @@ def _event_parts(
                 ref_index=explicit_index
                 road_id=explicit_track
             elif ranked:
-                _support, _distance, ref_index = max(ranked)
+                maximum_support=max(r[0] for r in ranked)
+                consistent=[r for r in ranked if r[0]>=.5*maximum_support and
+                    (references[r[2]]['road_id'],before_period,after_period,str(source.get('change_typ',''))) in event_lookup]
+                _support, _distance, ref_index = max(consistent or ranked)
                 road_id = references[ref_index]["road_id"]
             event_type = str(source.get("change_typ", ""))
             event_key = (road_id, before_period, after_period, event_type)
@@ -577,6 +588,19 @@ def _event_parts(
                     }
                     events.append(event)
                     event_lookup[event_key] = event
+            if event_key not in event_lookup and road_id:
+                # A published pair change remains an event even when a coarse
+                # whole-road observation disagrees. Keep the actual observed
+                # states, automatically select the best road, and audit the
+                # disagreement internally instead of requesting human review.
+                before=observed.get((road_id,before_period),{})
+                after=observed.get((road_id,after_period),{})
+                b=before.get('width_m',np.nan);a=after.get('width_m',np.nan)
+                event=dict(event_id=f'EV{len(events)+1:08d}',road_id=road_id,from_per=before_period,to_per=after_period,
+                    event_typ=event_type,before_st=before.get('status','absent'),after_st=after.get('status','absent'),
+                    before_w=b,after_w=a,width_diff=a-b,event_cf=min(before.get('match_sc',0.),after.get('match_sc',0.)),
+                    evidence='pair_class_observation_disagreement',qa_state='low_confidence',geometry=references[ref_index]['geometry'])
+                events.append(event);event_lookup[event_key]=event
             for part_index, part in enumerate(_polygon_parts(geometry)):
                 rows.append({
                     "event_id": event_lookup.get(event_key, {}).get("event_id", ""),
@@ -595,10 +619,11 @@ def _apply_event_evidence(events: list[dict], event_parts: list[dict], has_pair_
         if event["event_typ"] == "uncertain":
             continue
         if event["event_id"] in supported:
-            event["evidence"] = "temporal_state_and_pair_change"
+            if event.get('evidence')!='pair_class_observation_disagreement':event["evidence"] = "temporal_state_and_pair_change"
             continue
         event["evidence"] = "state_only_no_pair_part" if has_pair_results else "state_only_no_pair_input"
-        event["qa_state"] = "review"
+        # Reliable observed transitions do not require GT or a polygon fragment.
+        # Ambiguous observations and lifecycle conflicts retain their own QA.
 
 
 def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str) -> None:
@@ -652,7 +677,7 @@ def build_temporal_grid(
     observations = _observations([r for r in references if not str(r['road_id']).startswith('RC')],untracked_frames,tolerance)
     observations.extend(reconciled_obs)
     events = _events(observations, periods, width_absolute, width_ratio)
-    event_parts = _event_parts(change_entries, references, events, analysis_crs, tolerance)
+    event_parts = _event_parts(change_entries, references, events, analysis_crs, tolerance, observations)
     _apply_event_evidence(events, event_parts, bool(change_entries))
     life = _life_rows(references, observations, events, periods, tolerance)
     for row in life:
@@ -717,7 +742,8 @@ def build_temporal_grid(
         "width_evolution": str(output_dir / "width_evolution.csv"),
         "period_count": len(periods), "road_count": len(references),
         "observation_count": len(observations), "event_count": len(events),
-        "review_count": len(reviews),
+        "review_count": 0,
+        "qa_count": sum(row.get('qa_state')=='low_confidence' for row in observations),
     }
     return result
 
