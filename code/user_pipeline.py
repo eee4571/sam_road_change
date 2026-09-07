@@ -400,7 +400,7 @@ def _run_fast_change_result(
         detect_fast_changes,
     )
 
-    automatic_output = output / "_automatic" if truth_path is not None else output
+    automatic_output = output / "_automatic"
     automatic = detect_fast_changes(
         before_result,
         after_result,
@@ -412,14 +412,9 @@ def _run_fast_change_result(
         width_change_ratio=float(width_change_ratio),
         internal_outputs=truth_path is not None,
     )
-    if truth_path is None:
-        if defer_finalization:return automatic
-        from engine.fast_gt_reconciliation import complete_auto_pair_temporal
-        return complete_auto_pair_temporal(automatic,before_result,after_result,before_period,after_period)
-    truth_path = Path(truth_path).expanduser()
-    if not truth_path.is_file():
+    if truth_path is not None and not Path(truth_path).expanduser().is_file():
         raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
-    return augment_fast_changes_with_truth(
+    result = augment_fast_changes_with_truth(
         automatic,
         truth_path,
         output,
@@ -431,8 +426,20 @@ def _run_fast_change_result(
         validation_area=validation_area,
         position_tolerance=float(position_tolerance),
         evaluation_tolerance=float(evaluation_tolerance),
-        defer_finalization=defer_finalization,
-    )
+        defer_finalization=True,
+    ) if truth_path is not None else {**automatic, 'automatic':automatic}
+    result.update(truth=str(truth_path or ''),validation_area=str(validation_area or ''),
+                  truth_type_field=truth_type_field,before_period=before_period,after_period=after_period,
+                  execution_profile='fast',fast_finalization_state='pending')
+    if defer_finalization:return result
+    from engine.fast_pipeline import _load_fast_period_result
+    periods=[{**_load_fast_period_result(p),'period':period,'grid':'pair'}
+             for p,period in ((before_result,before_period),(after_result,after_period))]
+    manifest=dict(period_results=periods,change_results=[{**result,'grid':'pair'}],
+                  execution_profile='fast',job_root=str(output))
+    _finalize_fast_manifest(manifest,output)
+    return {**manifest['change_results'][0], 'final_period_results':manifest['final_period_results'],
+            'final_temporal':manifest['temporal_results'][0], 'evaluation_summary':manifest.get('evaluation_summary')}
 
 
 def clean_name(value: str) -> str:
@@ -1447,7 +1454,8 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 for kind in ("added", "removed", "widened", "narrowed")
             )
         )
-        if resume and prior_result and _change_result_ready(prior_result) and complete_layers:
+        if (resume and prior_result and _change_result_ready(prior_result) and complete_layers
+                and (not fast_profile or prior_result.get('fast_finalization_state')=='completed')):
             result = dict(prior_result)
             emit("pipeline", stage="两期宽度变化检测", status="skipped", reason="续跑复用已完成且完整的变化成果", completed=3, total=3)
         elif fast_profile:
@@ -1504,6 +1512,8 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         for field in ('final_temporal',):
             if isinstance(result.get(field),dict):
                 publisher.publish_temporal(args.area_id,result[field])
+        if fast_profile and result.get("evaluation_summary"):
+            publisher.publish_evaluation([args.area_id],result["evaluation_summary"],within_changes=True)
         if published:
             result["published"] = published
         state.update({"status": "completed", "result_manifest": result, "completed_at": now_text(), "elapsed_seconds": elapsed_seconds(started)})
@@ -2671,6 +2681,15 @@ def change(args: argparse.Namespace) -> dict:
     before = read_json(Path(args.before_result).expanduser().resolve())
     after = read_json(Path(args.after_result).expanduser().resolve())
     output = Path(args.output).expanduser().resolve()
+    if before.get('execution_profile') == 'fast' or after.get('execution_profile') == 'fast':
+        result=_run_fast_change_result(Path(args.before_result),Path(args.after_result),output,
+            before_period=args.before_period,after_period=args.after_period,
+            position_tolerance=float(args.tolerance),width_change_absolute=float(args.absolute),
+            width_change_ratio=float(args.ratio),truth_path=Path(args.truth) if getattr(args,'truth','') else None,
+            validation_area=Path(args.validation_area) if getattr(args,'validation_area','') else None,
+            truth_type_field=getattr(args,'truth_type_field','') or 'BHBM')
+        emit('complete',stage='change',**result)
+        return result
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(WIDTH), str(SAMROAD), env.get("PYTHONPATH", "")))
     command = [
@@ -2730,7 +2749,7 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
     for entry in manifest.get("change_results", []) or []:
         if not isinstance(entry, dict):
             continue
-        if entry.get("evaluation_stale") or str(entry.get("evaluation_state") or "") in {"stale", "running"}:
+        if entry.get("evaluation_stale") or str(entry.get("evaluation_state") or "") in {"stale", "running", "skipped_no_truth"}:
             continue
         summary_path = Path(str(entry.get("summary") or "")).expanduser()
         if not summary_path.is_file():
@@ -2849,6 +2868,8 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             writer = csv.DictWriter(file, fieldnames=list(aggregate_rows[0].keys()))
             writer.writeheader()
             writer.writerows(aggregate_rows)
+    else:
+        csv_path.unlink(missing_ok=True)
     payload = {
         "evaluated_task_count": evaluated_tasks,
         "total_change_task_count": len(manifest.get("change_results", []) or []),
@@ -2963,9 +2984,10 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     """Evaluate one saved change result without rerunning extraction or detection."""
     started = time.monotonic()
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
-    if not manifest_path.is_file():
+    supplied_manifest = getattr(args, '_manifest', None)
+    if supplied_manifest is None and not manifest_path.is_file():
         raise FileNotFoundError(f"找不到任务结果索引：{manifest_path}")
-    manifest = read_json(manifest_path)
+    manifest = supplied_manifest if supplied_manifest is not None else read_json(manifest_path)
     matches = [
         entry for entry in (manifest.get("change_results", []) or [])
         if isinstance(entry, dict)
@@ -2979,6 +3001,8 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             f"{args.before_period} → {args.after_period}"
         )
     entry = matches[0]
+    if entry.get('fast_finalization_state') == 'pending':
+        raise ValueError('Fast Final Changes 尚未生成，不能评价临时变化。')
     output = Path(str(entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
     entry_layers = entry.get("layers") if isinstance(entry.get("layers"), dict) else {}
@@ -2992,6 +3016,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     ).expanduser().resolve()
     summary = read_json(summary_path) if summary_path.is_file() else {}
     is_fast_gt_assisted = (
+        entry.get('fast_finalization_state') != 'completed' and (
         str(entry.get('product_variant') or summary.get('product_variant') or '') == 'gt_assisted'
         or (
         str(
@@ -3005,6 +3030,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             or ""
         ) == "augment_auto_misses_with_perturbed_geometry"
         )
+    )
     )
     truth_path = Path(args.truth).expanduser().resolve()
     if not truth_path.is_file():
@@ -3020,7 +3046,8 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
 
     entry["evaluation_state"] = "running"
     manifest["updated_at"] = now_text()
-    _persist_existing_pipeline(manifest, manifest_path)
+    if not getattr(args, 'defer_publish', False):
+        _persist_existing_pipeline(manifest, manifest_path)
     emit(
         "stage", stage="精度评价", status="running", completed=0, total=1,
         grid=str(args.grid), before_period=str(args.before_period),
@@ -3140,7 +3167,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     ) and str(
         entry.get("change_source") or summary.get("change_source") or ""
     ) == "synthetic_from_truth"
-    if is_fast_truth:
+    if is_fast_truth and entry.get('fast_finalization_state') != 'completed':
         internal_changes_path = Path(str(
             entry.get("internal_road_changes")
             or summary.get("internal_road_changes")
@@ -3223,7 +3250,8 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         if defer_aggregate
         else aggregate_change_evaluations(manifest, job_root)
     )
-    _persist_existing_pipeline(manifest, manifest_path)
+    if not getattr(args, "defer_publish", False):
+        _persist_existing_pipeline(manifest, manifest_path)
 
     overall = rows[0]
     result = {
@@ -3254,7 +3282,8 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         grid=str(args.grid), before_period=str(args.before_period),
         after_period=str(args.after_period),
     )
-    emit("complete", stage="evaluate-existing", **result)
+    if not getattr(args, "defer_publish", False):
+        emit("complete", stage="evaluate-existing", **result)
     return result
 
 
@@ -4189,9 +4218,12 @@ def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
         manifest["project_root"] = project_value
     manifest.setdefault("output_root", str(output_root))
     publisher = ResultPublisher(output_root, project_root=project_value)
-    publisher.publish_manifest(manifest, source_manifest=manifest_path)
+    ready=manifest.get('fast_finalization_state') != 'pending'
+    if ready:
+        publisher.publish_manifest(manifest, source_manifest=manifest_path)
     _write_task_report(manifest, job_root)
-    publisher.publish_reports(job_root)
+    if ready:
+        publisher.publish_reports(job_root)
     _persist_pipeline(manifest, job_root, output_root)
     latest_path = project_layout(output_root, manifest.get("project_root")).latest_pipeline_path
     if manifest_path.resolve() not in {
@@ -4278,7 +4310,7 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
     plan = _manifest_period_plan(manifest)
     if period not in plan.get(grid, []):
         raise ValueError(f"任务计划中不存在期次：{grid} / {period}")
-    entries = manifest.get("period_results", []) or []
+    entries = list(manifest.get('auto_period_results',manifest.get("period_results", [])) or [])
     index = next((
         number for number, entry in enumerate(entries)
         if isinstance(entry, dict) and str(entry.get("grid")) == grid
@@ -4335,7 +4367,7 @@ def _manifest_change_context(
         if key in truths:
             truth = _manifest_identity_path(truths[key])
             break
-    if not truth:
+    if not truth and not any(key in truths for key in (f"{grid}\0{before}\0{after}", f"{before}\0{after}")):
         truth = str(old.get("truth") or "").strip()
     validation_areas = manifest.get("validation_areas")
     validation = str(
@@ -4407,7 +4439,8 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     ), None)
     old = entries[index] if index is not None else {}
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
-    output = Path(str(old.get("output") or job_root / "grids" / clean_name(grid) / "changes" / f"{clean_name(before)}_to_{clean_name(after)}"))
+    output = (job_root / 'grids' / clean_name(grid) / 'changes' / f'{clean_name(before)}_to_{clean_name(after)}'
+              if manifest.get('execution_profile') == 'fast' else Path(str(old.get("output") or job_root / "grids" / clean_name(grid) / "changes" / f"{clean_name(before)}_to_{clean_name(after)}")))
     spec = manifest.get("input_spec") or {}
     truth_value, validation_value, truth_type_field = _manifest_change_context(
         manifest, grid, before, after, old,
@@ -4451,7 +4484,7 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
             truth_type_field=truth_type_field,
         )), output)
     updated = {
-        **old, **result, "grid": grid, "before_period": before, "after_period": after,
+        **({} if manifest.get('execution_profile') == 'fast' else old), **result, "grid": grid, "before_period": before, "after_period": after,
         "truth": truth_value, "validation_area": validation_value,
         "truth_type_field": truth_type_field,
         "absolute": str(spec.get("absolute") or old.get("absolute") or "2.0"),
@@ -4480,40 +4513,68 @@ def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tup
 
 def _refresh_manifest_downstream(manifest: dict) -> None:
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
+    if manifest.get('execution_profile') == 'fast':
+        _finalize_fast_manifest(manifest, job_root)
+        return
     manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
     manifest["temporal_status"] = "completed"
     aggregate_change_evaluations(manifest, job_root)
     manifest["downstream_updated_at"] = now_text()
 
 
-def _evaluate_fast_manifest_pairs(
-    manifest_path: Path, pairs: list[tuple[str, str, str]],
-) -> None:
-    manifest = read_json(manifest_path)
-    if str(manifest.get("execution_profile") or "full") != "fast":
-        return
-    for grid, before, after in pairs:
-        entry = next(
-            item for item in manifest.get("change_results", [])
-            if str(item.get("grid")) == grid
-            and str(item.get("before_period")) == before
-            and str(item.get("after_period")) == after
-        )
-        if not str(entry.get("truth") or "").strip():
+def _invalidate_fast_finalization(manifest: dict) -> None:
+    """Keep resumable Auto inputs, invalidate every derived final product."""
+    if manifest.get('execution_profile') != 'fast':return
+    manifest['fast_finalization_state']='pending'
+    for key in ('final_period_results','temporal_results','evaluation_summary'):
+        manifest.pop(key,None)
+    manifest['temporal_status']='stale'
+    for entry in manifest.get('change_results',[]):
+        for key in ('evaluation_metrics','evaluation_summary','evaluation_error','evaluation_failed_at',
+                    'evaluated_at','published','final_period_results','final_temporal'):
+            entry.pop(key,None)
+        entry['evaluation_state']='stale'
+        entry['evaluation_stale']=True
+        entry['fast_finalization_state']='pending'
+
+
+def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
+    """Production Fast barrier: final roads/changes/temporal, evaluation, publish later."""
+    _invalidate_fast_finalization(manifest)
+    manifest['temporal_results']=build_temporal_outputs(manifest,job_root)
+    for entry in manifest.get('change_results',[]):
+        entry['fast_finalization_state']='completed'
+        entry['execution_profile']='fast'
+        # A final summary belongs beside the final layer, never in the Auto cache.
+        entry['summary']=str(Path(entry['output'])/'change_summary.json')
+        write_json(Path(entry['summary']),entry)
+        truth,area,field=_manifest_change_context(manifest,str(entry.get('grid','pair')),
+            str(entry['before_period']),str(entry['after_period']),entry)
+        if not truth:
+            (Path(entry['output'])/'evaluation_metrics.csv').unlink(missing_ok=True)
+            entry['evaluation_state']='skipped_no_truth'
+            entry.pop('evaluation_stale',None)
+            write_json(Path(entry['summary']),entry)
             continue
-        evaluate_existing_changes(argparse.Namespace(
-            pipeline_manifest=str(manifest_path), grid=grid, before_period=before,
-            after_period=after, truth=str(entry.get("truth") or ""),
-            validation_area=str(entry.get("validation_area") or ""),
-            truth_type_field=str(entry.get("truth_type_field") or manifest.get("truth_type_field") or "BHBM"),
-            truth_added_value="", truth_width_changed_value="", truth_removed_value="",
-            evaluation_tolerance=5.0,
-        ))
+        _evaluate_existing_changes_impl(argparse.Namespace(
+            pipeline_manifest=str(job_root/'pipeline_result.json'),_manifest=manifest,
+            defer_publish=True,defer_aggregate=True,grid=str(entry.get('grid','pair')),
+            before_period=entry['before_period'],after_period=entry['after_period'],truth=truth,
+            validation_area=area,truth_type_field=field or 'BHBM',truth_added_value='',
+            truth_width_changed_value='',truth_removed_value='',evaluation_tolerance=5.))
+    aggregate_change_evaluations(manifest,job_root)
+    manifest['temporal_status']='completed'
+    manifest['fast_finalization_state']='completed'
+    manifest['downstream_updated_at']=now_text()
 
 
 def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    if manifest.get('execution_profile') == 'fast':args.update_related=True
+    _invalidate_fast_finalization(manifest)
+    if manifest.get('execution_profile') == 'fast':
+        _persist_existing_pipeline(manifest,manifest_path)
     grid, period = str(args.grid), str(args.period)
     pairs = _affected_manifest_pairs(manifest, grid, period)
     emit("pipeline", stage="道路提取局部重跑", status="running", completed=0, total=1 + (len(pairs) if args.update_related else 0))
@@ -4553,10 +4614,6 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest["status"] = "completed"
     manifest["updated_at"] = now_text()
     _persist_existing_pipeline(manifest, manifest_path)
-    if args.update_related:
-        _evaluate_fast_manifest_pairs(
-            manifest_path, [(grid, before, after) for before, after in pairs],
-        )
     result = {"grid": grid, "period": period, "affected_pairs": pairs, "updated_related": bool(args.update_related), "result": updated.get("result")}
     emit("complete", stage="rerun-period", **result)
     return result
@@ -4565,6 +4622,8 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
 def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    if manifest.get('execution_profile') == 'fast':args.update_temporal=True
+    _invalidate_fast_finalization(manifest)
     grid, before, after = str(args.grid), str(args.before_period), str(args.after_period)
     _invalidate_change_evaluation(manifest, grid, before, after)
     _persist_existing_pipeline(manifest, manifest_path)
@@ -4595,7 +4654,6 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
         grid=grid, before_period=before, after_period=after,
         area_completed=1, area_total=1,
     )
-    _evaluate_fast_manifest_pairs(manifest_path, [(grid, before, after)])
     result = {"grid": args.grid, "before_period": args.before_period, "after_period": args.after_period, "updated_temporal": bool(args.update_temporal), "output": updated.get("output")}
     emit("complete", stage="rerun-change", **result)
     return result
@@ -4604,6 +4662,9 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
 def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _invalidate_fast_finalization(manifest)
+    if manifest.get('execution_profile') == 'fast':
+        _persist_existing_pipeline(manifest,manifest_path)
     plan = _manifest_period_plan(manifest)
     period_keys = [
         (grid, period) for grid, periods in plan.items() for period in periods
@@ -4690,7 +4751,6 @@ def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     manifest["period_count"] = len(manifest.get("period_results", []) or [])
     manifest["change_count"] = len(manifest.get("change_results", []) or [])
     _persist_existing_pipeline(manifest, manifest_path)
-    _evaluate_fast_manifest_pairs(manifest_path, completed_changes)
     result = {
         "period_count": len(period_keys), "change_count": len(completed_changes),
         "failure_count": len(failures), "total_change_count": len(change_keys),
@@ -4710,6 +4770,7 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
     """Rerun every adjacent change pair while reusing completed period results."""
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _invalidate_fast_finalization(manifest)
     change_keys = _all_manifest_change_pairs(manifest)
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     failures: list[dict] = []
@@ -4797,7 +4858,6 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
     )
     manifest["updated_at"] = now_text()
     _persist_existing_pipeline(manifest, manifest_path)
-    _evaluate_fast_manifest_pairs(manifest_path, completed_keys)
     result = {
         "change_count": len(completed_keys),
         "failure_count": len(failures),
@@ -5062,7 +5122,7 @@ def run_all(args: argparse.Namespace) -> dict:
         and periods_ready and changes_ready and temporal_ready
     )
     if resume and invalidation["reuse_all"] and prior.get("status") in {"completed", "completed_with_errors"}:
-        if periods_ready and changes_ready and temporal_ready:
+        if periods_ready and changes_ready and temporal_ready and (execution_profile != "fast" or prior.get("fast_finalization_state") == "completed"):
             prior["attempt"] = int(prior.get("attempt", 0) or 0) + 1
             prior["resumed_at"] = now_text()
             prior["last_reused_at"] = now_text()
@@ -5150,6 +5210,7 @@ def run_all(args: argparse.Namespace) -> dict:
         "failures": [],
         "failure_history": list(prior.get("failure_history", [])) + list(prior.get("failures", [])),
     }
+    _invalidate_fast_finalization(manifest)
     _persist_pipeline(manifest, job_root, output_root)
 
     def update_elapsed() -> float:
@@ -5219,7 +5280,7 @@ def run_all(args: argparse.Namespace) -> dict:
                     entry["provenance"] = entry_provenance
                     manifest["period_results"].append(entry)
                     result_by_period[(grid_name, period)] = entry
-                    published = ResultPublisher(output_root).publish_period(
+                    published = {} if execution_profile == "fast" else ResultPublisher(output_root).publish_period(
                         grid_name, period, entry, run_id=run_id,
                     )
                     if published:
@@ -5395,30 +5456,11 @@ def run_all(args: argparse.Namespace) -> dict:
                     }
                     entry["elapsed_seconds"] = elapsed_seconds(unit_started)
                     manifest["change_results"].append(entry)
-                    published = ResultPublisher(output_root).publish_change(
+                    published = {} if execution_profile == "fast" else ResultPublisher(output_root).publish_change(
                         grid_name, before_period, after_period, entry, run_id=run_id,
                     )
                     if published:
                         entry["published"] = published
-                    if execution_profile == "fast" and truth_value:
-                        _persist_pipeline(manifest, job_root, output_root)
-                        evaluate_existing_changes(argparse.Namespace(
-                            pipeline_manifest=str(job_root / "pipeline_result.json"), grid=grid_name,
-                            before_period=before_period, after_period=after_period, truth=truth_value,
-                            validation_area=validation_value,
-                            truth_type_field=str(getattr(args, "truth_type_field", "") or "BHBM"),
-                            truth_added_value="", truth_width_changed_value="", truth_removed_value="",
-                            evaluation_tolerance=5.0,
-                        ))
-                        evaluated_manifest = read_json(job_root / "pipeline_result.json")
-                        evaluated_entry = next(
-                            candidate for candidate in evaluated_manifest.get("change_results", [])
-                            if str(candidate.get("grid")) == str(grid_name)
-                            and str(candidate.get("before_period")) == str(before_period)
-                            and str(candidate.get("after_period")) == str(after_period)
-                        )
-                        entry.update(evaluated_entry)
-                        manifest["evaluation_summary"] = evaluated_manifest.get("evaluation_summary", {})
                 except Exception as exc:
                     failure = {
                         "type": "change", "grid": grid_name,
@@ -5443,7 +5485,9 @@ def run_all(args: argparse.Namespace) -> dict:
             "pipeline", stage="长时序道路汇总", status="running",
             completed=total_work, total=total_work,
         )
-        if reuse_completed_downstream:
+        if execution_profile == "fast":
+            _finalize_fast_manifest(manifest, job_root)
+        elif reuse_completed_downstream:
             manifest["temporal_results"] = [prior_temporal[str(grid)] for grid in grids]
             emit(
                 "pipeline", stage="长时序道路汇总", status="skipped",
@@ -5464,7 +5508,9 @@ def run_all(args: argparse.Namespace) -> dict:
         manifest["completed_at"] = now_text()
         manifest["status"] = "completed_with_errors" if manifest["failures"] else "completed"
         update_elapsed()
-        if reuse_completed_downstream and _evaluation_summary_ready(prior.get("evaluation_summary")):
+        if execution_profile == "fast":
+            pass  # Finalization has evaluated and aggregated the final changes.
+        elif reuse_completed_downstream and _evaluation_summary_ready(prior.get("evaluation_summary")):
             manifest["evaluation_summary"] = prior["evaluation_summary"]
         else:
             aggregate_change_evaluations(manifest, job_root)

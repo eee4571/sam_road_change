@@ -490,7 +490,7 @@ class ProjectBatchExtractionTests(unittest.TestCase):
 
 
 class ProjectPeriodChangeTests(unittest.TestCase):
-    def test_fast_without_truth_publishes_automatic_result_directly(self) -> None:
+    def test_fast_without_truth_defers_until_shared_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             output = root / "changes"
@@ -498,7 +498,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
             with (
                 patch("engine.fast_pipeline.detect_fast_changes", return_value=automatic) as detect_mock,
                 patch("engine.fast_pipeline.augment_fast_changes_with_truth") as augment_mock,
-                patch("engine.fast_gt_reconciliation.complete_auto_pair_temporal",return_value=automatic) as temporal_mock,
+                patch.object(user_pipeline,"_finalize_fast_manifest") as temporal_mock,
             ):
                 result = user_pipeline._run_fast_change_result(
                     root / "before.json",
@@ -508,13 +508,13 @@ class ProjectPeriodChangeTests(unittest.TestCase):
                     after_period="2022",
                     position_tolerance=3.0,
                     width_change_absolute=2.0,
-                    width_change_ratio=0.2,
+                    width_change_ratio=0.2, defer_finalization=True,
                 )
 
-            self.assertEqual(result, automatic)
-            self.assertEqual(detect_mock.call_args.args[2], output)
+            self.assertIs(result["automatic"], automatic)
+            self.assertEqual(detect_mock.call_args.args[2], output / "_automatic")
             augment_mock.assert_not_called()
-            temporal_mock.assert_called_once()
+            temporal_mock.assert_not_called()
 
     def test_fast_truth_runs_auto_then_augmentation_without_legacy_builder(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -542,7 +542,7 @@ class ProjectPeriodChangeTests(unittest.TestCase):
                     after_period="2022",
                     position_tolerance=3.0,
                     width_change_absolute=2.0,
-                    width_change_ratio=0.2,
+                    width_change_ratio=0.2, defer_finalization=True,
                     truth_path=truth,
                 )
 
@@ -1931,8 +1931,7 @@ class DependencyInvalidationTests(unittest.TestCase):
             calls = []
             with patch.object(user_pipeline, "_rerun_period_entry") as period_mock, \
                     patch.object(user_pipeline, "_rerun_change_entry", side_effect=lambda _m, g, b, a: calls.append((g, b, a)) or {}), \
-                    patch.object(user_pipeline, "_refresh_manifest_downstream"), \
-                    patch.object(user_pipeline, "_evaluate_fast_manifest_pairs") as evaluation_mock, \
+                    patch.object(user_pipeline, "_refresh_manifest_downstream") as finalization_mock, \
                     patch.object(user_pipeline, "_write_task_report"):
                 result = user_pipeline.rerun_all_pipeline_changes(argparse.Namespace(
                     pipeline_manifest=str(manifest_path), continue_on_error=True,
@@ -1944,7 +1943,7 @@ class DependencyInvalidationTests(unittest.TestCase):
                 ("south", "2020", "2023"),
             ])
             self.assertEqual(result, {"change_count": 3, "failure_count": 0, "total_change_count": 3})
-            evaluation_mock.assert_called_once()
+            finalization_mock.assert_called_once()
 
     def test_rerun_all_periods_includes_failed_planned_period_and_continues(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1967,8 +1966,7 @@ class DependencyInvalidationTests(unittest.TestCase):
             with patch.object(user_pipeline, "_rerun_period_entry", side_effect=rerun_period), \
                     patch.object(user_pipeline, "_rerun_change_entry", side_effect=RuntimeError("missing dependency")), \
                     patch.object(user_pipeline, "_refresh_manifest_downstream"), \
-                    patch.object(user_pipeline, "_persist_existing_pipeline"), \
-                    patch.object(user_pipeline, "_evaluate_fast_manifest_pairs"):
+                    patch.object(user_pipeline, "_persist_existing_pipeline"):
                 result = user_pipeline.rerun_all_pipeline_periods(argparse.Namespace(
                     pipeline_manifest=str(manifest_path), continue_on_error=True,
                 ))

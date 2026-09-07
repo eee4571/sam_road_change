@@ -295,7 +295,7 @@ class ResultPublisher:
         target = Path(target).resolve()
         if not target.is_relative_to(root):
             raise ValueError('Publication target outside results root')
-        for name in ('Auto', 'GT-assisted'):
+        for name in ('Auto', 'GT-assisted', 'review', '04_精度评价'):
             old = (target / name).resolve()
             if not old.is_relative_to(target):
                 raise ValueError('Variant directory escaped publication target')
@@ -324,8 +324,6 @@ class ResultPublisher:
                 if len(columns)!=len(frame.columns):frame[columns].to_file(path,encoding='UTF-8')
             elif path.name=='width_evolution.csv':
                 frame=pd.read_csv(path);frame[[c for c in frame if c in allowed]].to_csv(path,index=False,encoding='utf-8-sig')
-            elif path.name=='road_state.gpkg':
-                frame=gpd.read_file(path);frame[[c for c in frame if c in allowed]].to_file(path,layer='road_state',driver='GPKG')
 
     def publish_period(
         self, area: object, period: object, result: dict,
@@ -339,8 +337,8 @@ class ResultPublisher:
             ("surfaces", "road_surfaces.shp"),
             ("width_segments", "road_width_segments.shp"),
             ("corridors", "road_corridors.shp"),
-            ("road_state", "road_state.gpkg"),
         ), base_dir=base_dir)
+        (target/'road_state.gpkg').unlink(missing_ok=True)
         previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
         extraction_preview = result.get("road_extraction")
         if not extraction_preview:
@@ -385,6 +383,7 @@ class ResultPublisher:
         self, area: object, before: object, after: object, result: dict,
         *, run_id: object = "", base_dir: Path | None = None, save: bool = True,
     ) -> dict[str, str]:
+        if result.get('fast_finalization_state') == 'pending':return {}
         pair = f"{safe_name(before)}_to_{safe_name(after)}"
         target = self.layout.results_root / safe_name(area) / "02_变化检测" / pair
         layers = dict(result.get("layers") or {})
@@ -471,15 +470,20 @@ class ResultPublisher:
 
     def publish_evaluation(
         self, areas: Iterable[object], summary: dict, *, base_dir: Path | None = None,
-        save: bool = True,
+        save: bool = True, within_changes: bool = False,
     ) -> None:
         sources = {"csv": summary.get("csv"), "json": summary.get("json")}
         for area in areas:
             target = self.layout.results_root / safe_name(area) / "04_精度评价"
+            if within_changes:
+                target=self.layout.results_root/safe_name(area)/'02_变化检测'/'精度评价'
+                self._retire_product_variants(self.layout.results_root/safe_name(area))
             published = self._copy_fields(sources, target, (
                 ("csv", "evaluation_summary.csv"),
                 ("json", "evaluation_summary.json"),
             ), base_dir=base_dir)
+            if within_changes and not sources.get('csv'):
+                (target/'evaluation_summary.csv').unlink(missing_ok=True)
             if published:
                 self._area(area)["evaluation"] = {
                     **published, "status": "已生成",
@@ -503,6 +507,8 @@ class ResultPublisher:
     def publish_manifest(
         self, manifest: dict, *, source_manifest: Path | str | None = None,
     ) -> dict:
+        if manifest.get('fast_finalization_state') == 'pending':
+            return self.index
         run_id = manifest.get("run_id", "")
         for entry in (manifest.get('final_period_results',manifest.get('period_results',[])) or []):
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
@@ -528,7 +534,7 @@ class ResultPublisher:
         areas = list(self.index.get("areas", {}))
         summary = manifest.get("evaluation_summary")
         if isinstance(summary, dict) and areas:
-            self.publish_evaluation(areas, summary, save=False)
+            self.publish_evaluation(areas, summary, save=False,within_changes=manifest.get('execution_profile')=='fast')
         job_root = _manifest_path(manifest.get("job_root"))
         if job_root is not None:
             self.publish_reports(job_root, save=False)
@@ -555,12 +561,14 @@ def result_index_from_manifest(
     output_value = manifest.get("output_root") or (Path(project_value) / RESULT_DIRECTORY_NAME)
     layout = ProjectLayout.from_project(project_value, output_value)
     index = empty_result_index(layout)
+    if manifest.get('fast_finalization_state') == 'pending':
+        return index
 
     def path_text(value: object) -> str:
         path = _manifest_path(value, base_dir)
         return str(path) if path is not None else ""
 
-    for entry in manifest.get("period_results", []) or []:
+    for entry in manifest.get('final_period_results',manifest.get("period_results", [])) or []:
         if not isinstance(entry, dict):
             continue
         area, period = str(entry.get("grid") or "validation"), str(entry.get("period") or "未命名期次")
