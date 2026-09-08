@@ -1,0 +1,8 @@
+{
+  "id": "road_change",
+  "name": "道路变化检测",
+  "version": "1.0.0",
+  "api_version": "1",
+  "entry": "plugin:create_plugin",
+  "description": "多区域多期遥感道路提取、变化检测与成果评价"
+}

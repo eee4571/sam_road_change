@@ -1,0 +1,2 @@
+# Preserve the exact backend snapshot bytes recorded in backend_snapshot.json.
+code/** -text

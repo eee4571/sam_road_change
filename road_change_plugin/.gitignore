@@ -1,0 +1,13 @@
+# Keep only directory placeholders; environments and weights stay local.
+!/runtime/env/
+/runtime/env/*
+!/runtime/env/PLACEHOLDER
+/runtime/model/*
+!/runtime/model/PLACEHOLDER
+
+# Runtime products and caches.
+__pycache__/
+*.py[cod]
+_work/
+_logs/
+outputs/
