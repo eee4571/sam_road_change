@@ -11,7 +11,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea, QTabBar, QStackedWidget
 from PySide6.QtCore import QThreadPool
 from plugin import create_plugin
 from plugin.ui.project_browser import scan_project, check_files, pairs
@@ -137,14 +137,45 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget.show()
         for width in (300, 380, 450):
             self.widget.resize(width, 760)
-            for index in range(4):
-                self.widget.pages.setCurrentIndex(index)
-                APP.processEvents()
-                self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
-        self.assertEqual(self.widget.navigation.count(), 3)
+            APP.processEvents()
+            self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
+            self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
+        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 1)
+        self.assertFalse(self.widget.findChildren(QTabBar))
+        self.assertFalse(self.widget.findChildren(QStackedWidget))
         self.assertFalse(self.widget.local.toggle.isChecked())
         self.assertFalse(self.widget.advanced.toggle.isChecked())
         self.assertFalse(self.widget.corrections.toggle.isChecked())
+        self.assertFalse(self.widget.records_fold.toggle.isChecked())
+
+    def test_group_open_and_automatic_completion_results(self):
+        received = []
+        self.plugin.result_ready.connect(received.append)
+        self.widget._reset_results()
+        self.widget._finished({"status": "completed", "task_id": "demo"})
+        self.assertTrue(self.widget.group_buttons["单期道路"].isEnabled())
+        self.assertFalse(received)
+        self.widget.group_buttons["单期道路"].click()
+        self.assertEqual({r["result_type"] for r in received}, {"road_centerline", "road_surface", "road_width"})
+
+    def test_hidden_widget_keeps_task_updates(self):
+        with patch.object(self.widget.controller, "cancel") as cancel:
+            self.widget._started({"task_id": "hidden-test"})
+            self.widget.hide()
+            for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+                fold.toggle.setChecked(True)
+                fold.toggle.setChecked(False)
+            self.widget._progress({"stage": "道路提取", "event": {"kind": "pipeline", "progress": .25}})
+            self.assertEqual(self.widget.progress.value(), 250)
+            self.assertTrue(self.widget.timer.isActive())
+            cancel.assert_not_called()
+
+    def test_evaluation_summary(self):
+        report = self.root / "metrics.json"
+        report.write_text(json.dumps({"metrics": [{"class": "all", "precision": .9, "recall": .8, "f1": .847}]}))
+        self.widget._result({"result_type": "road_evaluation", "path": str(report), "name": "评价报告", "metadata": {}})
+        self.assertIn("Precision 90.0%", self.widget.metrics.text())
+        self.assertIn("F1 84.7%", self.widget.metrics.text())
 
 
 if __name__ == "__main__":

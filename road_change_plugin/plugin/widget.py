@@ -4,15 +4,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtCore import QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QComboBox, QStackedWidget, QScrollArea, QLabel, QPushButton, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
+    QComboBox, QScrollArea, QLabel, QPushButton, QLineEdit,
     QCheckBox, QProgressBar, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QTabBar, QToolButton, QStyle, QHeaderView)
+    QStyle, QHeaderView)
 from .ui.forms import PathField, Rows, Fold, form_layout
 from .ui.project_browser import ROOT, scan_project, check_files, pairs, discover_tasks, natural, resolve
 from .ui.background import BrowseJob
+from .ui.evaluation_summary import metrics_text
 from .result_parser import read_results
 
 RESULT_LABELS = {"road_centerline": "道路中心线", "road_surface": "道路面",
@@ -56,29 +57,23 @@ class RoadChangeWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        header = QHBoxLayout()
-        header.addWidget(label("道路变化检测"), 1)
-        records = QToolButton()
-        records.setText("运行记录")
-        records.clicked.connect(lambda: self.pages.setCurrentIndex(3))
-        header.addWidget(records)
-        layout.addLayout(header)
-        self.navigation = QTabBar()
-        for title in ("数据准备", "运行", "成果"):
-            self.navigation.addTab(title)
-        self.navigation.setExpanding(True)
-        self.navigation.setDrawBase(False)
-        layout.addWidget(self.navigation)
-        self.pages = QStackedWidget()
-        layout.addWidget(self.pages, 1)
-        self.navigation.currentChanged.connect(self.pages.setCurrentIndex)
-        self.navigation.tabBarClicked.connect(self.pages.setCurrentIndex)
-        self._data_page()
-        self._run_page()
-        self._results_page()
-        self._history_page()
+        self.scroll = QScrollArea()
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll.setWidgetResizable(True)
+        body = QWidget()
+        form = form_layout(body)
+        form.setContentsMargins(0, 0, 4, 0)
+        form.setSpacing(6)
+        self.scroll.setWidget(body)
+        layout.addWidget(self.scroll)
+        self._data_section(form)
+        self._processing_section(form)
+        self._results_section(form)
+        self._history_section()
+        for fold in (self.corrections, self.advanced, self.local, self.records_fold):
+            form.addRow(fold)
         self.status = label("选择项目目录，开始扫描数据")
-        layout.addWidget(self.status)
+        form.addRow(self.status)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._tick)
@@ -92,18 +87,6 @@ class RoadChangeWidget(QWidget):
             self._log(entry)
         self._update_controls()
 
-    def _page(self):
-        body = QWidget()
-        form = form_layout(body)
-        form.setContentsMargins(0, 0, 4, 0)
-        form.setSpacing(8)
-        scroll = QScrollArea()
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(body)
-        self.pages.addWidget(scroll)
-        return form
-
     def _button(self, text, callback, icon=None):
         button = QPushButton(text)
         if icon is not None:
@@ -111,8 +94,7 @@ class RoadChangeWidget(QWidget):
         button.clicked.connect(callback)
         return button
 
-    def _data_page(self):
-        form = self._page()
+    def _data_section(self, form):
         self.project = PathField(directory=True)
         self.project.edit.setPlaceholderText("选择项目 / 数据目录")
         self.project.edit.textChanged.connect(self._directory_changed)
@@ -127,12 +109,14 @@ class RoadChangeWidget(QWidget):
         self.data_tree.setMinimumHeight(190)
         self.data_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.data_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        form.addRow(self.data_tree)
+        self.corrections = Fold("数据详情与修正")
+        self.corrections.form.addRow(self.data_tree)
+        self.check_details = label("暂无检查详情")
+        self.corrections.form.addRow(self.check_details)
         self.check_note = label("扫描后检查数据；无需手动填写区域与期次。")
         form.addRow(self.check_note)
         self.check_button = self._button("检查数据", self.check_data, QStyle.StandardPixmap.SP_DialogApplyButton)
         form.addRow(self.check_button)
-        self.corrections = Fold("识别有误？修正数据")
         self.areas = Rows(["区域", "验证区 SHP"], "Shapefile (*.shp)")
         self.periods = Rows(["区域", "期次", "影像 TXT"], "影像清单 (*.txt)")
         self.truths = Rows(["区域", "前期", "后期", "GT SHP"], "Shapefile (*.shp)")
@@ -141,17 +125,10 @@ class RoadChangeWidget(QWidget):
             rows.table.itemChanged.connect(self._edited)
             rows.table.model().rowsRemoved.connect(self._edited)
         self.corrections.form.addRow(self._button("应用修正", self._apply_corrections))
-        form.addRow(self.corrections)
-        structure = Fold("支持的目录结构")
-        structure.form.addRow(label("支持 project_config.json，或每个区域下的：\n01_验证区：SHP\n02_影像：以期次命名的 TXT\n03_变化真值：前期_to_后期.shp（可选）\n也支持共享影像清单的平铺目录。"))
-        form.addRow(structure)
-        self.next_button = self._button("下一步：运行", lambda: self.navigation.setCurrentIndex(1), QStyle.StandardPixmap.SP_ArrowForward)
-        form.addRow(self.next_button)
+        self.corrections.form.addRow(label("目录结构：01_验证区 / 02_影像 / 03_变化真值（可选）。也支持 project_config.json。"))
 
-    def _run_page(self):
-        form = self._page()
-        self.run_summary = label("先在数据准备页扫描并检查数据")
-        form.addRow(self.run_summary)
+    def _processing_section(self, form):
+        form.addRow(label("处理设置"))
         self.profile = QComboBox()
         self.profile.addItem("标准", "full")
         self.profile.addItem("Fast", "fast")
@@ -161,6 +138,7 @@ class RoadChangeWidget(QWidget):
         self.run_button.setProperty("role", "primary")
         self.run_button.setDefault(True)
         form.addRow(self.run_button)
+        form.addRow(label("当前任务"))
         self.state_text = label("待就绪")
         self.area_text = label("—")
         self.scope_text = label("—")
@@ -183,7 +161,7 @@ class RoadChangeWidget(QWidget):
         form.addRow(self.progress_note)
         self.cancel_button = self._button("取消任务", self.controller.cancel)
         form.addRow(self.cancel_button)
-        self.local = Fold("局部运行与重跑")
+        self.local = Fold("局部重跑")
         self.task = QComboBox()
         self.task.setMinimumWidth(0)
         self.task.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -198,7 +176,6 @@ class RoadChangeWidget(QWidget):
         self.local.form.addRow("变化对", self.pair)
         self.rerun_pair = self._button("重跑该变化对", lambda: self._run("rerun-change"))
         self.local.form.addRow(self.rerun_pair)
-        form.addRow(self.local)
         self.advanced = Fold("高级设置")
         self.output = PathField(directory=True)
         self.output.edit.textChanged.connect(self._invalidate_check)
@@ -223,31 +200,30 @@ class RoadChangeWidget(QWidget):
             self.parameters[key] = field
             self.advanced.form.addRow(title, field)
         self.advanced.form.addRow(self._button("检查运行资源", self._runtime))
-        form.addRow(self.advanced)
 
-    def _results_page(self):
-        form = self._page()
+    def _results_section(self, form):
+        form.addRow(label("成果与评价"))
         self.result_summary = label("扫描项目后自动发现已有成果")
         form.addRow(self.result_summary)
-        form.addRow(self._button("刷新项目成果", self._refresh_results, QStyle.StandardPixmap.SP_BrowserReload))
         self.results = QTreeWidget()
         self.results.setHeaderLabels(["成果", "操作"])
         self.results.setMinimumWidth(0)
-        self.results.setMinimumHeight(320)
+        self.results.setMinimumHeight(140)
+        self.results.setMaximumHeight(144)
         self.results.header().setStretchLastSection(False)
         self.results.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.results.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         form.addRow(self.results)
         self._reset_results()
         form.addRow(label("点击“打开”将成果路径交给宿主使用。"))
-        self.evaluation_fold = Fold("精度评价")
-        self.evaluation_fold.form.addRow(label("使用当前项目已识别的 GT 评价已有成果。"))
+        self.metrics = label("Precision —   Recall —   F1 —")
+        form.addRow(self.metrics)
         self.evaluate_button = self._button("评价已有成果", lambda: self._run("evaluate-all-existing"))
-        self.evaluation_fold.form.addRow(self.evaluate_button)
-        form.addRow(self.evaluation_fold)
+        self.advanced.form.addRow(self.evaluate_button)
 
-    def _history_page(self):
-        form = self._page()
+    def _history_section(self):
+        self.records_fold = Fold("运行记录")
+        form = self.records_fold.form
         self.recent = QComboBox()
         self.recent.setMinimumWidth(0)
         self.recent.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -353,7 +329,6 @@ class RoadChangeWidget(QWidget):
             node.setExpanded(True)
         text = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次\n{len(change_pairs)} 个变化对 · {len(gt)} 个 GT"
         self.summary.setText(text)
-        self.run_summary.setText(text)
 
     def check_data(self):
         self.status.setText("正在检查输入文件…")
@@ -366,8 +341,9 @@ class RoadChangeWidget(QWidget):
         except (ValueError, OSError, TypeError) as exc:
             issues.append(str(exc))
         self.checked = not issues
-        self.check_note.setText("\n".join(issues[:8]) if issues else "数据文件已就绪。空间参考与影像内容在运行前检查。")
-        self.status.setText("数据待修正" if issues else "数据已就绪，可以运行")
+        self.check_details.setText("\n".join(issues) if issues else "输入文件与清单检查通过。空间参考与影像内容在正式运行前检查。")
+        self.check_note.setText(f"检查失败 · {len(issues)} 项待修正" if issues else "数据已就绪")
+        self.status.setText("检查失败，请展开数据详情修正" if issues else "数据已就绪，可以运行")
         self.state_text.setText("待修正" if issues else "数据已就绪")
         self._update_controls()
 
@@ -437,7 +413,6 @@ class RoadChangeWidget(QWidget):
         self.run_button.setEnabled(available and self.checked and evaluation_ok)
         self.scan_button.setEnabled(available)
         self.check_button.setEnabled(available and has_data)
-        self.next_button.setEnabled(available and self.checked)
         self.project.setEnabled(available)
         self.corrections.setEnabled(available)
         self.advanced.setEnabled(available)
@@ -449,6 +424,7 @@ class RoadChangeWidget(QWidget):
         self.evaluate_button.setEnabled(available and has_task)
         summary = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次\n{len(pairs(self.model['periods']))} 个变化对 · {len(self.model['truths'])} 个 GT"
         self.summary.setText(summary + (" · 已就绪" if self.checked else " · 待检查"))
+        self.check_note.setVisible(not self.checked)
         if not evaluation_ok and not self.busy:
             self.status.setText("标准模式评价需要每个变化对的 GT；请修正或在高级设置关闭评价")
 
@@ -483,7 +459,6 @@ class RoadChangeWidget(QWidget):
         self.progress_note.setText("等待后端总体进度")
         self.timer.start()
         self._log({"task_id": self._active_record, "message": "任务开始", "level": "INFO"})
-        self.navigation.setCurrentIndex(1)
         self._update_controls()
 
     def _tick(self):
@@ -565,26 +540,38 @@ class RoadChangeWidget(QWidget):
         if finished:
             self.progress.setValue(1000)
         self.progress_note.setText("成果已生成" if finished else "已停止，已完成成果可供续跑")
-        self.status.setText("处理完成，可前往成果页使用结果" if finished else "任务已取消")
+        self.status.setText("处理完成，可直接打开下方成果" if finished else "任务已取消")
         self._log({**payload, "message": self.state_text.text()})
-        self._refresh_results()
+        self._refresh_results(latest=True)
         self._update_controls()
 
     def _reset_results(self):
         self.results.clear()
         self._result_keys.clear()
         nodes = {}
+        self._group_payloads = {}
+        self.group_buttons = {}
         for name in ("单期道路", "变化检测", "长时序", "精度评价"):
             nodes[name] = QTreeWidgetItem([name, ""])
             self.results.addTopLevelItem(nodes[name])
+            self._group_payloads[name] = []
+            button = self._button("打开", lambda _checked=False, group=name: self._open_group(group))
+            button.setEnabled(False)
+            button.setToolTip("报告本类全部成果路径；展开分类可单独打开")
+            self.results.setItemWidget(nodes[name], 1, button)
+            self.group_buttons[name] = button
         self.groups = {kind: nodes[group] for kind, group in GROUPS.items()}
+        if hasattr(self, "metrics"):
+            self.metrics.setText("Precision —   Recall —   F1 —")
 
-    def _refresh_results(self):
+    def _refresh_results(self, latest=False):
         root = self.model.get("root")
         if not root:
             return
         tasks = discover_tasks(Path(root), self.output.text())
         self._set_tasks(tasks)
+        if latest and tasks:
+            self.task.setCurrentIndex(0)
         self._reset_results()
         task = self.task.currentData()
         if task:
@@ -604,6 +591,9 @@ class RoadChangeWidget(QWidget):
         if key in self._result_keys:
             return
         self._result_keys.add(key)
+        group = GROUPS[kind]
+        self._group_payloads[group].append(dict(payload))
+        self.group_buttons[group].setEnabled(True)
         meta = payload.get("metadata", {})
         scope = str(meta.get("period") or "")
         if meta.get("before_period") and meta.get("after_period"):
@@ -614,13 +604,20 @@ class RoadChangeWidget(QWidget):
         item = QTreeWidgetItem([title + (f" · {context}" if context else ""), ""])
         item.setToolTip(0, payload["path"])
         self.groups[kind].addChild(item)
-        self.groups[kind].setExpanded(True)
+        self.groups[kind].setText(0, f"{group}（{len(self._group_payloads[group])}）")
         button = self._button("打开", lambda: self._open_result(payload))
         self.results.setItemWidget(item, 1, button)
+        self.result_summary.setText(f"{len(self._result_keys)} 项可用成果 · 展开分类可单独打开")
+        if kind == "road_evaluation" and Path(payload["path"]).suffix.lower() == ".json":
+            self.metrics.setText(metrics_text(Path(payload["path"])))
+
+    def _open_group(self, group):
+        for payload in list(self._group_payloads[group]):
+            self._open_result(payload)
 
     def _open_result(self, payload):
         if not Path(payload["path"]).is_file():
-            self.status.setText("成果文件已不存在，请刷新项目成果")
+            self.status.setText("成果文件已不存在，请重新扫描项目")
             return
         self.controller.result_ready.emit(dict(payload))
         self.status.setText("已将成果路径报告给宿主")

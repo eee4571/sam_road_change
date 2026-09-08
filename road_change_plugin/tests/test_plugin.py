@@ -62,10 +62,9 @@ class PluginTests(unittest.TestCase):
         self.assertIs(QApplication.instance(), APP)
         widget.resize(300, 700)
         widget.show()
-        for index in range(4):
-            widget.pages.setCurrentIndex(index)
+        for width in (300, 380, 450):
+            widget.resize(width, 700)
             APP.processEvents()
-            self.assertEqual(widget.pages.currentIndex(), index)
             self.assertLessEqual(widget.minimumSizeHint().width(), 300)
         self.assertFalse(widget.local.toggle.isChecked())
         self.assertFalse(widget.advanced.toggle.isChecked())
