@@ -156,7 +156,10 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertTrue(self.widget.group_buttons["单期道路"].isEnabled())
         self.assertFalse(received)
         self.widget.group_buttons["单期道路"].click()
-        self.assertEqual({r["result_type"] for r in received}, {"road_centerline", "road_surface", "road_width"})
+        self.assertFalse(received)
+        self.assertFalse(self.widget.chooser.isHidden())
+        self.widget.chooser.open_button.click()
+        self.assertEqual(len(received), 1)
 
     def test_hidden_widget_keeps_task_updates(self):
         with patch.object(self.widget.controller, "cancel") as cancel:
@@ -188,6 +191,27 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(self.widget.scan_button.styleSheet(), "")
         for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
             self.assertTrue(fold.toggle.autoRaise())
+
+    def test_footer_stays_visible_with_expanded_tools(self):
+        self.widget.show()
+        for width in (300, 360, 680):
+            self.widget.resize(width, 600)
+            for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+                self.widget._reveal(fold)
+                APP.processEvents()
+                APP.processEvents()
+                self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
+                bottom = self.widget.run_button.mapTo(self.widget, self.widget.run_button.rect().bottomRight())
+                self.assertLess(bottom.y(), self.widget.height())
+                self.widget._reveal(fold)
+        self.widget._started({"task_id": "state-test"})
+        self.assertFalse(self.widget.running_status.isHidden())
+        self.widget._finished({"status": "completed", "task_id": "state-test"})
+        self.assertTrue(self.widget.running_status.isHidden())
+        self.assertEqual(self.widget.task_line.text().count("已完成"), 1)
+        self.widget._failed({"message": "测试错误", "detail": "错误详情"})
+        self.assertIn("测试错误", self.widget.task_line.text())
+        self.assertFalse(self.widget.failure_details.isHidden())
 
     def test_host_can_override_local_appearance(self):
         application_style = APP.styleSheet()

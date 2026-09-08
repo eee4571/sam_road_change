@@ -59,25 +59,29 @@ def main():
                 widget.project.edit.setText(str(project))
                 widget._scanned(scan_project(project))
                 widget._checked([])
-                widget._started({"task_id": "preview-only"})
-                widget._started_at -= 146
-                widget._finished({"status": "completed", "task_id": "preview-only"})
-                widget.area_text.setText("南区")
-                widget.scope_text.setText("2022 → 2024")
-                widget.stage_text.setText("正式成果已生成")
-                widget.status.setText("示例数据与模拟完成状态 · 未运行模型")
-
                 def capture():
-                    widget.setWindowTitle("道路变化检测 · 单页 standalone 预览")
-                    widget.resize(400, 970)
-                    QApplication.processEvents()
-                    target = ROOT / "resources/ui_preview.png"
-                    widget.grab().save(str(target))
-                    widget.resize(300, 760)
-                    QApplication.processEvents()
-                    assert widget.scroll.horizontalScrollBar().maximum() == 0
-                    widget.grab().save(str(ROOT / "resources/ui_preview_300.png"))
-                    print(target)
+                    widget.resize(680, 600)
+                    def save(name):
+                        QApplication.processEvents()
+                        QApplication.processEvents()
+                        assert widget.scroll.horizontalScrollBar().maximum() == 0
+                        assert widget.run_button.isVisible()
+                        assert widget.run_button.mapTo(widget, widget.run_button.rect().bottomRight()).y() < widget.height()
+                        widget.grab().save(str(ROOT / ("resources/" + name + ".png")))
+                    widget._reset_results()
+                    widget.result_summary.setText("暂无成果，运行完成后在此查看")
+                    save("ui_idle_680")
+                    widget._started({"task_id": "preview-only"})
+                    widget._started_at -= 98
+                    widget._progress({"stage": "道路提取", "event": {"kind": "pipeline", "grid": "南区", "period": "2022", "progress": .68}})
+                    widget._tick()
+                    save("ui_running_680")
+                    widget._started_at -= 48
+                    widget._finished({"status": "completed", "task_id": "preview-only"})
+                    save("ui_completed_680")
+                    widget.resize(360, 600)
+                    save("ui_narrow_360")
+                    print("Captured idle, running, completed (680 × 600), narrow (360 × 600)")
                     QApplication.instance().quit()
 
                 QTimer.singleShot(100, capture)

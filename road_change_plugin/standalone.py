@@ -9,7 +9,7 @@ def main():
     plugin = create_plugin()
     widget = plugin.create_widget()
     widget.setWindowTitle(plugin.name)
-    widget.resize(460, 760)
+    widget.resize(680, 600)
     app.aboutToQuit.connect(plugin.shutdown)
     widget.show()
     return app.exec()

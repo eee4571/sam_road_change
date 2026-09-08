@@ -75,5 +75,5 @@ def result_menu(button, title, payloads, open_result):
         action = menu.addAction(caption)
         action.setToolTip(payload["path"])
         action.triggered.connect(lambda _checked=False, value=payload: open_result(value))
-    button.setToolTip(f"打开全部{title}成果；右键可选择单项")
+    button.setToolTip(f"查看{title}成果并选择单个文件")
     return menu
