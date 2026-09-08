@@ -16,7 +16,8 @@ class PathField(QWidget):
         super().__init__(parent)
         self.edit = QLineEdit()
         self.edit.setMinimumWidth(0)
-        button = QPushButton("…")
+        button = QToolButton()
+        button.setText("…")
         button.setToolTip("选择目录" if directory else "选择文件")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -75,6 +76,14 @@ class Rows(QWidget):
     def values(self):
         return [[self.table.item(r, c).text().strip() if self.table.item(r, c) else ""
                  for c in range(self.table.columnCount())] for r in range(self.table.rowCount())]
+
+    def set_values(self, values):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(values))
+        for r, row in enumerate(values):
+            for c, value in enumerate(row):
+                self.table.setItem(r, c, QTableWidgetItem(str(value)))
+        self.table.blockSignals(False)
 
 
 class Fold(QWidget):

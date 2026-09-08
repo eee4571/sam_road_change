@@ -63,7 +63,7 @@ class PluginTests(unittest.TestCase):
         widget.resize(300, 700)
         widget.show()
         for index in range(4):
-            widget.navigation.setCurrentIndex(index)
+            widget.pages.setCurrentIndex(index)
             APP.processEvents()
             self.assertEqual(widget.pages.currentIndex(), index)
             self.assertLessEqual(widget.minimumSizeHint().width(), 300)
