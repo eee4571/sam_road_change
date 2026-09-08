@@ -1,13 +1,16 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QLineEdit,
-    QToolButton, QFormLayout)
+    QToolButton, QFormLayout, QFrame)
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
+from .presentation import AccordionButton
 
 
 def form_layout(widget):
     form = QFormLayout(widget)
     form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
     form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    form.setSpacing(8)
     return form
 
 
@@ -21,6 +24,7 @@ class PathField(QWidget):
         button.setToolTip("选择目录" if directory else "选择文件")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         layout.addWidget(self.edit, 1)
         layout.addWidget(button)
         button.clicked.connect(lambda: self.browse(directory))
@@ -91,7 +95,9 @@ class Fold(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.toggle = QToolButton()
+        layout.setSpacing(8)
+        self.toggle = AccordionButton()
+        self.toggle.setAutoRaise(True)
         self.toggle.setText(title)
         self.toggle.setCheckable(True)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)

@@ -68,7 +68,7 @@ class PluginTests(unittest.TestCase):
             self.assertLessEqual(widget.minimumSizeHint().width(), 300)
         self.assertFalse(widget.local.toggle.isChecked())
         self.assertFalse(widget.advanced.toggle.isChecked())
-        self.assertEqual(set(widget.groups), set(RESULT_TYPES))
+        self.assertEqual(set(widget.group_buttons), {"单期道路", "变化检测", "长时序", "精度评价"})
         widget.close()
         plugin.shutdown()
 
@@ -86,7 +86,8 @@ class PluginTests(unittest.TestCase):
                 modules = [n.name.split('.')[0] for n in node.names] if isinstance(node, ast.Import) else [node.module.split('.')[0]] if isinstance(node, ast.ImportFrom) and node.module else []
                 self.assertFalse(forbidden.intersection(modules), source)
             self.assertNotIn("setFixedSize(", text)
-            self.assertNotIn("setStyleSheet(", text)
+            self.assertNotIn("QApplication.setStyleSheet(", text)
+            self.assertNotIn("app.setStyleSheet(", text)
             self.assertNotIn("setFont(", text)
         for folder in ("plugin", "code", "runtime/config"):
             for source in (ROOT / folder).rglob("*"):

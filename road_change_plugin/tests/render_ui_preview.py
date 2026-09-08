@@ -34,6 +34,21 @@ def main():
             report.write_text(json.dumps({"metrics": [{"class": "all", "precision": .912, "recall": .876, "f1": .894}]}))
             manifest = project / "_work/tasks/latest_pipeline.json"
             data = json.loads(manifest.read_text())
+            # Distinct placeholder files make the displayed scope counts real.
+            for entry in data["period_results"]:
+                folder = project / "成果输出" / entry["grid"] / entry["period"]
+                folder.mkdir(parents=True, exist_ok=True)
+                for kind in entry["published"]:
+                    target = folder / (kind + ".shp")
+                    target.touch()
+                    entry["published"][kind] = str(target)
+            data["change_results"] = []
+            for area in ("北区", "南区"):
+                for before, after in (("2020", "2022"), ("2022", "2024")):
+                    target = project / "成果输出" / area / (before + "_to_" + after + ".shp")
+                    target.touch()
+                    data["change_results"].append({"grid": area, "before_period": before, "after_period": after,
+                                                   "published": {"changes": str(target)}})
             data["evaluation_summary"]["json"] = str(report)
             manifest.write_text(json.dumps(data))
             plugin = original()
@@ -54,7 +69,7 @@ def main():
 
                 def capture():
                     widget.setWindowTitle("道路变化检测 · 单页 standalone 预览")
-                    widget.resize(400, 1020)
+                    widget.resize(400, 970)
                     QApplication.processEvents()
                     target = ROOT / "resources/ui_preview.png"
                     widget.grab().save(str(target))

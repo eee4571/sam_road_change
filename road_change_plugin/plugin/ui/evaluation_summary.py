@@ -4,7 +4,7 @@ import math
 
 
 def metrics_text(path):
-    empty = "Precision —   Recall —   F1 —"
+    empty = "P — · R — · F1 —"
     try:
         if path.stat().st_size > 2 * 1024 * 1024:
             return empty
@@ -15,9 +15,9 @@ def metrics_text(path):
         def value(key):
             metric = overall.get(key)
             if isinstance(metric, (int, float)) and not isinstance(metric, bool) and math.isfinite(metric) and 0 <= metric <= 1:
-                return f"{metric:.1%}"
+                return f"{metric:.0%}"
             return "—"
 
-        return f"Precision {value('precision')}   Recall {value('recall')}   F1 {value('f1')}"
+        return f"P {value('precision')} · R {value('recall')} · F1 {value('f1')}"
     except (OSError, ValueError, TypeError, AttributeError):
         return empty

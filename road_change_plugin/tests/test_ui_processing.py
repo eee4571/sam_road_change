@@ -74,7 +74,8 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(check_files(self.widget.model), [])
         self.widget._checked([])
         self.assertTrue(self.widget.run_button.isEnabled())
-        self.assertIn("已就绪", self.widget.summary.text())
+        self.assertIn("已就绪", self.widget.check_note.text())
+        self.assertIn("GT 2/4", self.widget.summary.text())
 
     def test_background_scan(self):
         self.widget.scan()
@@ -126,12 +127,11 @@ class ProcessingUiTests(unittest.TestCase):
         self.plugin.result_ready.connect(received.append)
         self.widget._refresh_results()
         self.assertFalse(received)
-        item = self.widget.groups["road_centerline"].child(0)
-        button = self.widget.results.itemWidget(item, 1)
-        button.click()
+        action = self.widget.result_menus["单期道路"].actions()[0]
+        action.trigger()
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["result_type"], "road_centerline")
-        self.assertNotIn("road_centerline", item.text(0))
+        self.assertNotIn("road_centerline", action.text())
 
     def test_narrow_dock_and_default_visibility(self):
         self.widget.show()
@@ -174,8 +174,28 @@ class ProcessingUiTests(unittest.TestCase):
         report = self.root / "metrics.json"
         report.write_text(json.dumps({"metrics": [{"class": "all", "precision": .9, "recall": .8, "f1": .847}]}))
         self.widget._result({"result_type": "road_evaluation", "path": str(report), "name": "评价报告", "metadata": {}})
-        self.assertIn("Precision 90.0%", self.widget.metrics.text())
-        self.assertIn("F1 84.7%", self.widget.metrics.text())
+        self.assertIn("P 90%", self.widget.metrics.text())
+        self.assertIn("F1 85%", self.widget.metrics.text())
+
+    def test_visual_hierarchy_and_native_boundaries(self):
+        from PySide6.QtWidgets import QTreeWidget
+        self.assertFalse(self.widget.results.findChildren(QTreeWidget))
+        self.assertTrue(self.widget.scan_button.icon().isNull())
+        self.assertTrue(self.widget.check_button.icon().isNull())
+        self.assertTrue(self.widget.run_button.icon().isNull())
+        self.assertEqual(self.widget.run_button.property("role"), "primary")
+        self.assertIn("#roadChangeDock", self.widget.styleSheet())
+        self.assertEqual(self.widget.scan_button.styleSheet(), "")
+        for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+            self.assertTrue(fold.toggle.autoRaise())
+
+    def test_host_can_override_local_appearance(self):
+        application_style = APP.styleSheet()
+        self.widget.setProperty("hostStyled", True)
+        self.assertEqual(self.widget.styleSheet(), "")
+        self.widget.setProperty("hostStyled", False)
+        self.assertTrue(self.widget.styleSheet())
+        self.assertEqual(APP.styleSheet(), application_style)
 
 
 if __name__ == "__main__":
