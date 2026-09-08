@@ -12,6 +12,7 @@ import csv
 import hashlib
 import io
 import json
+from engine.fast_timing import timed_stage
 import math
 import os
 import re
@@ -4538,6 +4539,8 @@ def _invalidate_fast_finalization(manifest: dict) -> None:
         entry['fast_finalization_state']='pending'
 
 
+
+@timed_stage("finalization_total")
 def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     """Production Fast barrier: final roads/changes/temporal, evaluation, publish later."""
     _invalidate_fast_finalization(manifest)

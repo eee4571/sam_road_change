@@ -9,7 +9,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
     QComboBox, QScrollArea, QLabel, QPushButton, QLineEdit,
     QCheckBox, QProgressBar, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QHeaderView, QGridLayout, QToolButton, QMenu)
+    QHeaderView, QGridLayout, QToolButton, QMenu, QGroupBox)
 from .ui.forms import PathField, Rows, Fold, form_layout
 from .ui.presentation import SectionHeader, inline, primary_button, result_menu
 from .ui.appearance import dock_style
@@ -62,8 +62,8 @@ class RoadChangeWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-        logs_button = self._button("运行记录", lambda: self._reveal(self.records_fold))
-        more = self._button("更多", lambda: None)
+        logs_button = self._tool_button("运行记录", lambda: self._reveal(self.records_fold))
+        more = self._tool_button("更多", lambda: None)
         menu = QMenu(more)
         menu.addAction("局部重跑", lambda: self._reveal(self.local))
         menu.addAction("检查运行资源", self._runtime)
@@ -79,9 +79,9 @@ class RoadChangeWidget(QWidget):
         form.setSpacing(8)
         self.scroll.setWidget(body)
         layout.addWidget(self.scroll, 1)
-        self._data_section(form)
-        self._processing_section(form)
-        self._results_section(form)
+        self._data_section(self._section(form, "项目与数据"))
+        self._processing_section(self._section(form, "处理参数"))
+        self._results_section(self._section(form, "成果与评价", expand=True))
         self._history_section()
         for fold in (self.local, self.records_fold):
             form.addRow(fold)
@@ -110,8 +110,19 @@ class RoadChangeWidget(QWidget):
         for control in self.findChildren(QWidget):
             if not isinstance(control, (QPushButton, QLineEdit, QComboBox, QToolButton)):
                 continue
-            control.setMinimumHeight(max(control.minimumHeight(), 30))
+            control.setMinimumHeight(max(control.minimumHeight(), 28))
         self._refresh_appearance()
+
+    def _section(self, parent_form, title, expand=False):
+        group = QGroupBox(title)
+        group.setProperty("role", "processingGroup")
+        content = form_layout(group)
+        content.setContentsMargins(8, 14, 8, 8)
+        content.setSpacing(8)
+        if expand:
+            group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        parent_form.addRow(group)
+        return content
 
     def _reveal(self, fold):
         visible = fold.isHidden()
@@ -121,18 +132,29 @@ class RoadChangeWidget(QWidget):
             self.scroll.ensureWidgetVisible(fold)
 
     def _footer(self, layout):
-        self.footer = QWidget()
+        self.footer = QGroupBox("任务状态")
         box = QVBoxLayout(self.footer)
-        box.setContentsMargins(0, 8, 0, 0)
+        box.setContentsMargins(8, 14, 8, 8)
         box.setSpacing(8)
         self.task_line = label("选择项目目录，开始扫描数据")
         self.failure_details = self._button("详情", lambda: self._reveal(self.records_fold))
-        self.running_status = inline(self.progress, self.progress_text, self.elapsed_text, self.cancel_button)
+        self.task_fields = QWidget()
+        fields = QGridLayout(self.task_fields)
+        fields.setContentsMargins(0, 0, 0, 0)
+        fields.setHorizontalSpacing(8)
+        fields.setVerticalSpacing(6)
+        for row, (title, value) in enumerate((("当前区域", self.area_text), ("当前期次", self.scope_text),
+                                             ("当前阶段", self.stage_text), ("已用时间", self.elapsed_text))):
+            fields.addWidget(label(title, "secondary"), row, 0)
+            fields.addWidget(value, row, 1)
+        fields.setColumnMinimumWidth(0, 80)
+        fields.setColumnStretch(1, 1)
+        box.addWidget(self.task_fields)
+        self.running_status = inline(self.progress, self.progress_text)
         box.addWidget(self.running_status)
-        box.addWidget(inline(self.task_line, self.failure_details, self.run_button))
+        box.addWidget(inline(self.task_line, self.failure_details, self.cancel_button, self.run_button))
         layout.addWidget(self.footer)
-        # Event-backed values are retained separately from the concise status presentation.
-        for value in (self.state_text, self.area_text, self.scope_text, self.stage_text, self.progress_note):
+        for value in (self.state_text, self.progress_note):
             value.setParent(self.footer)
             value.hide()
 
@@ -140,10 +162,11 @@ class RoadChangeWidget(QWidget):
         if not hasattr(self, "footer"):
             return
         self.running_status.setVisible(self.busy)
+        self.task_fields.setVisible(self.busy)
         state = self.state_text.text()
         self.failure_details.setVisible(state == "失败")
         if self.busy:
-            self.task_line.setText(" · ".join(v for v in (self.area_text.text(), self.scope_text.text(), self.stage_text.text()) if v != "—"))
+            self.task_line.setText("运行中")
         elif state in ("已完成", "已取消"):
             self.task_line.setText(f"{state} · {self.area_text.text()} · {self.elapsed_text.text()}")
         elif state == "失败":
@@ -173,6 +196,14 @@ class RoadChangeWidget(QWidget):
             self._refresh_appearance()
         return result
 
+    def _tool_button(self, text, callback):
+        button = QToolButton()
+        button.setText(text)
+        button.setAutoRaise(True)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.clicked.connect(callback)
+        return button
+
     def _button(self, text, callback):
         button = QPushButton(text)
         button.setMinimumWidth(0)
@@ -200,12 +231,15 @@ class RoadChangeWidget(QWidget):
         self.check_button = self._button("检查", self.check_data)
         details = self._button("数据详情", lambda: self._reveal(self.corrections))
         info = QWidget()
-        info_layout = QVBoxLayout(info)
+        info_layout = QGridLayout(info)
         info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(4)
-        info_layout.addWidget(self.summary)
-        info_layout.addWidget(self.check_note)
-        form.addRow(ResponsiveRow("", info, inline(self.check_button, details, stretch_first=False)))
+        info_layout.setSpacing(6)
+        info_layout.addWidget(self.summary, 0, 0, 1, 3)
+        info_layout.addWidget(self.check_note, 1, 0)
+        info_layout.addWidget(self.check_button, 1, 1)
+        info_layout.addWidget(details, 1, 2)
+        info_layout.setColumnStretch(0, 1)
+        form.addRow(ResponsiveRow("", info))
         form.addRow(self.corrections)
         self.areas = Rows(["区域", "验证区 SHP"], "Shapefile (*.shp)")
         self.periods = Rows(["区域", "期次", "影像 TXT"], "影像清单 (*.txt)")
@@ -282,7 +316,6 @@ class RoadChangeWidget(QWidget):
         self.advanced.form.addRow(self._button("检查运行资源", self._runtime))
 
     def _results_section(self, form):
-        form.addRow(SectionHeader("成果与评价"))
         self.result_summary = label("扫描项目后自动发现已有成果", "secondary")
         form.addRow(self.result_summary)
         self.results = QWidget()
@@ -296,6 +329,7 @@ class RoadChangeWidget(QWidget):
             heading = label(name)
             summary = label("暂无成果", "secondary")
             button = self._button("查看", lambda _checked=False, group=name: self._open_group(group))
+            button.setProperty("role", "resultAction")
             button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             button.customContextMenuRequested.connect(
                 lambda point, group=name, target=button: self.result_menus[group].exec(target.mapToGlobal(point))
@@ -303,7 +337,7 @@ class RoadChangeWidget(QWidget):
             line = QWidget()
             line.setProperty("role", "resultRow")
             line.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            line.setMinimumHeight(38)
+            line.setMinimumHeight(32)
             columns = QHBoxLayout(line)
             columns.setContentsMargins(0, 0, 0, 0)
             columns.setSpacing(8)

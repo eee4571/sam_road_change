@@ -8,9 +8,11 @@ become change boundaries. No ground-truth input is accepted here.
 """
 
 import json
+from .fast_timing import timed_stage
 import sys
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
+from functools import lru_cache
 from pathlib import Path
 
 import geopandas as gpd
@@ -18,7 +20,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import CRS, Transformer
-from shapely import intersection, line_merge, make_valid, prepare, union_all
+from shapely import intersection, line_merge, make_valid, prepare, union_all, line_interpolate_point, get_coordinates
 from shapely.geometry import LineString, Point, box
 from shapely.ops import substring
 from shapely.strtree import STRtree
@@ -44,7 +46,7 @@ def _parts(geometry):
 class WindowedProbability(RoadProbabilityRaster):
     """Metric sampling of a georeferenced raster, including geographic rasters."""
 
-    def __init__(self, path, metric_crs):
+    def __init__(self, path, metric_crs, *, ram_limit_bytes=128*1024*1024, cache_limit_bytes=64*1024*1024):
         self.dataset = rasterio.open(path)
         self.crs = CRS.from_user_input(self.dataset.crs)
         self.metric_crs = CRS.from_user_input(metric_crs)
@@ -65,9 +67,20 @@ class WindowedProbability(RoadProbabilityRaster):
         self.scene_values = np.sort(values.astype(np.float64))
         self.scene_percentiles = {f"p{q}": float(np.percentile(values, q)) if len(values) else None
                                   for q in (50, 90, 95, 99)}
+        self._ram = None
+        self._blocks = OrderedDict()
+        self._cache_bytes = 0
+        self._cache_limit = cache_limit_bytes
+        self._block_shape = self.dataset.block_shapes[0]
+        required = self.dataset.width*self.dataset.height*(np.dtype(self.dataset.dtypes[0]).itemsize+1)
+        if required <= ram_limit_bytes:
+            self._ram = self.dataset.read(1, masked=True)
 
     def close(self):
         self.dataset.close()
+        self._ram = None
+        self._blocks.clear()
+        self._cache_bytes = 0
 
     def _values_at(self, x, y):
         x, y = self.to_raster.transform(np.asarray(x), np.asarray(y))
@@ -77,12 +90,40 @@ class WindowedProbability(RoadProbabilityRaster):
         inside = (cols >= 0) & (rows >= 0) & (cols < self.dataset.width) & (rows < self.dataset.height)
         if not inside.any():
             return result
-        c0, c1 = int(cols[inside].min()), int(cols[inside].max()) + 1
-        r0, r1 = int(rows[inside].min()), int(rows[inside].max()) + 1
-        values = self.dataset.read(1, window=rasterio.windows.Window(c0, r0, c1-c0, r1-r0), masked=True)
-        picked = values[rows[inside]-r0, cols[inside]-c0].astype(float).filled(np.nan)
+        rr, cc = rows[inside], cols[inside]
+        if self._ram is not None:
+            picked = self._ram[rr, cc].astype(float).filled(np.nan)
+        else:
+            height, width = self._block_shape
+            block_rows, block_cols = rr//height, cc//width
+            if (block_rows == block_rows[0]).all() and (block_cols == block_cols[0]).all():
+                br, bc = int(block_rows[0]), int(block_cols[0])
+                values = self._cached_block(br, bc)
+                picked = values[rr-br*height, cc-bc*width].astype(float).filled(np.nan)
+            else:
+                unique, groups = np.unique(np.column_stack((block_rows, block_cols)), axis=0, return_inverse=True)
+                picked = np.full(rr.shape, np.nan)
+                for group, (br, bc) in enumerate(unique):
+                    values = self._cached_block(int(br), int(bc))
+                    take = groups == group
+                    picked[take] = values[rr[take]-br*height, cc[take]-bc*width].astype(float).filled(np.nan)
         result[inside] = picked / self.divisor
         return result
+
+    def _cached_block(self, br, bc):
+        key = (br, bc)
+        values = self._blocks.pop(key, None)
+        if values is None:
+            height, width = self._block_shape
+            values = self.dataset.read(1, window=rasterio.windows.Window(
+                bc*width, br*height, min(width, self.dataset.width-bc*width),
+                min(height, self.dataset.height-br*height)), masked=True)
+            self._cache_bytes += values.data.nbytes + np.ma.getmaskarray(values).nbytes
+        self._blocks[key] = values
+        while self._cache_bytes > self._cache_limit and self._blocks:
+            _, old = self._blocks.popitem(last=False)
+            self._cache_bytes -= old.data.nbytes + np.ma.getmaskarray(old).nbytes
+        return values
 
     def sample_cross_section(self, center, normal, geometry_crs, *, search_radius):
         distances = np.arange(-search_radius, search_radius + 0.25, 0.5)
@@ -90,20 +131,18 @@ class WindowedProbability(RoadProbabilityRaster):
         return {"distance": distances, "probability": values,
                 "valid_mask": np.isfinite(values), "sample_step": 0.5}
 
-    def sample_axis(self, axis, axis_crs, *, road_width, position_tolerance):
+    def _axis_coordinates(self, axis, *, road_width, position_tolerance):
         positions = np.linspace(0, axis.length, max(3, int(np.ceil(axis.length/2))+1))
-        centers, backgrounds = [], []
-        for station in positions:
-            point = axis.interpolate(float(station))
-            normal = _normal(axis, float(station))
-            inner = max(road_width * 0.70, position_tolerance + 2.0)
-            for offset in (-1.0, 0.0, 1.0):
-                centers.append((point.x + offset*normal[0], point.y + offset*normal[1]))
-            for offset in (-inner-3, -inner, inner, inner+3):
-                backgrounds.append((point.x + offset*normal[0], point.y + offset*normal[1]))
-        coords = np.asarray(centers + backgrounds)
-        values = self._values_at(coords[:, 0], coords[:, 1])
-        center, background = values[:len(centers)], values[len(centers):]
+        points = get_coordinates(line_interpolate_point(axis, positions))
+        normals = np.asarray([_normal(axis, float(station)) for station in positions])
+        inner = max(road_width * 0.70, position_tolerance + 2.0)
+        centers = (points[:, None, :] + np.asarray([-1., 0., 1.])[None, :, None]*normals[:, None, :]).reshape(-1, 2)
+        backgrounds = (points[:, None, :] + np.asarray([-inner-3, -inner, inner, inner+3])[None, :, None]*normals[:, None, :]).reshape(-1, 2)
+        return np.concatenate((centers, backgrounds)), len(centers)
+
+    @staticmethod
+    def _axis_summary(values, center_count, sampler):
+        center, background = values[:center_count], values[center_count:]
         center, background = center[np.isfinite(center)], background[np.isfinite(background)]
         mean = float(np.mean(center)) if len(center) else None
         bg = float(np.median(background)) if len(background) else None
@@ -111,9 +150,28 @@ class WindowedProbability(RoadProbabilityRaster):
                 "center_probability_q25": float(np.quantile(center, .25)) if len(center) else None,
                 "local_background_probability": bg,
                 "local_probability_contrast": mean-bg if mean is not None and bg is not None else None,
-                "scene_percentile_rank": self.percentile_rank(mean),
-                "background_percentile_rank": self.percentile_rank(bg),
+                "scene_percentile_rank": sampler.percentile_rank(mean),
+                "background_percentile_rank": sampler.percentile_rank(bg),
                 "probability_valid_ratio": float(np.isfinite(values).mean())}
+
+    def sample_axes(self, axes, widths, tolerance, *, coordinates=None):
+        if coordinates is None:
+            coordinates = [self._axis_coordinates(axis, road_width=width, position_tolerance=tolerance)
+                           for axis, width in zip(axes, widths)]
+        if not coordinates:
+            return []
+        coords = np.concatenate([item[0] for item in coordinates])
+        values = self._values_at(coords[:, 0], coords[:, 1])
+        result, offset = [], 0
+        for points, count in coordinates:
+            result.append(self._axis_summary(values[offset:offset+len(points)], count, self))
+            offset += len(points)
+        return result
+
+    def sample_axis(self, axis, axis_crs, *, road_width, position_tolerance):
+        coords, count = self._axis_coordinates(axis, road_width=road_width, position_tolerance=position_tolerance)
+        return self._axis_summary(self._values_at(coords[:, 0], coords[:, 1]), count, self)
+
 
 
 def _normal(line, station):
@@ -130,7 +188,11 @@ class RoadScene:
         self.surfaces = surfaces
         self.surface_tree = STRtree(surfaces.geometry.values)
         self.widths = widths
-        self.width_tree = STRtree(widths.geometry.values)
+        self.width_geometries = widths.geometry.values
+        self.width_values = widths["width_m"].to_numpy() if "width_m" in widths else np.full(len(widths), 6.)
+        self.width_tree = STRtree(self.width_geometries)
+        self.width = lru_cache(maxsize=4096)(self.width)
+        self.surface = lru_cache(maxsize=32)(self.surface)
         self.valid = make_valid(union_all(valid.geometry.values))
         prepare(self.valid)
         self.probability = probability
@@ -153,14 +215,14 @@ class RoadScene:
         ids = self.width_tree.query(point, predicate="dwithin", distance=3)
         if not len(ids):
             return 6.0
-        index = min(ids, key=lambda i: self.widths.geometry.iloc[i].distance(point))
-        value = self.widths.iloc[index].get("width_m", 6.0)
+        index = min(ids, key=lambda i: self.width_geometries[i].distance(point))
+        value = self.width_values[index]
         return float(value) if pd.notna(value) and value > 0 else 6.0
 
-    def match(self, axis, station, tolerance, source_width):
-        point = axis.interpolate(station)
+    def match(self, axis, station, tolerance, source_width, *, point=None, normal=None):
+        point = axis.interpolate(station) if point is None else point
         local = substring(axis, max(0, station-6), min(axis.length, station+6))
-        normal = _normal(axis, station)
+        normal = _normal(axis, station) if normal is None else normal
         ranked = []
         for target_id in self.tree.query(point, predicate="dwithin", distance=tolerance+1e-6):
             target = self.lines[int(target_id)]
@@ -192,13 +254,14 @@ class RoadScene:
                 "direction": best[4], "coverage": best[5], "corridor": best[6],
                 "reliable": not ambiguous}
 
-    def evidence(self, axis, geometry_present, width, tolerance, surface_support=None):
+    def evidence(self, axis, geometry_present, width, tolerance, surface_support=None, probability=None):
         footprint = axis.buffer(max(width/2, tolerance)+1, cap_style="flat")
         valid = self.valid.covers(footprint)
         if surface_support is None:
             surface_support = self.surface(axis, max(width, tolerance)+2).buffer(tolerance)
         coverage = axis.intersection(surface_support).length / max(axis.length, 1e-9)
-        probability = self.probability.sample_axis(axis, self.crs, road_width=width, position_tolerance=tolerance)
+        if probability is None:
+            probability = self.probability.sample_axis(axis, self.crs, road_width=width, position_tolerance=tolerance)
         rank = probability["scene_percentile_rank"]
         bg_rank = probability["background_percentile_rank"]
         contrast = probability["local_probability_contrast"]
@@ -228,6 +291,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
     from .auto_presence_candidates import LongitudinalCoverage, presence_seeds
     records, audit, width_audit = [], [], []
     counts = Counter()
+    sampling_seconds = matching_seconds = 0.
     width_config = PairedWidthConfig(sample_spacing=4, absolute_change=absolute,
                                     relative_change=relative, minimum_continuous_length=minimum_length,
                                     maximum_gap_samples=1, maximum_gap_length=8.)
@@ -242,14 +306,26 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
             source_support, target_support = source_surface.buffer(tolerance), target_surface.buffer(tolerance)
             width_surfaces = ((source_surface, source_surface.buffer(.1)),
                               (target_surface, target_surface.buffer(.1)))
+            sampling_started = time.perf_counter()
+            stations = (np.arange(count)+.5)*spacing
+            points = line_interpolate_point(axis, stations)
+            normals = [_normal(axis, float(station)) for station in stations]
+            cells = [substring(axis, index*spacing, (index+1)*spacing) for index in range(count)]
+            widths = [source.width(point) for point in points]
+            coordinates = [source.probability._axis_coordinates(cell, road_width=width, position_tolerance=tolerance)
+                           for cell, width in zip(cells, widths)]
+            source_probabilities = source.probability.sample_axes(cells, widths, tolerance, coordinates=coordinates)
+            target_probabilities = target.probability.sample_axes(cells, widths, tolerance, coordinates=coordinates)
+            sampling_seconds += time.perf_counter()-sampling_started
             for index in range(count):
-                station = (index+.5)*spacing
-                point = axis.interpolate(station)
-                cell = substring(axis, index*spacing, (index+1)*spacing)
-                width = source.width(point)
-                match = target.match(axis, station, tolerance, width)
-                source_evidence = source.evidence(cell, True, width, tolerance, source_support)
-                target_evidence = target.evidence(cell, match is not None, width, tolerance, target_support)
+                sample_started = time.perf_counter()
+                match_seconds = 0.
+                station, point, cell, width = float(stations[index]), points[index], cells[index], widths[index]
+                match_started = time.perf_counter()
+                match = target.match(axis, station, tolerance, width, point=point, normal=normals[index])
+                match_seconds += time.perf_counter()-match_started
+                source_evidence = source.evidence(cell, True, width, tolerance, source_support, source_probabilities[index])
+                target_evidence = target.evidence(cell, match is not None, width, tolerance, target_support, target_probabilities[index])
                 bef, aft = (source_evidence, target_evidence) if side == "before" else (target_evidence, source_evidence)
                 junction = source.junction.intersects(cell) or target.junction.intersects(cell)
                 accepted = bef["valid"] and aft["valid"] and not junction
@@ -268,17 +344,21 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 if match is None:
                     counts[f"{change_type}_candidate_cells"] += 1
                 if side != "before":
+                    matching_seconds += match_seconds
+                    sampling_seconds += time.perf_counter()-sample_started-match_seconds
                     continue
                 target_point = target.lines[match["target"]].interpolate(match["station"]) if match else point
                 common = Point((point.x+target_point.x)/2, (point.y+target_point.y)/2)
                 valid_width = accepted and match is not None and match["reliable"] and bef["state"] == aft["state"] == "present"
                 if valid_width:
+                    match_started = time.perf_counter()
                     reverse = source.match(target.lines[match["target"]], match["station"], tolerance, target.width(target_point))
+                    match_seconds += time.perf_counter()-match_started
                     valid_width = reverse is not None and reverse["target"] == line_id and reverse["reliable"]
                 before_width = after_width = None
                 reason = "unreliable_match_or_existence_or_junction"
                 if valid_width:
-                    normal = _normal(axis, station)
+                    normal = normals[index]
                     target_normal = _normal(target.lines[match["target"]], match["station"])
                     if np.dot(normal, target_normal) < 0:
                         target_normal = -target_normal
@@ -302,6 +382,8 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                                                 before_width, after_width,
                                                 after_width-before_width if valid_width else None,
                                                 bool(valid_width), reason))
+                matching_seconds += match_seconds
+                sampling_seconds += time.perf_counter()-sample_started-match_seconds
             local, intervals, presence_counts = presence_seeds(
                 axis, station_rows, source, coverage, change_type, minimum_length, minimum_area)
             records.extend(local)
@@ -350,9 +432,11 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                                         "geometry": axis})
             if line_id % 25 == 0:
                 print(f"[Fast Auto] {side} axes {line_id+1}/{len(source.lines)}", flush=True)
+    print(f"[Fast timing] auto_station_sampling={sampling_seconds:.6f}s auto_matching={matching_seconds:.6f}s", flush=True)
     return records, audit, width_audit, dict(counts)
 
 
+@timed_stage("auto_total")
 def detect_final_road_changes(before_result, after_result, output_dir, *, before_period, after_period,
                               position_tolerance, width_change_absolute, width_change_ratio,
                               min_change_area, min_change_length, internal_outputs):
@@ -386,11 +470,13 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     finally:
         for scene in scenes:
             scene.probability.close()
+            scene.width.cache_clear()
+            scene.surface.cache_clear()
 
 
 def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_audit, scenes, centerlines,
                              output_dir, before_period, after_period, position_tolerance=3.,
-                             min_change_area=4., min_change_length=None, elapsed_seconds=0.):
+                             min_change_area=4., min_change_length=None, elapsed_seconds=0., diagnostics=False):
     """Qualify, assemble and publish; also reusable with saved observation evidence."""
     from .fast_pipeline import _fast_polygon_parts, _write_fast_public_changes
     started = time.perf_counter()
@@ -415,108 +501,126 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     candidate_audit, width_samples = qualify_width_candidates(candidate_audit, scenes,
                                 minimum_length=24. if min_change_length is None else float(min_change_length))
     seeds = candidate_audit.loc[candidate_audit.publication_state == 'accepted'].copy().reset_index(drop=True)
+    assembly_started = time.perf_counter()
     changes, assembly = assemble_change_objects(seeds, centerlines[0], centerlines[1])
     changes = annotate_objects(changes, seeds, assembly["membership"])
     from .auto_change_geometry import render_change_geometry
     changes, geometry_audit = render_change_geometry(
         changes, seeds, assembly, {side: scene.widths for side, scene in scenes.items()}, width_samples)
     assembly["change_objects"] = changes
-    write_assembly_audit(output_dir, seeds, assembly)
+    print(f"[Fast timing] auto_assembly={time.perf_counter()-assembly_started:.6f}s", flush=True)
+    io_started = time.perf_counter()
+    if diagnostics:
+        write_assembly_audit(output_dir, seeds, assembly)
     changes = changes.to_crs(output_crs)
     # Reprojection of touching width ribbons can create sub-pixel ring
     # intersections. Keep only valid polygon components for GIS publication.
     changes.geometry = changes.geometry.map(lambda g: union_all(_fast_polygon_parts(g, min_area=0.)))
     changes["before_per"], changes["after_per"] = before_period, after_period
     _, public_path = _write_fast_public_changes(changes, output_dir)
-    gpkg = output_dir / "auto_diagnostics.gpkg"
-    changes.to_file(gpkg, layer="changes", driver="GPKG")
-    for name, geometry_frame in geometry_audit.items():
-        geometry_frame.to_file(gpkg, layer=name, driver="GPKG")
-    observation.to_file(gpkg, layer="existence_candidates", driver="GPKG")
-    raw_candidates.to_file(gpkg, layer="input_candidates", driver="GPKG")
-    candidate_audit.to_file(gpkg, layer="candidate_audit", driver="GPKG")
-    candidate_audit.loc[candidate_audit.publication_state == "review"].to_file(gpkg, layer="review_candidates", driver="GPKG")
-    frame(presence_audit).to_file(gpkg, layer="presence_intervals", driver="GPKG")
-    seeds.to_file(gpkg, layer="local_seeds", driver="GPKG")
-    frame(width_audit).to_file(gpkg, layer="width_candidates", driver="GPKG")
-    frame(width_samples).to_file(gpkg, layer="width_precision_samples", driver="GPKG")
-    candidate_audit.loc[candidate_audit.change_typ.isin(['widened','narrowed'])].to_file(
-        gpkg, layer="width_precision_candidates", driver="GPKG")
+    if not diagnostics:
+        for name in ('auto_diagnostics.gpkg', 'network_assembly.gpkg',
+                     'existence_candidates.csv', 'width_candidates.csv',
+                     'assembly_membership.csv', 'assembly_decisions.csv',
+                     'assembly_summary.json', 'candidate_funnel.json'):
+            (output_dir/name).unlink(missing_ok=True)
+    if diagnostics:
+        gpkg = output_dir / "auto_diagnostics.gpkg"
+        changes.to_file(gpkg, layer="changes", driver="GPKG")
+        for name, geometry_frame in geometry_audit.items():
+            geometry_frame.to_file(gpkg, layer=name, driver="GPKG")
+        observation.to_file(gpkg, layer="existence_candidates", driver="GPKG")
+        raw_candidates.to_file(gpkg, layer="input_candidates", driver="GPKG")
+        candidate_audit.to_file(gpkg, layer="candidate_audit", driver="GPKG")
+        candidate_audit.loc[candidate_audit.publication_state == "review"].to_file(gpkg, layer="review_candidates", driver="GPKG")
+        frame(presence_audit).to_file(gpkg, layer="presence_intervals", driver="GPKG")
+        seeds.to_file(gpkg, layer="local_seeds", driver="GPKG")
+        frame(width_audit).to_file(gpkg, layer="width_candidates", driver="GPKG")
+        frame(width_samples).to_file(gpkg, layer="width_precision_samples", driver="GPKG")
+        candidate_audit.loc[candidate_audit.change_typ.isin(['widened','narrowed'])].to_file(
+            gpkg, layer="width_precision_candidates", driver="GPKG")
     layers = {"changes": str(public_path)}
     names = {"added": "added_roads.shp", "removed": "removed_roads.shp",
              "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp"}
     for kind, name in names.items():
         selected = changes.loc[changes.change_typ == kind]
-        selected.to_file(output_dir/name, encoding="UTF-8")
-        layers[kind] = str(output_dir/name)
+        if diagnostics:
+            selected.to_file(output_dir/name, encoding="UTF-8")
+            layers[kind] = str(output_dir/name)
         counts[f"final_{kind}"] = len(selected)
-    evidence = pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in audit])
-    evidence.to_csv(output_dir/"existence_candidates.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in width_audit]).to_csv(
-        output_dir/"width_candidates.csv", index=False, encoding="utf-8-sig")
-    funnel = {"count_units": "evidence: 4 m station cells; presence candidates: longitudinal intervals; final: network objects",
-              "road_matching": {k: v for k, v in counts.items() if "matched" in k and not k.startswith("width")},
-              "width": {k: v for k, v in counts.items() if k.startswith("width")},
-              "final": {k: v for k, v in counts.items() if k.startswith("final")}}
-    for kind, side in (("added", "after"), ("removed", "before")):
-        candidates = evidence.loc[(evidence.side == side) & ~evidence.matched] if len(evidence) else evidence
-        funnel[kind] = {"candidate_cells": len(candidates)}
-        if len(candidates):
-            for period in ("before", "after"):
-                funnel[kind][period] = {
-                    "geometry_support": int(candidates[f"{period}_geometry"].sum()),
-                    "surface_support": int((candidates[f"{period}_surface"] >= .55).sum()),
-                    "probability_support": int(candidates[f"{period}_probability"].sum()),
-                    "valid_area_pass": int(candidates[f"{period}_valid"].sum()),
-                    **candidates[f"{period}_state"].value_counts().to_dict()}
-            funnel[kind]["existence_pass"] = int(candidates.existence_pass.sum())
-            funnel[kind]["continuity_pass"] = int(candidates.get("continuity_pass", pd.Series(dtype=bool)).eq(True).sum())
-        funnel[kind]["final_auto_count"] = counts[f"final_{kind}"]
-        funnel[kind]["longitudinal"] = {k.removeprefix(kind+"_"): v for k, v in counts.items() if k.startswith(kind+"_")}
-        local = seeds.loc[seeds.change_typ == kind]
-        final = changes.loc[changes.change_typ == kind]
-        funnel[kind]["local_seed_count"] = len(local)
-        funnel[kind]["local_seed_length_m"] = float(local.length_m.sum()) if len(local) else 0.
-        funnel[kind]["seed_qa_counts"] = {state: int((local.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
-        funnel[kind]["object_qa_counts"] = {state: int((final.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
-        qa = candidate_audit.loc[candidate_audit.change_typ == kind]
-        funnel[kind]["recall_candidate_count"] = len(qa)
-        funnel[kind]["review_candidate_count"] = int((qa.publication_state == "review").sum())
-        funnel[kind]["precision_reason_counts"] = dict(Counter(reason for reasons in qa.precision_reason for reason in reasons.split(";")))
-    funnel["network_assembly"] = assembly["summary"]
-    funnel['publication_review'] = {}
-    for kind in ('added','removed','widened','narrowed'):
-        rows = candidate_audit.loc[candidate_audit.change_typ == kind]
-        review = rows.loc[rows.publication_state == 'review']
-        funnel['publication_review'][kind] = dict(raw_candidates=len(rows),
-            accepted_seeds=int(rows.publication_state.eq('accepted').sum()),review_candidates=len(review),
-            review_reason_counts=dict(Counter(reason for reasons in review.precision_reason for reason in reasons.split(';')
-                                              if reason not in ('stable_paired_width_profile','corroborated_source_and_sustained_absence'))))
-        if kind in ('widened','narrowed'):
-            for reason in ('cross_track_width_match','unstable_width_profile','insufficient_sustained_width_change',
-                           'junction_width_instability','road_end_width_instability','centerline_offset_measurement_bias',
-                           'surface_geometry_disagreement','uncertainty_not_clearly_exceeded','alternating_width_change_signs'):
-                funnel['publication_review'][kind]['review_reason_counts'].setdefault(reason,0)
-    funnel["assembly_rejection_counts"] = (assembly["decisions"].loc[~assembly["decisions"].accepted, "reason"].value_counts().to_dict()
-                                             if len(assembly["decisions"]) else {})
-    funnel["count_units"] += "; assembled final: network objects"
-    (output_dir/"candidate_funnel.json").write_text(json.dumps(funnel, indent=2, ensure_ascii=False), encoding="utf-8")
+    if diagnostics:
+        evidence = pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in audit])
+        evidence.to_csv(output_dir/"existence_candidates.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in width_audit]).to_csv(
+            output_dir/"width_candidates.csv", index=False, encoding="utf-8-sig")
+        funnel = {"count_units": "evidence: 4 m station cells; presence candidates: longitudinal intervals; final: network objects",
+                  "road_matching": {k: v for k, v in counts.items() if "matched" in k and not k.startswith("width")},
+                  "width": {k: v for k, v in counts.items() if k.startswith("width")},
+                  "final": {k: v for k, v in counts.items() if k.startswith("final")}}
+        for kind, side in (("added", "after"), ("removed", "before")):
+            candidates = evidence.loc[(evidence.side == side) & ~evidence.matched] if len(evidence) else evidence
+            funnel[kind] = {"candidate_cells": len(candidates)}
+            if len(candidates):
+                for period in ("before", "after"):
+                    funnel[kind][period] = {
+                        "geometry_support": int(candidates[f"{period}_geometry"].sum()),
+                        "surface_support": int((candidates[f"{period}_surface"] >= .55).sum()),
+                        "probability_support": int(candidates[f"{period}_probability"].sum()),
+                        "valid_area_pass": int(candidates[f"{period}_valid"].sum()),
+                        **candidates[f"{period}_state"].value_counts().to_dict()}
+                funnel[kind]["existence_pass"] = int(candidates.existence_pass.sum())
+                funnel[kind]["continuity_pass"] = int(candidates.get("continuity_pass", pd.Series(dtype=bool)).eq(True).sum())
+            funnel[kind]["final_auto_count"] = counts[f"final_{kind}"]
+            funnel[kind]["longitudinal"] = {k.removeprefix(kind+"_"): v for k, v in counts.items() if k.startswith(kind+"_")}
+            local = seeds.loc[seeds.change_typ == kind]
+            final = changes.loc[changes.change_typ == kind]
+            funnel[kind]["local_seed_count"] = len(local)
+            funnel[kind]["local_seed_length_m"] = float(local.length_m.sum()) if len(local) else 0.
+            funnel[kind]["seed_qa_counts"] = {state: int((local.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
+            funnel[kind]["object_qa_counts"] = {state: int((final.qa_state == state).sum()) for state in ("confirmed", "probable", "uncertain")}
+            qa = candidate_audit.loc[candidate_audit.change_typ == kind]
+            funnel[kind]["recall_candidate_count"] = len(qa)
+            funnel[kind]["review_candidate_count"] = int((qa.publication_state == "review").sum())
+            funnel[kind]["precision_reason_counts"] = dict(Counter(reason for reasons in qa.precision_reason for reason in reasons.split(";")))
+        funnel["network_assembly"] = assembly["summary"]
+        funnel['publication_review'] = {}
+        for kind in ('added','removed','widened','narrowed'):
+            rows = candidate_audit.loc[candidate_audit.change_typ == kind]
+            review = rows.loc[rows.publication_state == 'review']
+            funnel['publication_review'][kind] = dict(raw_candidates=len(rows),
+                accepted_seeds=int(rows.publication_state.eq('accepted').sum()),review_candidates=len(review),
+                review_reason_counts=dict(Counter(reason for reasons in review.precision_reason for reason in reasons.split(';')
+                                                  if reason not in ('stable_paired_width_profile','corroborated_source_and_sustained_absence'))))
+            if kind in ('widened','narrowed'):
+                for reason in ('cross_track_width_match','unstable_width_profile','insufficient_sustained_width_change',
+                               'junction_width_instability','road_end_width_instability','centerline_offset_measurement_bias',
+                               'surface_geometry_disagreement','uncertainty_not_clearly_exceeded','alternating_width_change_signs'):
+                    funnel['publication_review'][kind]['review_reason_counts'].setdefault(reason,0)
+        funnel["assembly_rejection_counts"] = (assembly["decisions"].loc[~assembly["decisions"].accepted, "reason"].value_counts().to_dict()
+                                                 if len(assembly["decisions"]) else {})
+        funnel["count_units"] += "; assembled final: network objects"
+        (output_dir/"candidate_funnel.json").write_text(json.dumps(funnel, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Fast timing] diagnostics_export_io={time.perf_counter()-io_started:.6f}s", flush=True)
     return complete_written_auto_result(output_dir, before_period=before_period, after_period=after_period,
-                                        min_change_length=min_change_length, elapsed_seconds=elapsed_seconds+time.perf_counter()-started)
+                                        min_change_length=min_change_length, elapsed_seconds=elapsed_seconds+time.perf_counter()-started, changes=changes, diagnostics=diagnostics)
 
 
+@timed_stage("auto_preview_export_io")
 def complete_written_auto_result(output_dir, *, before_period, after_period, min_change_length=None,
-                                 elapsed_seconds=None):
+                                 elapsed_seconds=None, changes=None, diagnostics=False):
     """Publish previews/summary from written results; also resume a failed preview."""
     from road_change_detection import render_change_preview
     started = time.perf_counter()
     output_dir = Path(output_dir).resolve()
     public_path = output_dir/"road_changes.shp"
     gpkg = output_dir/"auto_diagnostics.gpkg"
-    changes = gpd.read_file(public_path)
+    if changes is None:
+        changes = gpd.read_file(public_path)
     names = {"added": "added_roads.shp", "removed": "removed_roads.shp",
              "widened": "widened_road_parts.shp", "narrowed": "narrowed_road_parts.shp"}
-    layers = {"changes": str(public_path), **{kind: str(output_dir/name) for kind, name in names.items()}}
+    layers = {"changes": str(public_path)}
+    if diagnostics:
+        layers.update({kind: str(output_dir/name) for kind, name in names.items()})
     preview = output_dir/"change_preview.png"
     render_change_preview(preview, changes, changes.iloc[:0], title=f"Auto {before_period} to {after_period}",
                           empty_message="No Auto change candidates")
@@ -526,11 +630,11 @@ def complete_written_auto_result(output_dir, *, before_period, after_period, min
                "presence_change_source": "final_axis_symmetric_qualified_candidates", "width_change_source": "paired_local_profile",
                "min_change_length_m": 24. if min_change_length is None else float(min_change_length),
                "changes_feature_count": len(changes), **{f"{k}_feature_count": int((changes.change_typ == k).sum()) for k in names},
-               "candidate_funnel": str(output_dir/"candidate_funnel.json"), "diagnostics": str(gpkg),
+               "candidate_funnel": str(output_dir/"candidate_funnel.json") if diagnostics else "", "diagnostics": str(gpkg) if diagnostics else "",
                "auto_change_total_seconds": elapsed_seconds+time.perf_counter()-started if elapsed_seconds is not None else None}
     if (output_dir/"assembly_summary.json").is_file():
         summary["network_assembly"] = str(output_dir/"assembly_summary.json")
     summary_path = output_dir/"change_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"output": str(output_dir), "summary": str(summary_path), "road_changes": str(public_path),
-            "layers": layers, "gpkg": str(gpkg), "previews": {"change": str(preview)}, "road_change": str(preview), **summary}
+            "layers": layers, "gpkg": str(gpkg) if diagnostics else "", "previews": {"change": str(preview)}, "road_change": str(preview), **summary}

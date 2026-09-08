@@ -104,6 +104,7 @@ class Fold(QWidget):
         self.toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.body = QWidget()
         self.form = form_layout(self.body)
+        self.form.setContentsMargins(0, 8, 0, 0)
         self.body.hide()
         layout.addWidget(self.toggle)
         layout.addWidget(self.body)

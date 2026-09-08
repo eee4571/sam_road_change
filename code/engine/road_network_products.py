@@ -5,6 +5,7 @@ when exporting. Filtering is never performed separately for individual tiles.
 """
 from pathlib import Path
 import json
+from .fast_timing import timed_stage
 
 NETWORK_CONNECTION_VERSION = 1
 NETWORK_REPORT = 'road_network_report.json'
@@ -59,6 +60,7 @@ def network_products_current(directory):
         return False
 
 
+@timed_stage("regional_network_recovery")
 def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
     """Recover one period/region; keep original CRS and trace every source row."""
     import geopandas as gpd
@@ -142,6 +144,7 @@ def write_network_report(directory, stats, audits):
     return report
 
 
+@timed_stage("width_corridor_rebuild")
 def rebuild_network_width_products(centerlines, measured=None, source_tolerance=2.0,
                                    *, connection_input=None):
     """Use metre coordinates for segmentation and buffering, including lon/lat inputs."""

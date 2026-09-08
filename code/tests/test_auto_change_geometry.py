@@ -130,7 +130,7 @@ class GeometryTests(unittest.TestCase):
             with patch('engine.auto_presence_candidates.qualify_presence_candidates',return_value=(s,s)), \
                  patch('engine.auto_width_precision.qualify_width_candidates',return_value=(s,[])):
                 finalize_auto_candidates(s.to_dict('records'),[],[],{},presence_audit=[],scenes=scenes,
-                    centerlines=[roads,roads],output_dir=temporary,before_period='before',after_period='after')
+                    centerlines=[roads,roads],output_dir=temporary,before_period='before',after_period='after',diagnostics=True)
             saved=gpd.read_file(Path(temporary)/'auto_diagnostics.gpkg',layer='local_seeds')
             public=gpd.read_file(Path(temporary)/'road_changes.shp')
             self.assertAlmostEqual(saved.geometry.iloc[0].symmetric_difference(s.geometry.iloc[0]).area,0)

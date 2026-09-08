@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -1053,18 +1054,49 @@ def _polygon_union(frame: gpd.GeoDataFrame) -> BaseGeometry:
 
 
 def _clip_frame(frame: gpd.GeoDataFrame, area: BaseGeometry) -> gpd.GeoDataFrame:
+    frame = _clean_evaluation_geometries(frame)
+    area = _evaluation_geometry(area)
     if frame.empty:
         return frame.copy()
     clipped = frame.loc[frame.geometry.intersects(area)].copy()
+    polygon_rows = clipped.geom_type.isin(POLYGON_TYPES)
     clipped.geometry = clipped.geometry.intersection(area)
-    return clipped.loc[~clipped.geometry.is_empty].copy()
+    clipped.geometry = [_evaluation_geometry(geometry, polygon_only=polygon_only)
+                        for geometry, polygon_only in zip(clipped.geometry, polygon_rows)]
+    return _clean_evaluation_geometries(clipped)
+
+
+def _evaluation_geometry(geometry, *, polygon_only=False):
+    """Repair polygon support without retaining collapsed rings as line truth.
+
+    Line inputs remain supported by the existing line evaluation contract.
+    Valid geometries are returned unchanged, without precision snapping.
+    """
+    if geometry is None or geometry.is_empty:
+        return geometry
+    if geometry.is_valid and geometry.geom_type in POLYGON_TYPES:
+        return geometry
+    polygonal = polygon_only or geometry.geom_type in POLYGON_TYPES or geometry.geom_type == 'GeometryCollection'
+    cleaned = geometry if geometry.is_valid else make_valid(geometry)
+    if polygonal:
+        parts = list(_iter_family_parts(cleaned, 'polygon'))
+        cleaned = union_all(parts)
+    return cleaned
+
+
+def _clean_evaluation_geometries(frame):
+    frame = frame.loc[frame.geometry.notna()].copy()
+    frame.geometry = frame.geometry.map(_evaluation_geometry)
+    return frame.loc[~frame.geometry.is_empty & frame.geometry.is_valid].copy()
 
 
 def _support_geometry(frame: gpd.GeoDataFrame, line_tolerance: float) -> BaseGeometry:
-    if frame.empty:
-        return box(0, 0, 0, 0)
+    return _support_geometries(frame.geometry, line_tolerance)
+
+
+def _support_geometries(geometries, line_tolerance):
     supports = []
-    for geometry in frame.geometry:
+    for geometry in geometries:
         if geometry.geom_type in LINE_TYPES:
             if line_tolerance <= 0:
                 raise ValueError("Evaluation tolerance must be greater than zero for line changes.")
@@ -1072,8 +1104,7 @@ def _support_geometry(frame: gpd.GeoDataFrame, line_tolerance: float) -> BaseGeo
         elif geometry.geom_type in POLYGON_TYPES:
             supports.append(geometry)
         elif hasattr(geometry, "geoms"):
-            nested = gpd.GeoDataFrame(geometry=list(geometry.geoms), crs=frame.crs)
-            supports.append(_support_geometry(nested, line_tolerance))
+            supports.append(_support_geometries(geometry.geoms, line_tolerance))
     return union_all(np.asarray(supports, dtype=object)) if supports else box(0, 0, 0, 0)
 
 
@@ -1126,16 +1157,19 @@ def _matched_object_pairs(
     iou_threshold: float,
 ) -> list[tuple[int, int]]:
     predicted_support = [
-        _support_geometry(predicted.iloc[[index]], line_tolerance)
-        for index in range(len(predicted))
+        _support_geometries([geometry], line_tolerance)
+        for geometry in predicted.geometry
     ]
     truth_support = [
-        _support_geometry(truth.iloc[[index]], line_tolerance)
-        for index in range(len(truth))
+        _support_geometries([geometry], line_tolerance)
+        for geometry in truth.geometry
     ]
     candidates = []
+    truth_tree = STRtree(truth_support)
     for predicted_index, predicted_geometry in enumerate(predicted_support):
-        for truth_index, truth_geometry in enumerate(truth_support):
+        for raw_index in truth_tree.query(predicted_geometry):
+            truth_index = int(raw_index)
+            truth_geometry = truth_support[truth_index]
             intersection = float(predicted_geometry.intersection(truth_geometry).area)
             if intersection <= 0:
                 continue
@@ -1160,6 +1194,7 @@ def _centerline_offset_metrics(
     truth: gpd.GeoDataFrame,
     evaluation_tolerance: float,
     object_iou_threshold: float = 0.1,
+    *, matched_pairs=None,
 ) -> dict:
     """Measure axes only for same-class object true-positive pairs."""
     total_truth_count = int(len(truth))
@@ -1179,9 +1214,10 @@ def _centerline_offset_metrics(
     if predicted.empty or truth.empty:
         result["centerline_offset_reason"] = "预测或真值中没有可配对的变化面"
         return result
-    matched_pairs = _matched_object_pairs(
-        predicted, truth, evaluation_tolerance, object_iou_threshold,
-    )
+    if matched_pairs is None:
+        matched_pairs = _matched_object_pairs(
+            predicted, truth, evaluation_tolerance, object_iou_threshold,
+        )
     if not matched_pairs:
         result["centerline_offset_reason"] = "同类型预测与真值中没有对象级真阳性配对"
         return result
@@ -1314,10 +1350,12 @@ def _object_metric_values(
     truth: gpd.GeoDataFrame,
     line_tolerance: float,
     iou_threshold: float,
+    *, matched_pairs=None,
 ) -> dict:
-    matched_pairs = _matched_object_pairs(
-        predicted, truth, line_tolerance, iou_threshold,
-    )
+    if matched_pairs is None:
+        matched_pairs = _matched_object_pairs(
+            predicted, truth, line_tolerance, iou_threshold,
+        )
     matched_predicted = {predicted_index for predicted_index, _truth_index in matched_pairs}
     matched_truth = {truth_index for _predicted_index, truth_index in matched_pairs}
     true_positive = len(matched_predicted)
@@ -1345,11 +1383,14 @@ def evaluate_changes(
     class_mode: str = "four",
     object_iou_threshold: float = 0.1,
 ) -> tuple[list[dict], dict]:
+    evaluation_started = time.perf_counter()
     if predicted.crs is None or truth.crs is None:
         raise ValueError("Predicted changes and truth must define a CRS.")
-    predicted = _clean_geometries(predicted)
-    truth = _clean_geometries(truth)
+    predicted = _clean_evaluation_geometries(predicted)
+    truth = _clean_evaluation_geometries(truth)
     predicted, truth, metric_crs, _output_crs = _analysis_crs(predicted, truth)
+    predicted = _clean_evaluation_geometries(predicted)
+    truth = _clean_evaluation_geometries(truth)
     field = _truth_type_field(truth, truth_type_field)
     truth = truth.copy()
     if class_mode not in {"three", "four"}:
@@ -1365,7 +1406,8 @@ def evaluate_changes(
     if validation_area is not None:
         if validation_area.crs is None:
             raise ValueError("The validation area layer must define a CRS.")
-        validation = _polygon_union(_clean_geometries(validation_area).to_crs(predicted.crs))
+        validation = _polygon_union(_clean_evaluation_geometries(
+            _clean_evaluation_geometries(validation_area).to_crs(predicted.crs)))
         validation_extent_source = "validation_area"
     else:
         extent_source = truth if not truth.empty else predicted
@@ -1386,13 +1428,22 @@ def evaluate_changes(
 
     predicted = _clip_frame(predicted, validation)
     truth = _clip_frame(truth, validation)
+    clipping_seconds = time.perf_counter()-evaluation_started
+    matching_seconds = 0.
+    def match_objects(left, right):
+        nonlocal matching_seconds
+        started = time.perf_counter()
+        pairs = _matched_object_pairs(left, right, evaluation_tolerance, object_iou_threshold)
+        matching_seconds += time.perf_counter()-started
+        return pairs
     overall = _metric_row(
             "all",
             _support_geometry(predicted, evaluation_tolerance).intersection(validation),
             _support_geometry(truth, evaluation_tolerance).intersection(validation),
             validation,
         )
-    overall.update(_object_metric_values(predicted, truth, evaluation_tolerance, object_iou_threshold))
+    overall.update(_object_metric_values(predicted, truth, evaluation_tolerance, object_iou_threshold,
+                                        matched_pairs=match_objects(predicted, truth)))
     rows = [overall]
     classified = int(truth["_eval_type"].notna().sum()) if field else 0
     if field:
@@ -1406,13 +1457,14 @@ def evaluate_changes(
                     _support_geometry(truth_part, evaluation_tolerance).intersection(validation),
                     validation,
                 )
-            row.update(_object_metric_values(pred_part, truth_part, evaluation_tolerance, object_iou_threshold))
+            pairs = match_objects(pred_part, truth_part)
+            row.update(_object_metric_values(pred_part, truth_part, evaluation_tolerance, object_iou_threshold, matched_pairs=pairs))
             if change_type in {"added", "removed"}:
                 row.update(_centerline_offset_metrics(
                     pred_part,
                     truth_part,
                     evaluation_tolerance,
-                    object_iou_threshold,
+                    object_iou_threshold, matched_pairs=pairs,
                 ))
             elif change_type == "width_changed":
                 row.update({
@@ -1499,6 +1551,12 @@ def evaluate_changes(
             "type_judgment_accuracy": "Correctly classified detected truth area / truth change area covered by any prediction.",
         },
     }
+    metadata['evaluation_clipping_seconds'] = clipping_seconds
+    metadata['evaluation_matching_seconds'] = matching_seconds
+    metadata['evaluation_total_seconds'] = time.perf_counter()-evaluation_started
+    print(f"[Fast timing] evaluation_clipping={clipping_seconds:.6f}s "
+          f"evaluation_matching={metadata['evaluation_matching_seconds']:.6f}s "
+          f"evaluation_total={metadata['evaluation_total_seconds']:.6f}s", flush=True)
     return rows, metadata
 
 

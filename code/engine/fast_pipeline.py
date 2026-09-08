@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from .fast_timing import timed_stage
 import sys
 import time
 import warnings
@@ -2949,6 +2950,7 @@ def _write_fast_period_previews(
     }
 
 
+@timed_stage("period_export")
 def export_fast_products(
     width_dir: Path,
     output_dir: Path,
@@ -2962,6 +2964,18 @@ def export_fast_products(
     from .road_network_products import (
         NETWORK_REPORT, recover_centerline_frame, write_network_report, rebuild_network_width_products,
     )
+    from .product_cache import signature, read_completed, write_completed
+    marker = output_dir/'fast_export_cache.json'
+    inputs = signature([working, validation_area, __file__,
+                        Path(__file__).with_name('road_network_products.py'),
+                        Path(__file__).with_name('road_network_connection.py'),
+                        Path(__file__).with_name('road_track_corridors.py'),
+                        Path(__file__).with_name('road_geometry.py'),
+                        WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py']) + [str(image_dir)]
+    cached = read_completed(marker, inputs)
+    if cached is not None:
+        print('[Fast timing] period_export_reused=1', flush=True)
+        return cached
     (output_dir / NETWORK_REPORT).unlink(missing_ok=True)
     mapping = {
         "centerlines": "road_centerlines.shp", "surfaces": "road_surfaces.shp",
@@ -2970,8 +2984,20 @@ def export_fast_products(
     gpkg = output_dir / "roads.gpkg"
     gpkg.unlink(missing_ok=True)
     outputs = {}
-    frames = {layer: _clip_frame(gpd.read_file(working, layer=layer), validation_area)
-              for layer in mapping}
+    frames = {layer: gpd.read_file(working, layer=layer) for layer in mapping}
+    if validation_area is not None and validation_area.is_file():
+        validation = gpd.read_file(validation_area)
+        if validation.crs is None:
+            raise ValueError(f"Validation area lacks CRS: {validation_area}")
+        masks = {}
+        for layer, frame in frames.items():
+            if frame.empty:
+                continue
+            key = str(frame.crs)
+            if key not in masks:
+                local = validation.to_crs(frame.crs) if validation.crs != frame.crs else validation
+                masks[key] = local.geometry.union_all()
+            frames[layer] = gpd.clip(frame, masks[key])
     frames['centerlines'], connection_stats, connection_audits = recover_centerline_frame(
         frames['centerlines'], frames['surfaces'],
     )
@@ -2992,6 +3018,9 @@ def export_fast_products(
     outputs["road_width"] = outputs["previews"]["width"]
     outputs["execution_profile"] = "fast"
     write_network_report(output_dir, connection_stats, connection_audits)
+    write_completed(marker, inputs, outputs,
+                    [outputs[key] for key in mapping] + [gpkg, output_dir/NETWORK_REPORT,
+                     output_dir/'road_network_audit.gpkg', *outputs['previews'].values()])
     return outputs
 
 

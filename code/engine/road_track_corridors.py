@@ -165,8 +165,15 @@ def infer_track_corridors(roads, maximum_gap=300.0):
         if not duplicate:
             models.append(dict(axis=axis, center=center, rho=rho, start=start, end=end, coverage=coverage, mask=mask.copy()))
     pairs = []
+    # Unit directions within four degrees have chord distance <= this radius.
+    # Keep the original ordered pairs and exact dot-product predicate below.
+    from scipy.spatial import cKDTree
+    directions = np.asarray([model['axis'] for model in models])
+    direction_tree = cKDTree(directions) if len(directions) else None
     for i, first in enumerate(models):
-        for j, second in enumerate(models[i+1:], i+1):
+        nearby = direction_tree.query_ball_point(first['axis'], 2*np.sin(np.deg2rad(2))+1e-12)
+        for j in sorted(j for j in nearby if j > i):
+            second = models[j]
             if first['axis'] @ second['axis'] < np.cos(np.deg2rad(4)):
                 continue
             axis = first['axis'] + second['axis']

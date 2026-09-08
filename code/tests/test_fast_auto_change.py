@@ -147,13 +147,14 @@ class FastFinalAutoTests(unittest.TestCase):
         self.assertFalse(result["ground_truth_used"])
         self.assertEqual(result["added_feature_count"], 1)
         self.assertEqual(result["removed_feature_count"], 0)
-        for key in ("road_changes", "candidate_funnel", "summary", "road_change"):
+        for key in ("road_changes", "summary", "road_change"):
             self.assertTrue(Path(result[key]).is_file(), key)
-        self.assertEqual(len(gpd.read_file(result["diagnostics"], layer="changes")), 1)
-        local = gpd.read_file(result["diagnostics"], layer="local_seeds")
-        assembled = gpd.read_file(result["diagnostics"], layer="changes")
-        self.assertEqual(local.qa_state.tolist(), assembled.qa_state.tolist())
-        self.assertTrue({"confidence", "qa_state", "audit_reason"}.issubset(local.columns))
+        self.assertEqual(result['diagnostics'], '')
+        self.assertEqual(set(result['layers']), {'changes'})
+        self.assertFalse(list(output.glob('*.gpkg')))
+        self.assertFalse(list(output.glob('*.csv')))
+        self.assertEqual([p.name for p in output.glob('*.shp')], ['road_changes.shp'])
+        self.assertFalse((output/'candidate_funnel.json').exists())
         self.assertTrue(gpd.read_file(result["road_changes"]).is_valid.all())
 
     def test_empty_formal_result_still_publishes_funnel_and_audits(self):
@@ -164,8 +165,8 @@ class FastFinalAutoTests(unittest.TestCase):
                     centerlines=[scene.widths for scene in scenes.values()], output_dir=output,
                     before_period="before", after_period="after")
         self.assertEqual(result['changes_feature_count'], 0)
-        self.assertTrue(Path(result['candidate_funnel']).is_file())
-        self.assertTrue(gpd.read_file(result['diagnostics'],layer='candidate_audit').empty)
+        self.assertEqual(result['candidate_funnel'], '')
+        self.assertFalse(list(output.glob('*.gpkg')))
 
 
 if __name__ == "__main__":

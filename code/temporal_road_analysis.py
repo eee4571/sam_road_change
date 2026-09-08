@@ -10,6 +10,7 @@ is the one-row-per-road wide table intended for direct GIS inspection, while
 import argparse
 import hashlib
 import json
+from engine.fast_timing import timed_stage
 import math
 import re
 from pathlib import Path
@@ -172,10 +173,12 @@ def _best_match(
     targets: list[BaseGeometry],
     tree: STRtree | None,
     tolerance: float,
+    indices=None,
 ) -> tuple[int | None, float, float, float, bool]:
     if tree is None or not targets:
         return None, 0.0, 0.0, float("inf"), False
-    indices = tree.query(geometry, predicate="dwithin", distance=max(tolerance, 0.1))
+    if indices is None:
+        indices = tree.query(geometry, predicate="dwithin", distance=max(tolerance, 0.1))
     ranked = []
     for raw_index in indices:
         index = int(raw_index)
@@ -203,25 +206,27 @@ def _build_reference(period_frames: dict[str, gpd.GeoDataFrame], tolerance: floa
         existing_geometries = [item["geometry"] for item in references]
         tree = STRtree(np.asarray(existing_geometries, dtype=object)) if existing_geometries else None
         new_references: list[dict] = []
-        new_geometries: list[BaseGeometry] = []
-        for _, row in frame.iterrows():
+        period_geometries = list(frame.geometry)
+        period_tree = STRtree(period_geometries)
+        accepted_indices = set()
+        for row_index, (_, row) in enumerate(frame.iterrows()):
             geometry = row.geometry
             index, score, overlap, _distance, _ambiguous = _best_match(
                 geometry, existing_geometries, tree, tolerance,
             )
             matched = index is not None and score >= 0.48 and overlap >= 0.35
-            if not matched and new_geometries:
+            if not matched and accepted_indices:
                 # Outside tolerance the overlap is zero and the maximum score
                 # is .20, below .48. Spatial pruning preserves the old decision
                 # exactly while avoiding a quadratic all-road buffer workload.
-                local_tree=STRtree(np.asarray(new_geometries,dtype=object))
-                local_index,local_score,local_overlap,_,_=_best_match(geometry,new_geometries,local_tree,tolerance)
+                indices = [int(i) for i in period_tree.query(geometry, predicate="dwithin", distance=max(tolerance, .1)) if int(i) in accepted_indices]
+                local_index,local_score,local_overlap,_,_=_best_match(geometry,period_geometries,period_tree,tolerance,indices=indices)
                 matched=local_index is not None and local_score>=.48 and local_overlap>=.35
             if matched:
                 continue
             item = {"geometry": geometry, "born_period": period}
             new_references.append(item)
-            new_geometries.append(geometry)
+            accepted_indices.add(row_index)
         references.extend(new_references)
     return references
 
@@ -626,7 +631,7 @@ def _apply_event_evidence(events: list[dict], event_parts: list[dict], has_pair_
         # Ambiguous observations and lifecycle conflicts retain their own QA.
 
 
-def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str) -> None:
+def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str, output_crs=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
         frame = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
@@ -637,11 +642,15 @@ def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geome
     else:
         data = {name: pd.Series(dtype=dtype) for name, dtype in columns.items()}
         frame = gpd.GeoDataFrame(data, geometry=gpd.GeoSeries([], crs=crs), crs=crs)
+    if output_crs is not None and frame.crs != output_crs:
+        frame = frame.to_crs(output_crs)
     pyogrio.write_dataframe(
         frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=geometry_type,
     )
 
 
+
+@timed_stage("temporal")
 def build_temporal_grid(
     grid_name: str,
     period_entries: list[dict],
@@ -696,40 +705,33 @@ def build_temporal_grid(
 
     _write_shp(output_dir / "road_life.shp", life,
                {name: ("str" if name not in {"present_n", "event_n", "max_conf", "min_conf"} and not name.startswith(("W", "C")) else "float64")
-                for name in life[0] if name != "geometry"}, analysis_crs, "LineString")
+                for name in life[0] if name != "geometry"}, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_obs.shp", observations, {
         "road_id": "str", "period": "str", "status": "str", "width_m": "float64",
         "length_m": "float64", "coverage": "float64", "match_sc": "float64",
         "extract_cf": "float64", "geom_dev_m": "float64", "source_fid": "str", "qa_state": "str",
         "qa_reason": "str", "dir_sim": "float64",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_event.shp", events, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "before_st": "str", "after_st": "str", "before_w": "float64",
         "after_w": "float64", "width_diff": "float64", "event_cf": "float64",
         "evidence": "str", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "event_parts.shp", event_parts, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "source_id": "str", "area_m2": "float64", "qa_state": "str",
-    }, analysis_crs, "Polygon")
+    }, analysis_crs, "Polygon", output_crs)
     _write_shp(output_dir / "road_lineage.shp", [], {
         "parent_id": "str", "child_id": "str", "period": "str", "relation": "str",
         "confidence": "float64", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_review.shp", reviews, {
         "road_id": "str", "period": "str", "reason": "str", "match_sc": "float64",
         "coverage": "float64", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     pd.DataFrame([{k:v for k,v in row.items() if k!='geometry'} for row in observations]).to_csv(
         output_dir/'width_evolution.csv',index=False,encoding='utf-8-sig')
-
-    if output_crs is not None and output_crs != analysis_crs:
-        for name in ("road_life.shp", "road_obs.shp", "road_event.shp", "event_parts.shp", "road_lineage.shp", "road_review.shp"):
-            path = output_dir / name
-            frame = gpd.read_file(path).to_crs(output_crs)
-            geometry_type = "Polygon" if name == "event_parts.shp" else "LineString"
-            pyogrio.write_dataframe(frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=geometry_type)
 
     result = {
         "grid": grid_name, "output": str(output_dir),

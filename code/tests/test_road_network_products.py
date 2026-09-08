@@ -82,8 +82,14 @@ class NetworkProductTests(unittest.TestCase):
                 self.assertLess(unary_union(final.geometry).symmetric_difference(unary_union(measured.geometry)).length,.001)
                 self.assertAlmostEqual(final.length.sum(),230)
                 first=list(final.geometry.to_wkb())
-                export_fast_products(width,output)
+                with patch("engine.road_network_products.recover_centerline_frame", side_effect=AssertionError("repeated recovery")):
+                    export_fast_products(width,output)
                 self.assertEqual(first,list(gpd.read_file(output/'roads.gpkg',layer='centerlines').geometry.to_wkb()))
+            # Changed inputs must invalidate the cache and preserve failure semantics.
+            import os
+            working=width/'fast_products.gpkg'
+            stat=working.stat()
+            os.utime(working, ns=(stat.st_atime_ns, stat.st_mtime_ns+1000000000))
             with patch('engine.fast_pipeline._write_fast_period_previews',side_effect=RuntimeError('preview failure')):
                 with self.assertRaises(RuntimeError):
                     export_fast_products(width,output)

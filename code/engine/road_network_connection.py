@@ -4,6 +4,7 @@ from __future__ import annotations
 All decisions use metric geometry, never feature IDs or region-specific rules.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import networkx as nx
 import numpy as np
@@ -27,6 +28,11 @@ def _parts(geometry, kind):
     return [part for child in getattr(geometry, 'geoms', ()) for part in _parts(child, kind)]
 
 
+@lru_cache(maxsize=4096)
+def _contact_geometry(first, second):
+    return first.intersection(second)
+
+
 def _node_network(roads):
     """Insert planar contacts and emit edges between junctions, retaining bodies."""
     lines = [LineString(road.points) for road in roads]
@@ -38,7 +44,7 @@ def _node_network(roads):
             j = int(raw_j)
             if j <= i:
                 continue
-            intersection = line.intersection(lines[j])
+            intersection = _contact_geometry(line, lines[j])
             points = _parts(intersection, 'Point')
             for overlap in _parts(intersection, 'LineString'):
                 points.extend([Point(overlap.coords[0]), Point(overlap.coords[-1])])
@@ -369,14 +375,19 @@ def _nearby_conflict(candidate,roads,lines,tree):
 def _short_cycle(candidate,graph,lines):
     # A long existing route around a city block is not a redundant local loop.
     limit = max(25.0,candidate.row['distance_m']*1.7)
-    distances = nx.single_source_dijkstra_path_length(graph,_key(candidate.first.point),cutoff=limit,weight='weight')
+    cutoff = max(120,candidate.row['distance_m']*3)
+    cache = graph.graph.setdefault('_shortest_cache', {})
+    key = (_key(candidate.first.point), cutoff)
+    if key not in cache:
+        cache[key] = nx.single_source_dijkstra(graph,key[0],cutoff=cutoff,weight='weight')
+    length_map, paths = cache[key]
+    distances = {node: distance for node, distance in length_map.items() if distance <= limit}
     if candidate.second is not None:
         if _key(candidate.second.point) in distances:
             return True
         # A long, narrow return path is still a redundant parallel loop, even
         # when its length exceeds the local shortest-path cutoff.
         end = _key(candidate.second.point)
-        length_map, paths = nx.single_source_dijkstra(graph,_key(candidate.first.point),cutoff=max(120,candidate.row['distance_m']*3),weight='weight')
         if end in paths:
             from shapely.geometry import Polygon
             perimeter = length_map[end]+LineString(candidate.points).length
@@ -390,7 +401,6 @@ def _short_cycle(candidate,graph,lines):
     contacts.extend(graph.graph.get('attachment_contacts',{}).get(candidate.target,()))
     if min(distances.get(node,math.inf)+abs(position-along) for node,along in contacts)<=limit:
         return True
-    length_map,paths = nx.single_source_dijkstra(graph,_key(candidate.first.point),cutoff=max(120,candidate.row['distance_m']*3),weight='weight')
     from shapely.geometry import Polygon
     for node,along in contacts:
         if node not in paths:
@@ -451,6 +461,7 @@ def _select(candidates,roads,lines,tree,graph,corridors=()):
             continue
         accepted.append(c)
         used.update(endpoints)
+        graph.graph.pop('_shortest_cache', None)
         first,second = _key(c.first.point),_key(c.second.point if c.second else c.points[-1])
         graph.add_edge(first,second,weight=c.row['distance_m'])
         if c.second is None:
@@ -522,10 +533,11 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
         from shapely.affinity import scale
         surface_geometry = scale(surface_geometry,xfact=unit_size_m,yfact=unit_size_m,origin=(0,0))
     surface = prep(surface_geometry) if surface_geometry is not None and not surface_geometry.is_empty else None
-    baseline = _metrics(_node_network(active))
+    noded = _node_network(active)
+    baseline = _metrics(noded)
     corridors = infer_track_corridors(active,max_gap_m)
     active,replaced,corridor_bridges,cleanup = restore_track_corridors(active,corridors,max_gap_m) if corridors else (active,LineString(),[],dict(connection_redundant_fragment_count=0,connection_redundant_length_m=0.))
-    active = _join_chains(_node_network(active))
+    active = _join_chains(_node_network(active) if corridors else noded)
     audit = [dict(first_sources=list(sources),second_sources=[],distance_m=line.length,lateral_offset_m=0.,surface_support=_support(line.coords,surface),score=0.,kind='corridor_reconstruction',status='accepted',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=line) for line,sources in corridor_bridges]
     if not replaced.is_empty:
         audit.append(dict(first_sources=[],second_sources=[],distance_m=replaced.length,lateral_offset_m=0.,surface_support=0.,score=0.,kind='corridor_replacement',status='replaced',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=replaced))

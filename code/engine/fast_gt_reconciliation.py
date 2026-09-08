@@ -6,6 +6,7 @@ axis/track edits; polygon overlap is never a deletion instruction.
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from .fast_timing import timed_stage
 from pathlib import Path
 
 import geopandas as gpd
@@ -489,6 +490,7 @@ def reconcile_periods(periods, changes, output_dir):
     return outputs
 
 
+@timed_stage("final_road")
 def _write_final_period(original,base,cuts,centers,inserts,directory,metric,output_crs):
     """Preserve road decisions and axes; render all final surfaces from widths.
 
@@ -496,6 +498,20 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     are continuous per road, and surface boundaries are dissolved at junctions;
     there are no station rectangles or separate junction patch features.
     """
+    from .product_cache import signature, read_completed, write_completed
+    cacheable = not cuts and not inserts and all(not row.get('track_id') for row in centers)
+    marker = directory/'regular_road_cache.json'
+    inputs = signature([original['centerlines'], original['width_segments'], __file__,
+                        Path(__file__).with_name('continuous_road_geometry.py'),
+                        Path(__file__).with_name('auto_change_geometry.py'),
+                        Path(__file__).with_name('auto_change_assembly.py')]) + [str(metric), str(output_crs)]
+    if cacheable:
+        row_values = [{k: (v.wkb_hex if k == "geometry" else v) for k, v in row.items()} for row in centers]
+        inputs.append(hashlib.sha256(json.dumps(row_values, sort_keys=True, default=str).encode()).hexdigest())
+        cached = read_completed(marker, inputs)
+        if cached is not None:
+            print('[Fast timing] final_road_reused=1', flush=True)
+            return cached
     cut_axes=[substring(base.geometry.iloc[i],a,b) for i,intervals in cuts.items() for a,b in intervals]
     originals={key:gpd.read_file(original[key]) for key in ('centerlines','width_segments')}
     widths=originals['width_segments'].to_crs(metric)
@@ -541,6 +557,8 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         exported.to_file(path,encoding='UTF-8');outputs[key]=str(path.resolve())
     if edited_corridors:outputs['geometry_audit']=str((directory/'road_geometry_audit.gpkg').resolve())
     outputs['regular_surface']=True
+    if cacheable:
+        write_completed(marker, inputs, outputs, [outputs[key] for key in frames])
     return outputs
 
 
@@ -565,6 +583,7 @@ def _publish_assisted_changes(frame, output, before_period, after_period):
         layers={'changes':str((output/'road_changes.shp').resolve())},road_change=str(preview.resolve()),previews={'change':str(preview.resolve())})
 
 
+@timed_stage("gt_correction")
 def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *, before_result, after_result,
         before_period='before',after_period='after',truth_type_field='BHBM',validation_area=None,
         position_tolerance=3.,evaluation_tolerance=5.,profile=GTProfile(),defer_finalization=False):
@@ -614,6 +633,7 @@ def _final_change_frame(entry, corrected, edits):
     return _frame(retained.to_dict('records')+edits.to_crs(corrected.crs).to_dict('records'),corrected.crs)
 
 
+@timed_stage("finalization_and_temporal")
 def build_fast_temporal_outputs(manifest, job_root):
     """Finalize GT-local edits, publish final changes, then build ONE temporal."""
     from temporal_road_analysis import build_from_manifest,clean_name
