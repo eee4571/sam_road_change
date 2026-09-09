@@ -411,7 +411,8 @@ def _run_fast_change_result(
         position_tolerance=float(position_tolerance),
         width_change_absolute=float(width_change_absolute),
         width_change_ratio=float(width_change_ratio),
-        internal_outputs=truth_path is not None,
+        # Both GT correction and the shared Final Changes publisher consume axes.
+        internal_outputs=True,
     )
     if truth_path is not None and not Path(truth_path).expanduser().is_file():
         raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
@@ -4872,7 +4873,7 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
         "failure_count": len(failures),
         "total_change_count": len(change_keys),
     }
-    emit("complete", stage="rerun-all-changes", **result)
+    emit("complete", stage="rerun-all-changes", status=manifest["status"], **result)
     return result
 
 

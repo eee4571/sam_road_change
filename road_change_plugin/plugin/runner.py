@@ -139,7 +139,7 @@ class Runner(TaskSignals):
         if kind == "complete":
             self._completion = event
             if event.get("failure_count", 0):
-                self._failure = "部分处理失败，请查看运行记录"
+                self._failure = f"任务结束，其中 {event['failure_count']} 项失败，请查看运行记录"
 
     def _fail(self, message):
         if self._terminal:

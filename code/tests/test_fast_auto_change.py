@@ -157,6 +157,26 @@ class FastFinalAutoTests(unittest.TestCase):
         self.assertFalse((output/'candidate_funnel.json').exists())
         self.assertTrue(gpd.read_file(result["road_changes"]).is_valid.all())
 
+        # Rerunning for GT retains only its two required internal layers.
+        for name in ('auto_diagnostics.gpkg', 'existence_candidates.csv', 'assembly_summary.json'):
+            (output/name).touch()
+        result = detect_fast_changes(*inputs, output, internal_outputs=True)
+        self.assertEqual(set(gpd.list_layers(output/'network_assembly.gpkg').name),
+                         {'change_objects', 'object_axes'})
+        self.assertFalse((output/'auto_diagnostics.gpkg').exists())
+        self.assertFalse(list(output.glob('*.csv')))
+        from engine.fast_gt_reconciliation import augment_fast_changes_with_truth
+        truth = Path(self.tmp.name)/'truth.gpkg'
+        gpd.GeoDataFrame({'BHBM': [2]}, geometry=[self.road(170)[0].buffer(4)],
+                         crs=self.crs).to_file(truth)
+        corrected = augment_fast_changes_with_truth(result, truth,
+                            Path(self.tmp.name)/'corrected', before_result=inputs[0],
+                            after_result=inputs[1], defer_finalization=True)
+        self.assertTrue(corrected['ground_truth_used'])
+        self.assertIn('corrected_intervals', set(gpd.list_layers(corrected['correction_audit']).name))
+        detect_fast_changes(*inputs, output, internal_outputs=False)
+        self.assertFalse((output/'network_assembly.gpkg').exists())
+
     def test_empty_formal_result_still_publishes_funnel_and_audits(self):
         from engine.fast_auto_change import finalize_auto_candidates
         scenes = {period: self.scene([self.road(100)]) for period in ("before", "after")}

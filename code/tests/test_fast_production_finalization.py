@@ -9,6 +9,25 @@ from app.result_publisher import ResultPublisher, result_index_from_manifest
 
 
 class FastProductionTests(unittest.TestCase):
+    def test_batch_change_failures_continue_and_complete_reports_manifest_status(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); path = root/'pipeline.json'
+            p.write_json(path, {'job_root': raw, 'execution_profile': 'fast',
+                'period_results': [{'grid':'area', 'period':str(i)} for i in range(3)],
+                'change_results': []})
+            with patch.object(p, '_rerun_change_entry', side_effect=[RuntimeError('pair failed'), {}]) as run, \
+                 patch.object(p, '_refresh_manifest_downstream'), \
+                 patch.object(p, '_persist_existing_pipeline'), \
+                 patch.object(p, '_period_result_ready', return_value=True), \
+                 patch.object(p, 'emit') as emit:
+                result = p.rerun_all_pipeline_changes(argparse.Namespace(
+                    pipeline_manifest=str(path), continue_on_error=True))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(result['failure_count'], 1)
+            self.assertEqual(result['change_count'], 1)
+            emit.assert_any_call('complete', stage='rerun-all-changes',
+                                 status='completed_with_errors', **result)
+
     def test_completed_gt_final_exports_existing_pixel_centerline_metrics(self):
         import geopandas as gpd
         import numpy as np

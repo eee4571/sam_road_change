@@ -173,6 +173,18 @@ class PluginTests(unittest.TestCase):
             self.assertEqual(runner.state, "failed")
             self.assertEqual(len(failures), 1)
 
+    def test_batch_failure_count_prevents_success_with_zero_exit(self):
+        runner = FakeRunner()
+        runner.script = "print('__SAMROAD_USER__{\"kind\":\"complete\",\"stage\":\"rerun-all-changes\",\"failure_count\":2}')"
+        failures, finished = [], []
+        runner.task_failed.connect(failures.append)
+        runner.task_finished.connect(finished.append)
+        runner.start([])
+        wait_done(runner)
+        self.assertEqual(runner.state, 'failed')
+        self.assertFalse(finished)
+        self.assertIn('2 项失败', failures[0]['message'])
+
     def test_cancel_and_shutdown(self):
         for shutdown in (False, True):
             runner = FakeRunner()
