@@ -38,7 +38,7 @@ def fixture(root):
         p = output / (key + (".csv" if key == "csv" else ".shp"))
         p.touch()
         products[key] = str(p)
-    manifest = {"run_id": "示例任务", "status": "completed", "period_results": [
+    manifest = {"run_id": "示例任务", "execution_profile": "fast", "status": "completed", "period_results": [
         {"grid": a, "period": y, "published": {k: products[k] for k in ("centerlines", "surfaces", "width_segments")}}
         for a in ("北区", "南区") for y in ("2020", "2022", "2024")],
         "change_results": [{"grid": "北区", "before_period": "2020", "after_period": "2022", "published": {"changes": products["changes"]}}],
@@ -75,7 +75,26 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget._checked([])
         self.assertTrue(self.widget.run_button.isEnabled())
         self.assertIn("已就绪", self.widget.check_note.text())
-        self.assertIn("GT 2/4", self.widget.summary.text())
+        self.assertIn("真值数据 2/4", self.widget.summary.text())
+
+    def test_fixed_processing_and_automatic_evaluation(self):
+        self.assertFalse(hasattr(self.widget, "profile"))
+        self.assertFalse(hasattr(self.widget, "evaluate"))
+        data = self.widget._data()
+        self.assertEqual(data["profile"], "fast")
+        self.assertTrue(data["evaluate"])  # partial truth coverage is sufficient
+        command = self.widget.controller.build_command("all", data)
+        self.assertNotIn("--no-evaluation", command)
+        self.widget.model["truths"] = []
+        data = self.widget._data()
+        self.assertFalse(data["evaluate"])
+        self.assertIn("--no-evaluation", self.widget.controller.build_command("all", data))
+        task = self.widget.task.currentData()
+        task["data"]["execution_profile"] = "full"
+        self.widget.task.setItemData(self.widget.task.currentIndex(), task)
+        self.widget._update_controls()
+        self.assertFalse(self.widget.rerun_period.isEnabled())
+        self.assertFalse(self.widget.resume.isEnabled())
 
     def test_background_scan(self):
         self.widget.scan()

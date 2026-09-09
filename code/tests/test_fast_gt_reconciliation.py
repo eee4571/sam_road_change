@@ -20,6 +20,51 @@ def frame(rows):return _frame(rows,3857)
 
 
 class FastGTReconciliationTests(unittest.TestCase):
+    def test_bhbm_three_area_deficit_is_completed_after_existing_perturbation(self):
+        truth=frame([dict(BHBM=3,DLKD=14,geometry=box(0,-7,100,7))])
+        truth['_gt_type']=truth.BHBM
+        widths={side:FinalWidths(frame([dict(width_m=value,geometry=line(0))]))
+                for side,value in (('before',8),('after',14))}
+        gt,_=perturb_truth(truth,widths,'T1','T2',GTProfile(omission_probability=0,type_error_probability=0))
+        self.assertTrue(gt.gt_type.eq('width_changed').all())
+        auto=frame([dict(change_id='auto',change_src='AUTO',change_typ='widened',width_bef=8.,width_aft=9.,
+            axis_wkt=line(0).wkt,geometry=_change_polygon(line(0),'widened',8,9))])
+        result,audit=correct_changes(auto,gt)
+        target=gt.geometry.union_all()
+        before=target.intersection(auto.geometry.union_all()).area/target.area
+        after=target.intersection(result.geometry.union_all()).area/target.area
+        self.assertGreater(after,.9);self.assertGreater(after,before+.3)
+        self.assertTrue(any(row['action']=='complete_same_type_area' for row in audit))
+
+    def test_same_type_longitudinal_match_repairs_area_for_all_four_types(self):
+        for kind,b,a,gb,ga in [('added',0,4,0,10),('removed',4,0,10,0),
+                               ('widened',8,9,8,14),('narrowed',14,13,14,8)]:
+            with self.subTest(kind=kind):
+                axis=line(0);local=line(0,20,80)
+                auto=frame([dict(change_id='auto',change_src='AUTO',change_typ=kind,width_bef=b,width_aft=a,
+                    axis_wkt=axis.wkt,geometry=_change_polygon(axis,kind,b,a))])
+                gt=frame([dict(change_id='gt',truth_id='gt',change_src='GT_ASSISTED',change_typ=kind,
+                    gt_type='width_changed' if kind in ('widened','narrowed') else kind,
+                    width_bef=gb,width_aft=ga,axis_wkt=local.wkt,match_axis_wkt=local.wkt,
+                    geometry=_change_polygon(local,kind,gb,ga))])
+                original=auto.geometry.iloc[0].wkb
+                result,audit=correct_changes(auto,gt)
+                self.assertLess(gt.geometry.iloc[0].difference(result.geometry.union_all()).area,1e-6)
+                self.assertTrue(any(r['action']=='complete_same_type_area' for r in audit))
+                retained=result[result.change_src.eq('AUTO')]
+                self.assertAlmostEqual(retained.length_m.sum(),40.)
+                self.assertTrue(retained.width_bef.eq(b).all());self.assertTrue(retained.width_aft.eq(a).all())
+                self.assertEqual(auto.geometry.iloc[0].wkb,original)
+
+    def test_sufficient_same_type_surface_remains_auto(self):
+        axis=line(0)
+        row=dict(change_id='auto',change_src='AUTO',change_typ='widened',width_bef=8.,width_aft=14.,
+                 axis_wkt=axis.wkt,geometry=_change_polygon(axis,'widened',8,14))
+        gt={**row,'change_id':'gt','truth_id':'gt','gt_type':'width_changed','match_axis_wkt':axis.wkt,'change_src':'GT_ASSISTED'}
+        result,audit=correct_changes(frame([row]),frame([gt]))
+        self.assertEqual(len(result),1);self.assertEqual(result.iloc[0].change_src,'AUTO')
+        self.assertEqual(audit[0]['action'],'retain_correct_auto')
+
     def period(self,root,name,roads):
         directory=root/name;directory.mkdir()
         f=frame([dict(width_m=w,geometry=g) for g,w in roads]);result=dict(period=name,grid='region')

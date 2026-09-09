@@ -3016,6 +3016,12 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         str(entry.get("summary") or output / "change_summary.json")
     ).expanduser().resolve()
     summary = read_json(summary_path) if summary_path.is_file() else {}
+    is_current_gt_assisted = (
+        str(entry.get('execution_profile') or manifest.get('execution_profile') or summary.get('execution_profile') or '') == 'fast'
+        and bool(entry.get('ground_truth_used', summary.get('ground_truth_used', False)))
+        and bool(entry.get('correction_audit') or entry.get('truth_path')
+                 or summary.get('correction_audit') or summary.get('truth_path'))
+    )
     is_fast_gt_assisted = (
         entry.get('fast_finalization_state') != 'completed' and (
         str(entry.get('product_variant') or summary.get('product_variant') or '') == 'gt_assisted'
@@ -3134,19 +3140,19 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
         }
-        if str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted':
-            image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(
-                manifest, entry, summary,
-            )
-            rows[0].update(evaluate_fast_assisted_centerline_metrics(
-                predicted,truth,truth_type_field=evaluation_truth_type_field,
-                image_crs=image_crs,image_transform=image_transform,image_shape=image_shape,validation_area=validation,
-            ))
-            metadata["fast_assisted_centerline_metrics"] = True
-            metadata["centerline_offset_unit"] = "px"
-        else:
-            metadata['geometry_source']='regular_axis_width_corridors'
-            metadata['centerline_offset_unit']='m'
+        metadata['geometry_source']='regular_axis_width_corridors'
+        metadata['centerline_offset_unit']='m'
+
+    if is_current_gt_assisted or (is_fast_gt_assisted and
+            str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted'):
+        image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        rows[0].update(evaluate_fast_assisted_centerline_metrics(
+            predicted, truth, truth_type_field=evaluation_truth_type_field,
+            image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
+            validation_area=validation,
+        ))
+        metadata['fast_assisted_centerline_metrics']=True
+        metadata['centerline_offset_unit']='px'
 
     for row in rows:
         if row.get("class") == "all":

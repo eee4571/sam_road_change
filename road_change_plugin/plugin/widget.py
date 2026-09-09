@@ -62,8 +62,12 @@ class RoadChangeWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-        logs_button = self._tool_button("运行记录", lambda: self._reveal(self.records_fold))
-        more = self._tool_button("更多", lambda: None)
+        logs_button = self._tool_button("记录", lambda: self._reveal(self.records_fold))
+        more = self._tool_button("…", lambda: None)
+        logs_button.setToolTip("运行记录")
+        more.setToolTip("更多操作")
+        logs_button.setProperty("role", "toolbarAction")
+        more.setProperty("role", "toolbarAction")
         menu = QMenu(more)
         menu.addAction("局部重跑", lambda: self._reveal(self.local))
         menu.addAction("检查运行资源", self._runtime)
@@ -243,8 +247,8 @@ class RoadChangeWidget(QWidget):
         form.addRow(self.corrections)
         self.areas = Rows(["区域", "验证区 SHP"], "Shapefile (*.shp)")
         self.periods = Rows(["区域", "期次", "影像 TXT"], "影像清单 (*.txt)")
-        self.truths = Rows(["区域", "前期", "后期", "GT SHP"], "Shapefile (*.shp)")
-        for title, rows in (("验证区", self.areas), ("影像期次", self.periods), ("可选 GT", self.truths)):
+        self.truths = Rows(["区域", "前期", "后期", "真值文件"], "Shapefile (*.shp)")
+        for title, rows in (("验证区", self.areas), ("影像期次", self.periods), ("可选真值数据", self.truths)):
             self.corrections.form.addRow(title, rows)
             rows.table.itemChanged.connect(self._edited)
             rows.table.model().rowsRemoved.connect(self._edited)
@@ -252,10 +256,6 @@ class RoadChangeWidget(QWidget):
         self.corrections.form.addRow(label("目录结构：01_验证区 / 02_影像 / 03_变化真值（可选）。也支持 project_config.json。"))
 
     def _processing_section(self, form):
-        self.profile = QComboBox()
-        self.profile.addItem("标准", "full")
-        self.profile.addItem("Fast", "fast")
-        self.profile.currentIndexChanged.connect(self._update_controls)
         self.run_button = self._button("运行完整流程", lambda: self._run("all"))
         primary_button(self.run_button)
         self.state_text = label("待就绪")
@@ -292,21 +292,13 @@ class RoadChangeWidget(QWidget):
         self.output.edit.textChanged.connect(self._invalidate_check)
         form.addRow(ResponsiveRow("成果目录", self.output))
         advanced_button = self._button("高级设置", lambda: self._reveal(self.advanced))
-        form.addRow(ResponsiveRow("处理模式", self.profile, advanced_button))
+        form.addRow(inline(label("道路变化检测"), advanced_button))
         form.addRow(self.advanced)
-        self.evaluate = QCheckBox("使用可用 GT 评价成果")
-        self.evaluate.toggled.connect(self._update_controls)
-        self.advanced.form.addRow(self.evaluate)
-        self.truth_field = QLineEdit()
-        self.advanced.form.addRow("GT 类型字段（可选）", self.truth_field)
         self.run_id = QLineEdit()
         self.run_id.setPlaceholderText("留空自动命名")
         self.advanced.form.addRow("任务名称", self.run_id)
         self.resume = QCheckBox("继续所选的未完成任务")
         self.advanced.form.addRow(self.resume)
-        self.device = QComboBox()
-        self.device.addItems(["auto", "cuda", "cpu"])
-        self.advanced.form.addRow("设备", self.device)
         self.parameters = {}
         for key, title, value in (("pixel-size", "像元大小（0 自动）", "0.0"), ("absolute", "宽度变化阈值", "2.0"),
                                   ("ratio", "宽度变化比例", "0.2"), ("tolerance", "匹配容差", "3.0")):
@@ -354,8 +346,7 @@ class RoadChangeWidget(QWidget):
         self.chooser = ResultChooser(self._open_result)
         form.addRow(self.chooser)
         self.chooser.hide()
-        self.evaluate_button = self._button("评价已有成果", lambda: self._run("evaluate-all-existing"))
-        self.advanced.form.addRow(self.evaluate_button)
+        self._ui_ready = True
 
     def _history_section(self):
         self.records_fold = Fold("运行记录")
@@ -434,7 +425,6 @@ class RoadChangeWidget(QWidget):
             rows.set_values(model[key])
         self._draw_catalog()
         self._set_tasks(model["tasks"])
-        self.evaluate.setChecked(bool(model["truths"]) and len(model["truths"]) == len(pairs(model["periods"])))
         self.check_note.setText("\n".join(model["issues"]) or "识别完成，请检查数据文件")
         self.status.setText("扫描完成")
         self._refresh_results()
@@ -465,9 +455,9 @@ class RoadChangeWidget(QWidget):
                 node.addChild(child)
             for a, before, after in change_pairs:
                 if a == area:
-                    node.addChild(QTreeWidgetItem([f"{before} → {after}", "有 GT" if (a, before, after) in gt else "无 GT（可选）"]))
+                    node.addChild(QTreeWidgetItem([f"{before} → {after}", "有真值数据" if (a, before, after) in gt else "无真值数据"]))
             node.setExpanded(True)
-        text = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次\n{len(change_pairs)} 个变化对 · {len(gt)} 个 GT"
+        text = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次\n{len(change_pairs)} 个变化对 · {len(gt)} 份真值数据"
         self.summary.setText(text)
 
     def check_data(self):
@@ -519,7 +509,7 @@ class RoadChangeWidget(QWidget):
         self.grid.clear()
         self.grid.addItems(sorted({r[0] for r in self._period_rows}, key=natural))
         self._grid_changed()
-        if hasattr(self, "evaluate_button"):
+        if getattr(self, "_ui_ready", False):
             self._update_controls()
 
     def _grid_changed(self, *args):
@@ -536,42 +526,38 @@ class RoadChangeWidget(QWidget):
         pair = self.pair.currentData() or ("", "")
         run_id = task["id"] if self.resume.isChecked() and task else self.run_id.text()
         return dict(areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
-                    output=self.output.text(), profile=self.profile.currentData(), evaluate=self.evaluate.isChecked(),
-                    truth_type_field=self.truth_field.text(), run_id=run_id, resume=self.resume.isChecked(),
+                    output=self.output.text(), profile="fast", evaluate=any(Path(row[-1]).is_file() for row in self.model["truths"]),
+                    truth_type_field="", run_id=run_id, resume=self.resume.isChecked(),
                     manifest=task["path"] if task else "", grid=self.grid.currentText(), period=self.period.currentText(),
-                    before_period=pair[0], after_period=pair[1], device=self.device.currentText(),
+                    before_period=pair[0], after_period=pair[1], device="auto",
                     **{key: field.text() for key, field in self.parameters.items()})
 
     def _update_controls(self, *args):
-        if not hasattr(self, "evaluate_button"):
+        if not getattr(self, "_ui_ready", False):
             return
         available = not self.busy and not self.browsing
         same_root = bool(self.model.get("root")) and self.controller.path(self.project.text()) == Path(self.model["root"])
         has_data = bool(self.model["areas"]) and same_root
-        gt_complete = len(self.model["truths"]) == len(pairs(self.model["periods"]))
-        evaluation_ok = not self.evaluate.isChecked() or self.profile.currentData() == "fast" or gt_complete
-        self.run_button.setEnabled(available and self.checked and evaluation_ok)
+        self.run_button.setEnabled(available and self.checked)
         self.scan_button.setEnabled(available)
         self.check_button.setEnabled(available and has_data)
         self.project.setEnabled(available)
         self.corrections.setEnabled(available)
         self.advanced.setEnabled(available)
-        self.profile.setEnabled(available)
         self.output.setEnabled(available)
         self.cancel_button.setEnabled(self.busy)
         self.cancel_button.setVisible(self.busy)
-        has_task = bool(self.task.currentData()) and same_root
+        has_task = bool(self.task.currentData()) and same_root and self.task.currentData()["data"].get("execution_profile") == "fast"
+        self.resume.setEnabled(available and has_task)
+        if not has_task:
+            self.resume.setChecked(False)
         self.rerun_period.setEnabled(available and has_task and self.period.count() > 0)
         self.rerun_pair.setEnabled(available and has_task and self.pair.count() > 0)
-        self.evaluate_button.setEnabled(available and has_task)
-        summary = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次 · {len(pairs(self.model['periods']))} 个变化对 · GT {len(self.model['truths'])}/{len(pairs(self.model['periods']))}"
+        summary = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次 · {len(pairs(self.model['periods']))} 个变化对 · 真值数据 {len(self.model['truths'])}/{len(pairs(self.model['periods']))}"
         self.summary.setText(summary)
         self.check_note.setVisible(True)
         if self.checked:
             self.check_note.setText("● 数据已就绪")
-        if not evaluation_ok and not self.busy:
-            self.status.setText("标准模式评价需要每个变化对的 GT；请修正或在高级设置关闭评价")
-
         self._render_task_state()
 
     def _run(self, action):

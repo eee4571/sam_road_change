@@ -9,6 +9,36 @@ from app.result_publisher import ResultPublisher, result_index_from_manifest
 
 
 class FastProductionTests(unittest.TestCase):
+    def test_completed_gt_final_exports_existing_pixel_centerline_metrics(self):
+        import geopandas as gpd
+        import numpy as np
+        import pandas as pd
+        import rasterio
+        from rasterio.transform import from_origin
+        from shapely.geometry import box
+        with tempfile.TemporaryDirectory() as raw:
+            root=Path(raw);gt=root/'truth.shp';final=root/'final.shp';raster=root/'probability.tif'
+            gpd.GeoDataFrame({'BHBM':[2]},geometry=[box(5,20,50,28)],crs=32650).to_file(gt)
+            gpd.GeoDataFrame({'change_typ':['added']},geometry=[box(5,20,50,28)],crs=32650).to_file(final)
+            with rasterio.open(raster,'w',driver='GTiff',width=64,height=64,count=1,dtype='uint8',
+                               crs=32650,transform=from_origin(0,64,1,1)) as dst:
+                dst.write(np.ones((1,64,64),dtype=np.uint8))
+            m=dict(execution_profile='fast',job_root=str(root),period_results=[
+                dict(grid='g',period='1',road_probability=str(raster))],change_results=[dict(grid='g',before_period='1',
+                after_period='2',output=str(root),road_changes=str(final),product_variant='final',execution_profile='fast',
+                ground_truth_used=True,truth_path=str(gt),fast_finalization_state='completed')])
+            args=argparse.Namespace(pipeline_manifest=str(root/'manifest.json'),_manifest=m,grid='g',before_period='1',
+                after_period='2',truth=str(gt),validation_area='',truth_type_field='BHBM',evaluation_tolerance=0.,
+                defer_publish=True,defer_aggregate=True)
+            result=p._evaluate_existing_changes_impl(args)
+            metrics=pd.read_csv(result['metrics'])
+            for name in ('centerline_mean_offset_px','road_centerline_completeness'):
+                self.assertIsNotNone(result[name]);self.assertTrue(np.isfinite(result[name]))
+                self.assertTrue(np.isfinite(metrics.iloc[0][name]))
+            summary=p.read_json(Path(result['summary']))
+            self.assertTrue(summary['evaluation']['metadata']['fast_assisted_centerline_metrics'])
+            self.assertNotIn('auto_evaluation',summary)
+
     def test_existing_gui_rerun_commands_still_parse(self):
         from app.task_manager import TaskManager
         commands=[TaskManager.build_rerun_period('manifest.json','g','2'),

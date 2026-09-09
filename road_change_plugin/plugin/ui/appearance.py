@@ -13,33 +13,38 @@ def dock_style(palette, font):
     secondary, border, hover = mix(.50), mix(.18), mix(.07)
     accent = palette.color(QPalette.ColorRole.Highlight).name()
     on_accent = palette.color(QPalette.ColorRole.HighlightedText).name()
-    title_size = max(10, font.pointSizeF() if font.pointSizeF() > 0 else 10) + 3
+    title_size = max(10, font.pointSizeF() if font.pointSizeF() > 0 else 10) + 1
     arrow = (Path(__file__).resolve().parents[2] / "resources/chevron_down.svg").as_posix()
     return f"""
         QWidget#roadChangeDock, QWidget#roadChangeBody {{ background: {mix(.035)}; color: {text.name()}; }}
-        #roadChangeDock QGroupBox {{ border: 1px solid {mix(.14)}; border-radius: 0; margin-top: 8px; font-weight: 600; }}
-        #roadChangeDock QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 8px; padding: 0 4px; }}
+        #roadChangeDock QGroupBox {{ border: none; border-top: 1px solid {mix(.14)}; border-radius: 0; margin-top: 10px; font-weight: 600; }}
+        #roadChangeDock QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 8px 0 0; background: {mix(.035)}; }}
         #roadChangeDock QLabel {{ background: transparent; color: {text.name()}; }}
         #roadChangeDock QLabel[role="title"] {{ font-size: {title_size}pt; font-weight: 600; }}
         #roadChangeDock QLabel[role="sectionHeading"] {{ font-weight: 600; }}
         #roadChangeDock QLabel[role="secondary"] {{ color: {secondary}; }}
         #roadChangeDock QLineEdit, #roadChangeDock QComboBox {{
             background: {base.name()}; color: {text.name()}; border: 1px solid {border};
-            border-radius: 1px; min-height: 28px; padding: 0 8px; placeholder-text-color: {mix(.38)};
+            border-radius: 2px; min-height: 28px; padding: 0 8px; placeholder-text-color: {mix(.38)};
         }}
         #roadChangeDock QLineEdit:hover, #roadChangeDock QComboBox:hover {{ border-color: {mix(.30)}; }}
-        #roadChangeDock QLineEdit:disabled, #roadChangeDock QComboBox:disabled {{ background: {mix(.035)}; color: {mix(.36)}; border-color: {mix(.12)}; }}
+        #roadChangeDock QLineEdit:disabled, #roadChangeDock QComboBox:disabled {{ background: {mix(.035)}; color: {mix(.44)}; border-color: {mix(.12)}; }}
         #roadChangeDock QLineEdit:focus, #roadChangeDock QComboBox:focus {{ border-color: {accent}; }}
         #roadChangeDock QComboBox::drop-down {{ border: none; width: 24px; }}
         #roadChangeDock QComboBox::down-arrow {{ image: url("{arrow}"); width: 12px; height: 8px; }}
         #roadChangeDock QPushButton, #roadChangeDock QToolButton {{
             background: {mix(.055)}; color: {text.name()}; border: 1px solid {border};
-            border-radius: 1px; min-height: 28px; padding: 0 12px;
+            border-radius: 2px; min-height: 28px; padding: 0 12px;
         }}
         #roadChangeDock QPushButton:hover, #roadChangeDock QToolButton:hover {{ background: {hover}; }}
         #roadChangeDock QPushButton:pressed, #roadChangeDock QToolButton:pressed {{ background: {mix(.13)}; border-color: {mix(.30)}; }}
         #roadChangeDock QPushButton:focus, #roadChangeDock QToolButton:focus {{ border-color: {accent}; }}
         #roadChangeDock QToolButton {{ background: transparent; padding: 0 6px; border-color: {mix(.12)}; }}
+        #roadChangeDock QToolButton[role="toolbarAction"] {{ border-color: transparent; background: transparent; padding: 0 6px; }}
+        #roadChangeDock QToolButton[role="toolbarAction"]:hover {{ background: {hover}; border-color: {mix(.12)}; }}
+        #roadChangeDock QToolButton[role="toolbarAction"]:pressed {{ background: {mix(.13)}; }}
+        #roadChangeDock QToolButton[role="toolbarAction"]:focus {{ border-color: transparent; }}
+        #roadChangeDock QToolButton[role="toolbarAction"]::menu-indicator {{ image: none; width: 0; }}
         #roadChangeDock QToolButton::menu-indicator {{ width: 8px; height: 5px; subcontrol-position: right center; }}
         #roadChangeDock QPushButton[role="resultAction"] {{ min-height: 26px; padding: 0 8px; }}
         #roadChangeDock QPushButton[role="primary"] {{
@@ -48,7 +53,7 @@ def dock_style(palette, font):
         }}
         #roadChangeDock QPushButton[role="primary"]:hover {{ background: {palette.color(QPalette.ColorRole.Highlight).lighter(108).name()}; }}
         #roadChangeDock QPushButton[role="primary"]:pressed {{ background: {palette.color(QPalette.ColorRole.Highlight).darker(112).name()}; }}
-        #roadChangeDock QPushButton:disabled, #roadChangeDock QToolButton:disabled {{ background: {mix(.035)}; border-color: {mix(.12)}; color: {mix(.36)}; }}
+        #roadChangeDock QPushButton:disabled, #roadChangeDock QToolButton:disabled {{ background: {mix(.035)}; border-color: {mix(.12)}; color: {mix(.44)}; }}
         #roadChangeDock QPushButton[role="primary"]:disabled {{ background: {hover}; border-color: {border}; color: {secondary}; }}
         #roadChangeDock QWidget[role="resultRow"] {{ border-bottom: 1px solid {mix(.10)}; background: transparent; }}
         #roadChangeDock QWidget[role="resultRow"]:hover {{ background: {hover}; }}

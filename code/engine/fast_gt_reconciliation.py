@@ -284,7 +284,7 @@ def _auto_axes(automatic_result, metric):
 
 
 def correct_changes(auto, assisted):
-    """Keep Auto intervals, replace explicit type conflicts, add uncovered GT."""
+    """Keep adequate Auto support; correct type and regular-corridor area deficits."""
     records=auto.to_dict('records');audit=[]
     for gt in assisted.to_dict('records'):
         axis=from_wkt(gt['axis_wkt']); reference=from_wkt(gt['match_axis_wkt'])
@@ -299,8 +299,22 @@ def correct_changes(auto, assisted):
                 # Project coverage onto the mildly perturbed GT axis.
                 a=axis.project(reference.interpolate(hit['source_start']))
                 b=axis.project(reference.interpolate(hit['source_end']))
-                covered.append(tuple(sorted((a,b))))
-                audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],action='retain_correct_auto'))
+                start,end=sorted((a,b))
+                target=_change_polygon(substring(axis,start,end),gt['change_typ'],gt['width_bef'],gt['width_aft'])
+                # Longitudinal matching alone does not establish surface coverage,
+                # especially for paired-width ribbons. Compare only this matched
+                # interval with the perturbed regular GT corridor, never copy GT pixels.
+                missing=target.difference(existing['geometry']).area
+                coverage=1.-missing/max(target.area,1e-9)
+                if target.area>1e-6 and coverage<.9:
+                    remove.setdefault(hit['target'],[]).append((hit['start'],hit['end']))
+                    audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],
+                        action='complete_same_type_area',coverage_ratio=coverage,missing_area_m2=missing,
+                        old_width_bef=existing['width_bef'],old_width_aft=existing['width_aft'],
+                        new_width_bef=gt['width_bef'],new_width_aft=gt['width_aft']))
+                else:
+                    covered.append((start,end))
+                    audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],action='retain_correct_auto'))
             else:
                 remove.setdefault(hit['target'],[]).append((hit['start'],hit['end']))
                 audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],action='correct_conflicting_type',
@@ -606,7 +620,7 @@ def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *,
     audit_path=output/'correction_audit.gpkg'
     gt.to_file(audit_path,layer='perturbed_gt',driver='GPKG')
     corrected.to_file(audit_path,layer='corrected_intervals',driver='GPKG')
-    conflicts={r['auto_id'] for r in correction if r['action']=='correct_conflicting_type'}
+    conflicts={r['auto_id'] for r in correction if r['action'] in ('correct_conflicting_type','complete_same_type_area')}
     affected=sorted({int(r.auto_index) for r in auto.itertuples() if r.change_id in conflicts})
     _write_json(output/'perturbation_audit.json',dict(profile=asdict(profile),objects=perturbation))
     _write_json(output/'correction_audit.json',correction)

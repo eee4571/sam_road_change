@@ -131,7 +131,7 @@ def check_files(model):
         rows = [r for r in model["periods"] if r[0] == name]
         if len(rows) < 2 or len({r[1] for r in rows}) != len(rows):
             issues.append(f"{name} 需要至少两个不同期次")
-    for kind, rows in (("验证区", model["areas"]), ("影像清单", model["periods"]), ("GT", model["truths"])):
+    for kind, rows in (("验证区", model["areas"]), ("影像清单", model["periods"]), ("真值数据", model["truths"])):
         for row in rows:
             path = Path(row[-1])
             label = " / ".join(row[:-1])
@@ -140,7 +140,7 @@ def check_files(model):
             if not path.is_file():
                 issues.append(f"{label}：{kind} 文件不存在")
                 continue
-            if kind in {"验证区", "GT"}:
+            if kind in {"验证区", "真值数据"}:
                 for suffix in (".shp", ".shx", ".dbf", ".prj"):
                     if not path.with_suffix(suffix).is_file():
                         issues.append(f"{label} 缺少 {suffix} 文件")
@@ -161,7 +161,7 @@ def check_files(model):
                     issues.append(f"{label} 有 {missing} 个影像路径不存在")
     gt_keys = [tuple(r[:3]) for r in model["truths"]]
     if len(set(gt_keys)) != len(gt_keys):
-        issues.append("同一变化对存在重复 GT")
+        issues.append("同一变化对存在重复真值数据")
     if any(k not in expected for k in gt_keys):
-        issues.append("GT 的期次未对应相邻变化对")
+        issues.append("真值数据的期次未对应相邻变化对")
     return issues
