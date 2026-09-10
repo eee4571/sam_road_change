@@ -148,6 +148,10 @@ def write_network_report(directory, stats, audits):
 def rebuild_network_width_products(centerlines, measured=None, source_tolerance=2.0,
                                    *, connection_input=None):
     """Use metre coordinates for segmentation and buffering, including lon/lat inputs."""
+    import time
+    import numpy as np
+    from shapely import covers
+    stage_started = time.perf_counter()
     from pyproj import CRS
     from shapely.ops import unary_union
     from .width.road_pair_matcher import build_width_segments, build_corridors
@@ -160,15 +164,26 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
             raise ValueError('Could not determine metric CRS for width products')
     metric = centerlines.to_crs(projected)
     observations = measured.to_crs(projected) if measured is not None else None
+    print(f'[Fast timing] width_rebuild_projection={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
     segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
+    print(f'[Fast timing] width_rebuild_segments={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
     if connection_input is not None and not segments.empty:
         observed_area = unary_union(connection_input.to_crs(projected).geometry).buffer(.25)
-        inferred = segments.geometry.map(lambda line: line.difference(observed_area).length > .05*line.length)
+        covered = covers(observed_area,segments.geometry.values)
+        inferred = np.zeros(len(segments),dtype=bool)
+        for i in np.flatnonzero(~covered):
+            line=segments.geometry.iloc[i]
+            inferred[i]=line.difference(observed_area).length > .05*line.length
         segments.loc[inferred, 'quality_grade'] = 'C'
         segments.loc[inferred, 'width_quality'] = 'C'
         segments.loc[inferred, 'line_source'] = 'connector'
         segments.loc[inferred, 'valid_ratio'] = 0.
         segments.loc[inferred, 'qa_state'] = 'review'
         segments.loc[inferred, 'qa_reason'] = 'connection_width_inherited'
+    print(f'[Fast timing] width_rebuild_inferred={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
     corridors = build_corridors(segments)
+    print(f'[Fast timing] width_rebuild_corridors={time.perf_counter()-stage_started:.6f}s',flush=True)
     return segments.to_crs(centerlines.crs), corridors.to_crs(centerlines.crs)

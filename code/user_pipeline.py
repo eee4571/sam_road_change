@@ -4847,6 +4847,7 @@ def _all_manifest_change_pairs(manifest: dict) -> list[tuple[str, str, str]]:
     return pairs
 
 
+@batch_models
 def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
     """Rerun every adjacent change pair while reusing completed period results."""
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()

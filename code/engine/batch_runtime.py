@@ -51,6 +51,9 @@ class Worker:
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.pending = None
         self.planner = None
+        self.centerline_command = None
+        from .auto_scene_cache import SceneCache
+        self.scene_cache = SceneCache()
 
     def run(self, command, cwd, env):
         key = command_key(command)
@@ -79,10 +82,15 @@ class Worker:
         return code
 
     def _prefetch(self, command, cwd, env):
-        if self.planner and Path(command[1]).name == 'inferencer.py' and self.pending is None:
+        if Path(command[1]).name == 'inferencer.py':
+            self.centerline_command = list(command)
+            return
+        if (self.planner and self.centerline_command is not None
+                and command[1:4] == ['-m','engine.fast_pipeline','width'] and self.pending is None):
+            centerline, self.centerline_command = self.centerline_command, None
             planner, self.planner = self.planner, None
             try:
-                following = planner(command)
+                following = planner(centerline)
             except Exception as exc:
                 # Preparation failure belongs to the following period's normal
                 # execution/retry, never to the already completed current stage.
@@ -119,6 +127,7 @@ class Worker:
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.scene_cache.close()
         if self.process is not None:
             try:
                 self.process.stdin.close()
@@ -128,6 +137,10 @@ class Worker:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.process.kill(); self.process.wait()
+
+
+def active_scene_cache():
+    return _active.scene_cache if _active is not None else None
 
 
 def run_resident(command, cwd, env):

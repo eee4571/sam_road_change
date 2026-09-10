@@ -282,12 +282,15 @@ class RoadScene:
                 "direction": best[4], "coverage": best[5], "corridor": best[6],
                 "reliable": not ambiguous}
 
-    def evidence(self, axis, geometry_present, width, tolerance, surface_support=None, probability=None):
-        footprint = axis.buffer(max(width/2, tolerance)+1, cap_style="flat")
-        valid = self.valid.covers(footprint)
-        if surface_support is None:
-            surface_support = self.surface(axis, max(width, tolerance)+2).buffer(tolerance)
-        coverage = axis.intersection(surface_support).length / max(axis.length, 1e-9)
+    def evidence(self, axis, geometry_present, width, tolerance, surface_support=None, probability=None, *, geometry_evidence=None):
+        if geometry_evidence is None:
+            footprint = axis.buffer(max(width/2, tolerance)+1, cap_style="flat")
+            valid = self.valid.covers(footprint)
+            if surface_support is None:
+                surface_support = self.surface(axis, max(width, tolerance)+2).buffer(tolerance)
+            coverage = axis.intersection(surface_support).length / max(axis.length, 1e-9)
+        else:
+            valid, coverage = geometry_evidence
         if probability is None:
             probability = self.probability.sample_axis(axis, self.crs, road_width=width, position_tolerance=tolerance)
         rank = probability["scene_percentile_rank"]
@@ -313,6 +316,62 @@ class RoadScene:
                 **probability}
 
 
+def _axis_surface_coverage(axis, support, starts, ends, cells, cell_lengths):
+    """Query axis/support intervals; preserve GEOS rounding at cut boundaries.
+
+    Interior cells need no overlay. Boundary cells use the original overlay:
+    subtracting projected chainages is mathematically equivalent, but need not
+    be bit-identical to GEOS length (especially in large projected coordinates).
+    Non-simple/closed axes cannot safely use unique endpoint chainages.
+    """
+    from shapely import intersection, length, points, line_locate_point
+
+    def exact(indices):
+        return length(intersection(cells[indices], support))/np.maximum(cell_lengths[indices], 1e-9)
+
+    if not axis.is_simple or axis.is_closed or axis.length <= 0:
+        return exact(slice(None))
+    clipped = axis.intersection(support)
+    parts, pending = [], [clipped]
+    while pending:
+        part = pending.pop()
+        if part.is_empty:
+            continue
+        if part.geom_type == 'LineString':
+            parts.append(part)
+        elif hasattr(part, 'geoms'):
+            pending.extend(part.geoms)
+    if not parts:
+        return np.zeros(len(cells))
+    endpoints = np.asarray([p.coords[i][:2] for p in parts for i in (0, -1)])
+    intervals = np.sort(line_locate_point(axis, points(endpoints)).reshape(-1, 2), axis=1)
+    intervals = intervals[np.argsort(intervals[:, 0], kind='stable')]
+    merged = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(hi, merged[-1][1])
+        else:
+            merged.append([lo, hi])
+    intervals = np.asarray(merged)
+    # Search the last interval starting before each cell; no station x interval
+    # matrix, and no per-station Shapely objects or overlays for interior cells.
+    indices = np.searchsorted(intervals[:, 0], starts, side='right')-1
+    safe = np.maximum(indices, 0)
+    full = (indices >= 0) & (intervals[safe, 1] >= ends)
+    result = np.where(full, cell_lengths/np.maximum(cell_lengths, 1e-9), 0.)
+    # Only cells touching a coverage boundary can have fractional coverage.
+    # Include a roundoff guard based on the input coordinate magnitude; this
+    # affects execution only, never a coverage/detection threshold.
+    scale = max(1., axis.length, float(np.max(np.abs(axis.bounds))))
+    guard = 64*np.finfo(float).eps*scale
+    boundaries = np.sort(intervals.ravel())
+    left = np.searchsorted(boundaries, starts-guard, side='left')
+    right = np.searchsorted(boundaries, ends+guard, side='right')
+    boundary_cells = np.flatnonzero(right > left)
+    result[boundary_cells] = exact(boundary_cells)
+    return result
+
+
 def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, minimum_length=24., minimum_area=4.,
                    presence_audit=None, candidate_driven=True):
     """Plan candidate cells before sampling; retain exact paired-width decisions.
@@ -322,6 +381,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
     """
     from .auto_presence_candidates import LongitudinalCoverage, presence_seeds
     from .auto_station_plan import presence_mask, width_mask, BatchSections
+    from shapely import buffer, covers, intersects, length
     records, audit, width_audit = [], [], []
     counts = Counter()
     sampling_seconds = matching_seconds = 0.
@@ -357,20 +417,38 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
             sampling_started = time.perf_counter()
             source_surface, target_surface = source.surface(axis), target.surface(axis)
             source_support, target_support = source_surface.buffer(tolerance), target_surface.buffer(tolerance)
-            width_surfaces = ((source_surface, source_surface.buffer(.1)),
-                              (target_surface, target_surface.buffer(.1)))
+            width_surfaces = None
             normals = _normals(axis, stations)
             cells = {index: substring(axis, index*spacing, (index+1)*spacing) for index in selected}
+            geometry_started = time.perf_counter()
+            cell_array = np.asarray(list(cells.values()),dtype=object)
+            cell_lengths = length(cell_array)
+            cell_starts = selected*spacing
+            cell_ends = np.minimum((selected+1)*spacing, axis.length)
+            footprints = buffer(cell_array,np.maximum(widths[selected]/2,tolerance)+1,
+                                cap_style="flat",quad_segs=16)
+            geometry_evidence = []
+            for scene,support in ((source,source_support),(target,target_support)):
+                valid_cells = covers(scene.valid,footprints)
+                coverage_started = time.perf_counter()
+                coverage_cells = _axis_surface_coverage(axis, support, cell_starts, cell_ends, cell_array, cell_lengths)
+                timing['station_surface_coverage'] += time.perf_counter()-coverage_started
+                geometry_evidence.append(dict(zip(selected,zip(valid_cells,coverage_cells))))
+            junction_cells = dict(zip(selected,intersects(source.junction,cell_array)|intersects(target.junction,cell_array)))
+            timing['station_geometry'] += time.perf_counter()-geometry_started
+            probability_started = time.perf_counter()
             coordinates = [source.probability._axis_coordinates(cell, road_width=width, position_tolerance=tolerance)
                            for cell, width in zip(cells.values(), widths[selected])]
             source_probabilities = dict(zip(selected, source.probability.sample_axes(list(cells.values()), widths[selected], tolerance, coordinates=coordinates)))
             target_probabilities = dict(zip(selected, target.probability.sample_axes(list(cells.values()), widths[selected], tolerance, coordinates=coordinates)))
+            timing['station_probability'] += time.perf_counter()-probability_started
             sampling_seconds += time.perf_counter()-sampling_started
             match_started = time.perf_counter()
             matches = {i: target.match(axis, float(stations[i]), tolerance, widths[i], point=points[i], normal=normals[i]) for i in selected}
             matching_seconds += time.perf_counter()-match_started
             section_started = time.perf_counter()
             centers, target_centers, paired_normals = [], [], {}
+            paired_target_points = {}
             if side == 'before':
                 for i, match in matches.items():
                     if match is None or not match['reliable'] or not width_needed[i]:
@@ -383,7 +461,8 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                     normal /= max(np.linalg.norm(normal), 1e-9)
                     paired_normals[i] = normal
                     centers.append(points[i])
-                    target_centers.append(target.lines[match['target']].interpolate(match['station']))
+                    paired_target_points[i] = target.lines[match['target']].interpolate(match['station'])
+                    target_centers.append(paired_target_points[i])
                 samplers = [BatchSections(scene.probability, locations, list(paired_normals.values()), width_config.normal_half_length)
                             for scene, locations in ((source, centers), (target, target_centers))]
             timing['exact_width_measurement'] += time.perf_counter()-section_started
@@ -395,10 +474,10 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 match_started = time.perf_counter()
                 match = matches[index]
                 match_seconds += time.perf_counter()-match_started
-                source_evidence = source.evidence(cell, True, width, tolerance, source_support, source_probabilities[index])
-                target_evidence = target.evidence(cell, match is not None, width, tolerance, target_support, target_probabilities[index])
+                source_evidence = source.evidence(cell, True, width, tolerance, source_support, source_probabilities[index], geometry_evidence=geometry_evidence[0][index])
+                target_evidence = target.evidence(cell, match is not None, width, tolerance, target_support, target_probabilities[index], geometry_evidence=geometry_evidence[1][index])
                 bef, aft = (source_evidence, target_evidence) if side == "before" else (target_evidence, source_evidence)
-                junction = source.junction.intersects(cell) or target.junction.intersects(cell)
+                junction = bool(junction_cells[index])
                 accepted = bef["valid"] and aft["valid"] and not junction
                 row = {"side": side, "axis_id": line_id, "station_m": station,
                        "candidate_type": change_type, "matched": match is not None,
@@ -418,7 +497,9 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                     matching_seconds += match_seconds
                     sampling_seconds += time.perf_counter()-sample_started-match_seconds
                     continue
-                target_point = target.lines[match["target"]].interpolate(match["station"]) if match else point
+                target_point = paired_target_points.get(index)
+                if target_point is None:
+                    target_point = target.lines[match["target"]].interpolate(match["station"]) if match else point
                 common = Point((point.x+target_point.x)/2, (point.y+target_point.y)/2)
                 valid_width = width_needed[index] and accepted and match is not None and match["reliable"] and bef["state"] == aft["state"] == "present"
                 if valid_width:
@@ -431,6 +512,9 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 if valid_width:
                     exact_started = time.perf_counter()
                     normal = paired_normals[index]
+                    if width_surfaces is None:
+                        width_surfaces = ((source_surface, source_surface.buffer(.1)),
+                                          (target_surface, target_surface.buffer(.1)))
                     measurements = []
                     for (scene, centre), (surface, support), sampler in zip(((source, point), (target, target_point)), width_surfaces, samplers):
                         measurements.append(_measure_period_width(centre, normal, surface, support,
@@ -513,7 +597,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
     counts['exact_width_measurement_seconds'] = timing['exact_width_measurement']
     counts.update({f'timing_{key}_seconds': value for key, value in timing.items()})
     print('[Fast timing] ' + ' '.join(f'{key}={timing[key]:.6f}s' for key in
-          ('presence_prefilter', 'width_prefilter', 'exact_station_sampling', 'exact_width_measurement')) +
+          ('presence_prefilter', 'width_prefilter', 'station_geometry', 'station_surface_coverage', 'station_probability', 'exact_station_sampling', 'exact_width_measurement')) +
           f" candidate_station_count={counts['candidate_station_count']} total_station_count={counts['total_station_count']}" +
           f" stable_skipped_station_count={counts['stable_skipped_station_count']} candidate_ratio={counts['candidate_ratio']:.6f}" +
           f" width_prefilter_seconds={timing['width_prefilter']:.6f} exact_width_measurement_seconds={timing['exact_width_measurement']:.6f}", flush=True)
@@ -532,15 +616,24 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     metric_crs = centerlines[0].estimate_utm_crs() if output_crs.is_geographic else output_crs
     if not metric_crs.is_projected or abs(metric_crs.axis_info[0].unit_conversion_factor-1) > 1e-6:
         metric_crs = centerlines[0].estimate_utm_crs()
+    from .batch_runtime import active_scene_cache
+    from .auto_scene_cache import close_scene
+    scene_cache = active_scene_cache()
     scenes = []
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         for p, lines in zip(payloads, centerlines):
-            surfaces, widths, valid = [_read_fast_change_layer(p, key).to_crs(metric_crs)
-                                       for key in ("surfaces", "width_segments", "valid_observation")]
-            probability = WindowedProbability(p["road_probability"], metric_crs)
-            scenes.append(RoadScene(lines.to_crs(metric_crs), surfaces, widths, valid, probability, metric_crs))
+            def load_scene():
+                surfaces, widths, valid = [_read_fast_change_layer(p, key).to_crs(metric_crs)
+                                           for key in ("surfaces", "width_segments", "valid_observation")]
+                probability = WindowedProbability(p["road_probability"], metric_crs)
+                try:
+                    return RoadScene(lines.to_crs(metric_crs), surfaces, widths, valid, probability, metric_crs)
+                except Exception:
+                    probability.close()
+                    raise
+            scenes.append(scene_cache.get(p,metric_crs,load_scene) if scene_cache is not None else load_scene())
         presence_audit = []
         records, audit, width_audit, counts = analyze_scenes(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
@@ -553,10 +646,8 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                                         min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started,
                                         internal_outputs=internal_outputs)
     finally:
-        for scene in scenes:
-            scene.probability.close()
-            scene.width.cache_clear()
-            scene.surface.cache_clear()
+        if scene_cache is None:
+            for scene in scenes:close_scene(scene)
 
 
 def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_audit, scenes, centerlines,

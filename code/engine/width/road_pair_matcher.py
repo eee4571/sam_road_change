@@ -174,6 +174,7 @@ def build_width_segments(
     measured = None
     measured_geometries: np.ndarray | None = None
     measured_tree = None
+    attributes = {}
     if source_width_segments is not None and not source_width_segments.empty:
         measured = source_width_segments
         if measured.crs is not None and centerlines.crs is not None and not measured.crs.equals(centerlines.crs):
@@ -209,22 +210,30 @@ def build_width_segments(
                     candidate_ids = measured_tree.query(
                         geometry, predicate="dwithin", distance=max(source_tolerance, 0.1),
                     )
+                    local_direction = _direction(geometry)
                     for candidate_id in candidate_ids:
-                        candidate = measured.iloc[int(candidate_id)]
-                        candidate_line = next(_line_parts(candidate.geometry), None)
-                        if candidate_line is None or direction_similarity(geometry, candidate_line) < 0.8:
+                        identifier = int(candidate_id)
+                        if identifier not in attributes:
+                            candidate = measured.iloc[identifier]
+                            grade = _quality(candidate)
+                            flags = str(candidate.get("quality_flags", "") or "").lower()
+                            rejected = any(token in flags for token in ("junction", "border", "boundary", "asym", "outlier", "outside"))
+                            value = _number(candidate, WIDTH_FIELDS)
+                            line_value = next(_line_parts(candidate.geometry), None) if value > 0 and grade != "C" and not rejected else None
+                            attributes[identifier] = (None if line_value is None else
+                                (value, grade, line_value, _direction(line_value), line_value.buffer(max(source_tolerance, .1))))
+                        cached = attributes[identifier]
+                        if cached is None:
                             continue
-                        overlap = float(geometry.intersection(candidate_line.buffer(max(source_tolerance, 0.1))).length)
+                        value, grade, candidate_line, direction, support = cached
+                        if abs(float(np.dot(local_direction, direction))) < .8:
+                            continue
+                        overlap = float(geometry.intersection(support).length)
                         if overlap <= 0:
                             continue
-                        grade = _quality(candidate)
-                        flags = str(candidate.get("quality_flags", "") or "").lower()
-                        rejected = any(token in flags for token in ("junction", "border", "boundary", "asym", "outlier", "outside"))
-                        value = _number(candidate, WIDTH_FIELDS)
-                        if value > 0 and grade != "C" and not rejected:
-                            width_values.extend([value] * max(1, int(round(overlap))))
-                            measured_grades.append(grade)
-                            measured_overlap += min(overlap, float(geometry.length))
+                        width_values.extend([value] * max(1, int(round(overlap))))
+                        measured_grades.append(grade)
+                        measured_overlap += min(overlap, float(geometry.length))
                 local_width, local_std, sample_count = _robust(width_values)
                 valid_ratio = min(1.0, measured_overlap / max(float(geometry.length), 1e-6)) if sample_count else source_valid_ratio
                 if sample_count:

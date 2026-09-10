@@ -68,7 +68,7 @@ class BatchRuntimeTests(unittest.TestCase):
                 if fail:
                     with self.assertRaisesRegex(ValueError,'T2 failed'): worker.run(second,Path('.'),{})
                 else: worker.run(second,Path('.'),{})
-                self.assertEqual(calls,[first,second,width])
+                self.assertEqual(calls,[first,width,second])
             finally: worker.close()
         self.assertEqual(command_key(['p','i','--a','1','--b']),command_key(['p','i','--b','--a','1']))
 
