@@ -2989,32 +2989,57 @@ def _fast_assisted_evaluation_grid(
 
     grid = str(change_entry.get("grid") or "")
     before_period = str(change_entry.get("before_period") or "")
-    period_entry = next((
-        row for row in (manifest.get("period_results", []) or [])
-        if isinstance(row, dict)
-        and str(row.get("grid") or "") == grid
-        and str(row.get("period") or "") == before_period
-    ), None)
-    if period_entry is None:
-        raise ValueError(
-            f"无法定位 Fast 精度评价影像网格：{grid} / {before_period}"
-        )
-    probability_path = Path(str(
-        period_entry.get("road_probability") or ""
-    )).expanduser().resolve()
-    if not probability_path.is_file():
-        result_path = Path(str(period_entry.get("result") or "")).expanduser()
-        period_summary = read_json(result_path) if result_path.is_file() else {}
-        probability_path = Path(str(
-            period_summary.get("road_probability") or ""
-        )).expanduser().resolve()
-    if not probability_path.is_file():
+    entries = [row for key in ('period_results', 'auto_period_results')
+               for row in (manifest.get(key, []) or [])
+               if isinstance(row, dict) and str(row.get('grid') or '') == grid
+               and str(row.get('period') or '') == before_period]
+    candidates = []
+    for entry in entries:
+        value = entry.get('result')
+        result_path = Path(value).expanduser() if value else None
+        payload = read_json(result_path) if result_path is not None and result_path.is_file() else {}
+        for record in (entry, payload):
+            value = record.get('road_probability')
+            if value:
+                path = Path(value).expanduser()
+                if not path.is_absolute() and result_path is not None:
+                    path = result_path.parent / path
+                candidates.append(path.resolve())
+            if record.get('run_root'):
+                candidates.append(Path(record['run_root']).expanduser() / 'products' / 'road_probability.tif')
+    probability_path = next((path for path in candidates if path.is_file()), None)
+    if probability_path is None:
+        attempted = '; '.join(dict.fromkeys(str(path) for path in candidates)) or 'no raster reference in final or Auto period records'
         raise FileNotFoundError(
-            f"找不到 Fast 精度评价所需道路概率栅格：{probability_path}"
+            f"Fast evaluation probability raster missing: {grid} / {before_period}; {attempted}"
         )
     import rasterio
     with rasterio.open(probability_path) as dataset:
         return dataset.crs, dataset.transform, dataset.shape
+
+
+def _recover_completed_fast_change(manifest, entry):
+    """Recover only the old interruption between final generation and evaluation.
+
+    Dependency invalidation removes final period/temporal records, so old files
+    alone cannot authorize evaluation of a genuinely pending rerun.
+    """
+    if (manifest.get('temporal_status') != 'completed'
+            or not manifest.get('temporal_results') or not manifest.get('final_period_results')
+            or entry.get('status') in ('stale', 'failed') or not manifest.get('job_root')):
+        return False
+    from temporal_road_analysis import clean_name
+    directory = (Path(manifest['job_root'])/'final_changes'/clean_name(str(entry.get('grid', 'validation')))
+                 /f"{entry['before_period']}_to_{entry['after_period']}").resolve()
+    layer = (entry.get('layers') or {}).get('changes') or entry.get('road_changes')
+    if not layer or Path(layer).resolve() != directory/'road_changes.shp' or not Path(layer).is_file():
+        return False
+    periods = {str(row.get('period')) for row in manifest['final_period_results']
+               if str(row.get('grid', 'validation')) == str(entry.get('grid', 'validation'))}
+    if not {str(entry['before_period']), str(entry['after_period'])} <= periods:
+        return False
+    entry['fast_finalization_state'] = 'completed'
+    return True
 
 
 def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
@@ -3038,7 +3063,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             f"{args.before_period} → {args.after_period}"
         )
     entry = matches[0]
-    if entry.get('fast_finalization_state') == 'pending':
+    if entry.get('fast_finalization_state') == 'pending' and not _recover_completed_fast_change(manifest, entry):
         raise ValueError('Fast Final Changes 尚未生成，不能评价临时变化。')
     output = Path(str(entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
@@ -3182,8 +3207,15 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     if is_current_gt_assisted or (is_fast_gt_assisted and
             str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted'):
         image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        centerline_predicted=predicted
+        final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
+        if is_current_gt_assisted and final_audit.is_file():
+            from engine.gt_road_geometry import matched_final_roads
+            centerline_predicted=matched_final_roads(predicted,final_audit)
+            metadata['centerline_association']='final_road_intervals_from_correction_identity'
+            metadata['centerline_matched_object_count']=len(centerline_predicted)
         rows[0].update(evaluate_fast_assisted_centerline_metrics(
-            predicted, truth, truth_type_field=evaluation_truth_type_field,
+            centerline_predicted, truth, truth_type_field=evaluation_truth_type_field,
             image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
             validation_area=validation,
         ))
@@ -4593,6 +4625,9 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
         # A final summary belongs beside the final layer, never in the Auto cache.
         entry['summary']=str(Path(entry['output'])/'change_summary.json')
         write_json(Path(entry['summary']),entry)
+    # All final products exist before any evaluation can fail.
+    manifest['fast_finalization_state']='completed'
+    for entry in manifest.get('change_results',[]):
         truth,area,field=_manifest_change_context(manifest,str(entry.get('grid','pair')),
             str(entry['before_period']),str(entry['after_period']),entry)
         if not truth:

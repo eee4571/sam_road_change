@@ -20,6 +20,55 @@ def frame(rows):return _frame(rows,3857)
 
 
 class FastGTReconciliationTests(unittest.TestCase):
+    def test_compact_wide_gt_is_not_dropped_and_bhbm_three_is_full_road(self):
+        from shapely.affinity import rotate
+        for kind in ('2','3','4'):
+            with self.subTest(kind=kind):
+                polygon=rotate(box(0,-8,28,8),17)
+                truth=frame([dict(_gt_type=kind,DLKD=16,geometry=polygon)])
+                widths={side:FinalWidths(frame([dict(width_m=16,geometry=line(0))])) for side in ('before','after')}
+                gt,audit=perturb_truth(truth,widths,'T1','T2',GTProfile(omission_probability=0,type_error_probability=0))
+                self.assertFalse(gt.empty)
+                self.assertFalse(any(r['action']=='review_no_road_axis' for r in audit))
+                self.assertGreater(gt.geometry.union_all().intersection(polygon).area/polygon.area,.9)
+                if kind=='3':
+                    self.assertTrue(gt.gt_geometry_role.eq('full_road_change').all())
+                    self.assertTrue((gt.width_bef>0).all())
+                    self.assertTrue((gt.width_aft>0).all())
+                    self.assertTrue((gt.width_aft!=gt.width_bef).all())
+                from engine.continuous_road_geometry import change_surfaces
+                final=change_surfaces(gt)
+                self.assertGreater(final.geometry.union_all().intersection(polygon).area/polygon.area,.9)
+
+    def test_centerline_association_excludes_attached_unrelated_auto_branch(self):
+        from engine.gt_road_geometry import matched_final_roads
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'engine'/'width'))
+        from road_change_detection import evaluate_fast_assisted_centerline_metrics
+        from rasterio.transform import from_origin
+        with tempfile.TemporaryDirectory() as raw:
+            axis=line(50,20,100);road=axis.buffer(4,cap_style='flat')
+            branch=line(50,100,280).buffer(4,cap_style='flat')
+            final=frame([dict(change_typ='added',geometry=road.union(branch))])
+            audit=frame([dict(truth_id='GT1',change_typ='added',axis_wkt=axis.wkt,width_bef=0.,width_aft=8.,geometry=road),
+                         dict(truth_id='',change_typ='added',geometry=branch)])
+            path=Path(raw)/'audit.gpkg';audit.to_file(path,layer='changes',driver='GPKG')
+            matched=matched_final_roads(final,path)
+            self.assertLess(matched.geometry.union_all().symmetric_difference(road).area,1e-8)
+            truth=frame([dict(BHBM=2,geometry=road)])
+            args=dict(truth_type_field='BHBM',image_crs=3857,image_transform=from_origin(0,100,1,1),image_shape=(100,300))
+            old=evaluate_fast_assisted_centerline_metrics(final,truth,**args)
+            new=evaluate_fast_assisted_centerline_metrics(matched,truth,**args)
+            self.assertGreater(old['centerline_mean_offset_px'],20)
+            self.assertLess(new['centerline_mean_offset_px'],.1)
+            self.assertAlmostEqual(new['road_centerline_completeness'],1.)
+            from shapely.affinity import translate
+            shifted=frame([dict(change_typ='added',geometry=translate(road,yoff=3))])
+            paired=matched_final_roads(shifted,path)
+            self.assertAlmostEqual(paired.geometry.area.sum(),shifted.geometry.area.sum())
+            offset=evaluate_fast_assisted_centerline_metrics(paired,truth,**args)
+            self.assertGreater(offset['centerline_mean_offset_px'],2.5)
+
+
     def test_bhbm_three_area_deficit_is_completed_after_existing_perturbation(self):
         truth=frame([dict(BHBM=3,DLKD=14,geometry=box(0,-7,100,7))])
         truth['_gt_type']=truth.BHBM

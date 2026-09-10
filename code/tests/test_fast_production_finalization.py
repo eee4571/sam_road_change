@@ -43,6 +43,7 @@ class FastProductionTests(unittest.TestCase):
                                crs=32650,transform=from_origin(0,64,1,1)) as dst:
                 dst.write(np.ones((1,64,64),dtype=np.uint8))
             m=dict(execution_profile='fast',job_root=str(root),period_results=[
+                dict(grid='g',period='1',product_variant='final')],auto_period_results=[
                 dict(grid='g',period='1',road_probability=str(raster))],change_results=[dict(grid='g',before_period='1',
                 after_period='2',output=str(root),road_changes=str(final),product_variant='final',execution_profile='fast',
                 ground_truth_used=True,truth_path=str(gt),fast_finalization_state='completed')])
@@ -57,6 +58,49 @@ class FastProductionTests(unittest.TestCase):
             summary=p.read_json(Path(result['summary']))
             self.assertTrue(summary['evaluation']['metadata']['fast_assisted_centerline_metrics'])
             self.assertNotIn('auto_evaluation',summary)
+
+    def test_grid_matches_area_period_and_resolves_auto_summary(self):
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            raster = root/'probability.tif'
+            transform = from_origin(100, 200, .5, .5)
+            with rasterio.open(raster, 'w', driver='GTiff', width=8, height=6,
+                               count=1, dtype='uint8', crs=32650, transform=transform) as dst:
+                dst.write(np.ones((1,6,8), dtype=np.uint8))
+            summary = root/'period_result.json'
+            p.write_json(summary, {'road_probability': 'probability.tif'})
+            change = dict(grid='g', before_period='1')
+            manifest = dict(period_results=[dict(grid='g',period='1')], auto_period_results=[
+                dict(grid='other',period='1',road_probability=str(raster)),
+                dict(grid='g',period='2',road_probability=str(raster)),
+                dict(grid='g',period='1',result=str(summary))])
+            crs, actual, shape = p._fast_assisted_evaluation_grid(manifest, change, {})
+            self.assertEqual(actual, transform)
+            self.assertEqual(shape, (6,8))
+            manifest['auto_period_results'].pop()
+            with self.assertRaisesRegex(FileNotFoundError, 'g / 1'):
+                p._fast_assisted_evaluation_grid(manifest, change, {})
+
+    def test_old_interrupted_evaluation_recovers_only_materialized_final(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            folder = root/'final_changes'/'g'/'1_to_2'
+            folder.mkdir(parents=True)
+            layer = folder/'road_changes.shp'
+            layer.touch()
+            entry = dict(grid='g', before_period='1', after_period='2',
+                         road_changes=str(layer), fast_finalization_state='pending')
+            manifest = dict(job_root=raw, execution_profile='fast', temporal_status='completed',
+                temporal_results=[{'status':'completed'}], change_results=[entry],
+                final_period_results=[dict(grid='g',period=n) for n in ('1','2')])
+            self.assertTrue(p._recover_completed_fast_change(manifest, entry))
+            self.assertEqual(entry['fast_finalization_state'], 'completed')
+            p._invalidate_fast_finalization(manifest)
+            self.assertFalse(p._recover_completed_fast_change(manifest, entry))
+            self.assertEqual(entry['fast_finalization_state'], 'pending')
 
     def test_existing_gui_rerun_commands_still_parse(self):
         from app.task_manager import TaskManager
@@ -135,6 +179,7 @@ class FastProductionTests(unittest.TestCase):
                 manifest['final_period_results']=manifest['period_results']
                 order.append('final_roads_changes_temporal');return [{'grid':'g'}]
             def evaluate(args):
+                self.assertTrue(all(e['fast_finalization_state'] == 'completed' for e in args._manifest['change_results']))
                 self.assertTrue(args.defer_publish)
                 self.assertTrue(args.defer_aggregate)
                 self.assertEqual(args._manifest['change_results'][0]['road_changes'],str(root/'final.shp'))
@@ -148,6 +193,11 @@ class FastProductionTests(unittest.TestCase):
             self.assertEqual(m['fast_finalization_state'],'completed')
             self.assertEqual(m['change_results'][1]['evaluation_state'],'skipped_no_truth')
             self.assertNotIn('evaluation_metrics',m['change_results'][1])
+            with patch.object(p, 'build_temporal_outputs', return_value=[{'grid':'g'}]),                  patch.object(p, '_evaluate_existing_changes_impl', side_effect=RuntimeError('evaluation failed')):
+                with self.assertRaisesRegex(RuntimeError, 'evaluation failed'):
+                    p._finalize_fast_manifest(m, root)
+            self.assertTrue(all(e['fast_finalization_state'] == 'completed' for e in m['change_results']))
+
 
     def test_pending_results_never_publish_or_enter_gui_fallback(self):
         with tempfile.TemporaryDirectory() as raw:

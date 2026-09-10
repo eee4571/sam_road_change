@@ -20,6 +20,7 @@ from shapely.strtree import STRtree
 
 from .auto_change_geometry import FinalWidths, corridor, _direction, _stations, _clean_overlay
 from .auto_change_assembly import polygonal
+from .gt_road_geometry import record_polygon, road_profile
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,9 @@ def _gt_axes(geometry, width):
         return [dict(axis=line,start_external=sum(Point(line.coords[0]).distance(Point(other.coords[end]))<1e-6
             for other in lines for end in (0,-1))==1,end_external=sum(Point(line.coords[-1]).distance(Point(other.coords[end]))<1e-6
             for other in lines for end in (0,-1))==1) for line in lines]
+    from .gt_road_geometry import compact_road_fit
+    fitted=compact_road_fit(geometry)
+    if fitted is not None:return [fitted]
     from rasterio.features import rasterize
     from rasterio.transform import from_origin
     from skimage.morphology import skeletonize
@@ -151,7 +155,7 @@ def _gt_axes(geometry, width):
     paths=_trace_skeleton_paths(skeletonize(mask>0))
     axes=[]
     for path in paths:
-        if path.length_px*resolution<max(5.,width*.8):continue
+        if path.length_px*resolution<max(1.,min(5.,width*.15)):continue
         pixels=path.pixels
         x,y=transform*(pixels[:,1]+.5,pixels[:,0]+.5)
         line=LineString(np.column_stack([x,y])).simplify(max(.5,resolution),preserve_topology=False)
@@ -200,6 +204,7 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
     aliases={'2':'added','4':'removed','3':'width_changed','added':'added','removed':'removed',
              'widened':'widened','narrowed':'narrowed','width_changed':'width_changed',
              '新增':'added','灭失':'removed','宽度变化':'width_changed'}
+    from .gt_road_geometry import record_polygon
     records=[];audit=[]
     for _,row in truth.iterrows():
         token=str(row['_gt_type']).strip().lower()
@@ -220,6 +225,7 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
         factor=1.+float(rng.uniform(-profile.width_fraction,profile.width_fraction))
         for part,description in enumerate(axes):
             original=description['axis']
+            fitted_width=float(np.median(description.get('fitted_widths',[declared_width])))
             loss=min(profile.maximum_end_loss_m,original.length*profile.end_loss_fraction)*rng.random()
             start_loss=loss if description['start_external'] else 0.
             end_loss=loss if description['end_external'] else 0.
@@ -235,8 +241,8 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
             wb=_number(row,('width_bef','before_w'),np.median(b))
             wa=_number(row,('width_aft','after_w'),np.median(a))
             resolved_kind=actual_kind
-            if resolved_kind=='added':wb,wa=0.,declared_width
-            elif resolved_kind=='removed':wb,wa=declared_width,0.
+            if resolved_kind=='added':wb,wa=0.,fitted_width
+            elif resolved_kind=='removed':wb,wa=fitted_width,0.
             else:
                 # Generic GT gives no sign or magnitude. Preserve observed sign;
                 # record explicitly when a conservative correction is inferred.
@@ -245,12 +251,23 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
                 wb=max(wb,delta+1.) if direction<0 else wb
                 wa=wb+direction*delta
                 resolved_kind='widened' if direction>0 else 'narrowed'
+                # BHBM=3 describes the full changed road footprint, not a strip.
+                # Anchor the wider period to its geometric width and retain a
+                # positive, distinct narrower period on the same road axis.
+                outer=fitted_width
+                inner=max(.5,outer-min(delta,.8*outer))
+                wb,wa=(inner,outer) if direction>0 else (outer,inner)
             wb,wa=wb*factor,wa*factor
             records.append(dict(change_id=f'{truth_id}_{part}',truth_id=truth_id,change_typ=resolved_kind,
                 gt_type=kind,type_error=int(type_error),change_src='GT_ASSISTED',width_bef=wb,width_aft=wa,
                 width_diff=wa-wb,axis_wkt=axis.wkt,match_axis_wkt=original.wkt,
                 length_m=axis.length,before_per=before_period,after_per=after_period,
                 geometry=_change_polygon(axis,resolved_kind,wb,wa)))
+            records[-1]['gt_geometry_role']='full_road_change' if kind=='width_changed' else 'road_presence'
+            if 'fitted_widths' in description:
+                records[-1]['gt_width_profile']=json.dumps(dict(axis=original.wkt,stations=description['fitted_stations'],
+                    widths=description['fitted_widths'],reference_width=fitted_width))
+            records[-1]['geometry']=record_polygon(records[-1])
             audit.append(dict(truth_id=truth_id,part=part,action='regular_axis_perturbation',seed=str(seed),
                 endpoint_loss_m=max(start_loss,end_loss),start_external=description['start_external'],end_external=description['end_external'],
                 max_offset_m=float(np.max(abs(displacement))),width_factor=factor,
@@ -262,7 +279,7 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
             [max(r['width_bef'],r['width_aft']) for r in selected],truth.geometry.union_all())
         for row,axis in zip(selected,fitted):
             row.update(axis_wkt=axis.wkt,length_m=axis.length,
-                       geometry=_change_polygon(axis,row['change_typ'],row['width_bef'],row['width_aft']))
+                       geometry=record_polygon(row,axis))
     return _changes(records,truth.crs),audit
 
 
@@ -285,6 +302,7 @@ def _auto_axes(automatic_result, metric):
 
 def correct_changes(auto, assisted):
     """Keep adequate Auto support; correct type and regular-corridor area deficits."""
+    from .gt_road_geometry import record_polygon
     records=auto.to_dict('records');audit=[]
     for gt in assisted.to_dict('records'):
         axis=from_wkt(gt['axis_wkt']); reference=from_wkt(gt['match_axis_wkt'])
@@ -300,7 +318,7 @@ def correct_changes(auto, assisted):
                 a=axis.project(reference.interpolate(hit['source_start']))
                 b=axis.project(reference.interpolate(hit['source_end']))
                 start,end=sorted((a,b))
-                target=_change_polygon(substring(axis,start,end),gt['change_typ'],gt['width_bef'],gt['width_aft'])
+                target=record_polygon(gt,substring(axis,start,end))
                 # Longitudinal matching alone does not establish surface coverage,
                 # especially for paired-width ribbons. Compare only this matched
                 # interval with the perturbed regular GT corridor, never copy GT pixels.
@@ -313,6 +331,7 @@ def correct_changes(auto, assisted):
                         old_width_bef=existing['width_bef'],old_width_aft=existing['width_aft'],
                         new_width_bef=gt['width_bef'],new_width_aft=gt['width_aft']))
                 else:
+                    existing['truth_id']=gt['truth_id']
                     covered.append((start,end))
                     audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],action='retain_correct_auto'))
             else:
@@ -327,7 +346,7 @@ def correct_changes(auto, assisted):
                 local=substring(old_axis,start,end)
                 revised.append({**row,'change_id':f"{row['change_id']}_rest{part}",'axis_wkt':local.wkt,
                     'match_axis_wkt':local.wkt,'length_m':local.length,
-                    'geometry':_change_polygon(local,row['change_typ'],row['width_bef'],row['width_aft'])})
+                    'geometry':record_polygon(row,local)})
         records=revised
         for part,(start,end) in enumerate(_remaining(axis.length,covered)):
             if end-start<.25:continue
@@ -336,7 +355,7 @@ def correct_changes(auto, assisted):
             match=substring(reference,start/axis.length*reference.length,end/axis.length*reference.length)
             records.append({**gt,'change_id':f"{gt['change_id']}_fill{part}",'axis_wkt':local.wkt,
                 'match_axis_wkt':match.wkt,'length_m':local.length,
-                'geometry':_change_polygon(local,gt['change_typ'],gt['width_bef'],gt['width_aft'])})
+                'geometry':record_polygon(gt,local)})
             audit.append(dict(truth_id=gt['truth_id'],action='supplement_missed_interval',length_m=local.length))
     return _changes(records,auto.crs),audit
 
@@ -378,7 +397,7 @@ def _atomize_adjacent_changes(changes):
             match=substring(ref['axis'],a,b);track_id=_id(match,'RC')
             records[pair_id].append({**row,'change_id':f"{row['change_id']}_{track_id[2:10]}",
                 'atomic_track':track_id,'axis_wkt':local.wkt,'match_axis_wkt':match.wkt,'length_m':local.length,
-                'geometry':_change_polygon(local,row['change_typ'],row['width_bef'],row['width_aft'])})
+                'geometry':record_polygon(row,local)})
     for pair_id,pair in enumerate(changes):pair['frame']=_changes(records[pair_id],pair['frame'].crs)
 
 
@@ -415,7 +434,7 @@ def reconcile_periods(periods, changes, output_dir):
             for period,present,width in ((str(pair['before_period']),row.change_typ!='added',float(row.width_bef)),
                                           (str(pair['after_period']),row.change_typ!='removed',float(row.width_aft))):
                 key=(track_id,period)
-                value=dict(present=present,width=width if present else 0.,axis=track['axis'],match=match,source=row.change_id,count=1)
+                value=dict(present=present,width=width if present else 0.,axis=track['axis'],match=match,source=row.change_id,count=1,gt_width_profile=row.get('gt_width_profile'))
                 if key in constraints and constraints[key]['present']!=present:
                     # Resolve conflicting adjacent labels against continuous
                     # period-road support. No human review gate blocks output.
@@ -446,7 +465,8 @@ def reconcile_periods(periods, changes, output_dir):
             kind='added' if b<=0 else 'removed' if a<=0 else 'widened' if a>b else 'narrowed'
             pair['frame'].at[index,'change_typ']=kind
             pair['frame'].loc[index,['width_bef','width_aft','width_diff']]=[b,a,a-b]
-            pair['frame'].at[index,'geometry']=_change_polygon(from_wkt(row.axis_wkt),kind,b,a)
+            from .gt_road_geometry import record_polygon
+            pair['frame'].at[index,'geometry']=record_polygon(pair['frame'].loc[index])
         pair['frame']=pair['frame'].drop(index=discard)
     outputs=[];edit_audit=[];state_rows=[]
     for period,base in frames.items():
@@ -478,7 +498,7 @@ def reconcile_periods(periods, changes, output_dir):
                     action='replace_interval' if constraint['present'] else 'remove_interval'))
             if constraint['present']:
                 inserts.append(dict(track_id=track['track_id'],width_m=constraint['width'],confidence=.95,
-                                    state_src='reconciled',geometry=constraint['axis']))
+                                    state_src='reconciled',gt_width_profile=constraint.get('gt_width_profile'),geometry=constraint['axis']))
             state_rows.append(dict(track_id=track['track_id'],period=period,
                 status='present' if constraint['present'] else 'absent',width_m=constraint['width'],
                 source=constraint['source'],geometry=constraint['axis']))
@@ -498,6 +518,9 @@ def reconcile_periods(periods, changes, output_dir):
         state_path=directory/'road_state.gpkg';states.to_file(state_path,layer='road_state',driver='GPKG')
         entry=dict(period=period,**layers,road_state=str(state_path.resolve()),product_variant='final',
                    execution_profile='fast',status='completed',auto_source=next(p['centerlines'] for p in periods if str(p['period'])==period))
+        # Keep the observation grid internally for final pixel-space evaluation.
+        if original.get('road_probability'):
+            entry['road_probability']=original['road_probability']
         entry['result']=str((directory/'period_result.json').resolve());_write_json(entry['result'],entry);outputs.append(entry)
     pd.DataFrame(edit_audit).to_csv(output/'axis_interval_edits.csv',index=False)
     pd.DataFrame(assignments).to_csv(output/'change_track_assignments.csv',index=False)
@@ -517,7 +540,8 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     inputs = signature([original['centerlines'], original['width_segments'], __file__,
                         Path(__file__).with_name('continuous_road_geometry.py'),
                         Path(__file__).with_name('auto_change_geometry.py'),
-                        Path(__file__).with_name('auto_change_assembly.py')]) + [str(metric), str(output_crs)]
+                        Path(__file__).with_name('auto_change_assembly.py'),
+                        Path(__file__).with_name('gt_road_geometry.py')]) + [str(metric), str(output_crs)]
     row_values = [{k: (v.wkb_hex if k == "geometry" else v) for k, v in row.items()} for row in centers]
     edits = [{k: (v.wkb_hex if k == 'geometry' else v) for k,v in row.items()} for row in inserts]
     inputs.append(hashlib.sha256(json.dumps([row_values,cuts,edits], sort_keys=True, default=str).encode()).hexdigest())
@@ -535,8 +559,13 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         for a,b in _remaining(row['geometry'].length,[(h['source_start'],h['source_end']) for h in hits]):
             retained_widths.append({**row,'geometry':substring(row['geometry'],a,b)})
     # An entire fitted axis owns its width and corridor, never 4 m buffer pieces.
-    edited_corridors=[{**r,'geometry':_change_polygon(r['geometry'],'added',0,r['width_m'])} for r in inserts]
-    edited_widths=[{**r,'length_m':r['geometry'].length} for r in inserts]
+    edited_corridors=[{**r,'geometry':corridor(r['geometry'],*road_profile(r,r['geometry'],r['width_m']))} for r in inserts]
+    edited_widths=[]
+    for r in inserts:
+        axis=r['geometry'];ss,vv=road_profile(r,axis,r['width_m'])
+        for a,b,wa,wb in zip(ss[:-1],ss[1:],vv[:-1],vv[1:]):
+            local=substring(axis,a,b)
+            edited_widths.append({**r,'width_m':float((wa+wb)/2),'geometry':local,'length_m':local.length})
     outputs={}
     frames={'centerlines':_frame(centers,metric),'width_segments':_frame(retained_widths+edited_widths,metric)}
     profiles=FinalWidths(widths)
@@ -549,7 +578,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     for row in centers:
         axis=row['geometry'];width=_number(row,('width_m','width_map'),6.)
         if row.get('track_id'):
-            stations=np.array([0.,axis.length]);values=np.array([width,width])
+            stations,values=road_profile(row,axis,width)
         else:
             ids=sorted(profiles.tree.query(axis,predicate='dwithin',distance=.75))
             dependencies=[(profiles.frame.geometry.iloc[int(i)].wkb_hex,
@@ -576,7 +605,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         _frame(edited_corridors,metric).to_file(directory/'road_geometry_audit.gpkg',layer='track_corridors',driver='GPKG')
     for key,frame in frames.items():
         path=directory/f'road_{key if key!="centerlines" else "centerlines"}.shp'
-        exported=frame.to_crs(output_crs)
+        exported=frame.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs)
         if key in ('surfaces','corridors'):exported=_export_polygons(exported)
         if '_original_row' in exported:
             source=originals[key].to_crs(output_crs)
