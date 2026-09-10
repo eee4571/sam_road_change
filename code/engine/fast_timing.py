@@ -11,6 +11,9 @@ def timed_stage(name):
             try:
                 return function(*args, **kwargs)
             finally:
-                print(f'[Fast timing] {name}={perf_counter()-started:.6f}s', flush=True)
+                seconds = perf_counter()-started
+                from .batch_runtime import record_timing
+                record_timing(name,seconds)
+                print(f'[Fast timing] {name}={seconds:.6f}s', flush=True)
         return wrapped
     return decorate

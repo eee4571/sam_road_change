@@ -100,7 +100,7 @@ parser.add_argument(
     "--execution-profile", choices=["full", "fast"], default="full",
     help="Fast writes road probability plus native TopoNet and skips weak postprocess.",
 )
-args = parser.parse_args()
+args = parser.parse_args([])
 
 
 def resolve_torch_device(device_arg):
@@ -241,33 +241,31 @@ def run_inference_on_images(
         f'total image count: {len(input_img_paths)}.'
     )
 
-    for img_path in input_img_paths:
-        # Threshold selection is per complete image.  Never mutate the shared
-        # batch config, otherwise one weak image would leak into the next tile.
-        image_config = copy.deepcopy(config)
-        if args.execution_profile == "fast":
-            image_config.RELATIVE_ROADNESS_ENABLED = False
-            image_config.RELATIVE_INJECT_INTO_TOPONET = False
-        img_path = Path(img_path).expanduser().resolve()
-        img_id = img_path.stem
-        if resume_manager is not None:
-            decision = resume_manager.inspect(img_path)
-            if decision["action"] == "skip":
-                recovery_summary, profile_decision = marker_summaries(decision["marker"])
-                recovery_summaries.append(recovery_summary)
-                profile_decisions.append(profile_decision)
-                total_inference_seconds += float(recovery_summary.get("total_image_seconds", 0.0) or 0.0)
-                if decision["origin"] == "legacy_adopted":
-                    resume_counts["legacy_adopted_count"] += 1
-                    print(f'[image-resume] Adopted complete legacy outputs for {img_path}.')
-                else:
-                    resume_counts["validated_marker_skip_count"] += 1
-                    print(f'[image-resume] Validated and skipped {img_path}.')
-                continue
-            print(f'[image-resume] Reprocessing {img_path}: {decision.get("reason", "not complete")}')
-            resume_manager.prepare_for_processing(img_path)
-        resume_counts["inferred_count"] += 1
-        print(f'Processing {img_path}')
+    def ready_images():
+        for img_path in input_img_paths:
+            # Threshold selection is per complete image.  Never mutate the shared
+            # batch config, otherwise one weak image would leak into the next tile.
+            image_config = copy.deepcopy(config)
+            if args.execution_profile == "fast":
+                image_config.RELATIVE_ROADNESS_ENABLED = False
+                image_config.RELATIVE_INJECT_INTO_TOPONET = False
+            img_path = Path(img_path).expanduser().resolve()
+            img_id = img_path.stem
+            if resume_manager is not None:
+                decision = resume_manager.inspect(img_path)
+                if decision["action"] == "skip":
+                    yield {'skip': decision, 'image': img_path}
+                    continue
+                print(f'[image-resume] Reprocessing {img_path}: {decision.get("reason", "not complete")}')
+                resume_manager.prepare_for_processing(img_path)
+            resume_counts["inferred_count"] += 1
+            print(f'Processing {img_path}')
+            yield img_path, img_id, image_config
+
+    def infer_image(item):
+        if isinstance(item, dict):
+            return item
+        img_path, img_id, image_config = item
         img = read_rgb_img(img_path)
         original_height, original_width = img.shape[:2]
         image_megapixels = original_height * original_width / 1_000_000.0
@@ -315,418 +313,440 @@ def run_inference_on_images(
             diagnostic_shape=(infer_height, infer_width),
         )
 
-        itsc_mask = itsc_mask[:infer_height, :infer_width]
-        road_mask = road_mask[:infer_height, :infer_width]
-        fast_enhanced_mask = None
-        if args.execution_profile == "fast" and isinstance(precomputed_relative_context, dict):
-            fast_enhanced_mask = np.asarray(
-                precomputed_relative_context.get("enhanced_road_mask"), dtype=np.uint8,
-            )[:infer_height, :infer_width]
-        candidate_nodes, candidate_edges, candidate_confidences = filter_graph_to_image_bounds(
-            pred_nodes, candidate_edges, infer_height, infer_width, candidate_confidences
-        )
-        pred_nodes, pred_edges, edge_confidences = filter_graph_to_image_bounds(
-            pred_nodes, pred_edges, infer_height, infer_width, edge_confidences
-        )
-        if resize_factor != 1.0:
-            itsc_mask = cv2.resize(itsc_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
-            road_mask = cv2.resize(road_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
-            if fast_enhanced_mask is not None:
-                fast_enhanced_mask = cv2.resize(
-                    fast_enhanced_mask,
-                    (original_width, original_height),
-                    interpolation=cv2.INTER_AREA,
-                )
-            pred_nodes = pred_nodes.astype(np.float32) / float(resize_factor)
-            candidate_nodes = candidate_nodes.astype(np.float32) / float(resize_factor)
+        print(f'[Fast batch timing] samroad_inference={time.perf_counter()-image_start_seconds:.6f}s', flush=True)
+        return (img_path, img_id, image_config, candidate_confidences, candidate_edges, edge_confidences, image_start_seconds, img, infer_height, infer_width, input_gsd, itsc_mask, model_gsd, original_height, original_width, performance_summary, precomputed_relative_context, pred_edges, pred_nodes, profile_decision, resize_factor, road_mask)
+
+    from engine.bounded_pipeline import Prefetch
+    with Prefetch(ready_images(), infer_image, enabled=args.execution_profile == "fast") as jobs:
+        for prepared in jobs:
+            if isinstance(prepared, dict):
+                decision, img_path = prepared['skip'], prepared['image']
+                recovery_summary, profile_decision = marker_summaries(decision["marker"])
+                recovery_summaries.append(recovery_summary)
+                profile_decisions.append(profile_decision)
+                total_inference_seconds += float(recovery_summary.get("total_image_seconds", 0.0) or 0.0)
+                if decision["origin"] == "legacy_adopted":
+                    resume_counts["legacy_adopted_count"] += 1
+                    print(f'[image-resume] Adopted complete legacy outputs for {img_path}.')
+                else:
+                    resume_counts["validated_marker_skip_count"] += 1
+                    print(f'[image-resume] Validated and skipped {img_path}.')
+                continue
+            (img_path, img_id, image_config, candidate_confidences, candidate_edges, edge_confidences, image_start_seconds, img, infer_height, infer_width, input_gsd, itsc_mask, model_gsd, original_height, original_width, performance_summary, precomputed_relative_context, pred_edges, pred_nodes, profile_decision, resize_factor, road_mask) = prepared
+            postprocess_started = time.perf_counter()
+            itsc_mask = itsc_mask[:infer_height, :infer_width]
+            road_mask = road_mask[:infer_height, :infer_width]
+            fast_enhanced_mask = None
+            if args.execution_profile == "fast" and isinstance(precomputed_relative_context, dict):
+                fast_enhanced_mask = np.asarray(
+                    precomputed_relative_context.get("enhanced_road_mask"), dtype=np.uint8,
+                )[:infer_height, :infer_width]
             candidate_nodes, candidate_edges, candidate_confidences = filter_graph_to_image_bounds(
-                candidate_nodes, candidate_edges, original_height, original_width, candidate_confidences
+                pred_nodes, candidate_edges, infer_height, infer_width, candidate_confidences
             )
             pred_nodes, pred_edges, edge_confidences = filter_graph_to_image_bounds(
-                pred_nodes, pred_edges, original_height, original_width, edge_confidences
+                pred_nodes, pred_edges, infer_height, infer_width, edge_confidences
             )
+            if resize_factor != 1.0:
+                itsc_mask = cv2.resize(itsc_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
+                road_mask = cv2.resize(road_mask, (original_width, original_height), interpolation=cv2.INTER_AREA)
+                if fast_enhanced_mask is not None:
+                    fast_enhanced_mask = cv2.resize(
+                        fast_enhanced_mask,
+                        (original_width, original_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                pred_nodes = pred_nodes.astype(np.float32) / float(resize_factor)
+                candidate_nodes = candidate_nodes.astype(np.float32) / float(resize_factor)
+                candidate_nodes, candidate_edges, candidate_confidences = filter_graph_to_image_bounds(
+                    candidate_nodes, candidate_edges, original_height, original_width, candidate_confidences
+                )
+                pred_nodes, pred_edges, edge_confidences = filter_graph_to_image_bounds(
+                    pred_nodes, pred_edges, original_height, original_width, edge_confidences
+                )
 
-        if args.execution_profile == "fast":
+            if args.execution_profile == "fast":
+                performance_summary["total_image_seconds"] = float(
+                    time.perf_counter() - image_start_seconds
+                )
+                total_inference_seconds += performance_summary["total_image_seconds"]
+                profile_decision.update({
+                    "graph_extraction_skipped": False,
+                    "toponet_skipped": False,
+                    "weak_postprocess_skipped": True,
+                })
+                profile_decision = {"image": str(img_path), "tile": img_id, **profile_decision}
+                recovery_summary = {
+                    "tile": img_id,
+                    **profile_decision,
+                    "execution_profile": "fast",
+                    "centerline_method": "native_toponet_on_fast_enhanced_probability",
+                    **performance_summary,
+                }
+                profile_decisions.append(profile_decision)
+                recovery_summaries.append(recovery_summary)
+                mask_save_dir = os.path.join(output_dir, "mask")
+                os.makedirs(mask_save_dir, exist_ok=True)
+                probability_path = os.path.join(mask_save_dir, f"{img_id}_road.png")
+                if not cv2.imwrite(probability_path, road_mask):
+                    raise OSError(f"Cannot write Fast road probability: {probability_path}")
+                enhanced_path = os.path.join(mask_save_dir, f"{img_id}_fast_enhanced.png")
+                if not cv2.imwrite(
+                    enhanced_path,
+                    fast_enhanced_mask if fast_enhanced_mask is not None else road_mask,
+                ):
+                    raise OSError(f"Cannot write enhanced Fast road probability: {enhanced_path}")
+                boost_path = os.path.join(mask_save_dir, f"{img_id}_fast_boost.png")
+                boost_mask = np.clip(
+                    (fast_enhanced_mask if fast_enhanced_mask is not None else road_mask).astype(np.int16)
+                    - road_mask.astype(np.int16),
+                    0,
+                    255,
+                ).astype(np.uint8)
+                if not cv2.imwrite(boost_path, boost_mask):
+                    raise OSError(f"Cannot write Fast probability boost: {boost_path}")
+                graph_save_dir = os.path.join(output_dir, "graph")
+                os.makedirs(graph_save_dir, exist_ok=True)
+                np.savez_compressed(
+                    os.path.join(graph_save_dir, f"{img_id}_fast_topology.npz"),
+                    nodes=np.asarray(pred_nodes, dtype=np.float32),
+                    edges=np.asarray(pred_edges, dtype=np.int32).reshape(-1, 2),
+                    scores=np.asarray(edge_confidences, dtype=np.float32),
+                )
+                if resume_manager is not None:
+                    resume_manager.complete(img_path, recovery_summary, profile_decision)
+                print(
+                    f"Done Fast probability + native TopoNet for {img_id}: "
+                    f"fast_graph_point_count="
+                    f"{performance_summary['fast_graph_point_count']}, "
+                    f"toponet_candidate_edge_count="
+                    f"{performance_summary['toponet_candidate_edge_count']}, "
+                    f"toponet_final_edge_count="
+                    f"{performance_summary['toponet_final_edge_count']}."
+                )
+                print(f'[Fast batch timing] samroad_postprocess={time.perf_counter()-postprocess_started:.6f}s', flush=True)
+                continue
+
+            postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
+            bootstrap_candidate_audit = []
+            weak_start_seconds = time.perf_counter()
+            relative_start_seconds = time.perf_counter()
+            relative_context, additional_relative_calls = resolve_relative_context_for_postprocess(
+                road_mask,
+                image_config,
+                scene_state=profile_decision["scene_confidence_state"],
+                distance_scale=postprocess_distance_scale,
+                precomputed_context=precomputed_relative_context,
+            )
+            performance_summary["relative_roadness_seconds"] += float(
+                time.perf_counter() - relative_start_seconds
+            )
+            performance_summary["relative_compute_call_count"] += int(additional_relative_calls)
+            relative_context["diagnostics"].update({
+                "relative_injected_into_toponet": performance_summary[
+                    "relative_injected_into_toponet"
+                ],
+            })
+            profile_decision.update(relative_context.get("diagnostics", {}))
+            pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
+                pred_nodes,
+                pred_edges,
+                road_mask,
+                image_config,
+                edge_scores=edge_confidences,
+                distance_scale=postprocess_distance_scale,
+                relative_context=relative_context,
+                bootstrap_candidate_audit=bootstrap_candidate_audit,
+                topology_candidate_nodes_rc=candidate_nodes,
+                topology_candidate_edges=candidate_edges,
+                topology_candidate_scores=candidate_confidences,
+            )
+            performance_summary["weak_postprocess_seconds"] = float(
+                time.perf_counter() - weak_start_seconds
+            )
+            weak_phase_timing = recovery_summary.get("timing", {})
+            for phase_name, output_name in {
+                "diagnosis_seconds": "weak_diagnosis_seconds",
+                "relative_context_seconds": "weak_relative_context_seconds",
+                "bootstrap_seconds": "weak_bootstrap_seconds",
+                "weak_endpoint_recovery_seconds": "weak_endpoint_recovery_seconds",
+                "endpoint_to_segment_recovery_seconds": "endpoint_to_segment_recovery_seconds",
+                "connectivity_statistics_seconds": "weak_connectivity_statistics_seconds",
+            }.items():
+                performance_summary[output_name] = float(
+                    weak_phase_timing.get(phase_name, 0.0)
+                )
+            performance_summary.update({
+                "relative_graph_point_count": int(
+                    recovery_summary.get("relative_graph_point_count", 0)
+                ),
+                "toponet_candidate_edge_count": int(candidate_edges.shape[0]),
+                "toponet_pred_edge_count": int(sum(
+                    float(score) > float(image_config.TOPO_THRESHOLD)
+                    for score in candidate_confidences.tolist()
+                )),
+                "relative_final_centerline_length": float(
+                    recovery_summary.get("relative_final_length_px", 0.0)
+                ),
+            })
             performance_summary["total_image_seconds"] = float(
                 time.perf_counter() - image_start_seconds
             )
             total_inference_seconds += performance_summary["total_image_seconds"]
-            profile_decision.update({
-                "graph_extraction_skipped": False,
-                "toponet_skipped": False,
-                "weak_postprocess_skipped": True,
-            })
+            edge_confidences = np.asarray(
+                [row["topology_probability"] for row in edge_metadata], dtype=np.float32
+            )
             profile_decision = {"image": str(img_path), "tile": img_id, **profile_decision}
+            profile_decisions.append(profile_decision)
             recovery_summary = {
                 "tile": img_id,
                 **profile_decision,
-                "execution_profile": "fast",
-                "centerline_method": "native_toponet_on_fast_enhanced_probability",
+                **recovery_summary,
                 **performance_summary,
+                "requested_profile": profile_decision["requested_profile"],
+                "effective_profile": profile_decision["effective_profile"],
             }
-            profile_decisions.append(profile_decision)
             recovery_summaries.append(recovery_summary)
-            mask_save_dir = os.path.join(output_dir, "mask")
+
+            viz_img = np.copy(img)
+            mask_save_dir = os.path.join(output_dir, 'mask')
             os.makedirs(mask_save_dir, exist_ok=True)
-            probability_path = os.path.join(mask_save_dir, f"{img_id}_road.png")
-            if not cv2.imwrite(probability_path, road_mask):
-                raise OSError(f"Cannot write Fast road probability: {probability_path}")
-            enhanced_path = os.path.join(mask_save_dir, f"{img_id}_fast_enhanced.png")
-            if not cv2.imwrite(
-                enhanced_path,
-                fast_enhanced_mask if fast_enhanced_mask is not None else road_mask,
-            ):
-                raise OSError(f"Cannot write enhanced Fast road probability: {enhanced_path}")
-            boost_path = os.path.join(mask_save_dir, f"{img_id}_fast_boost.png")
-            boost_mask = np.clip(
-                (fast_enhanced_mask if fast_enhanced_mask is not None else road_mask).astype(np.int16)
-                - road_mask.astype(np.int16),
-                0,
-                255,
-            ).astype(np.uint8)
-            if not cv2.imwrite(boost_path, boost_mask):
-                raise OSError(f"Cannot write Fast probability boost: {boost_path}")
-            graph_save_dir = os.path.join(output_dir, "graph")
-            os.makedirs(graph_save_dir, exist_ok=True)
-            np.savez_compressed(
-                os.path.join(graph_save_dir, f"{img_id}_fast_topology.npz"),
-                nodes=np.asarray(pred_nodes, dtype=np.float32),
-                edges=np.asarray(pred_edges, dtype=np.int32).reshape(-1, 2),
-                scores=np.asarray(edge_confidences, dtype=np.float32),
+            cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_road.png'), road_mask)
+            cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_itsc.png'), itsc_mask)
+            cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_centerline_probability.png'), road_mask)
+            cv2.imwrite(
+                os.path.join(mask_save_dir, f'{img_id}_relative_roadness.png'),
+                np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
             )
+            cv2.imwrite(
+                os.path.join(mask_save_dir, f'{img_id}_relative_candidate.png'),
+                relative_context['relative_candidate_mask'].astype(np.uint8) * 255,
+            )
+            for mask_name in (
+                'relative_skeleton_raw', 'relative_skeleton_normalized',
+                'junction_zone_mask', 'pruned_spur_mask', 'collapsed_zone_mask',
+            ):
+                cv2.imwrite(
+                    os.path.join(mask_save_dir, f'{img_id}_{mask_name}.png'),
+                    np.asarray(relative_context[mask_name], dtype=np.uint8) * 255,
+                )
+            high_threshold, _low_threshold, _profile = graph_extraction.resolve_road_thresholds(image_config)
+            combined_candidate = (
+                (graph_extraction._probability01(road_mask) >= high_threshold)
+                | (relative_context['relative_candidate_mask'] > 0)
+            )
+            cv2.imwrite(
+                os.path.join(mask_save_dir, f'{img_id}_combined_candidate.png'),
+                combined_candidate.astype(np.uint8) * 255,
+            )
+
+            viz_save_dir = os.path.join(output_dir, 'viz')
+            os.makedirs(viz_save_dir, exist_ok=True)
+            norm_scale = np.array([[viz_img.shape[0], viz_img.shape[1]]], dtype=np.float32)
+            viz_img = triage.visualize_image_and_graph(viz_img, pred_nodes / norm_scale, pred_edges, viz_img.shape[0])
+            cv2.imwrite(os.path.join(viz_save_dir, f'{img_id}.png'), viz_img)
+            probability_color = cv2.applyColorMap(road_mask, cv2.COLORMAP_VIRIDIS)
+            relative_color = cv2.applyColorMap(
+                np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
+                cv2.COLORMAP_VIRIDIS,
+            )
+            relative_color[relative_context['relative_candidate_mask'] > 0] = (0, 165, 255)
+            chain_panel = np.copy(img)
+            chain_panel[relative_context['relative_skeleton'] > 0] = (0, 255, 0)
+            acceptance_overlay = np.copy(img)
+            rejected_structure = np.asarray(relative_context.get('relative_rejected_skeleton', []))
+            if rejected_structure.shape == acceptance_overlay.shape[:2]:
+                acceptance_overlay[rejected_structure > 0] = (0, 0, 255)
+            decision_colors = {
+                'auto': (0, 255, 0),
+                'review': (0, 165, 255),
+                'rejected': (0, 0, 255),
+            }
+            for row in bootstrap_candidate_audit:
+                if row.get('candidate_source') not in {'relative', 'absolute+relative'}:
+                    continue
+                path = np.asarray(row.get('path', []), dtype=np.int32).reshape(-1, 2)
+                if len(path) < 2:
+                    continue
+                points = path[:, ::-1].reshape(-1, 1, 2)
+                cv2.polylines(
+                    acceptance_overlay,
+                    [points],
+                    False,
+                    decision_colors.get(row.get('decision', row.get('qa_state')), (0, 0, 255)),
+                    3,
+                    cv2.LINE_AA,
+                )
+            final_colored = np.copy(img)
+            for edge_id, (src_idx, dst_idx) in enumerate(pred_edges.tolist()):
+                row = edge_metadata[edge_id]
+                relative_edge = (
+                    row.get('candidate_source') in {'relative', 'absolute+relative'}
+                    or str(row.get('line_source', '')).startswith('relative')
+                )
+                color = (0, 255, 0) if relative_edge else (0, 220, 255)
+                src = pred_nodes[src_idx]
+                dst = pred_nodes[dst_idx]
+                cv2.line(
+                    final_colored,
+                    (int(round(src[1])), int(round(src[0]))),
+                    (int(round(dst[1])), int(round(dst[0]))),
+                    color,
+                    3,
+                    cv2.LINE_AA,
+                )
+            compare_panels = [
+                img, probability_color, relative_color,
+                chain_panel, acceptance_overlay, final_colored,
+            ]
+            compare_labels = [
+                'image', 'raw probability', 'relative candidate',
+                'relative chain', 'auto / review / rejected', 'final vector',
+            ]
+            max_panel_width = 720
+            if original_width > max_panel_width:
+                panel_scale = max_panel_width / float(original_width)
+                compare_panels = [
+                    cv2.resize(
+                        panel,
+                        (max_panel_width, max(1, int(round(original_height * panel_scale)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    for panel in compare_panels
+                ]
+            for panel, label in zip(compare_panels, compare_labels):
+                cv2.rectangle(panel, (0, 0), (220, 30), (255, 255, 255), -1)
+                cv2.putText(panel, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+            cv2.imwrite(
+                os.path.join(viz_save_dir, f'{img_id}_relative_compare.png'),
+                np.concatenate([
+                    np.concatenate(compare_panels[:3], axis=1),
+                    np.concatenate(compare_panels[3:], axis=1),
+                ], axis=0),
+            )
+            cv2.imwrite(
+                os.path.join(viz_save_dir, f'{img_id}_relative_acceptance_overlay.png'),
+                acceptance_overlay,
+            )
+
+            large_map_sat2graph_format = graph_utils.convert_to_sat2graph_format(pred_nodes, pred_edges)
+            graph_save_dir = os.path.join(output_dir, 'graph')
+            os.makedirs(graph_save_dir, exist_ok=True)
+            graph_save_path = os.path.join(graph_save_dir, f'{img_id}.p')
+            with open(graph_save_path, 'wb') as file:
+                pickle.dump(large_map_sat2graph_format, file)
+            score_path = os.path.join(graph_save_dir, f'{img_id}_edge_scores.csv')
+            with open(score_path, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.DictWriter(file, fieldnames=[
+                    'edge_id', 'src_row', 'src_col', 'dst_row', 'dst_col',
+                    'topology_probability', 'line_source', 'recovery_score',
+                    'center_conf', 'background_conf', 'probability_contrast',
+                    'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
+                    'candidate_source', 'scene_rank_mean', 'local_background_mean',
+                    'local_contrast_mean', 'normalized_contrast_mean',
+                    'relative_score_mean', 'relative_score_q25', 'relative_fraction',
+                ])
+                writer.writeheader()
+                for edge_id, ((src_idx, dst_idx), score, metadata) in enumerate(
+                    zip(pred_edges.tolist(), edge_confidences.tolist(), edge_metadata)
+                ):
+                    src_row, src_col = pred_nodes[src_idx]
+                    dst_row, dst_col = pred_nodes[dst_idx]
+                    writer.writerow({
+                        'edge_id': edge_id,
+                        'src_row': float(src_row), 'src_col': float(src_col),
+                        'dst_row': float(dst_row), 'dst_col': float(dst_col),
+                        'topology_probability': float(score),
+                        'line_source': metadata['line_source'],
+                        'recovery_score': metadata['recovery_score'],
+                        'center_conf': metadata['center_conf'],
+                        'background_conf': metadata.get('background_conf', 0.0),
+                        'probability_contrast': metadata.get('probability_contrast', 0.0),
+                        'surface_conf': metadata['surface_conf'],
+                        'recovery_reason': metadata['recovery_reason'],
+                        'qa_state': metadata['qa_state'],
+                        'recovery_id': metadata['recovery_id'],
+                        'candidate_source': metadata.get('candidate_source', 'absolute'),
+                        'scene_rank_mean': metadata.get('scene_rank_mean', 0.0),
+                        'local_background_mean': metadata.get('local_background_mean', 0.0),
+                        'local_contrast_mean': metadata.get('local_contrast_mean', 0.0),
+                        'normalized_contrast_mean': metadata.get('normalized_contrast_mean', 0.0),
+                        'relative_score_mean': metadata.get('relative_score_mean', 0.0),
+                        'relative_score_q25': metadata.get('relative_score_q25', 0.0),
+                        'relative_fraction': metadata.get('relative_fraction', 0.0),
+                    })
+            with open(os.path.join(graph_save_dir, f'{img_id}_weak_recovery.json'), 'w', encoding='utf-8') as file:
+                json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
+            with open(os.path.join(graph_save_dir, f'{img_id}_relative_acceptance_funnel.json'), 'w', encoding='utf-8') as file:
+                json.dump(recovery_summary.get('relative_acceptance_funnel', {}), file, ensure_ascii=False, indent=2)
+            with open(os.path.join(graph_save_dir, f'{img_id}_relative_skeleton_normalization.json'), 'w', encoding='utf-8') as file:
+                json.dump(
+                    {
+                        key: value for key, value in relative_context.get('diagnostics', {}).items()
+                        if key.startswith('raw_')
+                        or key.startswith('normalized_')
+                        or key.startswith('structure_rescued_')
+                        or key in {
+                            'pruned_spur_count', 'collapsed_zone_count',
+                            'junction_zone_radius_px', 'junction_cluster_radius_px',
+                            'junction_zones',
+                        }
+                    },
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            review_rows = [
+                row for row in bootstrap_candidate_audit
+                if row.get('decision') == 'review'
+                and row.get('candidate_source') in {'relative', 'absolute+relative'}
+            ]
+            review_path = os.path.join(graph_save_dir, f'{img_id}_relative_review_candidates.csv')
+            review_fields = [
+                'candidate_id', 'decision', 'review_reason', 'candidate_source',
+                'path_length', 'tortuosity', 'relative_evidence_tier',
+                'relative_score_mean', 'relative_score_q25', 'scene_rank_mean',
+                'normalized_contrast_mean', 'scale_agreement_mean',
+                'connection_count', 'endpoint_alignment',
+                'topology_candidate_support_fraction', 'path',
+            ]
+            with open(review_path, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.DictWriter(file, fieldnames=review_fields)
+                writer.writeheader()
+                for candidate_id, row in enumerate(review_rows):
+                    writer.writerow({
+                        key: (
+                            candidate_id if key == 'candidate_id'
+                            else json.dumps(row.get(key, []), ensure_ascii=False)
+                            if key == 'path'
+                            else row.get(key, '')
+                        )
+                        for key in review_fields
+                    })
+            candidate_path = os.path.join(graph_save_dir, f'{img_id}_edge_candidates.csv')
+            with open(candidate_path, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=['candidate_id', 'src_row', 'src_col', 'dst_row', 'dst_col', 'topology_probability', 'selected'],
+                )
+                writer.writeheader()
+                for candidate_id, ((src_idx, dst_idx), score) in enumerate(
+                    zip(candidate_edges.tolist(), candidate_confidences.tolist())
+                ):
+                    src_row, src_col = candidate_nodes[src_idx]
+                    dst_row, dst_col = candidate_nodes[dst_idx]
+                    writer.writerow({
+                        'candidate_id': candidate_id,
+                        'src_row': float(src_row), 'src_col': float(src_col),
+                        'dst_row': float(dst_row), 'dst_col': float(dst_col),
+                        'topology_probability': float(score),
+                        'selected': int(float(score) > float(image_config.TOPO_THRESHOLD)),
+                    })
+
             if resume_manager is not None:
                 resume_manager.complete(img_path, recovery_summary, profile_decision)
-            print(
-                f"Done Fast probability + native TopoNet for {img_id}: "
-                f"fast_graph_point_count="
-                f"{performance_summary['fast_graph_point_count']}, "
-                f"toponet_candidate_edge_count="
-                f"{performance_summary['toponet_candidate_edge_count']}, "
-                f"toponet_final_edge_count="
-                f"{performance_summary['toponet_final_edge_count']}."
-            )
-            continue
 
-        postprocess_distance_scale = 1.0 / max(float(resize_factor), 1e-6)
-        bootstrap_candidate_audit = []
-        weak_start_seconds = time.perf_counter()
-        relative_start_seconds = time.perf_counter()
-        relative_context, additional_relative_calls = resolve_relative_context_for_postprocess(
-            road_mask,
-            image_config,
-            scene_state=profile_decision["scene_confidence_state"],
-            distance_scale=postprocess_distance_scale,
-            precomputed_context=precomputed_relative_context,
-        )
-        performance_summary["relative_roadness_seconds"] += float(
-            time.perf_counter() - relative_start_seconds
-        )
-        performance_summary["relative_compute_call_count"] += int(additional_relative_calls)
-        relative_context["diagnostics"].update({
-            "relative_injected_into_toponet": performance_summary[
-                "relative_injected_into_toponet"
-            ],
-        })
-        profile_decision.update(relative_context.get("diagnostics", {}))
-        pred_nodes, pred_edges, edge_metadata, recovery_summary = graph_extraction.postprocess_weak_road_network(
-            pred_nodes,
-            pred_edges,
-            road_mask,
-            image_config,
-            edge_scores=edge_confidences,
-            distance_scale=postprocess_distance_scale,
-            relative_context=relative_context,
-            bootstrap_candidate_audit=bootstrap_candidate_audit,
-            topology_candidate_nodes_rc=candidate_nodes,
-            topology_candidate_edges=candidate_edges,
-            topology_candidate_scores=candidate_confidences,
-        )
-        performance_summary["weak_postprocess_seconds"] = float(
-            time.perf_counter() - weak_start_seconds
-        )
-        weak_phase_timing = recovery_summary.get("timing", {})
-        for phase_name, output_name in {
-            "diagnosis_seconds": "weak_diagnosis_seconds",
-            "relative_context_seconds": "weak_relative_context_seconds",
-            "bootstrap_seconds": "weak_bootstrap_seconds",
-            "weak_endpoint_recovery_seconds": "weak_endpoint_recovery_seconds",
-            "endpoint_to_segment_recovery_seconds": "endpoint_to_segment_recovery_seconds",
-            "connectivity_statistics_seconds": "weak_connectivity_statistics_seconds",
-        }.items():
-            performance_summary[output_name] = float(
-                weak_phase_timing.get(phase_name, 0.0)
-            )
-        performance_summary.update({
-            "relative_graph_point_count": int(
-                recovery_summary.get("relative_graph_point_count", 0)
-            ),
-            "toponet_candidate_edge_count": int(candidate_edges.shape[0]),
-            "toponet_pred_edge_count": int(sum(
-                float(score) > float(image_config.TOPO_THRESHOLD)
-                for score in candidate_confidences.tolist()
-            )),
-            "relative_final_centerline_length": float(
-                recovery_summary.get("relative_final_length_px", 0.0)
-            ),
-        })
-        performance_summary["total_image_seconds"] = float(
-            time.perf_counter() - image_start_seconds
-        )
-        total_inference_seconds += performance_summary["total_image_seconds"]
-        edge_confidences = np.asarray(
-            [row["topology_probability"] for row in edge_metadata], dtype=np.float32
-        )
-        profile_decision = {"image": str(img_path), "tile": img_id, **profile_decision}
-        profile_decisions.append(profile_decision)
-        recovery_summary = {
-            "tile": img_id,
-            **profile_decision,
-            **recovery_summary,
-            **performance_summary,
-            "requested_profile": profile_decision["requested_profile"],
-            "effective_profile": profile_decision["effective_profile"],
-        }
-        recovery_summaries.append(recovery_summary)
-
-        viz_img = np.copy(img)
-        mask_save_dir = os.path.join(output_dir, 'mask')
-        os.makedirs(mask_save_dir, exist_ok=True)
-        cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_road.png'), road_mask)
-        cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_itsc.png'), itsc_mask)
-        cv2.imwrite(os.path.join(mask_save_dir, f'{img_id}_centerline_probability.png'), road_mask)
-        cv2.imwrite(
-            os.path.join(mask_save_dir, f'{img_id}_relative_roadness.png'),
-            np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
-        )
-        cv2.imwrite(
-            os.path.join(mask_save_dir, f'{img_id}_relative_candidate.png'),
-            relative_context['relative_candidate_mask'].astype(np.uint8) * 255,
-        )
-        for mask_name in (
-            'relative_skeleton_raw', 'relative_skeleton_normalized',
-            'junction_zone_mask', 'pruned_spur_mask', 'collapsed_zone_mask',
-        ):
-            cv2.imwrite(
-                os.path.join(mask_save_dir, f'{img_id}_{mask_name}.png'),
-                np.asarray(relative_context[mask_name], dtype=np.uint8) * 255,
-            )
-        high_threshold, _low_threshold, _profile = graph_extraction.resolve_road_thresholds(image_config)
-        combined_candidate = (
-            (graph_extraction._probability01(road_mask) >= high_threshold)
-            | (relative_context['relative_candidate_mask'] > 0)
-        )
-        cv2.imwrite(
-            os.path.join(mask_save_dir, f'{img_id}_combined_candidate.png'),
-            combined_candidate.astype(np.uint8) * 255,
-        )
-
-        viz_save_dir = os.path.join(output_dir, 'viz')
-        os.makedirs(viz_save_dir, exist_ok=True)
-        norm_scale = np.array([[viz_img.shape[0], viz_img.shape[1]]], dtype=np.float32)
-        viz_img = triage.visualize_image_and_graph(viz_img, pred_nodes / norm_scale, pred_edges, viz_img.shape[0])
-        cv2.imwrite(os.path.join(viz_save_dir, f'{img_id}.png'), viz_img)
-        probability_color = cv2.applyColorMap(road_mask, cv2.COLORMAP_VIRIDIS)
-        relative_color = cv2.applyColorMap(
-            np.clip(relative_context['relative_score'] * 255.0, 0, 255).astype(np.uint8),
-            cv2.COLORMAP_VIRIDIS,
-        )
-        relative_color[relative_context['relative_candidate_mask'] > 0] = (0, 165, 255)
-        chain_panel = np.copy(img)
-        chain_panel[relative_context['relative_skeleton'] > 0] = (0, 255, 0)
-        acceptance_overlay = np.copy(img)
-        rejected_structure = np.asarray(relative_context.get('relative_rejected_skeleton', []))
-        if rejected_structure.shape == acceptance_overlay.shape[:2]:
-            acceptance_overlay[rejected_structure > 0] = (0, 0, 255)
-        decision_colors = {
-            'auto': (0, 255, 0),
-            'review': (0, 165, 255),
-            'rejected': (0, 0, 255),
-        }
-        for row in bootstrap_candidate_audit:
-            if row.get('candidate_source') not in {'relative', 'absolute+relative'}:
-                continue
-            path = np.asarray(row.get('path', []), dtype=np.int32).reshape(-1, 2)
-            if len(path) < 2:
-                continue
-            points = path[:, ::-1].reshape(-1, 1, 2)
-            cv2.polylines(
-                acceptance_overlay,
-                [points],
-                False,
-                decision_colors.get(row.get('decision', row.get('qa_state')), (0, 0, 255)),
-                3,
-                cv2.LINE_AA,
-            )
-        final_colored = np.copy(img)
-        for edge_id, (src_idx, dst_idx) in enumerate(pred_edges.tolist()):
-            row = edge_metadata[edge_id]
-            relative_edge = (
-                row.get('candidate_source') in {'relative', 'absolute+relative'}
-                or str(row.get('line_source', '')).startswith('relative')
-            )
-            color = (0, 255, 0) if relative_edge else (0, 220, 255)
-            src = pred_nodes[src_idx]
-            dst = pred_nodes[dst_idx]
-            cv2.line(
-                final_colored,
-                (int(round(src[1])), int(round(src[0]))),
-                (int(round(dst[1])), int(round(dst[0]))),
-                color,
-                3,
-                cv2.LINE_AA,
-            )
-        compare_panels = [
-            img, probability_color, relative_color,
-            chain_panel, acceptance_overlay, final_colored,
-        ]
-        compare_labels = [
-            'image', 'raw probability', 'relative candidate',
-            'relative chain', 'auto / review / rejected', 'final vector',
-        ]
-        max_panel_width = 720
-        if original_width > max_panel_width:
-            panel_scale = max_panel_width / float(original_width)
-            compare_panels = [
-                cv2.resize(
-                    panel,
-                    (max_panel_width, max(1, int(round(original_height * panel_scale)))),
-                    interpolation=cv2.INTER_AREA,
-                )
-                for panel in compare_panels
-            ]
-        for panel, label in zip(compare_panels, compare_labels):
-            cv2.rectangle(panel, (0, 0), (220, 30), (255, 255, 255), -1)
-            cv2.putText(panel, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
-        cv2.imwrite(
-            os.path.join(viz_save_dir, f'{img_id}_relative_compare.png'),
-            np.concatenate([
-                np.concatenate(compare_panels[:3], axis=1),
-                np.concatenate(compare_panels[3:], axis=1),
-            ], axis=0),
-        )
-        cv2.imwrite(
-            os.path.join(viz_save_dir, f'{img_id}_relative_acceptance_overlay.png'),
-            acceptance_overlay,
-        )
-
-        large_map_sat2graph_format = graph_utils.convert_to_sat2graph_format(pred_nodes, pred_edges)
-        graph_save_dir = os.path.join(output_dir, 'graph')
-        os.makedirs(graph_save_dir, exist_ok=True)
-        graph_save_path = os.path.join(graph_save_dir, f'{img_id}.p')
-        with open(graph_save_path, 'wb') as file:
-            pickle.dump(large_map_sat2graph_format, file)
-        score_path = os.path.join(graph_save_dir, f'{img_id}_edge_scores.csv')
-        with open(score_path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=[
-                'edge_id', 'src_row', 'src_col', 'dst_row', 'dst_col',
-                'topology_probability', 'line_source', 'recovery_score',
-                'center_conf', 'background_conf', 'probability_contrast',
-                'surface_conf', 'recovery_reason', 'qa_state', 'recovery_id',
-                'candidate_source', 'scene_rank_mean', 'local_background_mean',
-                'local_contrast_mean', 'normalized_contrast_mean',
-                'relative_score_mean', 'relative_score_q25', 'relative_fraction',
-            ])
-            writer.writeheader()
-            for edge_id, ((src_idx, dst_idx), score, metadata) in enumerate(
-                zip(pred_edges.tolist(), edge_confidences.tolist(), edge_metadata)
-            ):
-                src_row, src_col = pred_nodes[src_idx]
-                dst_row, dst_col = pred_nodes[dst_idx]
-                writer.writerow({
-                    'edge_id': edge_id,
-                    'src_row': float(src_row), 'src_col': float(src_col),
-                    'dst_row': float(dst_row), 'dst_col': float(dst_col),
-                    'topology_probability': float(score),
-                    'line_source': metadata['line_source'],
-                    'recovery_score': metadata['recovery_score'],
-                    'center_conf': metadata['center_conf'],
-                    'background_conf': metadata.get('background_conf', 0.0),
-                    'probability_contrast': metadata.get('probability_contrast', 0.0),
-                    'surface_conf': metadata['surface_conf'],
-                    'recovery_reason': metadata['recovery_reason'],
-                    'qa_state': metadata['qa_state'],
-                    'recovery_id': metadata['recovery_id'],
-                    'candidate_source': metadata.get('candidate_source', 'absolute'),
-                    'scene_rank_mean': metadata.get('scene_rank_mean', 0.0),
-                    'local_background_mean': metadata.get('local_background_mean', 0.0),
-                    'local_contrast_mean': metadata.get('local_contrast_mean', 0.0),
-                    'normalized_contrast_mean': metadata.get('normalized_contrast_mean', 0.0),
-                    'relative_score_mean': metadata.get('relative_score_mean', 0.0),
-                    'relative_score_q25': metadata.get('relative_score_q25', 0.0),
-                    'relative_fraction': metadata.get('relative_fraction', 0.0),
-                })
-        with open(os.path.join(graph_save_dir, f'{img_id}_weak_recovery.json'), 'w', encoding='utf-8') as file:
-            json.dump(recovery_summary, file, ensure_ascii=False, indent=2)
-        with open(os.path.join(graph_save_dir, f'{img_id}_relative_acceptance_funnel.json'), 'w', encoding='utf-8') as file:
-            json.dump(recovery_summary.get('relative_acceptance_funnel', {}), file, ensure_ascii=False, indent=2)
-        with open(os.path.join(graph_save_dir, f'{img_id}_relative_skeleton_normalization.json'), 'w', encoding='utf-8') as file:
-            json.dump(
-                {
-                    key: value for key, value in relative_context.get('diagnostics', {}).items()
-                    if key.startswith('raw_')
-                    or key.startswith('normalized_')
-                    or key.startswith('structure_rescued_')
-                    or key in {
-                        'pruned_spur_count', 'collapsed_zone_count',
-                        'junction_zone_radius_px', 'junction_cluster_radius_px',
-                        'junction_zones',
-                    }
-                },
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-        review_rows = [
-            row for row in bootstrap_candidate_audit
-            if row.get('decision') == 'review'
-            and row.get('candidate_source') in {'relative', 'absolute+relative'}
-        ]
-        review_path = os.path.join(graph_save_dir, f'{img_id}_relative_review_candidates.csv')
-        review_fields = [
-            'candidate_id', 'decision', 'review_reason', 'candidate_source',
-            'path_length', 'tortuosity', 'relative_evidence_tier',
-            'relative_score_mean', 'relative_score_q25', 'scene_rank_mean',
-            'normalized_contrast_mean', 'scale_agreement_mean',
-            'connection_count', 'endpoint_alignment',
-            'topology_candidate_support_fraction', 'path',
-        ]
-        with open(review_path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=review_fields)
-            writer.writeheader()
-            for candidate_id, row in enumerate(review_rows):
-                writer.writerow({
-                    key: (
-                        candidate_id if key == 'candidate_id'
-                        else json.dumps(row.get(key, []), ensure_ascii=False)
-                        if key == 'path'
-                        else row.get(key, '')
-                    )
-                    for key in review_fields
-                })
-        candidate_path = os.path.join(graph_save_dir, f'{img_id}_edge_candidates.csv')
-        with open(candidate_path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(
-                file,
-                fieldnames=['candidate_id', 'src_row', 'src_col', 'dst_row', 'dst_col', 'topology_probability', 'selected'],
-            )
-            writer.writeheader()
-            for candidate_id, ((src_idx, dst_idx), score) in enumerate(
-                zip(candidate_edges.tolist(), candidate_confidences.tolist())
-            ):
-                src_row, src_col = candidate_nodes[src_idx]
-                dst_row, dst_col = candidate_nodes[dst_idx]
-                writer.writerow({
-                    'candidate_id': candidate_id,
-                    'src_row': float(src_row), 'src_col': float(src_col),
-                    'dst_row': float(dst_row), 'dst_col': float(dst_col),
-                    'topology_probability': float(score),
-                    'selected': int(float(score) > float(image_config.TOPO_THRESHOLD)),
-                })
-
-        if resume_manager is not None:
-            resume_manager.complete(img_path, recovery_summary, profile_decision)
-
-        print(f'Done for {img_id}.')
+            print(f'Done for {img_id}.')
 
     known_timing_count = sum(
         "total_image_seconds" in row for row in recovery_summaries
@@ -1272,19 +1292,9 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         # [B, N_samples, N_pairs]
         topo_scores = torch.where(torch.isnan(topo_scores), -100.0, topo_scores).squeeze(-1).cpu().numpy()
         # aggregate edge scores
-        batch_size, n_samples, n_pairs = topo_scores.shape
-        for bi in range(batch_size):
-            for si in range(n_samples):
-                for pi in range(n_pairs):
-                    if not collated['valid'][bi, si, pi]:
-                        continue
-                    # idx to the full graph
-                    src_idx_patch, tgt_idx_patch = collated['pairs'][bi, si, pi, :]
-                    src_idx_all, tgt_idx_all = idx_maps[bi][src_idx_patch], idx_maps[bi][tgt_idx_patch]
-                    edge_score = topo_scores[bi, si, pi]
-                    assert 0.0 <= edge_score <= 1.0
-                    edge_scores[(src_idx_all, tgt_idx_all)] += edge_score
-                    edge_counts[(src_idx_all, tgt_idx_all)] += 1.0
+        from topology_aggregation import aggregate_votes
+        aggregate_votes(topo_scores, collated['pairs'], collated['valid'], idx_maps,
+                        edge_scores, edge_counts)
     # avg edge scores and filter
     pred_edges = []
     pred_edge_scores = []
@@ -1333,7 +1343,9 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
         performance_summary,
     )
 
-if __name__ == "__main__":
+def main(argv=None, *, model_pool=None):
+    global args, resolved_device_name
+    args = parser.parse_args(argv)
     config_path = resolve_repo_path(args.config).resolve()
     config = load_config(config_path)
     config.INFER_RESCALE_TO_MODEL_GSD = args.rescale_to_model_gsd == "on"
@@ -1346,15 +1358,17 @@ if __name__ == "__main__":
         # Good when model architecture/input shape are fixed.
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
-    net = SAMRoadplus(config)
-
-    # load checkpoint
     checkpoint_path = resolve_repo_path(args.checkpoint).resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    print(f'##### Loading Trained CKPT {checkpoint_path} #####')
-    net.load_state_dict(checkpoint["state_dict"], strict=True)
-    net.eval()
-    net.to(device)
+    def load_model():
+        net = SAMRoadplus(config)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        print(f'##### Loading Trained CKPT {checkpoint_path} #####')
+        net.load_state_dict(checkpoint['state_dict'], strict=True)
+        net.eval()
+        return net.to(device)
+    from engine.batch_runtime import resource_key
+    key = (resource_key(checkpoint_path, config_path), str(config), resolved_device_name)
+    net = model_pool.acquire('samroad', key, load_model, device) if model_pool else load_model()
 
     output_root = resolve_repo_path(args.output_root)
     output_dir_prefix = str(output_root / 'offline_infer')
@@ -1474,3 +1488,7 @@ if __name__ == "__main__":
         os.replace(metadata_temporary, metadata_path)
     finally:
         metadata_temporary.unlink(missing_ok=True)
+
+
+if __name__ == '__main__':
+    main()

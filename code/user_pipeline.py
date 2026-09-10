@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 from engine.fast_timing import timed_stage
+from engine.batch_runtime import batch_models, run_resident, plan_next_centerline, record_line, record_timing, normalization_lock
 import math
 import os
 import re
@@ -1182,6 +1183,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
         raise
 
 
+@batch_models
 def extract_project_all(args: argparse.Namespace) -> dict:
     """Extract every selected project area/period without running change detection."""
     started = time.monotonic()
@@ -1528,9 +1530,11 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         raise
 
 
+@timed_stage('normalization')
+@normalization_lock
 def normalize_validation_sources(
     periods: dict[str, Path], validation_area: str | Path, output_root: Path,
-    tile_size: int = 4096, strict_coverage: bool = False,
+    tile_size: int = 4096, strict_coverage: bool = False, cache_root: Path | None = None,
 ) -> dict[str, Path]:
     """Write every validation input onto one masked, common analysis grid.
 
@@ -1599,7 +1603,7 @@ def normalize_validation_sources(
     coverage_reports: dict[str, dict] = {}
     output_root.mkdir(parents=True, exist_ok=True)
     shared_signature = {
-        "version": 2,
+        "version": 3,
         "validation_geometry": validation_geometry.wkb_hex,
         "analysis_crs": str(analysis_crs),
         "transform": tuple(transform),
@@ -1618,18 +1622,38 @@ def normalize_validation_sources(
             for period, rasters in sources.items()
         },
     }
+    if cache_root is None:
+        work = next((p for p in output_root.resolve().parents if p.name == '_work'), None)
+        cache_root = work/'cache'/'normalized' if work else output_root
     for period, rasters in sources.items():
         signature_text = json.dumps(
-            {"shared": shared_signature, "period": period}, sort_keys=True, ensure_ascii=False,
+            {"shared": {**shared_signature, 'sources':shared_signature['sources'][period]}, "period": period}, sort_keys=True, ensure_ascii=False,
         )
         generation = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()[:16]
-        period_dir = output_root / clean_name(period) / generation
+        period_dir = cache_root / clean_name(period) / generation
         period_dir.mkdir(parents=True, exist_ok=True)
         state_path = period_dir / "normalization_state.json"
         try:
             state = read_json(state_path) if state_path.is_file() else {}
         except (OSError, UnicodeError, json.JSONDecodeError):
             state = {}
+        from engine.product_cache import read_completed, write_completed
+        cache_marker = period_dir/'normalized_cache.json'
+        cached = read_completed(cache_marker, [generation])
+        if cached is not None:
+            if strict_coverage and cached['coverage']['missing_pixels']:
+                raise ValueError(f'{period} 期验证区影像覆盖不足，缓存包含无效像素')
+            normalized[period] = period_dir.resolve()
+            tile_counts[period] = cached['tile_count']
+            coverage_reports[period] = cached['coverage']
+            print('[Fast batch timing] normalization_cache_hit=1', flush=True)
+            record_timing('normalization_cache_hit',1)
+            write_json(output_root/'normalization_complete.json', dict(version=2,
+                periods={k:str(v) for k,v in normalized.items()}, tile_counts=tile_counts,
+                coverage=coverage_reports, completed_at=now_text()))
+            continue
+        if cache_marker.is_file() and cached is None:
+            state = {}  # A completed cache was damaged; do not adopt stale window markers.
         if state.get("generation") != generation:
             state = {
                 "version": 2,
@@ -1856,6 +1880,12 @@ def normalize_validation_sources(
         write_json(state_path, state)
         normalized[period] = period_dir.resolve()
         tile_counts[period] = tile_index
+        paths = listed_rasters(period_dir)
+        if (period_dir/'valid_observation.shp').exists():
+            paths.append(period_dir/'valid_observation.shp')
+        write_completed(cache_marker, [generation], dict(tile_count=tile_index, coverage=coverage_reports[period]), paths)
+        print('[Fast batch timing] normalization_cache_hit=0', flush=True)
+        record_timing('normalization_cache_miss',1)
         write_json(output_root / "normalization_complete.json", {
             "version": 2,
             "periods": {name: str(path) for name, path in normalized.items()},
@@ -1896,7 +1926,8 @@ def prepare(args: argparse.Namespace) -> dict:
     if not source.exists():
         raise FileNotFoundError(f"找不到格网输入：{source}")
     workspace.mkdir(parents=True, exist_ok=True)
-    images = workspace / "images"
+    cached_normalization = (source/'normalized_cache.json').is_file()
+    images = source if cached_normalization else workspace / "images"
     images.mkdir(exist_ok=True)
     rasters = listed_rasters(source)
     if not rasters:
@@ -1909,7 +1940,8 @@ def prepare(args: argparse.Namespace) -> dict:
             name = f"{index:05d}_{name}"
         seen.add(name)
         target = images / name
-        import_raster(item, target)
+        if not cached_normalization:
+            import_raster(item, target)
         copied.append(str(target.resolve()))
         emit("prepare", index=index, total=len(rasters), name=item.name)
     txt = workspace / "batches" / "grid_tiles.txt"
@@ -2026,11 +2058,14 @@ def run_command(
     context = dict(event_context or {})
     defer_completion = bool(context.pop("_defer_completion", False))
     emit("stage", stage=label, status="running", started_at=started_at, **context)
-    process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line.rstrip(), flush=True)
-    code = process.wait()
+    code = run_resident(command, cwd, env)
+    if code is None:
+        process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line.rstrip(), flush=True)
+            record_line(line)
+        code = process.wait()
     if code != 0:
         emit(
             "stage", stage=label, status="failed", code=code,
@@ -4669,6 +4704,7 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     return result
 
 
+@batch_models
 def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
@@ -4957,6 +4993,7 @@ def _write_task_report(manifest: dict, job_root: Path) -> None:
         writer.writerows(rows)
 
 
+@batch_models
 def run_all(args: argparse.Namespace) -> dict:
     """Extract every grid/period and detect every adjacent-period change.
 
@@ -5272,6 +5309,7 @@ def run_all(args: argparse.Namespace) -> dict:
 
         result_by_period: dict[tuple[str, str], dict] = {}
         refreshed_periods = set()
+        period_plan = [(g,p,s) for g,periods in grids.items() for p,s in periods.items()]
         for grid_index, (grid_name, periods) in enumerate(grids.items(), start=1):
             safe_grid = clean_name(grid_name)
             for period_index, (period, source) in enumerate(periods.items(), start=1):
@@ -5326,6 +5364,33 @@ def run_all(args: argparse.Namespace) -> dict:
                     else:
                         prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
                     base_run_id = "roads"
+                    if execution_profile == 'fast':
+                        following = period_plan[period_plan.index((grid_name,period,source))+1:]
+                        following = next(((g,p,s) for g,p,s in following
+                                          if not (resume and prior_periods.get((g,p)) and
+                                                  _period_result_ready(prior_periods[(g,p)], require_current_network=True))), None)
+                        def next_command(command, following=following):
+                            if following is None:
+                                return None
+                            g,p,s = following
+                            target = job_root/'grids'/clean_name(g)/'periods'/clean_name(p)
+                            if not (resume and _prepared_workspace_complete(target)):
+                                prepare(argparse.Namespace(source=str(analysis_sources.get(f'{g}\0{p}',s)), workspace=str(target)))
+                            result = list(command)
+                            changes = {'--input_txt_dir': target/'batches',
+                                       '--output_root': target/'runs'/'roads'/'inference',
+                                       '--output_dir': target/'runs'/'roads'/'inference'/'road_graphs'}
+                            for flag,value in changes.items():
+                                result[result.index(flag)+1] = str(value)
+                            if '--resume-existing-images' in result:
+                                result.remove('--resume-existing-images')
+                            if resume and (g,p) not in invalid_periods:
+                                result.append('--resume-existing-images')
+                            elif '--pipeline-state' in result:
+                                index = result.index('--pipeline-state')
+                                del result[index:index+2]
+                            return result
+                        plan_next_centerline(next_command)
                     result = _ensure_extract_manifest_fields(extract(
                         argparse.Namespace(
                             workspace=str(workspace), source="", checkpoint=args.checkpoint,

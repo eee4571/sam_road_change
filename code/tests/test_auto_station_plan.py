@@ -111,6 +111,43 @@ class StationPlanTests(unittest.TestCase):
         self.assertGreater(new[3]['width_prefilter_skipped_station_count'], 0)
         self.assertLess(new[3]['candidate_station_count'],old[3]['candidate_station_count'])
 
+    def test_multitemporal_stable_width_skips_with_different_evidence(self):
+        before = self.scene([self.road(100, 8)])
+        after = self.scene([self.road(100.4, 8.1)], low=.12, high=.67)
+        self.assertFalse(np.array_equal(before.probability.scene_values, after.probability.scene_values))
+        with patch('engine.fast_auto_change._measure_period_width', side_effect=AssertionError('unexpected exact width')):
+            result = analyze_scenes(before, after)
+        stats = result[3]
+        self.assertEqual(stats['candidate_station_count'], 0)
+        self.assertEqual(stats['stable_skipped_station_count'], stats['total_station_count'])
+        self.assertEqual(stats['candidate_ratio'], 0.)
+        self.assertIn('width_prefilter_seconds', stats)
+        self.assertIn('exact_width_measurement_seconds', stats)
+
+    def test_threshold_neighbours_and_true_changes_keep_exact_width(self):
+        from engine.fast_auto_change import _measure_period_width
+        for width in (9.7, 10., 14., 4.):
+            with self.subTest(width=width):
+                before, after = self.scene([self.road(100, 8)]), self.scene([self.road(100, width)])
+                with patch('engine.fast_auto_change._measure_period_width', wraps=_measure_period_width) as exact:
+                    result = analyze_scenes(before, after)
+                self.assertGreater(exact.call_count, 0)
+                self.assertEqual(result[3]['width_prefilter_skipped_station_count'], 0)
+                self.assert_candidates_equal(self.reference(before, after)[0], result[0])
+
+    def test_unreliable_match_always_requests_exact_stations(self):
+        from engine.auto_station_plan import width_mask
+        from paired_width_profile import PairedWidthConfig
+        before, after = self.scene([self.road(100)]), self.scene([self.road(100.4)])
+        axis = before.lines[0]
+        stations = np.arange(2., axis.length, 4.)
+        original = after.match
+        def unreliable(*args, **kwargs):
+            return {**original(*args, **kwargs), 'reliable': False}
+        with patch.object(after, 'match', side_effect=unreliable):
+            mask = width_mask(axis, before, after, stations, np.full(len(stations), 8.), 3., PairedWidthConfig())
+        self.assertTrue(mask.all())
+
     def test_missing_width_quality_falls_back(self):
         before, after = self.scene([self.road(100)]), self.scene([self.road(100)])
         before.width_values = np.full(len(before.width_values), np.nan)

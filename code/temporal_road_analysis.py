@@ -128,13 +128,37 @@ def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
     return result.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
 
+from functools import lru_cache, wraps
+
+
+@lru_cache(maxsize=16384)
+def _geometry_facts(geometry):
+    ends = tuple(Point(geometry.coords[i]) for i in (0,-1)) if geometry.geom_type == 'LineString' else ()
+    return geometry.length, geometry.bounds, ends
+
+
+@lru_cache(maxsize=16384)
+def _geometry_buffer(geometry, distance):
+    return geometry.buffer(distance)
+
+
+def _geometry_scope(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _geometry_facts.cache_clear(); _geometry_buffer.cache_clear(); _direction_vector.cache_clear()
+    return wrapped
+
+
 def _line_score(source: BaseGeometry, target: BaseGeometry, tolerance: float) -> tuple[float, float, float]:
     if source.is_empty or target.is_empty or source.length <= 0 or target.length <= 0:
         return 0.0, 0.0, float("inf")
     distance = float(source.distance(target))
     buffer_distance = max(float(tolerance), 0.1)
-    source_cover = float(source.intersection(target.buffer(buffer_distance)).length) / float(source.length)
-    target_cover = float(target.intersection(source.buffer(buffer_distance)).length) / float(target.length)
+    source_cover = float(source.intersection(_geometry_buffer(target,buffer_distance)).length) / _geometry_facts(source)[0]
+    target_cover = float(target.intersection(_geometry_buffer(source,buffer_distance)).length) / _geometry_facts(target)[0]
     overlap = min(max(source_cover, 0.0), max(target_cover, 0.0), 1.0)
     proximity = max(0.0, 1.0 - distance / buffer_distance)
     direction = _direction_similarity(source, target)
@@ -143,6 +167,7 @@ def _line_score(source: BaseGeometry, target: BaseGeometry, tolerance: float) ->
     return 0.65 * overlap + 0.20 * direction + 0.15 * proximity, overlap, distance
 
 
+@lru_cache(maxsize=16384)
 def _direction_vector(geometry: BaseGeometry) -> np.ndarray | None:
     """Return an orientation vector (sign-free) using sampled-point PCA."""
     if geometry is None or geometry.is_empty or geometry.length <= 0:
@@ -188,7 +213,7 @@ def _best_match(
             continue
         # A continuous counterpart must explain the longitudinal axis, including
         # its endpoints. Direction alone cannot select an adjacent branch.
-        ends = [Point(geometry.coords[i]).distance(targets[index]) for i in (0,-1)]
+        ends = [point.distance(targets[index]) for point in _geometry_facts(geometry)[2]]
         continuity = float(np.mean(np.exp(-np.asarray(ends)/max(tolerance, .1))))
         total = .85*score + .15*continuity
         ranked.append((total, overlap, -distance, index))
@@ -255,6 +280,8 @@ def _assign_road_ids(references: list[dict], prior_path: Path, analysis_crs, tol
         prior_tree = STRtree(np.asarray(prior_geometries, dtype=object)) if prior_geometries else None
         candidates = []
         for ref_index, reference in enumerate(references):
+            if reference.get('road_id'):
+                continue
             prior_index, score, overlap, _distance, _ambiguous = _best_match(
                 reference["geometry"], prior_geometries, prior_tree, tolerance,
             )
@@ -426,15 +453,17 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
     states={str(entry['period']):gpd.read_file(entry['road_state'],layer='road_state').to_crs(analysis_crs)
             for entry in period_entries}
     track_ids=sorted({str(t) for frame in states.values() for t in frame.track_id})
+    state_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in states.items()}
+    road_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in period_frames.items()}
     references=[];observations=[]
     for track_id in track_ids:
-        first=next(frame.loc[frame.track_id==track_id].iloc[0] for frame in states.values() if frame.track_id.eq(track_id).any())
+        first=next(groups[track_id].iloc[0] for groups in state_groups.values() if track_id in groups)
         references.append(dict(road_id=track_id,born_period=next(iter(states)),geometry=first.geometry))
         for period,state in states.items():
-            rows=state.loc[state.track_id==track_id]
+            rows=state_groups[period].get(track_id,state.iloc[:0])
             if len(rows)!=1:raise ValueError(f'Reconciled road state incomplete: {track_id}/{period}')
             row=rows.iloc[0]; roads=period_frames[period]
-            actual=roads.loc[roads.track_id==track_id]
+            actual=road_groups[period].get(track_id,roads.iloc[:0])
             present=row.status=='present'
             if present != (not actual.empty):raise ValueError(f'Road state contradicts period centerline: {track_id}/{period}')
             width=float(np.average(actual.width_m,weights=actual.length)) if present else np.nan
@@ -651,6 +680,7 @@ def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geome
 
 
 @timed_stage("temporal")
+@_geometry_scope
 def build_temporal_grid(
     grid_name: str,
     period_entries: list[dict],

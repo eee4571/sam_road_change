@@ -513,19 +513,18 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     there are no station rectangles or separate junction patch features.
     """
     from .product_cache import signature, read_completed, write_completed
-    cacheable = not cuts and not inserts and all(not row.get('track_id') for row in centers)
     marker = directory/'regular_road_cache.json'
     inputs = signature([original['centerlines'], original['width_segments'], __file__,
                         Path(__file__).with_name('continuous_road_geometry.py'),
                         Path(__file__).with_name('auto_change_geometry.py'),
                         Path(__file__).with_name('auto_change_assembly.py')]) + [str(metric), str(output_crs)]
-    if cacheable:
-        row_values = [{k: (v.wkb_hex if k == "geometry" else v) for k, v in row.items()} for row in centers]
-        inputs.append(hashlib.sha256(json.dumps(row_values, sort_keys=True, default=str).encode()).hexdigest())
-        cached = read_completed(marker, inputs)
-        if cached is not None:
-            print('[Fast timing] final_road_reused=1', flush=True)
-            return cached
+    row_values = [{k: (v.wkb_hex if k == "geometry" else v) for k, v in row.items()} for row in centers]
+    edits = [{k: (v.wkb_hex if k == 'geometry' else v) for k,v in row.items()} for row in inserts]
+    inputs.append(hashlib.sha256(json.dumps([row_values,cuts,edits], sort_keys=True, default=str).encode()).hexdigest())
+    cached = read_completed(marker, inputs)
+    if cached is not None:
+        print('[Fast timing] final_road_reused=1', flush=True)
+        return cached
     cut_axes=[substring(base.geometry.iloc[i],a,b) for i,intervals in cuts.items() for a,b in intervals]
     originals={key:gpd.read_file(original[key]) for key in ('centerlines','width_segments')}
     widths=originals['width_segments'].to_crs(metric)
@@ -541,13 +540,29 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     outputs={}
     frames={'centerlines':_frame(centers,metric),'width_segments':_frame(retained_widths+edited_widths,metric)}
     profiles=FinalWidths(widths)
+    profile_path=directory/'width_profile_cache.json'
+    profile_inputs=signature([Path(__file__).with_name('auto_change_geometry.py')])+[str(metric)]
+    saved_profiles=read_completed(profile_path,profile_inputs) or {}
+    current_profiles={}
+    profile_hits=0
     regular=[]
     for row in centers:
         axis=row['geometry'];width=_number(row,('width_m','width_map'),6.)
         if row.get('track_id'):
             stations=np.array([0.,axis.length]);values=np.array([width,width])
-        else:stations,values,_=profiles.profile(axis,width)
+        else:
+            ids=sorted(profiles.tree.query(axis,predicate='dwithin',distance=.75))
+            dependencies=[(profiles.frame.geometry.iloc[int(i)].wkb_hex,
+                           str(profiles.frame.iloc[int(i)].get('width_m'))) for i in ids]
+            key=hashlib.sha256(json.dumps([axis.wkb_hex,width,dependencies]).encode()).hexdigest()
+            if key in saved_profiles:
+                stations,values=map(np.asarray,saved_profiles[key]);profile_hits+=1
+            else:
+                stations,values,_=profiles.profile(axis,width)
+            current_profiles[key]=[stations.tolist(),values.tolist()]
         regular.append((axis,stations,values))
+    write_completed(profile_path,profile_inputs,current_profiles,[])
+    print(f'[Fast batch timing] final_road_profile_cache_hit={profile_hits}',flush=True)
     from .continuous_road_geometry import network_surface
     joined=network_surface(regular)
     pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
@@ -571,8 +586,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         exported.to_file(path,encoding='UTF-8');outputs[key]=str(path.resolve())
     if edited_corridors:outputs['geometry_audit']=str((directory/'road_geometry_audit.gpkg').resolve())
     outputs['regular_surface']=True
-    if cacheable:
-        write_completed(marker, inputs, outputs, [outputs[key] for key in frames])
+    write_completed(marker, inputs, outputs, [outputs[key] for key in frames])
     return outputs
 
 

@@ -326,7 +326,6 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
     counts = Counter()
     sampling_seconds = matching_seconds = 0.
     timing = Counter()
-    rank_equal = np.array_equal(before.probability.scene_values, after.probability.scene_values)
     width_config = PairedWidthConfig(sample_spacing=4, absolute_change=absolute,
                                     relative_change=relative, minimum_continuous_length=minimum_length,
                                     maximum_gap_samples=1, maximum_gap_length=8.)
@@ -345,7 +344,7 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
             points = line_interpolate_point(axis, stations)
             widths = source.widths_at(points)
             started = time.perf_counter()
-            width_needed = (width_mask(axis, source, target, stations, widths, tolerance, width_config, rank_equal)
+            width_needed = (width_mask(axis, source, target, stations, widths, tolerance, width_config)
                             if side == 'before' and candidate_driven else np.full(count, side == 'before'))
             timing['width_prefilter'] += time.perf_counter()-started
             selected = np.flatnonzero(presence | width_needed) if candidate_driven else np.arange(count)
@@ -508,10 +507,16 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 print(f"[Fast Auto] {side} axes {line_id+1}/{len(source.lines)}", flush=True)
     print(f"[Fast timing] auto_station_sampling={sampling_seconds:.6f}s auto_matching={matching_seconds:.6f}s", flush=True)
     timing['exact_station_sampling'] = sampling_seconds
+    counts['stable_skipped_station_count'] = counts['total_station_count']-counts['candidate_station_count']
+    counts['candidate_ratio'] = counts['candidate_station_count']/max(1, counts['total_station_count'])
+    counts['width_prefilter_seconds'] = timing['width_prefilter']
+    counts['exact_width_measurement_seconds'] = timing['exact_width_measurement']
     counts.update({f'timing_{key}_seconds': value for key, value in timing.items()})
     print('[Fast timing] ' + ' '.join(f'{key}={timing[key]:.6f}s' for key in
           ('presence_prefilter', 'width_prefilter', 'exact_station_sampling', 'exact_width_measurement')) +
-          f" candidate_station_count={counts['candidate_station_count']} total_station_count={counts['total_station_count']}", flush=True)
+          f" candidate_station_count={counts['candidate_station_count']} total_station_count={counts['total_station_count']}" +
+          f" stable_skipped_station_count={counts['stable_skipped_station_count']} candidate_ratio={counts['candidate_ratio']:.6f}" +
+          f" width_prefilter_seconds={timing['width_prefilter']:.6f} exact_width_measurement_seconds={timing['exact_width_measurement']:.6f}", flush=True)
     return records, audit, width_audit, dict(counts)
 
 
@@ -695,7 +700,8 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
                                         min_change_length=min_change_length, elapsed_seconds=elapsed_seconds+time.perf_counter()-started,
                                         changes=changes, diagnostics=diagnostics,
                                         performance={key: value for key, value in counts.items()
-                                                     if key.startswith('timing_') or key.endswith('station_count')})
+                                                     if key.startswith('timing_') or key.endswith('station_count')
+                                                     or key in ('candidate_ratio', 'width_prefilter_seconds', 'exact_width_measurement_seconds')})
 
 
 @timed_stage("auto_preview_export_io")

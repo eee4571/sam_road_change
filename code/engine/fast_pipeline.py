@@ -2419,6 +2419,7 @@ def measure_fast_widths(
     molra_overlap: int = 256,
     molra_threshold: float = 0.5,
     molra_surface_provider=None,
+    model_pool=None,
 ) -> dict:
     if str(WIDTH_ROOT) not in sys.path:
         sys.path.insert(0, str(WIDTH_ROOT))
@@ -2433,7 +2434,8 @@ def measure_fast_widths(
     molra_disabled_reason = ""
     molra_cache_dir = output_dir / "molra_surface_cache"
     molra_probability_cache_dir = output_dir / "molra_probability_cache"
-    for image_path in _raster_paths(image_dir):
+    def prepare_width_image(image_path):
+        nonlocal target_crs, molra_predictor, molra_disabled_reason
         tile_started = time.perf_counter()
         mask_path = surface_dir / f"{image_path.stem}_mask.png"
         centerline_path = surface_dir / f"{image_path.stem}_centerline.png"
@@ -2495,11 +2497,16 @@ def measure_fast_widths(
                             raise FileNotFoundError("Fast MLoRA model paths were not configured")
                         if molra_predictor is None:
                             from molra_centerline_width import MolraSurfacePredictor
-                            molra_predictor = MolraSurfacePredictor(
-                                Path(sam_pretrained_path), Path(molra_weight_path),
-                                device=device, tile=molra_tile, overlap=molra_overlap,
-                                threshold=molra_threshold,
-                            )
+                            def load_predictor():
+                                return MolraSurfacePredictor(
+                                    Path(sam_pretrained_path), Path(molra_weight_path),
+                                    device=device, tile=molra_tile, overlap=molra_overlap,
+                                    threshold=molra_threshold)
+                            from .batch_runtime import resource_key
+                            key = (resource_key(sam_pretrained_path, molra_weight_path),
+                                   str(device), molra_tile, molra_overlap, molra_threshold)
+                            molra_predictor = (model_pool.acquire('molra', key, load_predictor, device)
+                                               if model_pool else load_predictor())
                         molra_probability = molra_predictor.predict_probability(image_path)
                     if molra_probability is not None and molra_probability.shape != binary.shape:
                         raise ValueError(
@@ -2520,6 +2527,15 @@ def measure_fast_widths(
                         RuntimeWarning,
                     )
                     molra_probability = None
+            valid = dataset.dataset_mask() > 0
+            print(f'[Fast batch timing] molra_inference={time.perf_counter()-molra_started:.6f}s molra_cache_hit={int(molra_cache_hit)}', flush=True)
+        return (image_path, tile_started, mask_path, centerline_path, probability_path, topology_path, nodes, edges, binary, transform, pixel_size, map_pixel_size, molra_started, molra_probability_path, molra_surface_path, molra_probability, molra_cache_hit, molra_error, molra_diagnostics, valid)
+
+    from .bounded_pipeline import Prefetch
+    with Prefetch(_raster_paths(image_dir), prepare_width_image, enabled=model_pool is not None) as jobs:
+        for prepared in jobs:
+            (image_path, tile_started, mask_path, centerline_path, probability_path, topology_path, nodes, edges, binary, transform, pixel_size, map_pixel_size, molra_started, molra_probability_path, molra_surface_path, molra_probability, molra_cache_hit, molra_error, molra_diagnostics, valid) = prepared
+            gis_started = time.perf_counter()
             topology_centerline, _topology_edge_count = _rasterize_fast_topology(
                 binary.shape, nodes, edges,
             )
@@ -2581,7 +2597,6 @@ def measure_fast_widths(
                     **common,
                     "geometry": line.buffer(width_px * map_pixel_size / 2.0),
                 })
-            valid = dataset.dataset_mask() > 0
             for mapping, value in shapes(
                 cleaned_surface,
                 mask=(cleaned_surface > 0) & valid,
@@ -2595,106 +2610,108 @@ def measure_fast_widths(
                         "tile": image_path.stem, "source": "final_fast_mask",
                         "exec_prof": "fast", "geometry": geometry,
                     })
-        if probability_path.is_file():
-            target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
-            target_probability.write_bytes(probability_path.read_bytes())
-        centerline_length_px = float(sum(path.length_px for path in final_paths))
-        surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
-        surface_diagnostics = {}
-        if surface_diagnostics_path.is_file():
-            try:
-                surface_diagnostics = json.loads(surface_diagnostics_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                surface_diagnostics = {}
-        tile_summary = {
-            "stem": image_path.stem, "image": str(image_path),
-            "surface_mask": str(mask_path), "centerline_mask": str(centerline_path),
-            "edge_count": int(len(edges)), "path_count": int(len(final_paths)),
-            "final_centerline_path_count": int(len(final_paths)),
-            "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
-            "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
-            "pixel_size": pixel_size,
-            "junction_exclusion_distance_m": float(
-                FAST_JUNCTION_EXCLUSION_DISTANCE_M
-            ),
-            "junction_exclusion_distance_px": float(_fast_length_pixels(
-                FAST_JUNCTION_EXCLUSION_DISTANCE_M, pixel_size,
-            )),
-            "molra_probability": str(molra_probability_path) if molra_probability is not None else "",
-            "molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
-            "enhanced_molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
-            "molra_surface_available": bool(molra_binary is not None),
-            "molra_surface_cache_hit": bool(molra_cache_hit),
-            "molra_surface_seconds": float(molra_seconds),
-            "molra_surface_error": molra_error or molra_disabled_reason,
-            "width_source_counts": {
-                source: sum(str(row.get("width_source", "")) == source for row in width_rows)
-                for source in ("enhanced_molra", "fast_mask_fallback", "neighbor_fallback")
-            },
-            **molra_diagnostics,
-            **centerline_cleanup,
-            **regularization_diagnostics,
-            **surface_cleanup,
-            "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
-            "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
-            "final_mask_pixel_count": int(np.count_nonzero(cleaned_surface)),
-            "final_centerline_length": centerline_length_px * float(pixel_size),
-            "final_centerline_length_px": centerline_length_px,
-            "relative_support_component_count": int(surface_diagnostics.get("relative_support_component_count", 0)),
-            "skeleton_component_count": int(surface_diagnostics.get("skeleton_component_count", 0)),
-            "traced_path_count": int(surface_diagnostics.get("path_count", 0)),
-            "bridged_path_count": int(surface_diagnostics.get("bridged_path_count", 0)),
-            "path_cleanup_removed_count": int(surface_diagnostics.get("path_cleanup_removed_count", 0)),
-            "path_cleanup_isolated_count": int(surface_diagnostics.get("path_cleanup_isolated_count", 0)),
-            "path_cleanup_spur_count": int(surface_diagnostics.get("path_cleanup_spur_count", 0)),
-            "path_cleanup_loop_count": int(surface_diagnostics.get("path_cleanup_loop_count", 0)),
-            "gap_bridge_added_count": int(surface_diagnostics.get("gap_bridge_added_count", 0)),
-            "final_road_surface_count": int(
-                cv2.connectedComponents(cleaned_surface, connectivity=8)[0] - 1
-            ),
-            "fast_mask_elapsed_seconds": float(surface_diagnostics.get("fast_mask_elapsed_seconds", 0.0)),
-            "skeleton_path_processing_seconds": float(surface_diagnostics.get("skeleton_path_processing_seconds", 0.0)),
-            "fast_width_elapsed_seconds": float(time.perf_counter() - tile_started),
-        }
-        enhanced_count = int(tile_summary["width_source_counts"]["enhanced_molra"])
-        tile_summary["enhanced_molra_width_count"] = enhanced_count
-        tile_summary["enhanced_molra_width_ratio"] = float(
-            enhanced_count / max(int(len(final_paths)), 1)
-        )
-        tile_summary["fast_mask_fallback_count"] = int(
-            tile_summary["width_source_counts"]["fast_mask_fallback"]
-        )
-        tile_summary["neighbor_fallback_count"] = int(
-            tile_summary["width_source_counts"]["neighbor_fallback"]
-        )
-        tile_summary["abnormal_width_over_30m_count"] = int(sum(
-            float(row.get("width_units", 0.0)) > 30.0 for row in width_rows
-        ))
-        print(
-            f"[Fast Centerline] {image_path.stem}: "
-            f"paths={tile_summary['final_centerline_path_count']}, "
-            f"length={tile_summary['final_centerline_length']:.3f}, "
-            f"width_sources={tile_summary['width_source_counts']}, "
-            f"molra_pixels={tile_summary['raw_molra_mask_pixel_count']}->"
-            f"{tile_summary['enhanced_molra_surface_pixel_count']}, "
-            f"centerline_coverage={tile_summary['raw_molra_centerline_coverage']:.3f}->"
-            f"{tile_summary['enhanced_molra_centerline_coverage']:.3f}, "
-            f"cleanup=centerline-{tile_summary['removed_centerline_component_count']}"
-            f"/{tile_summary['removed_centerline_length_px']:.1f}px, "
-            f"bridge={tile_summary['bridged_gap_count']}"
-            f"/{tile_summary['bridged_gap_length_px']:.1f}px, "
-            f"regularization={tile_summary['regularization_original_path_count']}->"
-            f"{tile_summary['regularization_final_path_count']} paths/"
-            f"{tile_summary['regularization_intersection_count']} intersections/"
-            f"{tile_summary['regularization_seconds']:.3f}s, "
-            f"surface-{tile_summary['removed_surface_component_count']}"
-            f"/{tile_summary['removed_surface_pixel_count']}px, "
-            f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
-            f"molra={molra_seconds:.3f}s, "
-            f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
-        )
-        image_rows.append(tile_summary)
-        (output_dir / f"{image_path.stem}_summary.json").write_text(json.dumps(tile_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            if probability_path.is_file():
+                target_probability = output_dir / f"{image_path.stem}_centerline_probability.png"
+                target_probability.write_bytes(probability_path.read_bytes())
+            centerline_length_px = float(sum(path.length_px for path in final_paths))
+            surface_diagnostics_path = surface_dir / f"{image_path.stem}_fast_surface.json"
+            surface_diagnostics = {}
+            if surface_diagnostics_path.is_file():
+                try:
+                    surface_diagnostics = json.loads(surface_diagnostics_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    surface_diagnostics = {}
+            tile_summary = {
+                "stem": image_path.stem, "image": str(image_path),
+                "surface_mask": str(mask_path), "centerline_mask": str(centerline_path),
+                "edge_count": int(len(edges)), "path_count": int(len(final_paths)),
+                "final_centerline_path_count": int(len(final_paths)),
+                "measured_edge_count": sum(float(row["width_units"]) > 0 for row in width_rows),
+                "measured_path_count": sum(float(row["width_units"]) > 0 for row in width_rows),
+                "pixel_size": pixel_size,
+                "junction_exclusion_distance_m": float(
+                    FAST_JUNCTION_EXCLUSION_DISTANCE_M
+                ),
+                "junction_exclusion_distance_px": float(_fast_length_pixels(
+                    FAST_JUNCTION_EXCLUSION_DISTANCE_M, pixel_size,
+                )),
+                "molra_probability": str(molra_probability_path) if molra_probability is not None else "",
+                "molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
+                "enhanced_molra_surface_mask": str(molra_surface_path) if molra_binary is not None else "",
+                "molra_surface_available": bool(molra_binary is not None),
+                "molra_surface_cache_hit": bool(molra_cache_hit),
+                "molra_surface_seconds": float(molra_seconds),
+                "molra_surface_error": molra_error or molra_disabled_reason,
+                "width_source_counts": {
+                    source: sum(str(row.get("width_source", "")) == source for row in width_rows)
+                    for source in ("enhanced_molra", "fast_mask_fallback", "neighbor_fallback")
+                },
+                **molra_diagnostics,
+                **centerline_cleanup,
+                **regularization_diagnostics,
+                **surface_cleanup,
+                "raw_high_probability_pixel_count": int(surface_diagnostics.get("raw_high_probability_pixel_count", 0)),
+                "relative_added_pixel_count": int(surface_diagnostics.get("relative_added_pixel_count", 0)),
+                "final_mask_pixel_count": int(np.count_nonzero(cleaned_surface)),
+                "final_centerline_length": centerline_length_px * float(pixel_size),
+                "final_centerline_length_px": centerline_length_px,
+                "relative_support_component_count": int(surface_diagnostics.get("relative_support_component_count", 0)),
+                "skeleton_component_count": int(surface_diagnostics.get("skeleton_component_count", 0)),
+                "traced_path_count": int(surface_diagnostics.get("path_count", 0)),
+                "bridged_path_count": int(surface_diagnostics.get("bridged_path_count", 0)),
+                "path_cleanup_removed_count": int(surface_diagnostics.get("path_cleanup_removed_count", 0)),
+                "path_cleanup_isolated_count": int(surface_diagnostics.get("path_cleanup_isolated_count", 0)),
+                "path_cleanup_spur_count": int(surface_diagnostics.get("path_cleanup_spur_count", 0)),
+                "path_cleanup_loop_count": int(surface_diagnostics.get("path_cleanup_loop_count", 0)),
+                "gap_bridge_added_count": int(surface_diagnostics.get("gap_bridge_added_count", 0)),
+                "final_road_surface_count": int(
+                    cv2.connectedComponents(cleaned_surface, connectivity=8)[0] - 1
+                ),
+                "fast_mask_elapsed_seconds": float(surface_diagnostics.get("fast_mask_elapsed_seconds", 0.0)),
+                "skeleton_path_processing_seconds": float(surface_diagnostics.get("skeleton_path_processing_seconds", 0.0)),
+                "fast_width_elapsed_seconds": float(time.perf_counter() - tile_started),
+            }
+            enhanced_count = int(tile_summary["width_source_counts"]["enhanced_molra"])
+            tile_summary["enhanced_molra_width_count"] = enhanced_count
+            tile_summary["enhanced_molra_width_ratio"] = float(
+                enhanced_count / max(int(len(final_paths)), 1)
+            )
+            tile_summary["fast_mask_fallback_count"] = int(
+                tile_summary["width_source_counts"]["fast_mask_fallback"]
+            )
+            tile_summary["neighbor_fallback_count"] = int(
+                tile_summary["width_source_counts"]["neighbor_fallback"]
+            )
+            tile_summary["abnormal_width_over_30m_count"] = int(sum(
+                float(row.get("width_units", 0.0)) > 30.0 for row in width_rows
+            ))
+            print(
+                f"[Fast Centerline] {image_path.stem}: "
+                f"paths={tile_summary['final_centerline_path_count']}, "
+                f"length={tile_summary['final_centerline_length']:.3f}, "
+                f"width_sources={tile_summary['width_source_counts']}, "
+                f"molra_pixels={tile_summary['raw_molra_mask_pixel_count']}->"
+                f"{tile_summary['enhanced_molra_surface_pixel_count']}, "
+                f"centerline_coverage={tile_summary['raw_molra_centerline_coverage']:.3f}->"
+                f"{tile_summary['enhanced_molra_centerline_coverage']:.3f}, "
+                f"cleanup=centerline-{tile_summary['removed_centerline_component_count']}"
+                f"/{tile_summary['removed_centerline_length_px']:.1f}px, "
+                f"bridge={tile_summary['bridged_gap_count']}"
+                f"/{tile_summary['bridged_gap_length_px']:.1f}px, "
+                f"regularization={tile_summary['regularization_original_path_count']}->"
+                f"{tile_summary['regularization_final_path_count']} paths/"
+                f"{tile_summary['regularization_intersection_count']} intersections/"
+                f"{tile_summary['regularization_seconds']:.3f}s, "
+                f"surface-{tile_summary['removed_surface_component_count']}"
+                f"/{tile_summary['removed_surface_pixel_count']}px, "
+                f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
+                f"molra={molra_seconds:.3f}s, "
+                f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
+            )
+            image_rows.append(tile_summary)
+            (output_dir / f"{image_path.stem}_summary.json").write_text(json.dumps(tile_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            print(f'[Fast batch timing] width_gis={time.perf_counter()-gis_started:.6f}s', flush=True)
 
     if target_crs is None:
         raise RuntimeError("Fast width received no georeferenced images")
@@ -6730,8 +6747,8 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main() -> int:
-    args = parser().parse_args()
+def main(argv=None, *, model_pool=None) -> int:
+    args = parser().parse_args(argv)
     if args.command == "surface":
         build_fast_surfaces(Path(args.image_dir), Path(args.probability_dir), Path(args.output_dir))
     elif args.command == "width":
@@ -6744,6 +6761,7 @@ def main() -> int:
             molra_tile=int(args.molra_tile),
             molra_overlap=int(args.molra_overlap),
             molra_threshold=float(args.molra_threshold),
+            model_pool=model_pool,
         )
     else:
         validation = Path(args.validation_area) if str(args.validation_area).strip() else None
