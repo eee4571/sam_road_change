@@ -23,6 +23,7 @@ def main():
     parser.add_argument('label')
     parser.add_argument('--no-profile', action='store_true')
     parser.add_argument('--source', type=Path)
+    parser.add_argument('--probability-probe', choices=('trace','detailed'))
     args = parser.parse_args()
     output = args.job / '_profiling' / 'auto_pair'
     output.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,9 @@ def main():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if args.probability_probe:
+        import probability_probe
+        probability_probe.install(module, detailed=args.probability_probe=='detailed')
     # cProfile only observes its own thread. Capture the two surface workers
     # separately so a threaded hot path cannot disappear from hotspot reports.
     worker_profiles = []
@@ -101,6 +105,7 @@ def main():
         # preparation block; attribute it to the same phase as old versions.
         module.phases['axis_preparation'] += result[3]['timing_axis_surface_wait_seconds']
     assert identities == [scene_key(p, crs) for p in payloads], 'Inputs changed during profiling'
+    probability_stats = probability_probe.reports(scenes) if args.probability_probe else None
     for scene in scenes:
         close_scene(scene)
     with (output/f'{args.label}_results.pkl').open('wb') as f:
@@ -117,8 +122,10 @@ def main():
                    source_sha256=source_hash,inputs=identities,
                    pair=[pair['before_period'],pair['after_period']],counts=result[3],
                    functions=sorted(stats,key=lambda row:row['cumulative_seconds'],reverse=True))
+    if probability_stats is not None:
+        summary['probability'] = probability_stats
     (output/f'{args.label}.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-    print(json.dumps({k:v for k,v in summary.items() if k not in ('functions','inputs')},ensure_ascii=False),flush=True)
+    print(json.dumps({k:v for k,v in summary.items() if k not in ('functions','inputs','probability')},ensure_ascii=False),flush=True)
 
 
 if __name__ == '__main__':

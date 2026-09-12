@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import pickle
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -17,9 +18,13 @@ def canonical(value):
     if isinstance(value, (list, tuple)):
         return [canonical(v) for v in value]
     if isinstance(value, np.ndarray):
-        return canonical(value.tolist())
+        if value.dtype.hasobject:
+            return {'__array__': value.dtype.str, 'shape': value.shape, 'values': canonical(value.tolist())}
+        return {'__array__': value.dtype.str, 'shape': value.shape, 'bytes': value.tobytes().hex()}
     if isinstance(value, np.generic):
-        return canonical(value.item())
+        return {'__scalar__': value.dtype.str, 'bytes': value.tobytes().hex()}
+    if isinstance(value, float):
+        return {'__float64__': struct.pack('<d', value).hex()}
     return value
 
 
@@ -50,6 +55,26 @@ def main():
     report['elapsed_seconds'] = [s['elapsed_seconds'] for s in summaries]
     report['phases'] = [s['phases'] for s in summaries]
     report['all_equal'] = report['counts_equal'] and all(report[k]['exact_equal'] for k in ('candidates','station_audit','width_audit','presence_audit'))
+    if all('probability' in s for s in summaries):
+        assert len(summaries[0]['probability']) == len(summaries[1]['probability']), 'Probability scene counts differ'
+        probability = []
+        for old, new in zip(summaries[0]['probability'], summaries[1]['probability']):
+            checks = {
+                'sampling_coordinates_and_values_exact': old['sample_sha256']==new['sample_sha256'],
+                'sample_count_equal': old['counts']['sample_count']==new['counts']['sample_count'],
+                'values_at_calls_equal': old['counts']['values_at_calls']==new['counts']['values_at_calls'],
+                'cache_access_order_exact': old['cache_access_sha256']==new['cache_access_sha256'],
+                'final_lru_order_exact': old['final_lru_sha256']==new['final_lru_sha256'],
+                'final_cache_bytes_equal': old['final_cache_bytes']==new['final_cache_bytes'],
+                'cache_hit_miss_eviction_equal': all(old['counts'].get(k,0)==new['counts'].get(k,0)
+                                                     for k in ('cache_hit','cache_miss','cache_eviction')),
+                'all_probability_non_timing_stats_equal': all(old[k]==new[k] for k in (
+                    'counts', 'blocks_per_call', 'unique_blocks', 'block_accesses',
+                    'repeated_accesses', 'grid')),
+            }
+            probability.append(checks)
+        report['probability'] = probability
+        report['all_equal'] = report['all_equal'] and all(all(c.values()) for c in probability)
     path=args.directory/f'{args.before}_vs_{args.after}.json'
     path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(report,ensure_ascii=False,indent=2))

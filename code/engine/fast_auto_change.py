@@ -92,23 +92,47 @@ class WindowedProbability(RoadProbabilityRaster):
             return result
         rr, cc = rows[inside], cols[inside]
         if self._ram is not None:
-            picked = self._ram[rr, cc].astype(float).filled(np.nan)
+            picked = self._gather_pixels(self._ram, rr, cc)
         else:
             height, width = self._block_shape
             block_rows, block_cols = rr//height, cc//width
             if (block_rows == block_rows[0]).all() and (block_cols == block_cols[0]).all():
                 br, bc = int(block_rows[0]), int(block_cols[0])
                 values = self._cached_block(br, bc)
-                picked = values[rr-br*height, cc-bc*width].astype(float).filled(np.nan)
+                picked = self._gather_pixels(values, rr-br*height, cc-bc*width)
             else:
-                unique, groups = np.unique(np.column_stack((block_rows, block_cols)), axis=0, return_inverse=True)
+                # Integer IDs have the same lexicographic (row, col) order as
+                # unique(axis=0). Stable sorting also preserves the input pixel
+                # order within each block, without scanning all pixels per block.
+                column_count = (self.dataset.width + width - 1)//width
+                block_ids = block_rows.astype(np.int64)*column_count + block_cols
+                order = np.argsort(block_ids, kind="stable")
+                ordered_ids = block_ids[order]
+                starts = np.r_[0, np.flatnonzero(ordered_ids[1:] != ordered_ids[:-1])+1]
+                stops = np.r_[starts[1:], len(order)]
+                unique_ids = ordered_ids[starts]
+                unique = np.column_stack((unique_ids//column_count, unique_ids % column_count))
                 picked = np.full(rr.shape, np.nan)
-                for group, (br, bc) in enumerate(unique):
+                for (br, bc), start, stop in zip(unique, starts, stops):
                     values = self._cached_block(int(br), int(bc))
-                    take = groups == group
-                    picked[take] = values[rr[take]-br*height, cc[take]-bc*width].astype(float).filled(np.nan)
+                    take = order[start:stop]
+                    picked[take] = self._gather_pixels(values, rr[take]-br*height, cc[take]-bc*width)
         result[inside] = picked / self.divisor
         return result
+
+    @staticmethod
+    def _gather_pixels(values, rows, cols):
+        # Gather the unchanged native pixels before converting to float, just as
+        # MaskedArray indexing/astype/filled does, without creating masked-array
+        # views and copying their metadata for every block. Keep cached blocks
+        # in their original dtype and preserve their exact mask and byte budget.
+        picked = values.data[rows, cols].astype(float)
+        mask = values.mask
+        if np.ndim(mask):
+            picked[mask[rows, cols]] = np.nan
+        elif mask:
+            picked[...] = np.nan
+        return picked
 
     def _cached_block(self, br, bc):
         key = (br, bc)
