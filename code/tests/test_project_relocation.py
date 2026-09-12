@@ -179,6 +179,44 @@ class ProjectRelocationTests(unittest.TestCase):
         self.assertEqual(listing.read_text(encoding="utf-8-sig"), original)
         self.assertFalse(listing.with_name(listing.name + BACKUP_SUFFIX).exists())
 
+    def test_fast_cache_reference_is_preserved_and_relocated_by_full_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / 'current'
+            job = project / '_work/tasks/runs/run'
+            listing = job / 'grids/g/periods/2022/batches/grid_tiles.txt'
+            listing.parent.mkdir(parents=True)
+            cache = project / '_work/cache/normalized/2022/key'
+            cache.mkdir(parents=True)
+            image = cache / 'v0001.tif'
+            image.write_bytes(b'image')
+            original = str(image.resolve()) + '\n'
+            listing.write_text(original, encoding='utf-8-sig')
+            result = repair_task_batch_lists(job)
+            self.assertEqual(result.modified_paths, 0)
+            self.assertEqual(listing.read_text(encoding='utf-8-sig'), original)
+            listing.write_text('Z:\\old-project\\_work\\cache\\normalized\\2022\\key\\v0001.tif\n', encoding='utf-8-sig')
+            self.assertEqual(repair_task_batch_lists(job).modified_paths, 1)
+            self.assertEqual(listing.read_text(encoding='utf-8-sig'), original)
+            self.assertEqual(repair_task_batch_lists(job).modified_paths, 0)
+
+    def test_cache_missing_never_uses_external_project_or_other_cache_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            job = base / 'current/_work/tasks/runs/run'
+            listing = job / 'grids/g/periods/2022/batches/grid_tiles.txt'
+            listing.parent.mkdir(parents=True)
+            external = base / 'other/_work/cache/normalized/2022/key/v0001.tif'
+            external.parent.mkdir(parents=True)
+            external.write_bytes(b'external')
+            wrong = base / 'current/_work/cache/normalized/2022/wrong-key/v0001.tif'
+            wrong.parent.mkdir(parents=True)
+            wrong.write_bytes(b'wrong')
+            original = str(external.resolve())+'\n'
+            listing.write_text(original, encoding='utf-8-sig')
+            with self.assertRaises(FileNotFoundError):
+                repair_task_batch_lists(job)
+            self.assertEqual(listing.read_text(encoding='utf-8-sig'), original)
+
     def test_gui_preview_reports_frozen_period_and_legacy_slice_candidate_read_only(self):
         temporary, state, state_path, project, output, job, _old_project, old_job = self.fixture()
         self.addCleanup(temporary.cleanup)

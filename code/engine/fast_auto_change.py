@@ -374,6 +374,29 @@ def _axis_surface_coverage(axis, support, starts, ends, cells, cell_lengths):
 
 def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, minimum_length=24., minimum_area=4.,
                    presence_audit=None, candidate_driven=True):
+    """Analyze in original order, with bounded parallel axis-surface preparation."""
+    from concurrent.futures import ThreadPoolExecutor
+    # GEOS overlay/buffer releases the GIL. These two jobs read independent
+    # scenes, never touch raster contexts, and finish before station decisions.
+    # Scope the pool to this call so failures also join all work and release it.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='auto-axis-surface') as surface_pool:
+        return _analyze_scenes(before, after, tolerance=tolerance, absolute=absolute, relative=relative,
+                               minimum_length=minimum_length, minimum_area=minimum_area,
+                               presence_audit=presence_audit, candidate_driven=candidate_driven,
+                               surface_pool=surface_pool)
+
+
+def _prepare_axis_surface(scene, axis, tolerance):
+    started = time.perf_counter()
+    surface = scene.surface(axis)
+    clipped_seconds = time.perf_counter()-started
+    started = time.perf_counter()
+    support = surface.buffer(tolerance)
+    return surface, support, clipped_seconds, time.perf_counter()-started
+
+
+def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_length, minimum_area,
+                    presence_audit, candidate_driven, surface_pool):
     """Plan candidate cells before sampling; retain exact paired-width decisions.
 
     candidate_driven=False is a full-station verification path for regression
@@ -415,11 +438,22 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
                 counts.update({f'{change_type}_source_axes': 1, f'{change_type}_uncovered_intervals': 0})
                 continue
             sampling_started = time.perf_counter()
-            source_surface, target_surface = source.surface(axis), target.surface(axis)
-            source_support, target_support = source_surface.buffer(tolerance), target_surface.buffer(tolerance)
+            surface_started = time.perf_counter()
+            source_job = surface_pool.submit(_prepare_axis_surface, source, axis, tolerance)
+            target_job = surface_pool.submit(_prepare_axis_surface, target, axis, tolerance)
             width_surfaces = None
+            cells_started = time.perf_counter()
             normals = _normals(axis, stations)
             cells = {index: substring(axis, index*spacing, (index+1)*spacing) for index in selected}
+            timing['axis_cell_construction'] += time.perf_counter()-cells_started
+            wait_started = time.perf_counter()
+            source_surface, source_support, source_clip_seconds, source_buffer_seconds = source_job.result()
+            target_surface, target_support, target_clip_seconds, target_buffer_seconds = target_job.result()
+            timing['axis_surface_wait'] += time.perf_counter()-wait_started
+            timing['axis_surface_preparation_wall'] += time.perf_counter()-surface_started
+            # Worker elapsed sums overlap; do not add them to main-loop wall time.
+            timing['axis_surface_clip_worker_sum'] += source_clip_seconds+target_clip_seconds
+            timing['axis_surface_buffer_worker_sum'] += source_buffer_seconds+target_buffer_seconds
             geometry_started = time.perf_counter()
             cell_array = np.asarray(list(cells.values()),dtype=object)
             cell_lengths = length(cell_array)
@@ -597,7 +631,9 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
     counts['exact_width_measurement_seconds'] = timing['exact_width_measurement']
     counts.update({f'timing_{key}_seconds': value for key, value in timing.items()})
     print('[Fast timing] ' + ' '.join(f'{key}={timing[key]:.6f}s' for key in
-          ('presence_prefilter', 'width_prefilter', 'station_geometry', 'station_surface_coverage', 'station_probability', 'exact_station_sampling', 'exact_width_measurement')) +
+          ('presence_prefilter', 'width_prefilter', 'axis_cell_construction', 'axis_surface_wait',
+           'axis_surface_preparation_wall', 'axis_surface_clip_worker_sum', 'axis_surface_buffer_worker_sum',
+           'station_geometry', 'station_surface_coverage', 'station_probability', 'exact_station_sampling', 'exact_width_measurement')) +
           f" candidate_station_count={counts['candidate_station_count']} total_station_count={counts['total_station_count']}" +
           f" stable_skipped_station_count={counts['stable_skipped_station_count']} candidate_ratio={counts['candidate_ratio']:.6f}" +
           f" width_prefilter_seconds={timing['width_prefilter']:.6f} exact_width_measurement_seconds={timing['exact_width_measurement']:.6f}", flush=True)
