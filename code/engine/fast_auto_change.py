@@ -46,6 +46,9 @@ def _parts(geometry):
 class WindowedProbability(RoadProbabilityRaster):
     """Metric sampling of a georeferenced raster, including geographic rasters."""
 
+    _STRIP_READ_BATCH = 32
+    _STRIP_READ_MAX_BYTES = 1024*1024
+
     def __init__(self, path, metric_crs, *, ram_limit_bytes=128*1024*1024, cache_limit_bytes=64*1024*1024):
         self.dataset = rasterio.open(path)
         self.crs = CRS.from_user_input(self.dataset.crs)
@@ -113,10 +116,13 @@ class WindowedProbability(RoadProbabilityRaster):
                 unique_ids = ordered_ids[starts]
                 unique = np.column_stack((unique_ids//column_count, unique_ids % column_count))
                 picked = np.full(rr.shape, np.nan)
-                for (br, bc), start, stop in zip(unique, starts, stops):
-                    values = self._cached_block(int(br), int(bc))
-                    take = order[start:stop]
-                    picked[take] = self._gather_pixels(values, rr[take]-br*height, cc[take]-bc*width)
+                blocks = self._cached_blocks(unique)
+                try:
+                    for (br, bc), start, stop, values in zip(unique, starts, stops, blocks):
+                        take = order[start:stop]
+                        picked[take] = self._gather_pixels(values, rr[take]-br*height, cc[take]-bc*width)
+                finally:
+                    blocks.close()
         result[inside] = picked / self.divisor
         return result
 
@@ -134,14 +140,53 @@ class WindowedProbability(RoadProbabilityRaster):
             picked[...] = np.nan
         return picked
 
-    def _cached_block(self, br, bc):
+    def _cached_blocks(self, unique):
+        """Read only consecutive requested misses; consume the original LRU order."""
+        height, width = self._block_shape
+        block_bytes = height*width*(np.dtype(self.dataset.dtypes[0]).itemsize+1)
+        batch_limit = min(self._STRIP_READ_BATCH, max(1, self._STRIP_READ_MAX_BYTES//block_bytes))
+        index, count = 0, len(unique)
+        batch = None
+        try:
+            while index < count:
+                br, bc = map(int, unique[index])
+                stop = index+1
+                if width == self.dataset.width and bc == 0 and batch_limit > 1 and (br, bc) not in self._blocks:
+                    # Stop at a currently cached block, even if preceding inserts
+                    # might later evict it. Never speculate across a hit or gap.
+                    while stop < min(count, index+batch_limit):
+                        nr, nc = map(int, unique[stop])
+                        if nr != br+stop-index or nc != bc or (nr, nc) in self._blocks:
+                            break
+                        stop += 1
+                if stop > index+1:
+                    batch = self.dataset.read(1, window=rasterio.windows.Window(
+                        0, br*height, width, min((stop-index)*height, self.dataset.height-br*height)), masked=True)
+                    for offset in range(stop-index):
+                        # Own each block's data/mask: an evicted slice must not
+                        # keep the whole read buffer alive in another cache entry.
+                        block = batch[offset*height:(offset+1)*height].copy()
+                        if index+offset+1 == stop:
+                            batch = None
+                        yield self._cached_block(br+offset, bc, loaded=block)
+                        block = None
+                else:
+                    yield self._cached_block(br, bc)
+                index = stop
+        finally:
+            batch = None
+
+    def _cached_block(self, br, bc, *, loaded=None):
         key = (br, bc)
         values = self._blocks.pop(key, None)
         if values is None:
-            height, width = self._block_shape
-            values = self.dataset.read(1, window=rasterio.windows.Window(
-                bc*width, br*height, min(width, self.dataset.width-bc*width),
-                min(height, self.dataset.height-br*height)), masked=True)
+            if loaded is None:
+                height, width = self._block_shape
+                values = self.dataset.read(1, window=rasterio.windows.Window(
+                    bc*width, br*height, min(width, self.dataset.width-bc*width),
+                    min(height, self.dataset.height-br*height)), masked=True)
+            else:
+                values = loaded
             self._cache_bytes += values.data.nbytes + np.ma.getmaskarray(values).nbytes
         self._blocks[key] = values
         while self._cache_bytes > self._cache_limit and self._blocks:

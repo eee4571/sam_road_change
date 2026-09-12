@@ -72,6 +72,9 @@ def main():
                     'counts', 'blocks_per_call', 'unique_blocks', 'block_accesses',
                     'repeated_accesses', 'grid')),
             }
+            if 'raster_io' in old and 'raster_io' in new:
+                checks['every_logical_hit_miss_exact'] = (
+                    old['raster_io']['miss_trace_sha256'] == new['raster_io']['miss_trace_sha256'])
             probability.append(checks)
         report['probability'] = probability
         report['all_equal'] = report['all_equal'] and all(all(c.values()) for c in probability)

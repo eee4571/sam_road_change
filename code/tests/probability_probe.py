@@ -11,13 +11,17 @@ import numpy as np
 
 
 class ProbabilityProbe:
-    def __init__(self):
+    def __init__(self, *, raster_io=False):
         self.seconds = Counter()
         self.counts = Counter()
         self.blocks_per_call = Counter()
         self.block_visits = Counter()
         self.samples = hashlib.sha256()
         self.accesses = hashlib.sha256()
+        self.miss_events = bytearray() if raster_io else None
+        self.io_counts = Counter()
+        self.io_seconds = 0.
+        self.io_windows = hashlib.sha256()
 
     def blocks(self, br, bc):
         for a, b in zip(br, bc):
@@ -32,12 +36,36 @@ class ProbabilityProbe:
             self.samples.update(array.tobytes())
 
     def report(self):
-        return dict(seconds=dict(self.seconds), counts=dict(self.counts),
+        result = dict(seconds=dict(self.seconds), counts=dict(self.counts),
                     blocks_per_call={str(k):v for k,v in sorted(self.blocks_per_call.items())},
                     unique_blocks=len(self.block_visits),
                     block_accesses={f'{r},{c}':n for (r,c),n in sorted(self.block_visits.items())},
                     repeated_accesses=sum(max(0,n-1) for n in self.block_visits.values()),
                     sample_sha256=self.samples.hexdigest(), cache_access_sha256=self.accesses.hexdigest())
+        if self.miss_events is not None:
+            result['raster_io'] = dict(self.io_counts, read_seconds=self.io_seconds,
+                                      window_sha256=self.io_windows.hexdigest(),
+                                      miss_trace_sha256=hashlib.sha256(self.miss_events).hexdigest())
+        return result
+
+
+class _RasterIOProbe:
+    """Count actual sampling I/O separately from logical cache misses."""
+    def __init__(self, dataset, probe):
+        self.dataset, self.probe = dataset, probe
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def read(self, *args, **kwargs):
+        started = time.perf_counter()
+        values = self.dataset.read(*args, **kwargs)
+        self.probe.io_seconds += time.perf_counter()-started
+        self.probe.io_counts['read_count'] += 1
+        self.probe.io_counts['max_read_bytes'] = max(self.probe.io_counts['max_read_bytes'],
+                                                    values.data.nbytes + np.ma.getmaskarray(values).nbytes)
+        self.probe.io_windows.update(repr(kwargs.get('window')).encode())
+        return values
 
 
 def _instrument(function, replacements, globals_):
@@ -51,14 +79,16 @@ def _instrument(function, replacements, globals_):
     return namespace[function.__name__]
 
 
-def install(module, *, detailed=False):
+def install(module, *, detailed=False, raster_io=False):
     cls = module.WindowedProbability
     original_init, original_values = cls.__init__, cls._values_at
     original_cached = cls._cached_block
 
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        self._probability_probe = ProbabilityProbe()
+        self._probability_probe = ProbabilityProbe(raster_io=raster_io)
+        if raster_io:
+            self.dataset = _RasterIOProbe(self.dataset, self._probability_probe)
     cls.__init__ = init
 
     if detailed:
@@ -79,9 +109,9 @@ def install(module, *, detailed=False):
         single_gather = gather_statement(
             '            picked = values[rr-br*height, cc-bc*width].astype(float).filled(np.nan)',
             '            picked = self._gather_pixels(values, rr-br*height, cc-bc*width)')
-        group_gather = gather_statement(
-            '                picked[take] = values[rr[take]-br*height, cc[take]-bc*width].astype(float).filled(np.nan)',
-            '                picked[take] = self._gather_pixels(values, rr[take]-br*height, cc[take]-bc*width)')
+        group_gather = next(line for line in values_source.splitlines()
+                            if line.lstrip().startswith('picked[take] = '))
+        group_indent = group_gather[:len(group_gather)-len(group_gather.lstrip())]
         grouping_start = gather_statement(
             '            unique, groups = np.unique',
             '            column_count = (self.dataset.width + width - 1)//width')
@@ -97,17 +127,25 @@ def install(module, *, detailed=False):
             ('            values = self._cached_block(br, bc)', "            tick = time.perf_counter()\n            values = self._cached_block(br, bc)\n"+stage('cache_dispatch', '            ').rstrip()),
             (grouping_start, "            tick = time.perf_counter()\n"+grouping_start),
             ('            picked = np.full(rr.shape, np.nan)', stage('block_group_unique', '            ')+"            probe.blocks(unique[:,0], unique[:,1])\n            picked = np.full(rr.shape, np.nan)"),
-            ('                values = self._cached_block(int(br), int(bc))', "                tick = time.perf_counter()\n                values = self._cached_block(int(br), int(bc))\n"+stage('cache_dispatch', '                ').rstrip()),
-            (group_gather, group_gather+"\n                probe.seconds['gather_groups'] += time.perf_counter()-tick"),
+            (group_gather, group_gather+f"\n{group_indent}probe.seconds['gather_groups'] += time.perf_counter()-tick\n{group_indent}tick = time.perf_counter()"),
             ('    result[inside] = picked / self.divisor', "    tick = time.perf_counter()\n    result[inside] = picked / self.divisor\n    probe.seconds['refill_divisor'] += time.perf_counter()-tick"),
             (ram_gather, ram_gather+"\n        probe.seconds['gather_ram'] += time.perf_counter()-tick"),
             (single_gather, single_gather+"\n            probe.seconds['gather_single'] += time.perf_counter()-tick"),
         ]
+        if 'blocks = self._cached_blocks(unique)' in values_source:
+            # Iterator advancement includes the batched read/copy and unchanged
+            # logical cache operations. Do not mislabel that aggregate as I/O.
+            loop = next(line for line in values_source.splitlines()
+                        if ' in zip(unique, starts, stops, blocks):' in line)
+            loop_indent = loop[:len(loop)-len(loop.lstrip())]
+            replacements.append((loop, loop_indent+'tick = time.perf_counter()\n'+loop+'\n'+stage('cache_dispatch', group_indent).rstrip()))
+        else:
+            replacements.append(('                values = self._cached_block(int(br), int(bc))', "                tick = time.perf_counter()\n                values = self._cached_block(int(br), int(bc))\n"+stage('cache_dispatch', '                ').rstrip()))
         sampled = _instrument(original_values, replacements, module.__dict__)
         cached_replacements = [
             ('    key = (br, bc)', '    probe = self._probability_probe\n    tick = time.perf_counter()\n    key = (br, bc)'),
             ('    if values is None:', stage('cache_lookup')+"    if values is None:\n        probe.counts['cache_miss'] += 1"),
-            ('        self._cache_bytes +=', "        probe.seconds['rasterio_read'] += time.perf_counter()-tick\n        tick = time.perf_counter()\n        self._cache_bytes +="),
+            ('        self._cache_bytes +=', "        probe.seconds['cache_miss_data'] += time.perf_counter()-tick\n        tick = time.perf_counter()\n        self._cache_bytes +="),
             ('    self._blocks[key] = values', "    else:\n        probe.counts['cache_hit'] += 1\n        probe.seconds['cache_hit'] += time.perf_counter()-tick\n        tick = time.perf_counter()\n    self._blocks[key] = values"),
             ('    while self._cache_bytes >', stage('cache_account_insert')+'    while self._cache_bytes >'),
             ('        _, old = self._blocks.popitem(last=False)', "        probe.counts['cache_eviction'] += 1\n        _, old = self._blocks.popitem(last=False)"),
@@ -118,6 +156,9 @@ def install(module, *, detailed=False):
         sampled, cached = original_values, original_cached
 
     def values_at(self, x, y):
+        if raster_io:
+            # A run cannot cross a sampling-call boundary or read future axes.
+            self._probability_probe.miss_events.extend(struct.pack('<ii?', -1, -1, False))
         count_before = self._probability_probe.counts['cached_block_calls']
         started = time.perf_counter()
         result = sampled(self, x, y)
@@ -126,15 +167,17 @@ def install(module, *, detailed=False):
         self._probability_probe.record(x, y, result)
         return result
 
-    def cached_block(self, br, bc):
+    def cached_block(self, br, bc, **kwargs):
         probe = self._probability_probe
         miss = (br,bc) not in self._blocks
+        if raster_io:
+            probe.miss_events.extend(struct.pack('<ii?', int(br), int(bc), miss))
         started = time.perf_counter()
         if not detailed:
             probe.counts['cache_miss' if miss else 'cache_hit'] += 1
             probe.block_visits[(br,bc)] += 1
             size = len(self._blocks)
-        values = cached(self, br, bc)
+        values = cached(self, br, bc, **kwargs)
         if not detailed:
             probe.counts['cache_eviction'] += max(0,size+int(miss)-len(self._blocks))
         elapsed = time.perf_counter()-started

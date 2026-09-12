@@ -2,8 +2,10 @@
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+import gc
 import tempfile
 import unittest
+import weakref
 
 import numpy as np
 from pyproj import Transformer
@@ -67,9 +69,12 @@ class _OriginalProbability(WindowedProbability):
 
 
 class _RecordingDataset:
-    def __init__(self, dataset):
+    def __init__(self, dataset, *, retain_arrays=False):
         self.dataset = dataset
         self.reads = []
+        self.arrays = []
+        self.array_refs = []
+        self.retain_arrays = retain_arrays
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -78,11 +83,30 @@ class _RecordingDataset:
         window = kwargs.get("window")
         self.reads.append((args, None if window is None else tuple(window.flatten()),
                            kwargs.get("masked"), kwargs.get("out_shape")))
-        return self.dataset.read(*args, **kwargs)
+        result = self.dataset.read(*args, **kwargs)
+        self.array_refs.append(weakref.ref(result))
+        if self.retain_arrays:
+            self.arrays.append(result)
+        return result
+
+
+def _record_logical_cache(sampler):
+    original = sampler._cached_block
+    sampler.cache_events = []
+
+    def cached(br, bc, **kwargs):
+        key = (br, bc)
+        miss = key not in sampler._blocks
+        old_size = len(sampler._blocks)
+        result = original(br, bc, **kwargs)
+        evictions = max(0, old_size+int(miss)-len(sampler._blocks))
+        sampler.cache_events.append((key, miss, evictions, tuple(sampler._blocks), sampler._cache_bytes))
+        return result
+    sampler._cached_block = cached
 
 
 @contextmanager
-def _probe_on_reference(*, detailed, base=_OriginalProbability):
+def _probe_on_reference(*, detailed, base=_OriginalProbability, raster_io=False):
     """Probe monkeypatches must not leak to the production class or other tests."""
     class Reference(base):
         pass
@@ -91,7 +115,7 @@ def _probe_on_reference(*, detailed, base=_OriginalProbability):
     originals = {name: getattr(Reference, name)
                  for name in ("__init__", "_values_at", "_cached_block")}
     try:
-        install(module, detailed=detailed)
+        install(module, detailed=detailed, raster_io=raster_io)
         yield Reference
     finally:
         for name, function in originals.items():
@@ -100,7 +124,7 @@ def _probe_on_reference(*, detailed, base=_OriginalProbability):
 
 class ProbabilityExactTests(unittest.TestCase):
     def _raster(self, root, *, dtype="uint8", nodata=None, explicit_mask=False,
-                transform=None, crs=32650, strip=False):
+                transform=None, crs=32650, strip=False, strip_height=1):
         path = Path(root)/"probability.tif"
         data = (np.arange(35*39).reshape(35, 39) % 251).astype(dtype)
         if np.issubdtype(data.dtype, np.floating):
@@ -110,7 +134,7 @@ class ProbabilityExactTests(unittest.TestCase):
             data[3:7, 4:10] = nodata
         if transform is None:
             transform = from_origin(500000, 3500000, 1, 1)
-        blocks = dict(tiled=False, blockysize=1) if strip else dict(tiled=True, blockxsize=16, blockysize=16)
+        blocks = dict(tiled=False, blockysize=strip_height) if strip else dict(tiled=True, blockxsize=16, blockysize=16)
         with rasterio.open(path, "w", driver="GTiff", width=39, height=35,
                            count=1, dtype=dtype, nodata=nodata, crs=crs,
                            transform=transform, **blocks) as dataset:
@@ -137,7 +161,30 @@ class ProbabilityExactTests(unittest.TestCase):
         self.assertEqual(list(actual._blocks), list(expected._blocks))
         self.assertEqual(actual._cache_bytes, expected._cache_bytes)
         self.assertLessEqual(actual._cache_bytes, actual._cache_limit)
-        self.assertEqual(actual.dataset.reads, expected.dataset.reads)
+        if hasattr(actual, 'cache_events'):
+            self.assertEqual(actual.cache_events, expected.cache_events)
+        for key in actual._blocks:
+            self._assert_bytes(actual._blocks[key].data, expected._blocks[key].data)
+            self._assert_bytes(np.ma.getmaskarray(actual._blocks[key]), np.ma.getmaskarray(expected._blocks[key]))
+            self._assert_bytes(actual._blocks[key].fill_value, expected._blocks[key].fill_value)
+        if actual._block_shape[1] != actual.dataset.width or actual._STRIP_READ_BATCH == 1:
+            self.assertEqual(actual.dataset.reads, expected.dataset.reads)
+        else:
+            # Physical reads deliberately differ. Expanding each merged strip
+            # window must recover every original read in exactly the same order.
+            expanded = []
+            block_height = actual._block_shape[0]
+            for args, window, masked, out_shape in actual.dataset.reads:
+                self.assertIsNotNone(window)
+                col, row, width, height = map(int, window)
+                self.assertEqual(col, 0)
+                self.assertEqual(row % block_height, 0)
+                self.assertEqual(width, actual.dataset.width)
+                self.assertEqual(masked, True)
+                self.assertIsNone(out_shape)
+                for offset in range(0, height, block_height):
+                    expanded.append((args, (col, row+offset, width, min(block_height, height-offset)), masked, out_shape))
+            self.assertEqual(expanded, expected.dataset.reads)
 
     def _exercise(self, path, *, cache_limit, ram_limit=0, metric_crs=32650,
                   implementation=WindowedProbability):
@@ -147,6 +194,7 @@ class ProbabilityExactTests(unittest.TestCase):
                                         cache_limit_bytes=cache_limit)
         for sampler in (actual, expected):
             sampler.dataset = _RecordingDataset(sampler.dataset)
+            _record_logical_cache(sampler)
         # Unsorted, repeated blocks; nodata; partial bottom/right tiles; misses/hits.
         batches = [
             ([38.25, 2.25, 17.25, 2.25, 34.25, 5.25, 18.25, 5.25],
@@ -213,6 +261,7 @@ class ProbabilityExactTests(unittest.TestCase):
                                 for cls in (WindowedProbability, _OriginalProbability)]
                     for sampler in samplers:
                         sampler.dataset = _RecordingDataset(sampler.dataset)
+                        _record_logical_cache(sampler)
                     try:
                         rng = np.random.default_rng(193306)
                         for _ in range(3):
@@ -246,6 +295,169 @@ class ProbabilityExactTests(unittest.TestCase):
             finally:
                 for sampler in samplers:
                     sampler.close()
+
+    def _strip_pair(self, path, *, batch, cache_limit, retain_arrays=False, temporary_limit=None):
+        actual = WindowedProbability(path, 32650, ram_limit_bytes=0, cache_limit_bytes=cache_limit)
+        expected = _OriginalProbability(path, 32650, ram_limit_bytes=0, cache_limit_bytes=cache_limit)
+        actual._STRIP_READ_BATCH = batch
+        if temporary_limit is not None:
+            actual._STRIP_READ_MAX_BYTES = temporary_limit
+        for sampler in (actual, expected):
+            sampler.dataset = _RecordingDataset(sampler.dataset, retain_arrays=retain_arrays)
+            _record_logical_cache(sampler)
+        self.addCleanup(actual.close)
+        self.addCleanup(expected.close)
+        return actual, expected
+
+    def _sample_rows(self, actual, expected, rows):
+        # All columns remain within the same full-width strip; duplicates and
+        # original coordinate order must survive grouped gathers unchanged.
+        rows = np.asarray(rows, dtype=float)
+        columns = np.resize(np.asarray([3.25, 5.25, 38.25, 17.25]), rows.shape)
+        x, y = self._coordinates(expected, columns, rows+.5)
+        self._assert_bytes(actual._values_at(x, y), expected._values_at(x, y))
+        self._assert_cache(actual, expected)
+
+    def test_strip_batch_sizes_masks_partial_blocks_and_logical_lru(self):
+        configurations = [("uint8", None, False), ("uint8", 255, False),
+                          ("uint8", None, True), ("float32", -9999., True),
+                          ("float64", None, False)]
+        for dtype, nodata, explicit in configurations:
+            for block_height in (1, 4):
+                with self.subTest(dtype=dtype, nodata=nodata, mask=explicit, block_height=block_height), tempfile.TemporaryDirectory() as root:
+                    path = self._raster(root, dtype=dtype, nodata=nodata, explicit_mask=explicit,
+                                        strip=True, strip_height=block_height)
+                    block_bytes = 39*block_height*(np.dtype(dtype).itemsize+1)
+                    for batch in (1, 8, 16, 32):
+                        for cache_limit in (0, block_bytes-1, 2*block_bytes, 100000):
+                            with self.subTest(batch=batch, cache_limit=cache_limit):
+                                actual, expected = self._strip_pair(path, batch=batch, cache_limit=cache_limit)
+                                try:
+                                    self._sample_rows(actual, expected, list(reversed(range(35)))+[3, 3, 5, 34])
+                                    self._sample_rows(actual, expected, [0, 1, 2, 5, 8, 9, 32, 34])
+                                    self._sample_rows(actual, expected, list(range(35)))
+                                    if batch > 1:
+                                        self.assertLess(len(actual.dataset.reads), len(expected.dataset.reads))
+                                finally:
+                                    actual.close()
+                                    expected.close()
+
+    def test_strip_future_hit_evicted_gaps_and_call_boundaries(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._raster(root, strip=True, explicit_mask=True)
+            for batch in (8, 16, 32):
+                actual, expected = self._strip_pair(path, batch=batch, cache_limit=39*2*2)
+                try:
+                    # Block 2 is initially a hit, but inserting 0 and 1 evicts
+                    # it. Safe lookahead stops before 2 and re-evaluates it later.
+                    self._sample_rows(actual, expected, [2])
+                    start = len(actual.dataset.reads)
+                    self._sample_rows(actual, expected, [0, 1, 2, 3, 4])
+                    self.assertEqual([entry[1] for entry in actual.dataset.reads[start:]],
+                                     [(0, 0, 39, 2), (0, 2, 39, 3)])
+                    self.assertEqual([event[1] for event in actual.cache_events[-5:]], [True]*5)
+                    # Current hits, requested row gaps and call boundaries each
+                    # force a physical read boundary even with a larger batch.
+                    self._sample_rows(actual, expected, [10])
+                    start = len(actual.dataset.reads)
+                    self._sample_rows(actual, expected, [9, 10, 11, 14, 15])
+                    self.assertEqual([entry[1] for entry in actual.dataset.reads[start:]],
+                                     [(0, 9, 39, 1), (0, 11, 39, 1), (0, 14, 39, 2)])
+                    start = len(actual.dataset.reads)
+                    self._sample_rows(actual, expected, [20, 21])
+                    self._sample_rows(actual, expected, [22, 23])
+                    self.assertEqual([entry[1] for entry in actual.dataset.reads[start:]],
+                                     [(0, 20, 39, 2), (0, 22, 39, 2)])
+                finally:
+                    actual.close()
+                    expected.close()
+
+    def test_strip_blocks_own_data_and_mask_and_temporary_byte_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._raster(root, strip=True, strip_height=4, dtype="float32", explicit_mask=True)
+            block_bytes = 4*39*5
+            for temporary_limit in (block_bytes-1, block_bytes, 3*block_bytes, 1024*1024):
+                actual, expected = self._strip_pair(path, batch=32, cache_limit=100000,
+                                                  retain_arrays=True, temporary_limit=temporary_limit)
+                try:
+                    self._sample_rows(actual, expected, range(35))
+                    for read, values in zip(actual.dataset.reads, actual.dataset.arrays):
+                        size = values.data.nbytes+np.ma.getmaskarray(values).nbytes
+                        self.assertLessEqual(size, max(temporary_limit, block_bytes))
+                        if read[1][3] > actual._block_shape[0]:
+                            for block in actual._blocks.values():
+                                self.assertFalse(np.shares_memory(block.data, values.data))
+                                self.assertFalse(np.shares_memory(np.ma.getmaskarray(block), np.ma.getmaskarray(values)))
+                    for key, block in actual._blocks.items():
+                        for other_key, other in actual._blocks.items():
+                            if key != other_key:
+                                self.assertFalse(np.shares_memory(block.data, other.data))
+                                self.assertFalse(np.shares_memory(np.ma.getmaskarray(block), np.ma.getmaskarray(other)))
+                finally:
+                    actual.close()
+                    expected.close()
+
+    def test_strip_gather_or_read_failure_closes_iterator_and_releases_batch(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._raster(root, strip=True, explicit_mask=True)
+            for failure in ('gather', 'read'):
+                actual, expected = self._strip_pair(path, batch=8, cache_limit=39*2)
+                iterators = []
+                original_blocks = actual._cached_blocks
+
+                def tracked_blocks(unique):
+                    iterator = original_blocks(unique)
+                    iterators.append(iterator)
+                    return iterator
+
+                actual._cached_blocks = tracked_blocks
+                original_read = actual.dataset.read
+                original_gather = actual._gather_pixels
+
+                def fail(*args, **kwargs):
+                    raise RuntimeError('synthetic '+failure+' failure')
+
+                if failure == 'read':
+                    actual.dataset.read = fail
+                else:
+                    actual._gather_pixels = fail
+                x, y = self._coordinates(expected, [3.25]*8, np.arange(8)+.5)
+                with self.assertRaisesRegex(RuntimeError, 'synthetic '+failure+' failure'):
+                    actual._values_at(x, y)
+                self.assertEqual(len(iterators), 1)
+                self.assertIsNone(iterators[0].gi_frame)
+                gc.collect()
+                self.assertTrue(all(reference() is None for reference in actual.dataset.array_refs))
+                actual.dataset.read = original_read
+                actual._gather_pixels = original_gather
+                # The sampler remains usable after a caught error. Its cache
+                # remains bounded, and close releases the copied final block.
+                self.assertLessEqual(actual._cache_bytes, actual._cache_limit)
+                actual._values_at(x, y)
+                actual.close()
+                self.assertEqual(actual._cache_bytes, 0)
+                self.assertFalse(actual._blocks)
+                expected.close()
+
+    def test_strip_detailed_and_trace_probe_preserve_logical_events_and_record_physical_io(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._raster(root, strip=True, nodata=255, explicit_mask=True)
+            reports = []
+            for base in (_OriginalProbability, WindowedProbability):
+                for detailed in (False, True):
+                    with self.subTest(base=base.__name__, detailed=detailed):
+                        with _probe_on_reference(detailed=detailed, base=base, raster_io=True) as implementation:
+                            reports.append(self._exercise(path, cache_limit=156, implementation=implementation))
+            for report in reports[1:]:
+                for key in ('counts', 'blocks_per_call', 'unique_blocks', 'block_accesses',
+                            'repeated_accesses', 'sample_sha256', 'cache_access_sha256'):
+                    self.assertEqual(reports[0][key], report[key], key)
+                self.assertEqual(reports[0]['raster_io']['miss_trace_sha256'], report['raster_io']['miss_trace_sha256'])
+            for report in reports[:2]:
+                self.assertEqual(report['raster_io']['read_count'], report['counts']['cache_miss'])
+            for report in reports[2:]:
+                self.assertLess(report['raster_io']['read_count'], report['counts']['cache_miss'])
+                self.assertGreater(report['raster_io']['read_seconds'], 0.)
 
     def test_detailed_and_trace_probes_preserve_original_values_and_cache(self):
         original_methods = tuple(getattr(WindowedProbability, name)
