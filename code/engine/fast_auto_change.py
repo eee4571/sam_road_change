@@ -388,11 +388,89 @@ def analyze_scenes(before, after, *, tolerance=3., absolute=2., relative=.2, min
 
 def _prepare_axis_surface(scene, axis, tolerance):
     started = time.perf_counter()
+    began = started
     surface = scene.surface(axis)
     clipped_seconds = time.perf_counter()-started
     started = time.perf_counter()
     support = surface.buffer(tolerance)
-    return surface, support, clipped_seconds, time.perf_counter()-started
+    finished = time.perf_counter()
+    return surface, support, clipped_seconds, finished-started, began, finished
+
+
+def _planned_axes(side, source, target, coverage, tolerance, width_config, candidate_driven, counts, timing):
+    """Original axis prefilters, evaluated in order with one valid-axis lookahead."""
+    from .auto_station_plan import presence_mask, width_mask
+    change_type = 'removed' if side == 'before' else 'added'
+    for line_id, axis in enumerate(source.lines):
+        count = max(1, int(np.ceil(axis.length/4)))
+        spacing = axis.length/count
+        started = time.perf_counter()
+        intervals = coverage.uncovered(axis)
+        presence = presence_mask(count, spacing, intervals)
+        timing['presence_prefilter'] += time.perf_counter()-started
+        stations = (np.arange(count)+.5)*spacing
+        points = line_interpolate_point(axis, stations)
+        widths = source.widths_at(points)
+        started = time.perf_counter()
+        width_needed = (width_mask(axis, source, target, stations, widths, tolerance, width_config)
+                        if side == 'before' and candidate_driven else np.full(count, side == 'before'))
+        timing['width_prefilter'] += time.perf_counter()-started
+        selected = np.flatnonzero(presence | width_needed) if candidate_driven else np.arange(count)
+        counts['total_station_count'] += count
+        counts['candidate_station_count'] += len(selected)
+        counts['width_prefilter_skipped_station_count'] += int((~width_needed).sum()) if side == 'before' else 0
+        if not len(selected):
+            counts.update({f'{change_type}_source_axes': 1, f'{change_type}_uncovered_intervals': 0})
+            continue
+        yield line_id, axis, count, spacing, intervals, stations, points, widths, width_needed, selected
+
+
+def _axis_surface_pipeline(plans, source, target, tolerance, pool, timing):
+    """At most one next valid axis in flight; consume results in axis order."""
+    def submit(plan):
+        return tuple(pool.submit(_prepare_axis_surface, scene, plan[1], tolerance)
+                     for scene in (source, target))
+
+    def union_seconds(intervals):
+        total, end = 0., float('-inf')
+        for a, b in sorted(intervals):
+            total += max(0., b-max(a, end))
+            end = max(end, b)
+        return total
+
+    began = time.perf_counter()
+    plans = iter(plans)
+    current = next(plans, None)
+    if current is None:
+        return
+    jobs = submit(current)
+    previous_processing = None
+    try:
+        while current is not None:
+            # Plan only the next effective axis while current surface work runs.
+            following = next(plans, None)
+            wait_started = time.perf_counter()
+            results = tuple(job.result() for job in jobs)
+            timing['axis_surface_wait'] += time.perf_counter()-wait_started
+            busy = [(r[4], r[5]) for r in results]
+            timing['surface_pipeline_worker_busy'] += sum(b-a for a, b in busy)
+            timing['surface_pipeline_active_wall'] += union_seconds(busy)
+            if previous_processing is not None:
+                start, end = previous_processing
+                overlap = [(max(a, start), min(b, end)) for a, b in busy if min(b, end)>max(a, start)]
+                timing['surface_pipeline_overlap'] += union_seconds(overlap)
+            timing['axis_surface_clip_worker_sum'] += sum(r[2] for r in results)
+            timing['axis_surface_buffer_worker_sum'] += sum(r[3] for r in results)
+            # Submit before handing the current axis back to its station loop.
+            jobs = submit(following) if following is not None else ()
+            processing_started = time.perf_counter()
+            yield current, results
+            previous_processing = (processing_started, time.perf_counter())
+            current = following
+    finally:
+        for job in jobs:
+            job.cancel()
+        timing['surface_pipeline_wall'] += time.perf_counter()-began
 
 
 def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_length, minimum_area,
@@ -403,7 +481,7 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
     tests, not a separate detection algorithm or a public pipeline option.
     """
     from .auto_presence_candidates import LongitudinalCoverage, presence_seeds
-    from .auto_station_plan import presence_mask, width_mask, BatchSections
+    from .auto_station_plan import BatchSections
     from shapely import buffer, covers, intersects, length
     records, audit, width_audit = [], [], []
     counts = Counter()
@@ -415,45 +493,19 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
     for side, source, target, change_type in (("before", before, after, "removed"),
                                                ("after", after, before, "added")):
         coverage = LongitudinalCoverage(target.lines, tolerance)
-        for line_id, axis in enumerate(source.lines):
-            count = max(1, int(np.ceil(axis.length/4)))
-            spacing = axis.length/count
+        plans = _planned_axes(side, source, target, coverage, tolerance, width_config, candidate_driven, counts, timing)
+        pipeline = _axis_surface_pipeline(plans, source, target, tolerance, surface_pool, timing)
+        for plan, surface_results in pipeline:
+            line_id, axis, count, spacing, intervals, stations, points, widths, width_needed, selected = plan
             samples, station_rows = [], []
-            started = time.perf_counter()
-            intervals = coverage.uncovered(axis)
-            presence = presence_mask(count, spacing, intervals)
-            timing['presence_prefilter'] += time.perf_counter()-started
-            stations = (np.arange(count)+.5)*spacing
-            points = line_interpolate_point(axis, stations)
-            widths = source.widths_at(points)
-            started = time.perf_counter()
-            width_needed = (width_mask(axis, source, target, stations, widths, tolerance, width_config)
-                            if side == 'before' and candidate_driven else np.full(count, side == 'before'))
-            timing['width_prefilter'] += time.perf_counter()-started
-            selected = np.flatnonzero(presence | width_needed) if candidate_driven else np.arange(count)
-            counts['total_station_count'] += count
-            counts['candidate_station_count'] += len(selected)
-            counts['width_prefilter_skipped_station_count'] += int((~width_needed).sum()) if side == 'before' else 0
-            if not len(selected):
-                counts.update({f'{change_type}_source_axes': 1, f'{change_type}_uncovered_intervals': 0})
-                continue
             sampling_started = time.perf_counter()
-            surface_started = time.perf_counter()
-            source_job = surface_pool.submit(_prepare_axis_surface, source, axis, tolerance)
-            target_job = surface_pool.submit(_prepare_axis_surface, target, axis, tolerance)
+            source_surface, source_support = surface_results[0][:2]
+            target_surface, target_support = surface_results[1][:2]
             width_surfaces = None
             cells_started = time.perf_counter()
             normals = _normals(axis, stations)
             cells = {index: substring(axis, index*spacing, (index+1)*spacing) for index in selected}
             timing['axis_cell_construction'] += time.perf_counter()-cells_started
-            wait_started = time.perf_counter()
-            source_surface, source_support, source_clip_seconds, source_buffer_seconds = source_job.result()
-            target_surface, target_support, target_clip_seconds, target_buffer_seconds = target_job.result()
-            timing['axis_surface_wait'] += time.perf_counter()-wait_started
-            timing['axis_surface_preparation_wall'] += time.perf_counter()-surface_started
-            # Worker elapsed sums overlap; do not add them to main-loop wall time.
-            timing['axis_surface_clip_worker_sum'] += source_clip_seconds+target_clip_seconds
-            timing['axis_surface_buffer_worker_sum'] += source_buffer_seconds+target_buffer_seconds
             geometry_started = time.perf_counter()
             cell_array = np.asarray(list(cells.values()),dtype=object)
             cell_lengths = length(cell_array)
@@ -623,6 +675,9 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
                                         "geometry": axis})
             if line_id % 25 == 0:
                 print(f"[Fast Auto] {side} axes {line_id+1}/{len(source.lines)}", flush=True)
+    # Keep historical sampling inclusive of the unhidden surface wait; worker
+    # time overlapping probability/matching/stations must not be double-counted.
+    sampling_seconds += timing['axis_surface_wait']
     print(f"[Fast timing] auto_station_sampling={sampling_seconds:.6f}s auto_matching={matching_seconds:.6f}s", flush=True)
     timing['exact_station_sampling'] = sampling_seconds
     counts['stable_skipped_station_count'] = counts['total_station_count']-counts['candidate_station_count']
@@ -632,7 +687,8 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
     counts.update({f'timing_{key}_seconds': value for key, value in timing.items()})
     print('[Fast timing] ' + ' '.join(f'{key}={timing[key]:.6f}s' for key in
           ('presence_prefilter', 'width_prefilter', 'axis_cell_construction', 'axis_surface_wait',
-           'axis_surface_preparation_wall', 'axis_surface_clip_worker_sum', 'axis_surface_buffer_worker_sum',
+           'surface_pipeline_worker_busy', 'surface_pipeline_active_wall', 'surface_pipeline_overlap',
+           'surface_pipeline_wall', 'axis_surface_clip_worker_sum', 'axis_surface_buffer_worker_sum',
            'station_geometry', 'station_surface_coverage', 'station_probability', 'exact_station_sampling', 'exact_width_measurement')) +
           f" candidate_station_count={counts['candidate_station_count']} total_station_count={counts['total_station_count']}" +
           f" stable_skipped_station_count={counts['stable_skipped_station_count']} candidate_ratio={counts['candidate_ratio']:.6f}" +

@@ -7,6 +7,7 @@ import json
 import pickle
 import pstats
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -50,9 +51,28 @@ def main():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # cProfile only observes its own thread. Capture the two surface workers
+    # separately so a threaded hot path cannot disappear from hotspot reports.
+    worker_profiles = []
+    if not args.no_profile and hasattr(module, '_prepare_axis_surface'):
+        prepare_surface = module._prepare_axis_surface
+        local = threading.local()
+        def profiled_surface(*values, **kwargs):
+            if not hasattr(local, 'profiler'):
+                local.profiler = cProfile.Profile()
+                worker_profiles.append(local.profiler)
+            local.profiler.enable()
+            try:
+                return prepare_surface(*values, **kwargs)
+            finally:
+                local.profiler.disable()
+        module._prepare_axis_surface = profiled_surface
     manifest = json.loads((args.job/'pipeline_result.json').read_text(encoding='utf-8'))
     pair = manifest['change_results'][0]
-    periods = [next(p for p in manifest['period_results'] if p['grid']==pair['grid'] and p['period']==pair[k])
+    # Completed manifests expose reconciled roads as period_results. Auto
+    # profiling must keep using the preserved extraction cache in that case.
+    period_cache = manifest.get('auto_period_results') or manifest['period_results']
+    periods = [next(p for p in period_cache if p['grid']==pair['grid'] and p['period']==pair[k])
                for k in ('before_period', 'after_period')]
     payloads = [_load_fast_period_result(p) for p in periods]
     centers = [_read_fast_change_layer(p, 'centerlines') for p in payloads]
@@ -76,6 +96,10 @@ def main():
     if not args.no_profile:
         profiler.disable()
     elapsed = time.perf_counter()-started
+    if 'timing_surface_pipeline_wall_seconds' in result[3]:
+        # Pipeline waiting occurs in the generator, outside the instrumented
+        # preparation block; attribute it to the same phase as old versions.
+        module.phases['axis_preparation'] += result[3]['timing_axis_surface_wait_seconds']
     assert identities == [scene_key(p, crs) for p in payloads], 'Inputs changed during profiling'
     for scene in scenes:
         close_scene(scene)
@@ -83,8 +107,11 @@ def main():
         pickle.dump((result,presence_audit), f, protocol=5)
     stats = []
     if not args.no_profile:
-        profiler.dump_stats(str(output/f'{args.label}.prof'))
-        for (file,line,name),(cc,nc,tt,ct,callers) in pstats.Stats(profiler).stats.items():
+        combined = pstats.Stats(profiler)
+        for worker_profile in worker_profiles:
+            combined.add(worker_profile)
+        combined.dump_stats(str(output/f'{args.label}.prof'))
+        for (file,line,name),(cc,nc,tt,ct,callers) in combined.stats.items():
             stats.append(dict(file=file,line=line,name=name,primitive_calls=cc,calls=nc,self_seconds=tt,cumulative_seconds=ct))
     summary = dict(label=args.label,elapsed_seconds=elapsed,phases=module.phases,
                    source_sha256=source_hash,inputs=identities,
