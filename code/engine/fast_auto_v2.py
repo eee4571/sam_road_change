@@ -1,7 +1,7 @@
 """Network/interval Auto, independent of the baseline station analyzer.
 
-Existing profile boundaries define width intervals. Only explicit conflicts use
-three cross-section events; neither detection nor qualification creates stations.
+Existing profile boundaries define width intervals. Object reconciliation and
+within-period width variability require no stations or new width measurements.
 Raster evidence never supplies published geometry. Truth is not an input.
 """
 from collections import Counter
@@ -31,6 +31,7 @@ class V2Config:
     source_surface_minimum: float = .55
     opposite_surface_maximum: float = .15
     require_confirmed_absence: bool = True
+    width_variability_factor: float = 2.
 
 
 class ChangeEvidence:
@@ -198,25 +199,6 @@ def _profile_events(scene,part,axis,start,end):
     return positions[(positions>start+1e-6)&(positions<end-1e-6)].tolist()
 
 
-def _event_validation(axis,other,start,end,before,after,counts):
-    """At most three paired cross sections for an explicit profile conflict."""
-    positions=np.array([start,(start+end)/2,end]);points=line_interpolate_point(axis,positions)
-    projected=line_locate_point(other,points);targets=line_interpolate_point(other,projected)
-    normals=legacy._normals(axis,positions);an=legacy._normals(other,projected)
-    an[np.sum(normals*an,axis=1)<0]*=-1;normals+=an
-    normals/=np.maximum(np.linalg.norm(normals,axis=1)[:,None],1e-9)
-    part=substring(axis,start,end);surfaces=[s.surface(part) for s in (before,after)]
-    supports=[s.buffer(.1) for s in surfaces];config=legacy.PairedWidthConfig();values=[]
-    for p,q,n in zip(points,targets,normals):
-        measurements=[legacy._measure_period_width(point,n,surface,support,scene.probability,scene.crs,config)
-                      for scene,point,surface,support in zip((before,after),(p,q),surfaces,supports)]
-        counts['v2_exact_width_event_sections']+=2
-        b,a=measurements
-        if b.final_width is not None and a.final_width is not None and not b.reject_reason and not a.reject_reason:
-            values.append((b.final_width,a.final_width))
-    return np.median(values,axis=0) if len(values)>=2 else None
-
-
 def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config):
     records=[];audit=[]
     for start,end,target_id in intervals:
@@ -240,18 +222,12 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
                 runs[-1]=(runs[-1][0],float(b[i]),int(s),runs[-1][3]+[i])
             else:runs.append((float(a[i]),float(b[i]),int(s),[i]))
         if not runs:counts['v2_stable_segments']+=1
+        variability=profile_variability(bw,aw,b-a)
         for low,high,direction,indexes in runs:
             if high-low<minimum_length:continue
             weights=b[indexes]-a[indexes]
             before_width=float(np.average(bw[indexes],weights=weights));after_width=float(np.average(aw[indexes],weights=weights))
             local=substring(axis,low,high)
-            inset=min(evidence.resolution,(high-low)/4)
-            positions=np.array([low+inset,(low+high)/2,high-inset]);tpositions=line_locate_point(other,line_interpolate_point(axis,positions))
-            rb=evidence.widths(0,axis,positions);ra=evidence.widths(1,other,tpositions)
-            conflict=np.isfinite(rb).all() and np.isfinite(ra).all() and direction*float(np.median(ra-rb)) < -max(absolute,2*evidence.resolution)
-            if conflict:
-                corrected=_event_validation(axis,other,low,high,before,after,counts)
-                if corrected is not None:before_width,after_width=map(float,corrected)
             difference=after_width-before_width
             if abs(difference)<max(absolute,relative*max(before_width,after_width)):continue
             # Require sustained margin on every existing profile interval;
@@ -260,6 +236,22 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
             sustained = max((sum(b[j]-a[j] for j in group) for group in _strong_runs(indexes,strong)),default=0.)
             publish = (sustained >= max(minimum_length,config.width_minimum_length)
                        and abs(difference) >= config.width_threshold_factor*max(absolute,relative*max(before_width,after_width)))
+            # Length weights make the test insensitive to profile segmentation.
+            # Use the whole matched interval so selecting a peak cannot hide the
+            # road's normal width variability outside that peak.
+            stable_profile=(abs(difference)>config.width_variability_factor*variability
+                            and sustained >= .8*(high-low))
+            if publish and not stable_profile:counts['v2_width_variability_suppressed']+=1
+            publish=publish and stable_profile
+            # Keep the previous cheap common-grid contradiction check, but
+            # never resolve it by remeasuring or rewriting the width profile.
+            inset=min(evidence.resolution,(high-low)/4)
+            positions=np.array([low+inset,(low+high)/2,high-inset])
+            target_positions=line_locate_point(other,line_interpolate_point(axis,positions))
+            rb=evidence.widths(0,axis,positions);ra=evidence.widths(1,other,target_positions)
+            conflict=np.isfinite(rb).all() and np.isfinite(ra).all() and direction*float(np.median(ra-rb)) < -max(absolute,2*evidence.resolution)
+            if publish and conflict:counts['v2_width_evidence_conflict_suppressed']+=1
+            publish=publish and not conflict
             xy=np.asarray(local.coords)[:,:2]
             partners=get_coordinates(line_interpolate_point(other,line_locate_point(other,[Point(p) for p in xy])))
             canonical=LineString((xy+partners)/2)
@@ -268,11 +260,19 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
             if geometry.area<minimum_area:continue
             records.append(dict(change_typ='widened' if difference>0 else 'narrowed',width_bef=before_width,width_aft=after_width,
                 width_diff=difference,length_m=local.length,axis_wkt=canonical.wkt,geometry=geometry,source_axis=axis_id,start_m=low,end_m=high,
-                qa_state='probable' if conflict else 'confirmed',confidence=.6 if conflict else .85,audit_reason='width_profile_interval',junction=False,
-                v2_publish=publish,v2_precision_reason='sustained_width_margin' if publish else 'small_or_short_width_fluctuation'))
+                qa_state='confirmed',confidence=.85,audit_reason='width_profile_interval',junction=False,
+                v2_profile_variability_m=variability,
+                v2_publish=publish,v2_precision_reason='profile_evidence_conflict' if conflict else 'within_period_width_fluctuation' if not stable_profile else 'sustained_width_margin' if publish else 'small_or_short_width_fluctuation'))
             audit.append(dict(axis_id=axis_id,target_axis=target_id,start_m=low,end_m=high,sign=direction,accepted=True,
-                              profile_interval_count=len(indexes),event_validation=bool(conflict),geometry=canonical))
+                              profile_interval_count=len(indexes),event_validation=False,profile_variability_m=variability,geometry=canonical))
     return records,audit
+
+
+def profile_variability(before,after,lengths):
+    """Combined within-period standard deviation, weighted by interval length."""
+    if not np.isfinite(before).all() or not np.isfinite(after).all():return float('inf')
+    return float(np.sqrt(sum(np.average((v-np.average(v,weights=lengths))**2,weights=lengths)
+                             for v in (before,after))))
 
 
 def _strong_runs(indexes, strong):
@@ -308,6 +308,8 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
                 records.extend(local);width_audit.extend(details)
                 counts['timing_v2_width_profile_seconds']+=time.perf_counter()-tick
             counts['v2_network_axes']+=1
+    from .fast_object_reconciliation import reconcile_presence
+    counts.update(reconcile_presence(records,tolerance=tolerance,scenes=(before,after)))
     counts['v2_local_sample_count']=counts['v2_probability_event_locations']+counts['v2_exact_width_event_sections']//2
     counts['timing_v2_total_seconds']=time.perf_counter()-started
     print('[Fast v2] '+str(dict(counts)),flush=True)

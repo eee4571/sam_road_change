@@ -83,12 +83,13 @@ class V2Tests(unittest.TestCase):
         self.assertEqual(accepted.iloc[0].publication_state,'accepted')
         self.assertGreater(accepted.iloc[0].length_m,200)
 
-    def test_profile_conflict_only_uses_three_paired_events(self):
+    def test_profile_conflict_does_not_remeasure(self):
         f=self.fixture
         b=f.scene([f.road(100,8)],surfaces=[box(30,93,260,107)])
         a=f.scene([f.road(100,14)],surfaces=[box(30,96,260,104)])
-        records,_,_,counts=analyze_scenes(b,a)
-        self.assertEqual(counts['v2_exact_width_event_sections'],6)
+        with patch.object(legacy,'_measure_period_width',side_effect=AssertionError('remeasurement')):
+            records,_,_,counts=analyze_scenes(b,a)
+        self.assertEqual(counts['v2_exact_width_event_sections'],0)
         self.assertEqual(counts['v2_station_count'],0)
         self.assertTrue(all(r['geometry'].is_valid for r in records))
 
@@ -120,6 +121,16 @@ class V2Tests(unittest.TestCase):
         rows,*_=analyze_scenes(f.scene([f.road(100,8)]),f.scene([f.road(100,10.5)]))
         self.assertTrue(rows)
         self.assertFalse(self.published(rows))
+
+    def test_width_difference_must_exceed_own_profile_variation(self):
+        f=self.fixture
+        before=f.scene([f.road(100,4,start=30,end=145),f.road(100,14,start=145,end=260)])
+        after=f.scene([f.road(100,14,start=30,end=145),f.road(100,24,start=145,end=260)])
+        with patch.object(legacy,'_measure_period_width',side_effect=AssertionError('remeasurement')):
+            rows,_,_,counts=analyze_scenes(before,after)
+        self.assertTrue(any(r['change_typ']=='widened' for r in rows))
+        self.assertFalse(self.published(rows))
+        self.assertGreater(counts['v2_width_variability_suppressed'],0)
 
     def test_short_strong_width_change_not_published(self):
         f=self.fixture
