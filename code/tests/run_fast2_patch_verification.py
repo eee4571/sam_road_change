@@ -26,10 +26,12 @@ def no_intersection(frame,truth,area):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('job',type=Path);parser.add_argument('--limit',type=int,default=6);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('job',type=Path);parser.add_argument('--limit',type=int,default=6)
+    parser.add_argument('--output-name',default='fast2_patch_verification')
+    parser.add_argument('--baseline-name',default='fast2_multitemporal');args=parser.parse_args()
     tuning=args.job/'_profiling'/'fast_v2_tuning'
-    previous=args.job/'_profiling'/'fast2_multitemporal'
-    output=args.job/'_profiling'/'fast2_patch_verification';output.mkdir(exist_ok=True,parents=True)
+    previous=args.job/'_profiling'/args.baseline_name
+    output=args.job/'_profiling'/args.output_name;output.mkdir(exist_ok=True,parents=True)
     manifest=json.loads((args.job/'pipeline_result.json').read_text(encoding='utf-8'))
     baseline={r['pair']:r for r in json.loads((previous/'comparison.json').read_text(encoding='utf-8'))}
     report=[];batch=time.perf_counter()

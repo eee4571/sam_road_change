@@ -1,0 +1,8 @@
+# Keep experiment source and usage instructions only. Generated artifacts stay local.
+/*
+!/.gitignore
+!/*.py
+!/README.md
+!/bootstrap/
+/bootstrap/*
+!/bootstrap/*.py

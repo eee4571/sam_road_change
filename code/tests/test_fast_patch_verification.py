@@ -11,72 +11,65 @@ from engine.fast_patch_verification import PatchVerifier,ImageTiles,road_boundar
 class DecisionTests(unittest.TestCase):
     def verifier(self):
         v=PatchVerifier.__new__(PatchVerifier)
-        v.calibration=dict(count=20,minimum=12,p_delta_low=-.2,p_delta_high=.2,s_delta_low=-.2,s_delta_high=.2,
-            ncc_low=.3,core_ncc_low=.3,left_median=0,right_median=0,boundary_delta_low=-1.,boundary_delta_high=1.)
-        for side in range(2):
-            for feature,value in [('p',.4),('s',.6),('contrast',.1),('edge',.1),('alignment',.7)]:
-                v.calibration[f'{side}_{feature}_low']=value
-                v.calibration[f'{side}_{feature}_count']=20
+        v.calibration=dict(count=24,minimum=12)
+        for k,median,low,high,mad in [('score_delta',0,-.2,.2,.08),('anomaly',0,-.1,.1,.03),
+                ('ncc',.8,.6,.95,.05),('ssim',.8,.6,.95,.05),('hog_distance',.1,0,.2,.04),
+                ('left',0,-1,1,.2),('right',0,-1,1,.2)]:
+            v.calibration.update({k+'_median':median,k+'_low':low,k+'_high':high,k+'_mad':mad,k+'_count':24})
+        v.calibration.update({'0_road_low':.5,'1_road_low':.5})
         return v
 
     def patch(self):
-        return dict(valid=True,straight=True,resolution=1.,left=np.full(3,4.),right=np.full(3,4.),ncc=0.,core_ncc=.8,
-                    periods=[dict(p=.05,contrast=.02,s=0.,edge=.01,alignment=.4),
-                             dict(p=.9,contrast=.5,s=1.,edge=.3,alignment=.9)])
+        return dict(valid=True,resolution=1.,left=np.full(3,4.),right=np.full(3,4.),ncc=.2,ssim=.2,
+                    hog_distance=.5,anomaly=.5,score_delta=2.,
+                    periods=[dict(road_score=.1,p=1.,s=1.),dict(road_score=2.1,p=0.,s=0.)])
 
-    def test_true_presence_loss_is_not_vetoed(self):
-        v=self.verifier();p=self.patch()
-        self.assertEqual(v.reasons(p,'added'),([],'verified'))
-        p['periods'].reverse()
-        self.assertEqual(v.reasons(p,'removed'),([],'verified'))
+    def test_raw_appearance_overrides_opposite_model_support(self):
+        self.assertEqual(self.verifier().reasons(self.patch(),'added'),([],'verified'))
 
-    def test_probability_and_surface_support_without_axis(self):
-        v=self.verifier();p=self.patch()
-        p['periods'][0].update(p=.85,contrast=.4,s=.9)
-        reasons,state=v.reasons(p,'added')
-        self.assertIn('opposite_probability_support',reasons)
-        self.assertIn('opposite_molra_surface_support',reasons)
-        self.assertEqual(state,'extraction_fluctuation')
+    def test_removed_is_symmetric(self):
+        p=self.patch();p['periods'].reverse();p['score_delta']*=-1
+        self.assertEqual(self.verifier().reasons(p,'removed'),([],'verified'))
 
-    def test_structural_image_support(self):
-        v=self.verifier();p=self.patch();p['ncc']=.8
-        p['periods'][0].update(p=.5,edge=.3,alignment=.9)
-        self.assertIn('persistent_image_road_structure',v.reasons(p,'added')[0])
+    def test_model_changes_cannot_affect_verdict(self):
+        p=self.patch();v=self.verifier();expected=v.reasons(p,'added')
+        for r in p['periods']:r.update(p=np.nan,s=np.nan)
+        self.assertEqual(v.reasons(p,'added'),expected)
+        p.update(score_delta=0,ncc=.9,ssim=.9,hog_distance=.05,anomaly=0)
+        p['periods'][0]['road_score']=2.
+        for r in p['periods']:r.update(p=0,s=0)
+        self.assertIn('persistent_raw_road_structure',v.reasons(p,'added')[0])
 
-    def test_model_conflict_does_not_restore_image_veto(self):
-        v=self.verifier();p=self.patch();p['ncc']=.8
-        p['periods'][0].update(edge=.3,alignment=.9)
-        self.assertEqual(v.reasons(p,'added'),(['persistent_image_road_structure'],'extraction_fluctuation'))
-        p['periods'].reverse()
-        self.assertEqual(v.reasons(p,'removed'),(['persistent_image_road_structure'],'extraction_fluctuation'))
+    def test_seasonal_ring_change_cannot_confirm_road_change(self):
+        p=self.patch();p['anomaly']=0
+        self.assertIn('normal_background_relative_change',self.verifier().reasons(p,'added')[0])
 
-    def test_unchanged_background_cannot_veto_changed_road_interior(self):
-        v=self.verifier();p=self.patch();p.update(ncc=.9,core_ncc=.05)
-        p['periods'][0].update(edge=.3,alignment=.9)
-        self.assertNotIn('persistent_image_road_structure',v.reasons(p,'added')[0])
+    def test_source_needs_parallel_edges(self):
+        p=self.patch();p['periods'][1]['road_score']=.1
+        self.assertIn('raw_parallel_boundaries_not_supported',self.verifier().reasons(p,'added')[0])
 
-    def test_boundary_translation_not_widening(self):
-        v=self.verifier();p=self.patch();p.update(left=np.full(3,-4.),right=np.full(3,4.))
-        self.assertIn('surface_lateral_displacement',v.reasons(p,'widened')[0])
+    def test_contrast_reversal_does_not_create_road_with_stable_edges(self):
+        p=self.patch();p['periods'][0]['road_score']=2.
+        p.update(ncc=-.3,ssim=.01,left=np.zeros(3),right=np.ones(3))
+        self.assertIn('persistent_raw_parallel_boundaries',self.verifier().reasons(p,'added')[0])
 
-    def test_sustained_one_sided_expansion_is_valid(self):
-        v=self.verifier();p=self.patch();p['left']=np.zeros(3)
-        self.assertEqual(v.reasons(p,'widened'),([],'verified'))
+    def test_bilateral_width_change(self):
+        p=self.patch();p['periods'][0]['road_score']=2.
+        self.assertEqual(self.verifier().reasons(p,'widened'),([],'verified'))
+        p['left']*=-1;p['right']*=-1
+        self.assertEqual(self.verifier().reasons(p,'narrowed'),([],'verified'))
 
-    def test_temporal_surface_scale_is_calibrated(self):
-        v=self.verifier();v.calibration.update(boundary_delta_low=6,boundary_delta_high=10)
-        self.assertIn('normal_temporal_surface_scale',v.reasons(self.patch(),'widened')[0])
+    def test_translation_and_one_sided_width_not_published(self):
+        p=self.patch();p['periods'][0]['road_score']=2.;p['left']*=-1
+        self.assertIn('raw_boundary_lateral_displacement',self.verifier().reasons(p,'widened')[0])
+        p['left'][:]=0
+        self.assertIn('raw_bilateral_change_not_sustained',self.verifier().reasons(p,'widened')[0])
 
-    def test_missing_calibration_does_not_delete_candidate(self):
-        v=self.verifier();v.calibration['count']=0
-        self.assertEqual(v.reasons(self.patch(),'added')[0],[])
-        v=self.verifier();v.calibration['boundary_delta_high']=np.nan
-        self.assertEqual(v.reasons(self.patch(),'widened')[0],[])
-
-    def test_observed_empty_surface_cannot_confirm_width_change(self):
-        v=self.verifier();p=self.patch();p['left'][:]=np.nan
-        for period in p['periods']:period['surface_observed']=True
-        self.assertEqual(v.reasons(p,'widened'),(['insufficient_road_boundary_support'],'unconfirmed_width'))
+    def test_unavailable_image_or_calibration_is_not_model_fallback(self):
+        p=self.patch();p['valid']=False
+        self.assertEqual(self.verifier().reasons(p,'added')[1],'unconfirmed_image')
+        p['valid']=True;v=self.verifier();v.calibration['count']=0
+        self.assertEqual(v.reasons(p,'added')[1],'unconfirmed_image')
 
 
 class RasterTests(unittest.TestCase):

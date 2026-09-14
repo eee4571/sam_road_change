@@ -145,7 +145,14 @@ class FastFinalAutoTests(unittest.TestCase):
         output = Path(self.tmp.name)/"auto"
         result = detect_fast_changes(*inputs, output)
         self.assertFalse(result["ground_truth_used"])
-        self.assertEqual(result["added_feature_count"], 1)
+        # This fixture has model rasters only. Raw-image-primary verification
+        # must not silently fall back to those models to publish an addition.
+        self.assertEqual(result["added_feature_count"], 0)
+        import json
+        patch_audit=json.loads((output/'patch_verification.json').read_text(encoding='utf8'))
+        self.assertTrue(patch_audit['candidates'])
+        self.assertTrue(all('raw_image_unavailable_or_invalid' in row['reasons']
+                            for row in patch_audit['candidates']))
         self.assertEqual(result["removed_feature_count"], 0)
         for key in ("road_changes", "summary", "road_change"):
             self.assertTrue(Path(result[key]).is_file(), key)
