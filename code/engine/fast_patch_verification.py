@@ -157,54 +157,78 @@ class PatchVerifier:
         self.counts['calibration_seconds']=time.perf_counter()-started
 
     def reasons(self,p,kind):
+        """Only a conjunction of positive stability evidence can veto.
+
+        Existing descriptors and calibration are unchanged. Failure of a change
+        test is an uncertainty reason, never evidence for the stable hypothesis.
+        """
         c=self.calibration
-        if not p['valid']:return ['raw_image_unavailable_or_invalid'],'unconfirmed_image'
+        if not p['valid']:return ['raw_image_unavailable_or_invalid'],'uncertain'
         if c.get('count',0)<c.get('minimum',12):
-            return ['insufficient_stable_image_controls'],'unconfirmed_image'
-        required=('score_delta','anomaly','ncc','ssim','hog_distance')
-        if any(c.get(k+'_count',0)<12 or not np.isfinite(p[k]) for k in required):
-            return ['uninformative_raw_image'],'unconfirmed_image'
-        a,b=p['periods'];reasons=[]
+            return ['insufficient_stable_image_controls'],'uncertain'
+        required=('score_delta','anomaly','ncc','ssim','hog_distance','left','right')
+        if any(c.get(k+'_count',0)<12 or not np.isfinite(p[k]).all() for k in required):
+            return ['uninformative_raw_image_or_boundaries'],'uncertain'
+        registration=p.get('registration',{})
+        proposed=np.asarray(registration.get('proposed_shift_px',[np.nan,np.nan]))
+        # align_pair does not mark an identity transform accepted if NCC cannot
+        # improve. A subpixel, high-response identity is still a valid alignment.
+        reliable=(registration.get('response',0.)>.1 and
+            (registration.get('accepted',False) or
+             (np.isfinite(proposed).all() and np.linalg.norm(proposed)<=.5)))
+        if not reliable:return ['registration_uncertain'],'uncertain'
+        supported=all(period['road_score']>max(0.,c[f'{side}_road_low'])
+                      for side,period in enumerate(p['periods']))
+        high_similarity=(p['ncc']>=max(0.,c['ncc_median']) and
+                         p['ssim']>=max(0.,c['ssim_median']) and
+                         p['hog_distance']<=c['hog_distance_median'])
+        l=p['left']-c['left_median'];r=p['right']-c['right_median']
+        stable_limits=[max(p['resolution'],1.4826*c[k+'_mad']) for k in ('left','right')]
+        stable_left=np.abs(l)<=stable_limits[0];stable_right=np.abs(r)<=stable_limits[1]
+        both_stable=np.count_nonzero(stable_left&stable_right)>=2
         if kind in ('added','removed'):
-            source=1 if kind=='added' else 0;direction=1 if source==1 else -1
+            if supported and high_similarity and both_stable:
+                return ['strong_persistent_raw_road'],'strong_stable'
+            source=1 if kind=='added' else 0;direction=1 if source else -1
             source_present=p['periods'][source]['road_score']>max(0.,c[f'{source}_road_low'])
-            target_present=p['periods'][1-source]['road_score']>max(0.,c[f'{1-source}_road_low'])
-            same=(p['ncc']>=c['ncc_low'] and p['ssim']>=c['ssim_low'] and
-                  p['hog_distance']<=c['hog_distance_high'])
-            # Contrast reversal can destroy NCC/SSIM while both road boundaries
-            # persist. Compare their positions independently of road brightness.
-            stable_edges=np.ones(3,dtype=bool)
-            for side in ('left','right'):
-                stable_edges &= (np.isfinite(p[side]) &
-                    (p[side]>=min(c[side+'_low'],-p['resolution'])) &
-                    (p[side]<=max(c[side+'_high'],p['resolution'])))
-            if source_present and target_present and np.count_nonzero(stable_edges)>=2:
-                reasons.append('persistent_raw_parallel_boundaries')
-            if target_present and same:reasons.append('persistent_raw_road_structure')
             delta=direction*(p['score_delta']-c['score_delta_median'])
             bound=(c['score_delta_high']-c['score_delta_median'] if source else
                    c['score_delta_median']-c['score_delta_low'])
-            if not source_present:reasons.append('raw_parallel_boundaries_not_supported')
-            if delta<=max(bound,1.4826*c['score_delta_mad']):reasons.append('no_directional_structure_appearance')
-            if p['anomaly']<=max(c['anomaly_high'],c['anomaly_median']+1.4826*c['anomaly_mad']):
-                reasons.append('normal_background_relative_change')
-        else:
-            if (not np.isfinite(p['left']).all() or not np.isfinite(p['right']).all() or
-                any(c.get(k+'_count',0)<12 for k in ('left','right'))):
-                return ['raw_boundaries_unavailable'],'unconfirmed_width'
-            direction=1 if kind=='widened' else -1
-            l=p['left']-c['left_median'];r=p['right']-c['right_median']
-            limits=[max(c[k+'_high']-c[k+'_median'] if direction>0 else c[k+'_median']-c[k+'_low'],
-                        1.4826*c[k+'_mad'],p['resolution']) for k in ('left','right')]
-            supported=all(period['road_score']>max(0.,c[f'{side}_road_low']) for side,period in enumerate((a,b)))
-            if not supported:reasons.append('raw_parallel_boundaries_not_supported')
-            if np.count_nonzero((l*r<0)&(np.abs(l+r)<=2*p['resolution']))>=2:
-                reasons.append('raw_boundary_lateral_displacement')
-            if np.count_nonzero((direction*l>limits[0])&(direction*r>limits[1]))<2:
-                reasons.append('raw_bilateral_change_not_sustained')
-        return reasons,'extraction_fluctuation' if reasons else 'verified'
+            directional_change=delta>max(bound,1.4826*c['score_delta_mad'])
+            anomaly=p['anomaly']>max(c['anomaly_high'],c['anomaly_median']+1.4826*c['anomaly_mad'])
+            if source_present and directional_change and anomaly:
+                return ['raw_structure_appearance' if source else 'raw_structure_disappearance'],'strong_change'
+            qa=[]
+            if not supported:qa.append('raw_parallel_boundaries_not_supported')
+            if not high_similarity:qa.append('mixed_raw_similarity')
+            if not both_stable:qa.append('incomplete_stable_boundaries')
+            if not directional_change:qa.append('no_directional_structure_appearance')
+            if not anomaly:qa.append('normal_background_relative_change')
+            return qa or ['mixed_raw_evidence'],'uncertain'
+        if not p.get('width_geometry_reliable',True):
+            return ['width_curvature_or_resolution_uncertain'],'uncertain'
+        if not supported:return ['raw_parallel_boundaries_not_supported'],'uncertain'
+        if both_stable and high_similarity:
+            return ['strong_stable_raw_width_boundaries'],'strong_stable'
+        # l/r are outward movements, so opposite signs represent a common
+        # signed lateral displacement. Both must exceed measurement uncertainty.
+        displaced=(l*r<0)&(np.abs(l)>stable_limits[0])&(np.abs(r)>stable_limits[1])
+        displaced &= np.abs(l+r)<=max(p['resolution'],min(stable_limits))
+        if np.count_nonzero(displaced)>=2:
+            return ['raw_boundary_lateral_displacement'],'strong_stable'
+        direction=1 if kind=='widened' else -1
+        limits=[max(c[k+'_high']-c[k+'_median'] if direction>0 else c[k+'_median']-c[k+'_low'],
+                    1.4826*c[k+'_mad'],p['resolution']) for k in ('left','right')]
+        moved_left=direction*l>limits[0];moved_right=direction*r>limits[1]
+        sustained=(moved_left&(stable_right|moved_right))|(moved_right&(stable_left|moved_left))
+        if np.count_nonzero(sustained)>=2:
+            return ['raw_one_or_two_sided_width_change'],'strong_change'
+        return ['raw_width_evidence_inconclusive'],'uncertain'
 
-    def verify(self,records,controls):
+    def verify(self,records,controls,*,profiles=None,width_audit=None,absolute=2.,relative=.2):
+        from .fast_candidate_publication import CandidateEvidence
+        self.fast2_evidence=CandidateEvidence(self.scenes,profiles,width_audit,absolute,relative)
+        self.absolute=absolute;self.relative=relative
         start=time.perf_counter();self.calibrate(controls)
         for i,row in enumerate(records):
             if not row.get('v2_publish',False):continue
@@ -218,23 +242,53 @@ class PatchVerifier:
 
     def record_decision(self,row,p,i):
         kind=row['change_typ']
+        # Geometry-only QA uses existing candidate axis/width, no new image
+        # descriptor or remeasurement. Unresolved narrow/curved strips stay QA.
+        if kind in ('widened','narrowed'):
+            axis=from_wkt(row['axis_wkt']);coords=np.asarray(axis.coords)[:,:2]
+            positive=[w for w in (row['width_bef'],row['width_aft']) if np.isfinite(w) and w>0]
+            p['width_geometry_reliable']=bool(positive and min(positive)>=4*p['resolution'] and
+                np.linalg.norm(coords[-1]-coords[0])>=.95*axis.length)
+        original_publish=bool(row.get('v2_publish',False))
+        original_reason=row.get('v2_precision_reason','')
         reasons,state=self.reasons(p,kind)
-        row.update(v2_publish_before_patch=True,v2_patch_state=state,v2_patch_reasons=';'.join(reasons),
+        row.update(v2_publish_before_patch=original_publish,v2_precision_reason_before_patch=original_reason,
+                   v2_patch_state=state,v2_patch_reasons=';'.join(reasons),
                    v2_patch_probability_before=p['periods'][0]['p'],v2_patch_probability_after=p['periods'][1]['p'],
                    v2_patch_surface_before=p['periods'][0]['s'],v2_patch_surface_after=p['periods'][1]['s'],v2_patch_image_ncc=p['ncc'],
                    v2_patch_image_core_ncc=p['core_ncc'])
-        if reasons:
+        from .fast_candidate_publication import grade_candidate
+        facts=self.fast2_evidence.facts(row) if hasattr(self,'fast2_evidence') else {}
+        level,conditions,metrics=grade_candidate(row,state,facts,
+            absolute=getattr(self,'absolute',2.),relative=getattr(self,'relative',.2))
+        row.update(v2_publication_level=level,v2_confidence_conditions=';'.join(conditions))
+        self.counts['level_'+level]+=1
+        if state=='uncertain':
+            for condition in conditions:self.counts['condition_'+condition]+=1
+            if conditions:self.counts['primary_condition_'+conditions[0]]+=1
+        self.counts[state]+=1
+        if state=='strong_stable':
             row.update(v2_publish=False,v2_precision_reason=state+':'+reasons[0])
-            self.counts[state]+=1
             self.counts['primary_'+reasons[0]]+=1
             for reason in reasons:self.counts['veto_'+reason]+=1
-        else:self.counts[f'after_{kind}']+=1
-        if not reasons and state!='verified':self.counts['qa_unknown']+=1
+        else:
+            if level=='Candidate':
+                row.update(v2_publish=False,v2_precision_reason='candidate_confidence:'+(';'.join(conditions)))
+            if row.get('v2_publish',False):self.counts[f'after_{kind}']+=1
+            if state=='uncertain':
+                self.counts['qa_unknown']+=1
+                for reason in reasons:self.counts['qa_'+reason]+=1
         self.audit.append(dict(candidate=i,kind=kind,state=state,reasons=reasons,
             left=p['left'].tolist(),right=p['right'].tolist(),ncc=p['ncc'],core_ncc=p['core_ncc'],
             ssim=p['ssim'],ring_ssim=p['ring_ssim'],anomaly=p['anomaly'],hog_distance=p['hog_distance'],
             road_scores=[r['road_score'] for r in p['periods']],score_delta=p['score_delta'],
-            registration=p['registration'],resolution=p['resolution'],valid=p['valid']))
+            registration=p['registration'],resolution=p['resolution'],valid=p['valid'],
+            width_geometry_reliable=p.get('width_geometry_reliable'),
+            published=bool(row.get('v2_publish',False)),publication_level=level,
+            confidence_conditions=conditions,fast2_evidence=metrics,
+            candidate_geometry_wkb=row['geometry'].wkb_hex if level=='Candidate' and 'geometry' in row else None,
+            candidate_axis_wkt=row.get('axis_wkt') if level=='Candidate' else None,
+            candidate_widths=[row.get('width_bef'),row.get('width_aft')] if level=='Candidate' else None))
 
     def write_audit(self,directory):
         directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)

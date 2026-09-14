@@ -364,7 +364,8 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
     from .fast_object_reconciliation import reconcile_presence
     counts.update(reconcile_presence(records,tolerance=tolerance,scenes=(before,after)))
     counts.update(reconcile_temporal(records,temporal_context or {},max(minimum_length,config.presence_minimum_length)))
-    if patch_verifier is not None:counts.update(patch_verifier.verify(records,controls))
+    if patch_verifier is not None:
+        counts.update(patch_verifier.verify(records,controls,profiles=profiles,width_audit=width_audit,absolute=absolute,relative=relative))
     counts['v2_local_sample_count']=counts['v2_probability_event_locations']+counts['v2_exact_width_event_sections']//2
     counts['timing_v2_total_seconds']=time.perf_counter()-started
     print('[Fast v2] '+str(dict(counts)),flush=True)

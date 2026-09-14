@@ -1,41 +1,47 @@
-# Radiometric normalization A/B
+# 独立 IR-MAD 辐射归一化实验
 
-本目录是独立实验，原图、正式项目缓存、正在进行的 Fast2 实验均不写入。
+当前固定 `T1=20250118`，只将 `T2=20260203` 归一化到 T1。复用 A 中已有 T1、Raw T2 道路成果，只运行 Normalized T2 提取。**不运行 Fast2、变化检测、GT 校正、Temporal 或多期批处理。** 不写正式代码、原始影像或正式成果。
 
-- 真实数据：验证区 `20250118 → 20260203`；reference 固定为 `20250118`。
-- A：原始 TIFF 的逐字节副本；B：reference 的逐字节副本和后期的独立归一化 TIFF。
-- 归一化：验证区有效像元每 8 像元抽样；每通道中位数匹配，IQR 估计增益；用 p1/p99 限制增益，使主要有效像素不越过 0–254。255 是原图 NoData，逐通道保持。无 GT、CLAHE、均衡或几何重采样。
-- 两组都从空的实验缓存运行 SAMRoad → Fast surface → SAM-MoLRA/测宽 → 产品导出。模型配置及 Fast2 阈值相同。Fast2 的背景宽度校正保留不变。
-- 不向推理和 Auto 传 GT；`evaluate.py` 必须确认两组完成且没有 GT 输入，冻结预测文件哈希后才复制和打开 GT。
-- A/B 均只使用这两个时期，没有调用正式任务的相邻期成果。
+## 方法
 
-## 代码冻结
+- 全部共同有效 RGB 像素做 IR-MAD，最多 30 次；CCA 相关系数最大变化小于 0.01 时收敛，与 ArrNorm 默认设置一致。
+- `NCP > 0.95` 选择 PIF；逐波段正交 / TLS 回归，`reference = gain * target + offset`。所有瓦片共用参数，不链式归一化，不使用道路、GT、Fast2 结果选择 PIF。
+- 原始 TIFF 不同 CRS/分辨率；复用 baseline 已有的 8 对严格共网格、未做辐射归一化的分析瓦片，零新增 warp。推理网格与 baseline 完全相同。
+- 另存原始 T2 网格的 normalized TIFF 用于 GIS；不将它再次空间处理后投入推理，以避免二次处理影响对照。
+- 保持 CRS、transform、shape、dtype、nodata、逐波段有效性、波段说明及非统计元数据。采用无损 DEFLATE；删除失效 DN 统计标签。uint8 四舍五入并裁剪至有效编码范围；原生 TIFF 的 255 保留为 nodata，记录裁剪数量。不改模型内部 normalization。
+- 使用 baseline 冻结生产代码 `snapshot/code`，提交 `734fe17cada16effc181336bfe1b18ad5e75daad`，相同模型、配置、fast 提取步骤和 Auto 参数。Auto 因影像改变 profile 属于原流程行为。
 
-本轮开始时工作树干净。运行过程中检测到其他任务修改共享 Fast2 代码，因此从开始时的提交 `734fe17cada16effc181336bfe1b18ad5e75daad` 冻结生产代码到 `snapshot/code`。
-A 的提取阶段所用源代码与快照一致；B 使用快照运行全部流水线。最后 `frozen_fast2.py` 在两组未经最终协调的 Auto 道路成果上使用同一快照重新检测，报告只使用这两个 `frozen_fast2` 结果。
-快照和原代码的比较记录见 `config/snapshot.json`。不修改任何生产文件。
-
-## 文件
-
-- `config/experiment.json`、`config/command_*.json`：固定参数和实际命令。
-- `inputs/raw`、`inputs/normalized`：输入 TIFF；`normalization.json`：线性参数、分位数和保真检查。
-- `normalized_tiffs`：供 GIS 查看使用的归一化 TIFF，移除了原图留下的旧统计标签；已验证像元、掩膜和网格与 B 实际输入完全一致。实际运行输入保持原样用于复现。
-- `A`、`B`：各自的缓存、完整流水线产品、独立 Fast2 输出。
-- `logs`、`tmp`、`cache`：实验运行日志和运行时缓存。
-- `diagnostics/radiometric_inputs.png`：统一 0–255 显示范围的 RGB 预览。
-- `evaluation`：GT 后验评价、无 GT 交集对象、固定采样点及整段宽差表。
-- `metrics.json`：机器可读结果；`REPORT.md`：最终结论。
+参考 [SMByC/ArrNorm](https://github.com/SMByC/ArrNorm)、[IR-MAD](https://github.com/SMByC/ArrNorm/blob/master/core/iMad.py) 和 [正交回归](https://github.com/SMByC/ArrNorm/blob/master/core/auxil/auxil.py)。使用 NumPy/SciPy 独立实现 SVD CCA、全像素流式矩和 TLS，未复制或安装开源程序。
 
 ## 执行
 
-在仓库根目录使用 `runtime/env/samroad_env/python.exe -B` 执行本目录脚本。已完成的目录不要再次 prepare 或 normalize。
+在仓库根目录执行。依赖本地已有 A 成果、冻结代码、模型及实验配置，Git 只保存代码和说明，不含这些资源。已完成步骤有防重复检查。
 
 ```powershell
-runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/run_experiment.py A
-runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/run_experiment.py B
-runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/frozen_fast2.py
-runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/evaluate.py
-runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/test_metrics.py
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/run_irmad_experiment.py normalize
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/run_irmad_experiment.py extract
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/compare_irmad_roads.py
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/report_irmad.py
+runtime/env/samroad_env/python.exe -B -m unittest discover -s experiments/radiometric_normalization_ab -p 'test_irmad*.py'
 ```
 
-seed=0；关闭 cuDNN benchmark 并启用 deterministic 选择。GPU 算子仍可能存在数值非确定性，reference A/B 的重复提取结果用于检查这一点。所有源模型只读。
+`finish_irmad_outputs.py` 仅用于恢复本次中断的 TIFF 导出；不拟合参数或推理，保留失败文件，逐像元验证已有输出。
+
+## 本地输出
+
+- `irmad/normalization.json`：参数、迭代、PIF 分布、裁剪和保真检查。
+- `irmad/normalized_tiles/`：实际推理用的 T2 GeoTIFF。
+- `irmad/normalized_native/20260203.tif`：原始 T2 网格的归一化 TIFF。
+- `irmad/pif/`：NCP 图，-1 为非共同有效像元。
+- `irmad/T2/`：唯一新增道路成果、SAM-MoLRA 概率、道路面和自然生成的宽度。
+- `irmad/evaluation/`：采样点、稳定道路宽差、指标、图和 `REPORT.md`。
+- `irmad/*audit.json`：原始副本和 baseline 的哈希保真检查。
+- `irmad/*.log`：本次日志；运行时缓存和临时文件仍在本实验 `cache/`、`tmp/`。
+
+评价使用验证范围内的共同有效像素；中心线每约 2m 采样，3m 距离和 30° 方向阈值匹配，另报 1/5m 敏感性。稳定道路是两种 T2 均匹配的长 T1 道路代理，不是真值。恢复、丢失、未匹配和新生片段不能直接解释为准确率或假变化数量。分别比较覆盖、偏移、道路总量、原始/增强 SAM-MoLRA 面、最终道路面，以及注明 fallback 比例的自然宽度。
+
+## 历史成果与 Git
+
+`A/`、`B/` 和旧 `run_experiment.py`、`evaluate.py`、`finish_experiment.py`、`frozen_fast2.py` 等属于此前 median/IQR 完整 A/B，保留追溯。**本轮不再调用旧入口**，只复用工具函数、A 成果和冻结配置。旧评价未完成，不能视为 IR-MAD 结论。
+
+`.gitignore` 默认忽略全部生成物，只允许根目录 Python、README、gitignore 和 bootstrap Python。影像、配置中的本机路径、模型、日志、缓存、图表和报告均不上传。

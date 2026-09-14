@@ -146,12 +146,13 @@ class FastFinalAutoTests(unittest.TestCase):
         result = detect_fast_changes(*inputs, output)
         self.assertFalse(result["ground_truth_used"])
         # This fixture has model rasters only. Raw-image-primary verification
-        # must not silently fall back to those models to publish an addition.
-        self.assertEqual(result["added_feature_count"], 0)
+        # must preserve the incoming Fast2 decision as uncertain, not reject it.
+        self.assertEqual(result["added_feature_count"], 1)
         import json
         patch_audit=json.loads((output/'patch_verification.json').read_text(encoding='utf8'))
         self.assertTrue(patch_audit['candidates'])
-        self.assertTrue(all('raw_image_unavailable_or_invalid' in row['reasons']
+        self.assertTrue(all(row['state']=='uncertain' and row['published'] and
+                            'raw_image_unavailable_or_invalid' in row['reasons']
                             for row in patch_audit['candidates']))
         self.assertEqual(result["removed_feature_count"], 0)
         for key in ("road_changes", "summary", "road_change"):
@@ -183,6 +184,19 @@ class FastFinalAutoTests(unittest.TestCase):
         self.assertIn('corrected_intervals', set(gpd.list_layers(corrected['correction_audit']).name))
         detect_fast_changes(*inputs, output, internal_outputs=False)
         self.assertFalse((output/'network_assembly.gpkg').exists())
+
+        # The same upstream addition without independent source surface support
+        # stays available internally as Candidate, even with diagnostics disabled.
+        weak_after=dict(inputs[1],surfaces=inputs[0]['surfaces'])
+        weak_output=Path(self.tmp.name)/'weak_auto'
+        weak=detect_fast_changes(inputs[0],weak_after,weak_output)
+        self.assertEqual(weak['added_feature_count'],0)
+        weak_audit=json.loads((weak_output/'patch_verification.json').read_text(encoding='utf8'))
+        candidates=[r for r in weak_audit['candidates'] if r['publication_level']=='Candidate']
+        self.assertTrue(candidates)
+        from shapely import from_wkb
+        self.assertTrue(all(from_wkb(bytes.fromhex(r['candidate_geometry_wkb'])).is_valid for r in candidates))
+        self.assertTrue(all(r['state']=='uncertain' and not r['published'] for r in candidates))
 
     def test_empty_formal_result_still_publishes_funnel_and_audits(self):
         from engine.fast_auto_change import finalize_auto_candidates
