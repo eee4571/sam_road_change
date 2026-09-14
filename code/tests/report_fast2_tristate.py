@@ -69,6 +69,9 @@ def main():
         analysis_seconds=sum(p['analysis_seconds'] for p in data),
         total_seconds=sum(p['total_seconds'] for p in data),geometry_checks=geometry,feature_checks=features)
     if args.tiers:
+        for key in ('old_919_reclassification','uncertain_recovered','strong_change_recovered','previously_kept_vetoed'):
+            summary.pop(key,None)
+        summary.update(uncertain_to_candidate=levels['Candidate'],image_rejected=levels['Rejected'])
         summary.update(publication_levels=dict(levels),uncertain_conditions=dict(conditions),
             primary_uncertain_conditions=dict(primary_conditions),
             by_kind={k:{level:grade_by_kind[(k,level)] for level in ('Confirmed','Probable','Candidate','Rejected')} for k in kinds})

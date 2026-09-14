@@ -47,6 +47,10 @@ class PublicationTests(unittest.TestCase):
         self.assertIn('presence_junction_context',grade_candidate(r,'uncertain',{'uncovered_axis_fraction':1})[1])
         r['v2_temporal_state']='persistent_change'
         self.assertEqual(grade_candidate(r,'uncertain',{'uncovered_axis_fraction':1})[0],'Probable')
+        r['qa_state']='probable'
+        self.assertNotIn('presence_ambiguous_correspondence',grade_candidate(r,'uncertain',{'uncovered_axis_fraction':1})[1])
+        r['ambiguous']=True
+        self.assertIn('presence_ambiguous_correspondence',grade_candidate(r,'uncertain',{'uncovered_axis_fraction':1})[1])
 
     def test_width_requires_continuous_reliable_profile(self):
         facts=dict(one_to_one_match=True,strong_profile_fraction=1.,matched_axis_fraction=.9)

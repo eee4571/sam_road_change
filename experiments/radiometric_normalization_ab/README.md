@@ -29,6 +29,8 @@ runtime/env/samroad_env/python.exe -B -m unittest discover -s experiments/radiom
 
 ## 本地输出
 
+当前新增 **原始 TopoNet 展示**：运行 `show_raw_toponet.py`，直接读取三组已有 `*_fast_topology.npz`，绕过全部下游道路后处理，不重新推理。结果在 `irmad/raw_toponet/`，包括独立显示、叠加 T1 对照、全区图和保留置信度的 `raw_toponet.gpkg`。保留原模型候选点生成和连接阈值 0.5；不补线、删支、平滑或进行道路面约束。此前 `irmad/evaluation/` 的图和数值仍是后处理成果，保留追溯，不能与原始 TopoNet 图混淆。
+
 - `irmad/normalization.json`：参数、迭代、PIF 分布、裁剪和保真检查。
 - `irmad/normalized_tiles/`：实际推理用的 T2 GeoTIFF。
 - `irmad/normalized_native/20260203.tif`：原始 T2 网格的归一化 TIFF。
