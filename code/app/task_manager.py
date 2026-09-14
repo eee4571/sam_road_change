@@ -160,6 +160,7 @@ def build_pipeline_command(
     area_truths: list[tuple[str, str, str, str]] | None = None,
     area_periods: dict[str, list[tuple[str, str]]] | None = None,
     execution_profile: str = "full",
+    irmad: bool = False,
 ) -> list[str]:
     """Build the backend command for the default validation or backup grid mode."""
     mode = str(mode or "validation").strip().casefold()
@@ -273,6 +274,7 @@ def build_pipeline_command(
         args.append("--data-check-only")
     elif runtime_preflight and not preflight_only:
         args.append("--runtime-preflight")
+    args.append("--irmad" if irmad else "--no-irmad")
     return args
 
 def build_apply_edits_command(item: dict[str, str], pipeline_manifest: Path | str | None = None) -> list[str]:
@@ -711,7 +713,7 @@ class TaskManager:
     @staticmethod
     def build_extract_all(
         project_root, run_id, *, output_root, device, pixel_size, rescale,
-        junction_node_mode, continue_on_error=False,
+        junction_node_mode, continue_on_error=False, irmad=False,
     ) -> list[str]:
         args = [
             "extract-project-all", "--project-root", str(project_root),
@@ -724,12 +726,13 @@ class TaskManager:
             args.append("--resume")
         if continue_on_error:
             args.append("--continue-on-error")
+        args.append("--irmad" if irmad else "--no-irmad")
         return args
 
     @staticmethod
     def build_extract_period(
         project_root, area_id, period, run_id, *, output_root, device,
-        pixel_size, rescale, junction_node_mode,
+        pixel_size, rescale, junction_node_mode, irmad=False,
     ) -> list[str]:
         args = [
             "extract-project-period", "--project-root", str(project_root),
@@ -743,6 +746,7 @@ class TaskManager:
         ) / "period_task.json"
         if state.is_file():
             args.append("--resume")
+        args.append("--irmad" if irmad else "--no-irmad")
         return args
 
     @staticmethod

@@ -105,11 +105,5 @@ def weighted_median(values,weights):
     return float(values[order[np.searchsorted(np.cumsum(w),w.sum()/2)]])
 
 
-def estimate_width_bias(samples,minimum=30):
-    """One vote per reliable road; majority-stable assumption is explicit."""
-    values=np.asarray(samples,dtype=float);values=values[np.isfinite(values)]
-    bias=float(np.median(values)) if len(values) else 0.
-    scatter=float(1.4826*np.median(np.abs(values-bias))) if len(values) else 0.
-    reliable=len(values)>=minimum
-    return dict(bias=bias if reliable else 0.,scatter=scatter if reliable else 0.,count=len(values),
-                reliable=reliable,estimated_bias=bias,estimated_scatter=scatter)
+# Keep the existing standalone estimator import for callers and baseline tests.
+from .fast2_compensation.width_temporal_bias_correction import estimate_width_bias

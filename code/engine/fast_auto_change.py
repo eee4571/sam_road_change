@@ -768,9 +768,16 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
 @timed_stage("auto_total")
 def detect_final_road_changes(before_result, after_result, output_dir, *, before_period, after_period,
                               position_tolerance, width_change_absolute, width_change_ratio,
-                              min_change_area, min_change_length, internal_outputs, algorithm="v2", temporal_results=None):
+                              min_change_area, min_change_length, internal_outputs, temporal_results=None, compensation=None):
+    """Official Fast detector: Fast2 only; analyze_scenes remains a separate Fast1 baseline."""
     from .fast_pipeline import _load_fast_period_result, _read_fast_change_layer
+    from .fast_auto_v2 import analyze_scenes as analyzer
+    from .fast_multitemporal import load_contexts
+    from .fast_patch_verification import PatchVerifier
+    from .fast2_compensation import Fast2Compensation
+    modules = Fast2Compensation(compensation)
     started = time.perf_counter()
+    print("[Fast Auto] Fast2 segment/interval detector", flush=True)
     payloads = [_load_fast_period_result(value) for value in (before_result, after_result)]
     centerlines = [_read_fast_change_layer(p, "centerlines") for p in payloads]
     output_crs = centerlines[0].crs
@@ -797,28 +804,28 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                     raise
             scenes.append(scene_cache.get(p,metric_crs,load_scene) if scene_cache is not None else load_scene())
         presence_audit = []
-        if algorithm == "v2":
-            from .fast_auto_v2 import analyze_scenes as analyzer
-            from .fast_multitemporal import load_contexts
-            from .fast_patch_verification import PatchVerifier
-            patch_verifier=PatchVerifier(scenes,payloads)
-            extra=dict(temporal_context=load_contexts(temporal_results,metric_crs,float(position_tolerance)*1.5),patch_verifier=patch_verifier)
-        elif algorithm == "baseline":
-            analyzer = analyze_scenes
-            extra={}
-        else:
-            raise ValueError(f"Unknown Fast Auto algorithm: {algorithm}")
+        patch_verifier=PatchVerifier(scenes,payloads,compensation=modules.config)
+        extra=dict(temporal_context=load_contexts(temporal_results,metric_crs,float(position_tolerance)*1.5),
+                   patch_verifier=patch_verifier,compensation=modules.config)
         records, audit, width_audit, counts = analyzer(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
             relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
             minimum_area=float(min_change_area), presence_audit=presence_audit,**extra)
         if patch_verifier is not None:patch_verifier.write_audit(output_dir)
-        return finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
+        result = finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
                                         scenes=dict(zip(("before", "after"), scenes)), centerlines=centerlines,
                                         output_dir=output_dir, before_period=before_period, after_period=after_period,
                                         position_tolerance=position_tolerance, min_change_area=min_change_area,
                                         min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started,
                                         internal_outputs=internal_outputs)
+        result.update(fast2_compensation=modules.config.to_dict(),
+                      fast2_compensation_identity=modules.config.cache_identity)
+        summary_path = Path(result['summary'])
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        summary.update(fast2_compensation=result['fast2_compensation'],
+                       fast2_compensation_identity=result['fast2_compensation_identity'])
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
+        return result
     finally:
         if patch_verifier is not None:patch_verifier.close()
         if scene_cache is None:

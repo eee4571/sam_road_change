@@ -18,6 +18,7 @@ from shapely.geometry import Point, LineString
 
 from . import fast_auto_change as legacy
 from .auto_presence_candidates import LongitudinalCoverage, line_parts
+from .fast2_compensation import Fast2Compensation
 
 
 @dataclass(frozen=True)
@@ -327,21 +328,26 @@ def _strong_runs(indexes, strong):
     if run:yield run
 
 
-def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None):
+def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None,compensation=None):
+    modules=Fast2Compensation(compensation)
+    if patch_verifier is not None and patch_verifier.compensation.config != modules.config:
+        raise ValueError("Analyzer and patch verifier compensation configurations must match")
     started=time.perf_counter();counts=Counter(v2_enabled=1,v2_station_count=0,v2_legacy_analyzer_calls=0,
                                               v2_exact_width_event_sections=0,v2_probability_event_locations=0)
+    counts['compensation']=modules.config.to_dict()
+    counts['compensation_identity']=modules.config.cache_identity
     records=[];audit=[];width_audit=[];evidence=ChangeEvidence(before,after,config)
     counts['timing_v2_change_evidence_seconds']=time.perf_counter()-started
     if not evidence.ready:return records,audit,width_audit,dict(counts)
     counts['v2_evidence_resolution_m']=float(evidence.resolution);buffers={}
-    from .fast_multitemporal import estimate_width_bias,reconcile_temporal
+    from .fast_multitemporal import reconcile_temporal
     tick=time.perf_counter();profiles={}
     for axis_id,axis in enumerate(before.lines):
         matched=_network_intervals(axis,after,tolerance,buffers,counts)
         profiles[axis_id]=_paired_profiles(axis,matched,before,after,minimum_length)
     counts['timing_v2_profile_preparation_seconds']=time.perf_counter()-tick
     tick=time.perf_counter();controls=_calibration_roads(profiles,before,after,tolerance)
-    calibration=estimate_width_bias([r['width_delta'] for r in controls])
+    calibration=modules.width.fit([r['width_delta'] for r in controls])
     counts.update(v2_width_bias_m=calibration['bias'],v2_width_bias_scatter_m=calibration['scatter'],
                   v2_width_bias_controls=calibration['count'],v2_width_bias_reliable=int(calibration['reliable']),
                   v2_width_bias_estimate_m=calibration['estimated_bias'],

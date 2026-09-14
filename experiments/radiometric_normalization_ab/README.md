@@ -1,6 +1,22 @@
 # 独立 IR-MAD 辐射归一化实验
 
-当前固定 `T1=20250118`，只将 `T2=20260203` 归一化到 T1。复用 A 中已有 T1、Raw T2 道路成果，只运行 Normalized T2 提取。**不运行 Fast2、变化检测、GT 校正、Temporal 或多期批处理。** 不写正式代码、原始影像或正式成果。
+当前固定 `T1=20250118`，只将 `T2=20260203` 归一化到 T1。三组道路提取阶段已经完成，后续全部复用 T1、Raw T2、IR-MAD T2 已有的中心线、道路面和宽度。不写正式代码、原始影像或正式成果。
+
+## 当前阶段：Fast2 基础变化对比
+
+按用户最新要求，运行独立 `fast2_basic.py`，复用冻结 Fast2 的纵向覆盖、网络对应和已有宽度区间，只发布基本 segment/interval 变化。两组参数相同，不运行多时相抑制、影像 patch 验证、segment/object reconciliation、宽度背景校正、额外概率/道路面否决或对象合并。既有道路后处理成果保持原样。
+
+旧 A 变化结果已经过额外过滤且没有保存完整基础候选；用户确认后，仅补算尚不存在的 A 基础变化结果，未重跑道路提取/道路面/测宽或旧 A 流水线。两组完成后保存预测哈希，再由 `evaluate_fast2_basic.py` 读取 GT 做离线评价。GT 不反馈给检测。
+
+```powershell
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/fast2_basic.py
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/evaluate_fast2_basic.py
+runtime/env/samroad_env/python.exe -B experiments/radiometric_normalization_ab/report_fast2_basic.py
+```
+
+输出在 `irmad/fast2_basic/`：`raw/changes.gpkg` 与 `normalized/changes.gpkg` 各含原始变化区间和轴线；`evaluation/REPORT.md`、全区及局部图、GT 交集表；`predictions_frozen_before_GT.json` 记录 GT 前冻结；`source/` 保存实际运行代码。本轮数量口径为一行一个基础 interval，不能与旧过滤后组装的对象数直接比较。重复运行检测入口会复用完成结果。
+
+下文保留归一化及道路提取阶段的复现方式；这些已完成步骤本轮没有重新执行。
 
 ## 方法
 

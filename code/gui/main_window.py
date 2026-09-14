@@ -285,6 +285,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             for key, value in {
                 "mode": "validation",
                 "execution_profile": "fast",
+                "irmad": "0",
                 "validation_area": "",
                 "truth_type_field": "",
                 "evaluate": "0",

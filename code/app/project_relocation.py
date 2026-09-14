@@ -357,6 +357,7 @@ def _validate_active_task_json(job_root: Path) -> int:
     candidates = {job_root / "job_state.json", job_root / "pipeline_result.json"}
     for name in ("period_state.json", "latest_result.json", "input_manifest.json"):
         candidates.update(job_root.glob(f"grids/*/periods/*/{name}"))
+        candidates.update(job_root.glob(f"grids/*/periods/*/radiometric/*/{name}"))
     checked = 0
     for path in sorted(candidates, key=str):
         if not path.is_file():
@@ -395,6 +396,7 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
     plans: list[tuple[Path, str, str, int]] = []
     missing: list[Path] = []
     list_paths = sorted(root.glob("grids/*/periods/*/batches/*.txt"), key=str)
+    list_paths += sorted(root.glob("grids/*/periods/*/radiometric/*/batches/*.txt"), key=str)
     for list_path in list_paths:
         try:
             original = list_path.read_text(encoding="utf-8-sig")
@@ -422,11 +424,13 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
             parts = PureWindowsPath(text).parts
             lowered = tuple(part.lower() for part in parts)
             for i in range(len(parts)-3):
-                if lowered[i:i+3] == ('_work', 'cache', 'normalized') and cache_root is not None:
-                    target = cache_root.joinpath(*parts[i+3:]).resolve()
+                if (lowered[i:i+2] == ('_work', 'cache') and lowered[i+2] in ('normalized','irmad')
+                        and cache_root is not None):
+                    target = cache_root.parent.joinpath(lowered[i+2],*parts[i+3:]).resolve()
+                    owned_cache_root = cache_root.parent / lowered[i+2]
                     cache_reference = True
                     break
-            owned = (_relative_to(target, cache_root) is not None if cache_reference
+            owned = (_relative_to(target, owned_cache_root) is not None if cache_reference
                      else _relative_to(target, images_root) is not None and _relative_to(target, root) is not None)
             if not owned:
                 raise ValueError(f"影像清单映射目标逃出当前任务：{text} -> {target}")

@@ -266,6 +266,37 @@ class FastProductionTests(unittest.TestCase):
             periods.assert_not_called();changes.assert_not_called()
             self.assertEqual(order,['pair','pair','finalize','publish'])
 
+    def test_completed_resume_replaces_old_auto_only_and_reuses_current_fast2(self):
+        from engine.fast_multitemporal import AUTO_REVISION
+        for revision in (None, 'fast1', AUTO_REVISION):
+            with self.subTest(revision=revision), tempfile.TemporaryDirectory() as raw:
+                root=Path(raw);source=root/'input';source.mkdir()
+                args=argparse.Namespace(source_root=str(source),output_root=str(root/'results'),run_id='run',
+                    checkpoint='model.ckpt',config='config.yaml',device='cpu',pixel_size='0',rescale='off',
+                    absolute='2',ratio='.2',tolerance='3',execution_profile='fast')
+                def finalize(manifest, job):
+                    manifest['final_period_results']=manifest['period_results']
+                    manifest['temporal_results']=[{'grid':'g','status':'completed'}]
+                    manifest['fast_finalization_state']='completed'
+                with patch.object(p,'discover_grid_periods',return_value={'g':{x:source/f'{x}.txt' for x in ('1','2')}}), \
+                     patch.object(p,'prepare') as prepare, patch.object(p,'extract',return_value={}) as extract, \
+                     patch.object(p,'_run_fast_change_result',return_value={'fast_auto_revision':revision}) as pair, \
+                     patch.object(p,'_finalize_fast_manifest',side_effect=finalize) as final, \
+                     patch.object(p,'_period_result_ready',return_value=True), \
+                     patch.object(p,'_change_result_ready',return_value=True), \
+                     patch.object(p,'_temporal_result_ready',return_value=True), \
+                     patch.object(ResultPublisher,'publish_manifest'),patch.object(ResultPublisher,'publish_reports'), \
+                     patch.object(p,'aggregate_change_evaluations'):
+                    p.run_all(args)
+                    prepare.reset_mock();extract.reset_mock();pair.reset_mock();final.reset_mock()
+                    pair.return_value={'fast_auto_revision':AUTO_REVISION}
+                    args.resume=True
+                    resumed=p.run_all(args)
+                prepare.assert_not_called();extract.assert_not_called()
+                self.assertEqual(pair.call_count, 0 if revision==AUTO_REVISION else 1)
+                self.assertEqual(final.call_count, 0 if revision==AUTO_REVISION else 1)
+                self.assertEqual(resumed['change_results'][0]['fast_auto_revision'], AUTO_REVISION)
+
     def test_road_state_is_internal_and_fast_evaluation_stays_under_changes(self):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw);state=root/'road_state.gpkg';state.write_text('private')

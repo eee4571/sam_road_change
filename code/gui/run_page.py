@@ -165,6 +165,11 @@ class RunPage:
         self.advanced_frame = ttk.Frame(self.run_settings_frame)
         self._field(self.advanced_frame, "道路模型", "checkpoint", "file")
         self._field(self.advanced_frame, "推理配置", "config", "file")
+        radiometric_row = ttk.Frame(self.advanced_frame)
+        radiometric_row.pack(fill=X, pady=(4, 2))
+        ttk.Checkbutton(radiometric_row, text="跨时相辐射归一化（IR-MAD）",
+                        variable=self.vars["irmad"], onvalue="1", offvalue="0").pack(side=LEFT)
+        ttk.Label(radiometric_row, text="参考期：20250118").pack(side=LEFT, padx=(12, 0))
         advanced_row = ttk.Frame(self.advanced_frame)
         advanced_row.pack(fill=X, pady=(4, 2))
         ttk.Label(advanced_row, text="计算设备", width=18).pack(side=LEFT)
@@ -217,6 +222,7 @@ class RunPage:
             area_truths=(self.project_area_truths or None),
             area_periods=(self.project_area_periods or None),
             execution_profile=self.vars["execution_profile"].get(),
+            irmad=(self.vars["irmad"].get() == "1") if "irmad" in self.vars else False,
         )
 
     def preflight_inputs(self) -> None:
@@ -427,6 +433,7 @@ class RunPage:
                 rescale=self.vars["rescale"].get(),
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 continue_on_error=self.vars["continue_on_error"].get() == "1",
+                irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)
@@ -447,6 +454,7 @@ class RunPage:
                 pixel_size=self.vars["pixel_size"].get(),
                 rescale=self.vars["rescale"].get(),
                 junction_node_mode=self.vars["junction_node_mode"].get(),
+                irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)

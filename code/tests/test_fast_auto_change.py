@@ -128,6 +128,15 @@ class FastFinalAutoTests(unittest.TestCase):
 
     def test_formal_entry_publishes_vectors_funnel_and_preview(self):
         from engine.fast_pipeline import detect_fast_changes
+        from engine import fast_auto_change as baseline
+        from unittest.mock import patch
+        # Guard the actual public entry and posterior GT chain, not just V2's
+        # direct analyzer. Fast1 stays independently callable in baseline tests.
+        for owner, name in ((baseline, 'analyze_scenes'), (RoadScene, 'match'),
+                            (baseline, '_measure_period_width')):
+            guard = patch.object(owner, name, side_effect=AssertionError('production called Fast1'))
+            guard.start()
+            self.addCleanup(guard.stop)
         scenes = [self.scene([self.road(100)]), self.scene([self.road(100), self.road(170)])]
         inputs = []
         for index, scene in enumerate(scenes):
@@ -145,6 +154,8 @@ class FastFinalAutoTests(unittest.TestCase):
         output = Path(self.tmp.name)/"auto"
         result = detect_fast_changes(*inputs, output)
         self.assertFalse(result["ground_truth_used"])
+        self.assertTrue(result['performance']['v2_enabled'])
+        self.assertEqual(result['performance']['v2_station_count'], 0)
         # This fixture has model rasters only. Raw-image-primary verification
         # must preserve the incoming Fast2 decision as uncertain, not reject it.
         self.assertEqual(result["added_feature_count"], 1)
@@ -173,14 +184,21 @@ class FastFinalAutoTests(unittest.TestCase):
                          {'change_objects', 'object_axes'})
         self.assertFalse((output/'auto_diagnostics.gpkg').exists())
         self.assertFalse(list(output.glob('*.csv')))
-        from engine.fast_gt_reconciliation import augment_fast_changes_with_truth
+        import user_pipeline
+        from engine.fast_multitemporal import AUTO_REVISION
         truth = Path(self.tmp.name)/'truth.gpkg'
         gpd.GeoDataFrame({'BHBM': [2]}, geometry=[self.road(170)[0].buffer(4)],
                          crs=self.crs).to_file(truth)
-        corrected = augment_fast_changes_with_truth(result, truth,
-                            Path(self.tmp.name)/'corrected', before_result=inputs[0],
-                            after_result=inputs[1], defer_finalization=True)
+        corrected = user_pipeline._run_fast_change_result(*inputs,
+                            Path(self.tmp.name)/'corrected', truth_path=truth,
+                            before_period='1', after_period='2', position_tolerance=3.,
+                            width_change_absolute=2., width_change_ratio=.2, defer_finalization=True)
         self.assertTrue(corrected['ground_truth_used'])
+        self.assertEqual(corrected['fast_auto_revision'], AUTO_REVISION)
+        self.assertEqual(corrected['fast_finalization_state'], 'pending')
+        auto_summary = json.loads((Path(self.tmp.name)/'corrected/_automatic/change_summary.json').read_text(encoding='utf8'))
+        self.assertTrue(auto_summary['performance']['v2_enabled'])
+        self.assertFalse(auto_summary['ground_truth_used'])
         self.assertIn('corrected_intervals', set(gpd.list_layers(corrected['correction_audit']).name))
         detect_fast_changes(*inputs, output, internal_outputs=False)
         self.assertFalse((output/'network_assembly.gpkg').exists())

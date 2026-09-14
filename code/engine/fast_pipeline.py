@@ -6331,8 +6331,9 @@ def detect_fast_changes(
     min_change_length: float | None = None,
     internal_outputs: bool = False,
     temporal_results: dict | None = None,
+    compensation=None,
 ) -> dict:
-    """No-truth Auto, using final products and symmetric road evidence."""
+    """Official no-truth Fast2 Auto; shared by all Fast workflow commands."""
     from .fast_auto_change import detect_final_road_changes
 
     return detect_final_road_changes(
@@ -6345,6 +6346,7 @@ def detect_fast_changes(
         min_change_length=min_change_length,
         internal_outputs=internal_outputs,
         temporal_results=temporal_results,
+        compensation=compensation,
     )
 
 

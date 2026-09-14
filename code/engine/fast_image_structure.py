@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 from scipy.ndimage import uniform_filter, binary_erosion, gaussian_filter1d
+from .fast2_compensation.patch_radiometric_normalization import PatchRadiometricNormalization
 
 
 def q(values, fraction, default=np.nan):
@@ -32,17 +33,14 @@ def axis_grid(axis,xy):
 
 
 def normalized_gray(rgb):
-    gray=np.mean(rgb,axis=0);valid=np.isfinite(gray)
-    low,high=q(gray,.1),q(gray,.9)
-    if not np.isfinite(high-low) or high-low<=1e-6:return np.zeros(gray.shape,np.float32),valid&False
-    return np.nan_to_num(np.clip((gray-low)/(high-low),-1,2),nan=0.).astype(np.float32),valid
+    return PatchRadiometricNormalization().grayscale(rgb)
 
 
 def gradients(gray):
     return cv2.Scharr(gray,cv2.CV_32F,1,0)/32, -cv2.Scharr(gray,cv2.CV_32F,0,1)/32
 
 
-def align_pair(a,b,va,vb,ring,max_shift=3.):
+def align_pair(a,b,va,vb,ring,max_shift=3.,*,radiometric=PatchRadiometricNormalization()):
     """Translation only, estimated/validated on background, never road edges.
 
     Three pixels is a registration safety bound, not a change threshold. An
@@ -65,13 +63,8 @@ def align_pair(a,b,va,vb,ring,max_shift=3.):
             b=shifted;vb=shifted_valid
             info.update(dx_px=float(delta[0]),dy_px=float(delta[1]),accepted=True)
     mask=ring&va&vb
-    # Robust affine illumination correction on background only; no histogram
-    # matching of the road, which could erase the very change being tested.
-    alo,ahi=q(a[mask],.2),q(a[mask],.8);blo,bhi=q(b[mask],.2),q(b[mask],.8)
-    if np.isfinite(ahi-alo) and bhi-blo>1e-6:
-        gain=float(np.clip((ahi-alo)/(bhi-blo),2/3,1.5))
-        offset=float(np.clip(q(a[mask],.5)-gain*q(b[mask],.5),-.25,.25))
-        b=(b*gain+offset).astype(np.float32);info.update(gain=gain,offset=offset)
+    b,illumination=radiometric.apply(a,b,mask)
+    info.update(illumination)
     return b,vb,info
 
 
@@ -119,9 +112,9 @@ def similarity(a,b,mask):
     return q(ssim[mask],.5),ncc(a['gradient'],b['gradient'],mask)
 
 
-def image_features(rgb_a,rgb_b,core,ring,lateral,bins,normal,width,resolution):
-    a,va=normalized_gray(rgb_a);b,vb=normalized_gray(rgb_b)
-    b,vb,registration=align_pair(a,b,va,vb,ring)
+def image_features(rgb_a,rgb_b,core,ring,lateral,bins,normal,width,resolution,*,radiometric=PatchRadiometricNormalization()):
+    a,va=radiometric.grayscale(rgb_a);b,vb=radiometric.grayscale(rgb_b)
+    b,vb,registration=align_pair(a,b,va,vb,ring,radiometric=radiometric)
     periods=[describe(g,v,core,ring,lateral,bins,normal,width,resolution) for g,v in ((a,va),(b,vb))]
     a,b=periods;valid=a['image_valid']&b['image_valid']
     cs,cn=similarity(a,b,core&valid);bs,bn=similarity(a,b,ring&valid)

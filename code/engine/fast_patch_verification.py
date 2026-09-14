@@ -16,6 +16,7 @@ from rasterio.warp import reproject, Resampling, transform_bounds
 from rasterio.vrt import WarpedVRT
 from scipy.ndimage import label
 from .fast_image_structure import axis_grid,image_features
+from .fast2_compensation import Fast2Compensation
 from shapely import from_wkt
 from shapely.geometry import box
 from shapely.strtree import STRtree
@@ -89,7 +90,8 @@ def road_boundaries(surface,anchor,outer,bins,lateral):
 
 
 class PatchVerifier:
-    def __init__(self,scenes,payloads,maximum_controls=96):
+    def __init__(self,scenes,payloads,maximum_controls=96,*,compensation=None):
+        self.compensation=Fast2Compensation(compensation)
         self.scenes=scenes;self.maximum_controls=maximum_controls;self.counts=Counter()
         self.tiles=[];self.controls=[];self.calibration={};self.audit=[]
         try:
@@ -118,13 +120,15 @@ class PatchVerifier:
         for scene,tiles in zip(self.scenes,self.tiles):
             rgb,surface=tiles.read(bounds,shape,transform)
             probability=scene.probability._values_at(xy[...,0].ravel(),xy[...,1].ravel()).reshape(shape)
+            probability,surface=self.compensation.surface_probability.apply(probability,surface)
             valid=np.isfinite(probability)
             pcore=quantile(probability[core&valid],.5);pbg=quantile(probability[flank&valid],.5)
             surface_valid=np.isfinite(surface)
             support=float(np.mean(surface[core&surface_valid])) if np.count_nonzero(core&surface_valid)>8 else np.nan
             periods.append(dict(p=pcore,contrast=pcore-pbg,s=support,rgb=rgb,surface=surface,probability=probability))
         tick=time.perf_counter()
-        features=image_features(periods[0]['rgb'],periods[1]['rgb'],core,ring,lateral,bins,normal,width,resolution)
+        features=image_features(periods[0]['rgb'],periods[1]['rgb'],core,ring,lateral,bins,normal,width,resolution,
+                                radiometric=self.compensation.patch)
         for model,raw in zip(periods,features.pop('periods')):model.update(raw)
         self.counts['raw_image_features_seconds']+=time.perf_counter()-tick
         self.counts['registration_accepted']+=int(features['registration']['accepted'])
@@ -143,17 +147,7 @@ class PatchVerifier:
                 # Retain descriptors only, not an image queue for all controls.
                 c.append({k:p[k] for k in ('score_delta','anomaly','ncc','ssim','hog_distance','left','right')} |
                          {'scores':[period['road_score'] for period in p['periods']]})
-        self.calibration={'count':len(c),'minimum':12,'evidence':'raw_image_primary',
-                          'encoder_features':'unavailable_skipped'}
-        for name in ('score_delta','anomaly','ncc','ssim','hog_distance','left','right'):
-            values=np.asarray([quantile(p[name],.5) if name in ('left','right') else p[name] for p in c])
-            median=quantile(values,.5);mad=quantile(np.abs(values-median),.5)
-            self.calibration.update({name+'_median':median,name+'_mad':mad,
-                name+'_low':quantile(values,.05),name+'_high':quantile(values,.95),
-                name+'_count':int(np.isfinite(values).sum())})
-        for side in range(2):
-            values=[p['scores'][side] for p in c]
-            self.calibration[f'{side}_road_low']=quantile(values,.1)
+        self.calibration=self.compensation.appearance.fit(c)
         self.counts['calibration_seconds']=time.perf_counter()-started
 
     def reasons(self,p,kind):
@@ -292,5 +286,5 @@ class PatchVerifier:
 
     def write_audit(self,directory):
         directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
-        (directory/'patch_verification.json').write_text(json.dumps(dict(calibration=self.calibration,
+        (directory/'patch_verification.json').write_text(json.dumps(dict(compensation=self.compensation.metadata(),calibration=self.calibration,
             counts=dict(self.counts),candidates=self.audit),ensure_ascii=False,indent=2),encoding='utf-8')
