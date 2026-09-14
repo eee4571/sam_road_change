@@ -56,3 +56,9 @@ CLI 的 `all`、`change`、`change-project-periods` 支持以下可选参数，�
 `code/tests/run_fast2_compensation_ab.py` 在改造前捕获合成道路、真实 GeoTIFF patch 读取和结构特征结果，改造后逐字段比较候选、presence/width/image audit、非计时统计、浮点字节及几何 WKB。只排除计时和新增补偿配置元数据，不使用容差或 rounding。
 
 `code/tests/test_fast2_compensation.py` 覆盖独立开关、identity、关闭补偿仍配准/计算结构、正式入口诊断、版本隔离，以及全任务配置切换/续跑缓存。
+
+## GUI 设置
+
+运行页的「变化检测」区域，点击「Fast2 / 变化检测高级设置」：四个中文复选框分别控制现有四项补偿，默认全开，项目重开后恢复。IR-MAD 开关及参考期独立保存，不自动联动。完整运行、单对和批量变化重跑均传递当前补偿配置；CLI 不提供覆盖参数时仍沿用原任务配置。日志记录 `[Fast2 settings]`，diagnostics 和缓存身份继续使用已有配置字段。
+
+「道路面与概率跨期校正」仍连接现有接口；该接口当前为 identity（尚无独立整体校正实现），本轮没有为使开关产生差异而添加新算法。

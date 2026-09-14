@@ -27,8 +27,10 @@ def digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=False).encode('utf8')).hexdigest()
 
 
-def configuration(enabled=False):
-    return dict(enabled=bool(enabled),reference_period=REFERENCE,version=VERSION,parameters=PARAMETERS.copy())
+def configuration(enabled=False, reference_period=REFERENCE):
+    reference_period = str(reference_period).strip()
+    if not reference_period: raise ValueError("IR-MAD 参考期不能为空")
+    return dict(enabled=bool(enabled),reference_period=reference_period,version=VERSION,parameters=PARAMETERS.copy())
 
 
 def fingerprint(path):
@@ -36,10 +38,10 @@ def fingerprint(path):
     return dict(path=str(path),size=st.st_size,mtime_ns=st.st_mtime_ns)
 
 
-def request_identity(enabled,period,source,reference=None,grid=None):
+def request_identity(enabled,period,source,reference=None,grid=None,*,reference_period=REFERENCE):
     """Input fingerprints + analysis-grid request identify extraction dependencies."""
     if not enabled:return 'raw'
-    return digest(dict(config=configuration(True),period=str(period),source=source,reference=reference,grid=grid))
+    return digest(dict(config=configuration(True,reference_period),period=str(period),source=source,reference=reference,grid=grid))
 
 
 def extraction_matches(entry,identity):
@@ -72,7 +74,7 @@ def pair_tiles(reference,target):
     return pairs
 
 
-def normalize_pair(pairs,out):
+def normalize_pair(pairs,out,*,reference_period=REFERENCE):
     """Promoted experiment run: full population -> IR-MAD -> NCP>.95 -> TLS."""
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     tick=time.perf_counter();path=out/'paired_valid_rgb.bin';counts=[]
@@ -95,7 +97,7 @@ def normalize_pair(pairs,out):
             gain,offset,correlations=core.tls(*moments.result())
     finally:
         z._mmap.close()
-    result=dict(config=configuration(True),selected_iteration=selected,converged=converged,
+    result=dict(config=configuration(True,reference_period),selected_iteration=selected,converged=converged,
                 pixels=n,pif_pixels=int(moments.n),pif_fraction=moments.n/n,
                 gain=gain.tolist(),offset=offset.tolist(),pif_correlation=correlations,
                 trace=trace,model={k:v.tolist() for k,v in model.items()},pif_by_tile=[])
@@ -113,6 +115,9 @@ def normalize_pair(pairs,out):
                         count+=int((probabilities>.95).sum());valid_count+=len(block)
             result['pif_by_tile'].append(dict(tile=target.name,valid=valid_count,pif=count))
     result['outputs']=[core.write_normalized(t,out/'normalized_tiles'/t.name,gain,offset) for _,t in pairs]
+    for row in result['outputs']:
+        with rasterio.open(row['output'], 'r+') as dst:
+            dst.update_tags(RRN_REFERENCE=reference_period)
     result['seconds']=time.perf_counter()-tick
     save(out/'normalization.json',result)
     return result
@@ -124,36 +129,36 @@ class PreparedInput:
     metadata: dict
 
 
-def prepare_period(period,sources,cache_root,*,enabled=False,origin=None):
+def prepare_period(period,sources,cache_root,*,enabled=False,origin=None,reference_period=REFERENCE):
     """Raw analysis directories -> one period's cached images and provenance.
 
     Source directories must be pre-radiometric analysis tiles. The reference
     entry is never replaced in this mapping; all target fits are independent.
     """
     source=Path(sources[period]).resolve()
-    base=dict(config=configuration(enabled),period=str(period),raw_analysis_source=str(source))
+    base=dict(config=configuration(enabled,reference_period),period=str(period),raw_analysis_source=str(source))
     if not enabled:return PreparedInput(source,dict(base,status='disabled'))
-    if REFERENCE not in sources:raise ValueError(f'开启 IR-MAD 必须提供参考期 {REFERENCE}')
-    reference=Path(sources[REFERENCE]).resolve()
-    if period==REFERENCE:
-        print(f'[IR-MAD] {REFERENCE}: 原始参考期，不执行归一化',flush=True)
+    if reference_period not in sources:raise ValueError(f'开启 IR-MAD 必须提供参考期 {reference_period}')
+    reference=Path(sources[reference_period]).resolve()
+    if period==reference_period:
+        print(f'[IR-MAD] {reference_period}: 原始参考期，不执行归一化',flush=True)
         return PreparedInput(source,dict(base,status='reference_raw',reference=str(reference)))
     pairs=pair_tiles(reference,source)
-    identity=dict(config=configuration(True),period=str(period),origin=origin,
+    identity=dict(config=configuration(True,reference_period),period=str(period),origin=origin,
                   pairs=[dict(reference=fingerprint(r),target=fingerprint(t)) for r,t in pairs])
     key=digest(identity);root=Path(cache_root)/key;marker=root/'complete.json'
     if marker.is_file():
         stored=json.loads(marker.read_text(encoding='utf8'))
         if stored.get('identity')==identity and stored.get('files') and all(
                 Path(row['path']).is_file() and fingerprint(row['path'])==row for row in stored.get('files',[])):
-            print(f'[IR-MAD] {period} → {REFERENCE}: cache hit {key}',flush=True)
+            print(f'[IR-MAD] {period} → {reference_period}: cache hit {key}',flush=True)
             return PreparedInput(root/'normalized_tiles',dict(base,status='cache_hit',cache_identity=key,audit=str(root/'normalization.json')))
         raise RuntimeError(f'IR-MAD 缓存损坏：{root}；请移走该缓存后重试，禁止回退原图')
     # Independent attempt directories prevent partial writes being mistaken for a hit.
     attempt=Path(cache_root)/f'{key}.pending-{uuid.uuid4().hex}'
     try:
-        print(f'[IR-MAD] {period} → {REFERENCE}: 独立 PIF / TLS 拟合',flush=True)
-        normalize_pair(pairs,attempt)
+        print(f'[IR-MAD] {period} → {reference_period}: 独立 PIF / TLS 拟合',flush=True)
+        normalize_pair(pairs,attempt,reference_period=reference_period)
         tiles=attempt/'normalized_tiles'
         for p in source.glob('valid_observation.*'):shutil.copy2(p,tiles/p.name)
         save(tiles/'normalized_cache.json',dict(irmad_identity=key,source=str(source)))
@@ -166,5 +171,5 @@ def prepare_period(period,sources,cache_root,*,enabled=False,origin=None):
         save(marker,dict(identity=identity,files=files))
     except Exception as exc:
         if attempt.is_dir():save(attempt/'failure.json',dict(error=str(exc),identity=identity))
-        raise RuntimeError(f'IR-MAD {period} → {REFERENCE} 失败：{exc}') from exc
+        raise RuntimeError(f'IR-MAD {period} → {reference_period} 失败：{exc}') from exc
     return PreparedInput(root/'normalized_tiles',dict(base,status='normalized',cache_identity=key,audit=str(root/'normalization.json')))

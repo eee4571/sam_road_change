@@ -68,6 +68,19 @@ class IRMADTests(unittest.TestCase):
         self.assertEqual(result.source,self.sources['20260203']);self.assertFalse((self.root/'cache').exists())
         self.assertEqual(rrn.workspace_for(self.root/'workspace','raw'),self.root/'workspace')
 
+    def test_selected_reference_is_raw_and_changes_pair_identity_and_metadata(self):
+        with patch.object(core,'fit_irmad',wraps=core.fit_irmad) as fit:
+            reference=rrn.prepare_period('20240106',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
+            self.assertEqual(reference.source,self.sources['20240106']);fit.assert_not_called()
+            first=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True)
+            second=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
+            self.assertEqual(fit.call_count,2)
+        self.assertNotEqual(first.metadata['cache_identity'],second.metadata['cache_identity'])
+        audit=json.loads(Path(second.metadata['audit']).read_text())
+        self.assertEqual(audit['config']['reference_period'],'20240106')
+        with rasterio.open(second.source/'v0001.tif') as ds:
+            self.assertEqual(ds.tags()['RRN_REFERENCE'],'20240106')
+
     def test_grid_mismatch_missing_reference_and_failure_never_fall_back(self):
         with self.assertRaisesRegex(ValueError,'参考期'):
             rrn.prepare_period('20260203',{'20260203':self.sources['20260203']},self.root/'cache',enabled=True)
@@ -162,7 +175,7 @@ class PipelineIRMADTests(unittest.TestCase):
             args=argparse.Namespace(source_root=str(raw),output_root=str(root/'results'),run_id='test',
                 checkpoint='m',config='c',device='cpu',pixel_size='0',rescale='off',absolute='2',ratio='.2',
                 tolerance='3',execution_profile='fast',irmad=False)
-            def preprocess(period,sources,cache_root,*,enabled,origin):
+            def preprocess(period,sources,cache_root,*,enabled,origin,reference_period="20250118"):
                 self.assertEqual(Path(sources['20250118']).parent.name,'20250118')
                 folder=Path(sources[period]) if period=='20250118' else root/'normalized'/period
                 folder.mkdir(parents=True,exist_ok=True);(folder/'v0001.tif').write_bytes(b'fixture')
@@ -216,7 +229,7 @@ class PipelineIRMADTests(unittest.TestCase):
             for command in commands:
                 self.assertEqual(p.parser().parse_args(command).irmad,enabled)
         source=(Path(__file__).resolve().parents[1]/'gui/run_page.py').read_text(encoding='utf8')
-        self.assertIn('跨时相辐射归一化（IR-MAD）',source);self.assertIn('参考期：20250118',source)
+        self.assertIn('跨时相辐射归一化（IR-MAD）',source);self.assertIn('参考期：',source)
 
 
 if __name__=='__main__':unittest.main()

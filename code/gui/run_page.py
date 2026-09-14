@@ -7,6 +7,8 @@ from tkinter import messagebox
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
 from tkinter import ttk
 
+from app.fast_settings import COMPENSATION_LABELS, compensation_values
+
 from .common_widgets import LAYOUT_METRICS, bind_dynamic_wrap
 
 class RunPage:
@@ -147,6 +149,29 @@ class RunPage:
         run_settings_shell.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.run_settings_toggle = ttk.Button(run_settings_shell, text="输出位置与高级设置...", command=self._toggle_run_settings)
         self.run_settings_toggle.pack(anchor="w")
+        fast_settings_shell = ttk.Frame(change_actions)
+        fast_settings_shell.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.fast_settings_toggle = ttk.Button(fast_settings_shell, text="Fast2 / 变化检测高级设置...",
+                                               command=self._toggle_fast_settings)
+        self.fast_settings_toggle.pack(anchor="w", pady=(4, 0))
+        self.fast_settings_frame = ttk.Frame(fast_settings_shell)
+        preprocessing = ttk.LabelFrame(self.fast_settings_frame, text="影像预处理", padding=8)
+        preprocessing.pack(fill=X)
+        ttk.Checkbutton(preprocessing, text="跨时相辐射归一化（IR-MAD）", variable=self.vars["irmad"],
+                        onvalue="1", offvalue="0", command=self._save_project_config).pack(anchor="w")
+        reference_row = ttk.Frame(preprocessing)
+        reference_row.pack(fill=X, padx=(20, 0), pady=4)
+        ttk.Label(reference_row, text="参考期：").pack(side=LEFT)
+        self.irmad_reference_combo = ttk.Combobox(reference_row, textvariable=self.vars["irmad_reference"],
+                                                width=16, postcommand=self._refresh_irmad_references)
+        self.irmad_reference_combo.pack(side=LEFT)
+        self.irmad_reference_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_project_config())
+        self.irmad_reference_combo.bind("<FocusOut>", lambda _e: self._save_project_config())
+        compensation = ttk.LabelFrame(self.fast_settings_frame, text="Fast2 跨期补偿", padding=8)
+        compensation.pack(fill=X, pady=(6, 0))
+        for name, label in COMPENSATION_LABELS:
+            ttk.Checkbutton(compensation, text=label, variable=self.vars[name], onvalue="1", offvalue="0",
+                            command=self._save_project_config).pack(anchor="w", pady=2)
         self.run_settings_frame = ttk.Frame(run_settings_shell)
         self._field(self.run_settings_frame, "成果输出目录", "output_root", "dir")
         self._field(self.run_settings_frame, "手工任务名称", "run_id")
@@ -165,11 +190,6 @@ class RunPage:
         self.advanced_frame = ttk.Frame(self.run_settings_frame)
         self._field(self.advanced_frame, "道路模型", "checkpoint", "file")
         self._field(self.advanced_frame, "推理配置", "config", "file")
-        radiometric_row = ttk.Frame(self.advanced_frame)
-        radiometric_row.pack(fill=X, pady=(4, 2))
-        ttk.Checkbutton(radiometric_row, text="跨时相辐射归一化（IR-MAD）",
-                        variable=self.vars["irmad"], onvalue="1", offvalue="0").pack(side=LEFT)
-        ttk.Label(radiometric_row, text="参考期：20250118").pack(side=LEFT, padx=(12, 0))
         advanced_row = ttk.Frame(self.advanced_frame)
         advanced_row.pack(fill=X, pady=(4, 2))
         ttk.Label(advanced_row, text="计算设备", width=18).pack(side=LEFT)
@@ -201,6 +221,22 @@ class RunPage:
 
         self._refresh_stage_selectors()
 
+    def _toggle_fast_settings(self):
+        if self.fast_settings_frame.winfo_manager():
+            self.fast_settings_frame.pack_forget()
+            self.fast_settings_toggle.configure(text="Fast2 / 变化检测高级设置...")
+        else:
+            self._refresh_irmad_references()
+            self.fast_settings_frame.pack(fill=X, after=self.fast_settings_toggle, pady=4)
+            self.fast_settings_toggle.configure(text="收起 Fast2 / 变化检测高级设置")
+        self._schedule_content_layout()
+
+    def _refresh_irmad_references(self):
+        periods = {str(period) for rows in self.project_area_periods.values() for period, _ in rows}
+        periods.update(str(period) for period, _ in self._period_values())
+        periods.add(self.vars["irmad_reference"].get() or "20250118")
+        self.irmad_reference_combo.configure(values=sorted(periods))
+
     def _build_current_command(self, *, preflight_only: bool = False, data_check_only: bool = False) -> list[str]:
         return self.task_manager.build_pipeline(
             mode=self.vars["mode"].get(), output_root=self.vars["output_root"].get(),
@@ -223,6 +259,8 @@ class RunPage:
             area_periods=(self.project_area_periods or None),
             execution_profile=self.vars["execution_profile"].get(),
             irmad=(self.vars["irmad"].get() == "1") if "irmad" in self.vars else False,
+            irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+            fast2_compensation=compensation_values(self.vars),
         )
 
     def preflight_inputs(self) -> None:
@@ -375,7 +413,7 @@ class RunPage:
             if not region or not period:
                 raise ValueError("请选择需要重跑的区域和影像期次。")
             args = self.task_manager.build_rerun_period(
-                manifest, region, period, update_related,
+                manifest, region, period, update_related, fast2_compensation=compensation_values(self.vars),
             )
         except ValueError as exc:
             messagebox.showerror("无法局部重跑", str(exc), parent=self.root)
@@ -392,7 +430,7 @@ class RunPage:
                 raise ValueError("请选择需要重跑的区域和相邻变化对。")
             before, after = (value.strip() for value in pair.split("→", 1))
             args = self.task_manager.build_rerun_change(
-                manifest, region, before, after, update_temporal,
+                manifest, region, before, after, update_temporal, fast2_compensation=compensation_values(self.vars),
             )
         except ValueError as exc:
             messagebox.showerror("无法重跑变化对", str(exc), parent=self.root)
@@ -408,7 +446,7 @@ class RunPage:
             return
         self._show_step(1, force=True)
         self._command(self.task_manager.build_rerun_all_periods(
-            manifest, self.vars["continue_on_error"].get() == "1",
+            manifest, self.vars["continue_on_error"].get() == "1", fast2_compensation=compensation_values(self.vars),
         ))
 
     def run_change_all(self) -> None:
@@ -419,7 +457,7 @@ class RunPage:
             return
         self._show_step(1, force=True)
         self._command(self.task_manager.build_rerun_all_changes(
-            manifest, self.vars["continue_on_error"].get() == "1",
+            manifest, self.vars["continue_on_error"].get() == "1", fast2_compensation=compensation_values(self.vars),
         ))
 
     def run_extract_all_legacy(self) -> None:
@@ -434,6 +472,7 @@ class RunPage:
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 continue_on_error=self.vars["continue_on_error"].get() == "1",
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
+                irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)
@@ -455,6 +494,7 @@ class RunPage:
                 rescale=self.vars["rescale"].get(),
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
+                irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)
@@ -478,6 +518,7 @@ class RunPage:
                 absolute=self.vars["absolute"].get(), ratio=self.vars["ratio"].get(),
                 tolerance=self.vars["tolerance"].get(),
                 truth_type_field=self.vars["truth_type_field"].get(),
+                fast2_compensation=compensation_values(self.vars),
             )
         except (KeyError, TypeError, ValueError) as exc:
             messagebox.showerror("无法分步检测", str(exc), parent=self.root)

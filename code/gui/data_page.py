@@ -6,6 +6,7 @@ from pathlib import Path
 from tkinter import END, filedialog, messagebox, simpledialog
 
 from input_catalog import period_order_manifest, period_sort_key
+from app.fast_settings import settings_values, restore_settings
 from app.project_manager import natural_key
 from app.result_publisher import RESULT_DIRECTORY_NAME
 from tkinter import BOTH, LEFT, RIGHT, X, StringVar
@@ -515,6 +516,7 @@ class DataPage:
         payload = dict(self.project_config)
         payload.update({
             "version": 3,
+            "fast_settings": settings_values(self.vars),
             "project_root": self.project_root_path,
             "external_data_sources": list(dict.fromkeys(self.project_data_sources)),
             "external_scan_cache": self.project_scan_cache,
@@ -622,6 +624,7 @@ class DataPage:
             str(payload.get("output_root") or "").strip() or None,
         )
         self.vars["output_root"].set(str(output_root))
+        restore_settings(self.vars, payload.get("fast_settings") or {})
         active = payload.get("active_task") or {}
         if isinstance(active, dict) and str(active.get("run_id") or "").strip():
             self.vars["run_id"].set(str(active["run_id"]))

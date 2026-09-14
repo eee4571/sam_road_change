@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Canvas, Menu, StringVar, TclError, Text, Tk, Toplevel, filedialog, font as tkfont, messagebox, simpledialog
 from tkinter import ttk
 
+from app.fast_settings import SETTING_DEFAULTS
 from app.backend_client import BackendClient, BackendEvent
 from app.editor_manager import EditorManager
 from app.project_manager import ProjectManager
@@ -285,7 +286,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
             for key, value in {
                 "mode": "validation",
                 "execution_profile": "fast",
-                "irmad": "0",
+                **SETTING_DEFAULTS,
                 "validation_area": "",
                 "truth_type_field": "",
                 "evaluate": "0",
