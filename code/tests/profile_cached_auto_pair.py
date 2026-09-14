@@ -27,6 +27,10 @@ def main():
     parser.add_argument('--raster-io-probe', action='store_true')
     parser.add_argument('--monitor-memory', action='store_true')
     parser.add_argument('--strip-read-batch', type=int, choices=(1, 8, 16, 32))
+    parser.add_argument('--surface-workers', type=int, choices=(2, 3, 4))
+    parser.add_argument('--surface-lookahead', type=int, choices=(1, 2), default=2)
+    parser.add_argument('--surface-timeline', action='store_true')
+    parser.add_argument('--match-probe', choices=('trace', 'detailed'))
     args = parser.parse_args()
     output = args.job / '_profiling' / 'auto_pair'
     output.mkdir(parents=True, exist_ok=True)
@@ -60,6 +64,19 @@ def main():
     if args.probability_probe:
         import probability_probe
         probability_probe.install(module, detailed=args.probability_probe=='detailed', raster_io=args.raster_io_probe)
+    if args.surface_workers:
+        import surface_pipeline_experiment
+        schedule_source = Path(surface_pipeline_experiment.__file__).read_bytes()
+        (output/f'{args.label}_surface_experiment.py').write_bytes(schedule_source)
+        surface_pipeline_experiment.install(module, args.surface_workers, args.surface_lookahead)
+    surface_report = None
+    if args.surface_timeline:
+        import surface_timing_probe
+        surface_report = surface_timing_probe.install(module)
+    match_report = None
+    if args.match_probe:
+        import match_probe
+        match_report = match_probe.install(module, detailed=args.match_probe=='detailed')
     # cProfile only observes its own thread. Capture the two surface workers
     # separately so a threaded hot path cannot disappear from hotspot reports.
     worker_profiles = []
@@ -144,6 +161,15 @@ def main():
     if memory is not None:
         summary['memory'] = memory.result
     summary['strip_read_batch'] = getattr(module.WindowedProbability, '_STRIP_READ_BATCH', 1)
+    if surface_report is not None:
+        summary['surface_timeline'] = surface_report()
+    if match_report is not None:
+        summary['match_profile'] = match_report()
+    summary['surface_configuration'] = dict(
+        workers=args.surface_workers or getattr(module, '_SURFACE_WORKERS', 2),
+        lookahead=args.surface_lookahead if args.surface_workers else getattr(module, '_SURFACE_LOOKAHEAD', 1))
+    if args.surface_workers:
+        summary['surface_configuration']['source_sha256'] = hashlib.sha256(schedule_source).hexdigest()
     (output/f'{args.label}.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps({k:v for k,v in summary.items() if k not in ('functions','inputs','probability')},ensure_ascii=False),flush=True)
 

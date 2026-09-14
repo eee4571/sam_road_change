@@ -2,6 +2,7 @@
 import ctypes
 from ctypes import wintypes
 import threading
+import time
 
 
 class ProcessMemory:
@@ -33,6 +34,7 @@ class ProcessMemory:
 
     def __enter__(self):
         self.sample()
+        self.started = time.perf_counter(), time.process_time(), time.thread_time()
         def monitor():
             while not self.stop.wait(.1):
                 self.sample()
@@ -44,3 +46,9 @@ class ProcessMemory:
         self.stop.set()
         self.thread.join()
         self.sample()
+        wall = time.perf_counter()-self.started[0]
+        cpu = time.process_time()-self.started[1]
+        self.result.update(process_cpu_seconds=cpu,
+                           main_thread_cpu_seconds=time.thread_time()-self.started[2],
+                           average_cpu_cores=cpu/max(wall, 1e-9),
+                           monitored_wall_seconds=wall)

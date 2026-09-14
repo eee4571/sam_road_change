@@ -768,7 +768,7 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
 @timed_stage("auto_total")
 def detect_final_road_changes(before_result, after_result, output_dir, *, before_period, after_period,
                               position_tolerance, width_change_absolute, width_change_ratio,
-                              min_change_area, min_change_length, internal_outputs):
+                              min_change_area, min_change_length, internal_outputs, algorithm="v2"):
     from .fast_pipeline import _load_fast_period_result, _read_fast_change_layer
     started = time.perf_counter()
     payloads = [_load_fast_period_result(value) for value in (before_result, after_result)]
@@ -796,7 +796,13 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                     raise
             scenes.append(scene_cache.get(p,metric_crs,load_scene) if scene_cache is not None else load_scene())
         presence_audit = []
-        records, audit, width_audit, counts = analyze_scenes(
+        if algorithm == "v2":
+            from .fast_auto_v2 import analyze_scenes as analyzer
+        elif algorithm == "baseline":
+            analyzer = analyze_scenes
+        else:
+            raise ValueError(f"Unknown Fast Auto algorithm: {algorithm}")
+        records, audit, width_audit, counts = analyzer(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
             relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
             minimum_area=float(min_change_area), presence_audit=presence_audit)
@@ -832,11 +838,17 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
         raw_candidates[key] = raw_candidates[key].fillna(default) if key in raw_candidates else default
     raw_candidates["candidate_id"] = np.arange(len(raw_candidates))
     observation = frame(audit)
-    seeds, candidate_audit = qualify_presence_candidates(raw_candidates, scenes, observation,
+    if counts.get('v2_enabled'):
+        from .fast_auto_v2 import qualify_candidates
+        candidate_audit, width_samples = qualify_candidates(raw_candidates,
                                 minimum_length=24. if min_change_length is None else float(min_change_length),
                                 minimum_area=float(min_change_area))
-    from .auto_width_precision import qualify_width_candidates
-    candidate_audit, width_samples = qualify_width_candidates(candidate_audit, scenes,
+    else:
+        seeds, candidate_audit = qualify_presence_candidates(raw_candidates, scenes, observation,
+                                minimum_length=24. if min_change_length is None else float(min_change_length),
+                                minimum_area=float(min_change_area))
+        from .auto_width_precision import qualify_width_candidates
+        candidate_audit, width_samples = qualify_width_candidates(candidate_audit, scenes,
                                 minimum_length=24. if min_change_length is None else float(min_change_length))
     seeds = candidate_audit.loc[candidate_audit.publication_state == 'accepted'].copy().reset_index(drop=True)
     assembly_started = time.perf_counter()
@@ -900,7 +912,10 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
         evidence.to_csv(output_dir/"existence_candidates.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame([{k: v for k, v in row.items() if k != "geometry"} for row in width_audit]).to_csv(
             output_dir/"width_candidates.csv", index=False, encoding="utf-8-sig")
-        funnel = {"count_units": "evidence: 4 m station cells; presence candidates: longitudinal intervals; final: network objects",
+        units = ("evidence: network intervals with start/middle/end events; widths: existing profile intervals; final: network objects"
+                 if counts.get('v2_enabled') else
+                 "evidence: 4 m station cells; presence candidates: longitudinal intervals; final: network objects")
+        funnel = {"count_units": units,
                   "road_matching": {k: v for k, v in counts.items() if "matched" in k and not k.startswith("width")},
                   "width": {k: v for k, v in counts.items() if k.startswith("width")},
                   "final": {k: v for k, v in counts.items() if k.startswith("final")}}
@@ -952,7 +967,7 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
                                         min_change_length=min_change_length, elapsed_seconds=elapsed_seconds+time.perf_counter()-started,
                                         changes=changes, diagnostics=diagnostics,
                                         performance={key: value for key, value in counts.items()
-                                                     if key.startswith('timing_') or key.endswith('station_count')
+                                                     if key.startswith(('timing_', 'v2_')) or key.endswith('station_count')
                                                      or key in ('candidate_ratio', 'width_prefilter_seconds', 'exact_width_measurement_seconds')})
 
 

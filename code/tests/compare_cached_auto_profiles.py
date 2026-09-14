@@ -55,6 +55,19 @@ def main():
     report['elapsed_seconds'] = [s['elapsed_seconds'] for s in summaries]
     report['phases'] = [s['phases'] for s in summaries]
     report['all_equal'] = report['counts_equal'] and all(report[k]['exact_equal'] for k in ('candidates','station_audit','width_audit','presence_audit'))
+    if all('match_profile' in s for s in summaries):
+        report['match_call_count_equal'] = (
+            summaries[0]['match_profile']['counts']['match_calls'] ==
+            summaries[1]['match_profile']['counts']['match_calls'])
+        report['all_equal'] &= report['match_call_count_equal']
+        if all(s['match_profile']['mode'] == 'detailed' for s in summaries):
+            report['match_candidate_counts_equal'] = (
+                summaries[0]['match_profile']['counts'] == summaries[1]['match_profile']['counts'])
+            report['all_equal'] &= report['match_candidate_counts_equal']
+    if all('surface_timeline' in s for s in summaries):
+        report['surface_task_count_equal'] = (
+            summaries[0]['surface_timeline']['worker_calls'] == summaries[1]['surface_timeline']['worker_calls'])
+        report['all_equal'] &= report['surface_task_count_equal']
     if all('probability' in s for s in summaries):
         assert len(summaries[0]['probability']) == len(summaries[1]['probability']), 'Probability scene counts differ'
         probability = []
