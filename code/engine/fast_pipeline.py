@@ -6330,6 +6330,7 @@ def detect_fast_changes(
     min_change_area: float = FAST_CHANGE_MIN_AREA_M2,
     min_change_length: float | None = None,
     internal_outputs: bool = False,
+    temporal_results: dict | None = None,
 ) -> dict:
     """No-truth Auto, using final products and symmetric road evidence."""
     from .fast_auto_change import detect_final_road_changes
@@ -6343,6 +6344,7 @@ def detect_fast_changes(
         min_change_area=min_change_area,
         min_change_length=min_change_length,
         internal_outputs=internal_outputs,
+        temporal_results=temporal_results,
     )
 
 

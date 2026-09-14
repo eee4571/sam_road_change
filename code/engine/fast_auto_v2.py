@@ -199,8 +199,8 @@ def _profile_events(scene,part,axis,start,end):
     return positions[(positions>start+1e-6)&(positions<end-1e-6)].tolist()
 
 
-def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config):
-    records=[];audit=[]
+def _paired_profiles(axis,intervals,before,after,minimum_length):
+    profiles=[]
     for start,end,target_id in intervals:
         if end-start<minimum_length:continue
         part=substring(axis,start,end);other=after.lines[target_id]
@@ -209,11 +209,40 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
         events=sorted(set([start,end]+_profile_events(before,part,axis,start,end)+_profile_events(after,other_part,axis,start,end)))
         a=np.asarray(events[:-1]);b=np.asarray(events[1:]);valid=b-a>1e-6;a=a[valid];b=b[valid]
         if not len(a):continue
-        # Existing profile endpoints define these intervals, not sample spacing.
         points=line_interpolate_point(axis,(a+b)/2);target_positions=line_locate_point(other,points)
         bw=before.widths_at(points);aw=after.widths_at(line_interpolate_point(other,target_positions))
-        threshold=np.maximum(absolute,relative*np.maximum(bw,aw));diff=aw-bw
-        sign=np.where(np.abs(diff)>=threshold,np.sign(diff),0).astype(int)
+        profiles.append((start,end,target_id,a,b,bw,aw))
+    return profiles
+
+
+def _calibration_roads(profiles,before,after,tolerance):
+    from .fast_multitemporal import weighted_median
+    samples=[];seen=set()
+    if not before.has_width_values or not after.has_width_values:return samples
+    for axis_id,rows in profiles.items():
+        if len(rows)!=1:continue
+        start,end,target_id,a,b,bw,aw=rows[0]
+        axis=before.lines[axis_id];other=after.lines[target_id]
+        if target_id in seen or end-start<32 or (end-start)/axis.length<.8 or (end-start)/other.length<.7:continue
+        positions=np.array([start,(start+end)/2,end]);points=line_interpolate_point(axis,positions)
+        tp=line_locate_point(other,points);targets=line_interpolate_point(other,tp)
+        if np.max(np.linalg.norm(get_coordinates(points)-get_coordinates(targets),axis=1))>tolerance*.75:continue
+        if np.min(np.abs(np.sum(legacy._normals(axis,positions)*legacy._normals(other,tp),axis=1)))<.985:continue
+        if not np.isfinite(bw).all() or not np.isfinite(aw).all() or min(bw.min(),aw.min())<=0:continue
+        samples.append(dict(axis=substring(axis,start,end),width=float(np.median(np.maximum(bw,aw))),
+                            width_delta=weighted_median(aw-bw,b-a)));seen.add(target_id)
+    return samples
+
+
+def _width_changes(axis_id,axis,profiles,before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config,calibration):
+    records=[];audit=[]
+    bias=calibration['bias'];background=2.5*calibration['scatter']
+    for start,end,target_id,a,b,bw,aw in profiles:
+        other=after.lines[target_id]
+        threshold=np.maximum(absolute,relative*np.maximum(bw,aw));raw_diff=aw-bw;diff=raw_diff-bias
+        # Retain original profile runs in diagnostics. Calibration qualifies
+        # publication; it cannot manufacture a new raw-width change.
+        sign=np.where(np.abs(raw_diff)>=threshold,np.sign(raw_diff),0).astype(int)
         counts['v2_width_profile_intervals']+=len(sign)
         runs=[]
         for i,s in enumerate(sign):
@@ -229,10 +258,11 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
             before_width=float(np.average(bw[indexes],weights=weights));after_width=float(np.average(aw[indexes],weights=weights))
             local=substring(axis,low,high)
             difference=after_width-before_width
+            corrected_difference=difference-bias
             if abs(difference)<max(absolute,relative*max(before_width,after_width)):continue
             # Require sustained margin on every existing profile interval;
             # an average must not hide short spikes or near-threshold sections.
-            strong = np.abs(diff[indexes]) >= threshold[indexes]*config.width_threshold_factor
+            strong = np.abs(raw_diff[indexes]) >= threshold[indexes]*config.width_threshold_factor
             sustained = max((sum(b[j]-a[j] for j in group) for group in _strong_runs(indexes,strong)),default=0.)
             publish = (sustained >= max(minimum_length,config.width_minimum_length)
                        and abs(difference) >= config.width_threshold_factor*max(absolute,relative*max(before_width,after_width)))
@@ -252,17 +282,29 @@ def _width_changes(axis_id,axis,intervals,before,after,evidence,absolute,relativ
             conflict=np.isfinite(rb).all() and np.isfinite(ra).all() and direction*float(np.median(ra-rb)) < -max(absolute,2*evidence.resolution)
             if publish and conflict:counts['v2_width_evidence_conflict_suppressed']+=1
             publish=publish and not conflict
+            raw_publish=publish
+            corrected_strong=(direction*diff[indexes]>=np.maximum(threshold[indexes]*config.width_threshold_factor,background))
+            corrected_sustained=max((sum(b[j]-a[j] for j in group) for group in _strong_runs(indexes,corrected_strong)),default=0.)
+            bias_pass=(direction*corrected_difference>=max(config.width_threshold_factor*max(absolute,relative*max(before_width,after_width)),background)
+                       and abs(corrected_difference)>config.width_variability_factor*variability
+                       and corrected_sustained>=max(minimum_length,config.width_minimum_length,.8*(high-low)))
+            publish=publish and bias_pass
             xy=np.asarray(local.coords)[:,:2]
             partners=get_coordinates(line_interpolate_point(other,line_locate_point(other,[Point(p) for p in xy])))
             canonical=LineString((xy+partners)/2)
             outer,inner=max(before_width,after_width),min(before_width,after_width)
             geometry=canonical.buffer(outer/2,cap_style='flat').difference(canonical.buffer(inner/2,cap_style='flat'))
             if geometry.area<minimum_area:continue
+            counts['v2_width_before_bias_published']+=int(raw_publish)
+            counts['v2_width_bias_suppressed']+=int(raw_publish and not publish)
+            counts['v2_width_after_bias_published']+=int(publish)
             records.append(dict(change_typ='widened' if difference>0 else 'narrowed',width_bef=before_width,width_aft=after_width,
                 width_diff=difference,length_m=local.length,axis_wkt=canonical.wkt,geometry=geometry,source_axis=axis_id,start_m=low,end_m=high,
                 qa_state='confirmed',confidence=.85,audit_reason='width_profile_interval',junction=False,
                 v2_profile_variability_m=variability,
-                v2_publish=publish,v2_precision_reason='profile_evidence_conflict' if conflict else 'within_period_width_fluctuation' if not stable_profile else 'sustained_width_margin' if publish else 'small_or_short_width_fluctuation'))
+                v2_publish_before_bias=raw_publish,
+                v2_width_bias_m=bias,v2_width_residual_m=corrected_difference,v2_width_background_scatter_m=calibration['scatter'],
+                v2_publish=publish,v2_precision_reason='temporal_width_bias_or_population_fluctuation' if raw_publish and not publish else 'profile_evidence_conflict' if conflict else 'within_period_width_fluctuation' if not stable_profile else 'sustained_width_margin' if publish else 'small_or_short_width_fluctuation'))
             audit.append(dict(axis_id=axis_id,target_axis=target_id,start_m=low,end_m=high,sign=direction,accepted=True,
                               profile_interval_count=len(indexes),event_validation=False,profile_variability_m=variability,geometry=canonical))
     return records,audit
@@ -285,13 +327,26 @@ def _strong_runs(indexes, strong):
     if run:yield run
 
 
-def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config()):
+def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None):
     started=time.perf_counter();counts=Counter(v2_enabled=1,v2_station_count=0,v2_legacy_analyzer_calls=0,
                                               v2_exact_width_event_sections=0,v2_probability_event_locations=0)
     records=[];audit=[];width_audit=[];evidence=ChangeEvidence(before,after,config)
     counts['timing_v2_change_evidence_seconds']=time.perf_counter()-started
     if not evidence.ready:return records,audit,width_audit,dict(counts)
     counts['v2_evidence_resolution_m']=float(evidence.resolution);buffers={}
+    from .fast_multitemporal import estimate_width_bias,reconcile_temporal
+    tick=time.perf_counter();profiles={}
+    for axis_id,axis in enumerate(before.lines):
+        matched=_network_intervals(axis,after,tolerance,buffers,counts)
+        profiles[axis_id]=_paired_profiles(axis,matched,before,after,minimum_length)
+    counts['timing_v2_profile_preparation_seconds']=time.perf_counter()-tick
+    tick=time.perf_counter();controls=_calibration_roads(profiles,before,after,tolerance)
+    calibration=estimate_width_bias([r['width_delta'] for r in controls])
+    counts.update(v2_width_bias_m=calibration['bias'],v2_width_bias_scatter_m=calibration['scatter'],
+                  v2_width_bias_controls=calibration['count'],v2_width_bias_reliable=int(calibration['reliable']),
+                  v2_width_bias_estimate_m=calibration['estimated_bias'],
+                  v2_width_scatter_estimate_m=calibration['estimated_scatter'])
+    counts['timing_v2_bias_estimation_seconds']=time.perf_counter()-tick
     for side,source,target in ((0,before,after),(1,after,before)):
         print(f'[Fast v2] {"before" if side==0 else "after"} network intervals',flush=True)
         coverage=LongitudinalCoverage(target.lines,tolerance*config.stable_position_factor)
@@ -302,14 +357,14 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
             if presence_audit is not None:presence_audit.extend(details)
             counts['timing_v2_presence_seconds']+=time.perf_counter()-tick
             if side==0:
-                tick=time.perf_counter();matched=_network_intervals(axis,after,tolerance,buffers,counts)
-                counts['timing_v2_correspondence_seconds']+=time.perf_counter()-tick
-                tick=time.perf_counter();local,details=_width_changes(axis_id,axis,matched,before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config)
+                tick=time.perf_counter();local,details=_width_changes(axis_id,axis,profiles[axis_id],before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config,calibration)
                 records.extend(local);width_audit.extend(details)
                 counts['timing_v2_width_profile_seconds']+=time.perf_counter()-tick
             counts['v2_network_axes']+=1
     from .fast_object_reconciliation import reconcile_presence
     counts.update(reconcile_presence(records,tolerance=tolerance,scenes=(before,after)))
+    counts.update(reconcile_temporal(records,temporal_context or {},max(minimum_length,config.presence_minimum_length)))
+    if patch_verifier is not None:counts.update(patch_verifier.verify(records,controls))
     counts['v2_local_sample_count']=counts['v2_probability_event_locations']+counts['v2_exact_width_event_sections']//2
     counts['timing_v2_total_seconds']=time.perf_counter()-started
     print('[Fast v2] '+str(dict(counts)),flush=True)

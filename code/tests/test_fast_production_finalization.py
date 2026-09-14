@@ -144,6 +144,7 @@ class FastProductionTests(unittest.TestCase):
                 result=p._rerun_change_entry(m,'g','1','2')
             self.assertEqual(run.call_args.args[:2],(root/'auto1.json',root/'auto2.json'))
             self.assertTrue(run.call_args.kwargs['defer_finalization'])
+            self.assertEqual(run.call_args.kwargs['temporal_results'],{'next':str(root/'auto3.json')})
             self.assertIsNone(run.call_args.kwargs['truth_path'])
             self.assertNotIn('correction_audit',result);self.assertNotIn('final_temporal',result)
 
@@ -249,6 +250,7 @@ class FastProductionTests(unittest.TestCase):
                 absolute='2',ratio='.2',tolerance='3',execution_profile='fast')
             def pair(*a,**kw):
                 self.assertTrue(kw['defer_finalization']);order.append('pair')
+                self.assertEqual(set(kw['temporal_results']),{'next'} if kw['before_period']=='1' else {'previous'})
                 return {'output':str(a[2])}
             def finalize(m,job):
                 self.assertEqual(len(m['change_results']),2);order.append('finalize')

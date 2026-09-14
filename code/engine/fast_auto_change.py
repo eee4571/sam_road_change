@@ -768,7 +768,7 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
 @timed_stage("auto_total")
 def detect_final_road_changes(before_result, after_result, output_dir, *, before_period, after_period,
                               position_tolerance, width_change_absolute, width_change_ratio,
-                              min_change_area, min_change_length, internal_outputs, algorithm="v2"):
+                              min_change_area, min_change_length, internal_outputs, algorithm="v2", temporal_results=None):
     from .fast_pipeline import _load_fast_period_result, _read_fast_change_layer
     started = time.perf_counter()
     payloads = [_load_fast_period_result(value) for value in (before_result, after_result)]
@@ -781,6 +781,7 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
     from .auto_scene_cache import close_scene
     scene_cache = active_scene_cache()
     scenes = []
+    patch_verifier = None
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -798,14 +799,20 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
         presence_audit = []
         if algorithm == "v2":
             from .fast_auto_v2 import analyze_scenes as analyzer
+            from .fast_multitemporal import load_contexts
+            from .fast_patch_verification import PatchVerifier
+            patch_verifier=PatchVerifier(scenes,payloads)
+            extra=dict(temporal_context=load_contexts(temporal_results,metric_crs,float(position_tolerance)*1.5),patch_verifier=patch_verifier)
         elif algorithm == "baseline":
             analyzer = analyze_scenes
+            extra={}
         else:
             raise ValueError(f"Unknown Fast Auto algorithm: {algorithm}")
         records, audit, width_audit, counts = analyzer(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
             relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
-            minimum_area=float(min_change_area), presence_audit=presence_audit)
+            minimum_area=float(min_change_area), presence_audit=presence_audit,**extra)
+        if patch_verifier is not None:patch_verifier.write_audit(output_dir)
         return finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
                                         scenes=dict(zip(("before", "after"), scenes)), centerlines=centerlines,
                                         output_dir=output_dir, before_period=before_period, after_period=after_period,
@@ -813,6 +820,7 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                                         min_change_length=min_change_length, elapsed_seconds=time.perf_counter()-started,
                                         internal_outputs=internal_outputs)
     finally:
+        if patch_verifier is not None:patch_verifier.close()
         if scene_cache is None:
             for scene in scenes:close_scene(scene)
 

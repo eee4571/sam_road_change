@@ -395,6 +395,7 @@ def _run_fast_change_result(
     truth_type_field: str = "BHBM",
     evaluation_tolerance: float = 5.0,
     defer_finalization: bool = False,
+    temporal_results: dict | None = None,
 ) -> dict:
     """Finish the independent Auto detector before any GT reconciliation."""
     from engine.fast_pipeline import (
@@ -414,6 +415,7 @@ def _run_fast_change_result(
         width_change_ratio=float(width_change_ratio),
         # Both GT correction and the shared Final Changes publisher consume axes.
         internal_outputs=True,
+        temporal_results=temporal_results,
     )
     if truth_path is not None and not Path(truth_path).expanduser().is_file():
         raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
@@ -434,6 +436,8 @@ def _run_fast_change_result(
     result.update(truth=str(truth_path or ''),validation_area=str(validation_area or ''),
                   truth_type_field=truth_type_field,before_period=before_period,after_period=after_period,
                   execution_profile='fast',fast_finalization_state='pending')
+    from engine.fast_multitemporal import AUTO_REVISION
+    result['fast_auto_revision']=AUTO_REVISION
     if defer_finalization:return result
     from engine.fast_pipeline import _load_fast_period_result
     periods=[{**_load_fast_period_result(p),'period':period,'grid':'pair'}
@@ -1458,8 +1462,10 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 for kind in ("added", "removed", "widened", "narrowed")
             )
         )
+        from engine.fast_multitemporal import AUTO_REVISION
         if (resume and prior_result and _change_result_ready(prior_result) and complete_layers
-                and (not fast_profile or prior_result.get('fast_finalization_state')=='completed')):
+                and (not fast_profile or (prior_result.get('fast_finalization_state')=='completed'
+                     and prior_result.get('fast_auto_revision')==AUTO_REVISION))):
             result = dict(prior_result)
             emit("pipeline", stage="两期宽度变化检测", status="skipped", reason="续跑复用已完成且完整的变化成果", completed=3, total=3)
         elif fast_profile:
@@ -4522,11 +4528,13 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     )
     started = time.monotonic()
     if str(manifest.get("execution_profile") or "full") == "fast":
+        from engine.fast_multitemporal import neighbor_results
         result = _run_fast_change_result(
             Path(str(before_entry["result"])),
             Path(str(after_entry["result"])),
             output,
             defer_finalization=True,
+            temporal_results=neighbor_results(periods.values(),grid,before,after,_manifest_period_plan(manifest).get(grid)),
             before_period=before,
             after_period=after,
             position_tolerance=float(
@@ -4583,7 +4591,10 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
 
 def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tuple[str, str]]:
     names = _manifest_period_plan(manifest).get(grid, [])
-    return [(before, after) for before, after in zip(names, names[1:]) if period in {before, after}]
+    from engine.fast_multitemporal import dependency_periods
+    return [(before, after) for before, after in zip(names, names[1:])
+            if period in (dependency_periods(names,before,after)
+                          if manifest.get('execution_profile')=='fast' else {before,after})]
 
 
 def _refresh_manifest_downstream(manifest: dict) -> None:
@@ -5467,12 +5478,15 @@ def run_all(args: argparse.Namespace) -> dict:
                     _persist_pipeline(manifest, job_root, output_root)
 
             period_names = list(periods)
+            from engine.fast_multitemporal import AUTO_REVISION, dependency_periods
             for before_period, after_period in zip(period_names, period_names[1:]):
                 unit_started = time.monotonic()
                 prior_entry = prior_changes.get((grid_name, before_period, after_period))
                 if (resume and prior_entry and _change_result_ready(prior_entry)
-                        and (grid_name, before_period) not in refreshed_periods
-                        and (grid_name, after_period) not in refreshed_periods):
+                        and (execution_profile!='fast' or prior_entry.get('fast_auto_revision')==AUTO_REVISION)
+                        and not any((grid_name,p) in refreshed_periods for p in
+                            (dependency_periods(period_names,before_period,after_period)
+                             if execution_profile=='fast' else {before_period,after_period}))):
                     manifest["change_results"].append(prior_entry)
                     manifest["processed_work"] += 1
                     progress(
@@ -5523,11 +5537,13 @@ def run_all(args: argparse.Namespace) -> dict:
                         validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area
                     )
                     if execution_profile == "fast":
+                        from engine.fast_multitemporal import neighbor_results
                         result = _run_fast_change_result(
                             Path(str(before_entry["result"])),
                             Path(str(after_entry["result"])),
                             change_output,
                             defer_finalization=True,
+                            temporal_results=neighbor_results(result_by_period.values(),grid_name,before_period,after_period,period_names),
                             before_period=before_period,
                             after_period=after_period,
                             position_tolerance=float(args.tolerance),
