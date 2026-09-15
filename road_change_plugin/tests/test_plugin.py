@@ -102,7 +102,9 @@ class PluginTests(unittest.TestCase):
         for path, digest in snapshot.items():
             self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(), digest, path)
         for name in ("env", "model"):
-            self.assertEqual([p.name for p in (ROOT / "runtime" / name).iterdir()], ["PLACEHOLDER"])
+            self.assertTrue((ROOT / "runtime" / name / "PLACEHOLDER").is_file())
+        self.assertTrue((ROOT/'code/engine/width/raw_road_surfaces.py').is_file())
+        self.assertTrue((ROOT/'code/engine/fast_auto_v2.py').is_file())
 
     def test_commands(self):
         plugin = create_plugin()
@@ -112,8 +114,8 @@ class PluginTests(unittest.TestCase):
             for name in ("area.shp", "a.txt", "b.txt", "truth.shp"):
                 (root/name).touch()
             manifest = root/"pipeline_result.json"
-            manifest.write_text('{}')
-            data = dict(areas=[["区1", str(root/"area.shp")]], periods=[["区1", "2020", str(root/"a.txt")], ["区1", "2021", str(root/"b.txt")]], output=str(root/"成果"), profile="fast", run_id="run_1", resume=True,
+            manifest.write_text(json.dumps(dict(execution_profile='fast',input_spec=dict(width_method='raw_image',irmad=dict(enabled=True,reference_period='20250118')))))
+            data = dict(areas=[["区1", str(root/"area.shp")]], periods=[["区1", "2020", str(root/"a.txt")], ["区1", "20250118", str(root/"b.txt")]], output=str(root/"成果"), profile="fast", run_id="run_1", resume=True,
                         manifest=str(manifest), grid="区1", period="2020", before_period="2020", after_period="2021")
             args = controller.build_command("all", data)
             self.assertIn("--resume", args)
@@ -128,7 +130,8 @@ class PluginTests(unittest.TestCase):
         plugin.shutdown()
 
     def test_missing_runtime_signal(self):
-        runner = Runner()
+        self.addCleanup(shutil.rmtree, missing := tempfile.mkdtemp())
+        runner = Runner(root=missing)
         failures = []
         runner.task_failed.connect(failures.append)
         runner.start(["all"])

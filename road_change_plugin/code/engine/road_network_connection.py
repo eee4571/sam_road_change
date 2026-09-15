@@ -4,6 +4,7 @@ from __future__ import annotations
 All decisions use metric geometry, never feature IDs or region-specific rules.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import networkx as nx
 import numpy as np
@@ -27,6 +28,11 @@ def _parts(geometry, kind):
     return [part for child in getattr(geometry, 'geoms', ()) for part in _parts(child, kind)]
 
 
+@lru_cache(maxsize=4096)
+def _contact_geometry(first, second):
+    return first.intersection(second)
+
+
 def _node_network(roads):
     """Insert planar contacts and emit edges between junctions, retaining bodies."""
     lines = [LineString(road.points) for road in roads]
@@ -38,7 +44,7 @@ def _node_network(roads):
             j = int(raw_j)
             if j <= i:
                 continue
-            intersection = line.intersection(lines[j])
+            intersection = _contact_geometry(line, lines[j])
             points = _parts(intersection, 'Point')
             for overlap in _parts(intersection, 'LineString'):
                 points.extend([Point(overlap.coords[0]), Point(overlap.coords[-1])])
@@ -208,7 +214,10 @@ def _support(points,surface):
     if surface is None:
         return 0.0
     line = LineString(points)
-    return float(np.mean([surface.covers(line.interpolate(t,normalized=True)) for t in np.linspace(0,1,max(5,min(101,int(line.length/3)+1)))]))
+    from shapely import covers, line_interpolate_point
+    samples = np.linspace(0,1,max(5,min(101,int(line.length/3)+1)))
+    geometry = getattr(surface, 'context', surface)
+    return float(np.mean(covers(geometry, line_interpolate_point(line,samples,normalized=True))))
 
 
 def _row(a,b,roads,distance,lateral,support,score,kind):
@@ -267,6 +276,7 @@ def _continuations(ports,roads,maximum,surface):
                 continue
             score = distance+16*lateral+distance*(2*(1-facing)+(1-turn))-8*support
             row = _row(a,b.road,roads,distance,lateral,support,score,'continuation')
+            row['direction_cosine']=float(facing)
             row['second_trim_wkt'] = _trim_wkt(b,roads)
             result.append(_Candidate(a,b,b.road,curve,score,row))
     return result
@@ -307,6 +317,7 @@ def _attachments(ports,roads,lines,tree,maximum,surface):
                 support = _support(curve,surface)
                 score = distance*(1+2*(1-facing))-5*support
                 candidate = _Candidate(port,None,j,curve,score,_row(port,j,roads,distance,0,support,score,'junction_attachment'))
+                candidate.row['direction_cosine']=float(facing)
                 if best is None or score<best.score:
                     best = candidate
             if best is not None:
@@ -369,14 +380,19 @@ def _nearby_conflict(candidate,roads,lines,tree):
 def _short_cycle(candidate,graph,lines):
     # A long existing route around a city block is not a redundant local loop.
     limit = max(25.0,candidate.row['distance_m']*1.7)
-    distances = nx.single_source_dijkstra_path_length(graph,_key(candidate.first.point),cutoff=limit,weight='weight')
+    cutoff = max(120,candidate.row['distance_m']*3)
+    cache = graph.graph.setdefault('_shortest_cache', {})
+    key = (_key(candidate.first.point), cutoff)
+    if key not in cache:
+        cache[key] = nx.single_source_dijkstra(graph,key[0],cutoff=cutoff,weight='weight')
+    length_map, paths = cache[key]
+    distances = {node: distance for node, distance in length_map.items() if distance <= limit}
     if candidate.second is not None:
         if _key(candidate.second.point) in distances:
             return True
         # A long, narrow return path is still a redundant parallel loop, even
         # when its length exceeds the local shortest-path cutoff.
         end = _key(candidate.second.point)
-        length_map, paths = nx.single_source_dijkstra(graph,_key(candidate.first.point),cutoff=max(120,candidate.row['distance_m']*3),weight='weight')
         if end in paths:
             from shapely.geometry import Polygon
             perimeter = length_map[end]+LineString(candidate.points).length
@@ -390,7 +406,6 @@ def _short_cycle(candidate,graph,lines):
     contacts.extend(graph.graph.get('attachment_contacts',{}).get(candidate.target,()))
     if min(distances.get(node,math.inf)+abs(position-along) for node,along in contacts)<=limit:
         return True
-    length_map,paths = nx.single_source_dijkstra(graph,_key(candidate.first.point),cutoff=max(120,candidate.row['distance_m']*3),weight='weight')
     from shapely.geometry import Polygon
     for node,along in contacts:
         if node not in paths:
@@ -407,8 +422,12 @@ def _short_cycle(candidate,graph,lines):
 def _select(candidates,roads,lines,tree,graph,corridors=()):
     candidates.sort(key=lambda c:(c.score,tuple(c.first.point),tuple(c.points[-1])))
     options = {}
+    fixed_conflicts = {}
     for c in candidates:
-        reason = corridor_conflict(c.points,corridors) or _nearby_conflict(c,roads,lines,tree)
+        reason = corridor_conflict(c.points,corridors)
+        if not reason:
+            fixed_conflicts[id(c)] = _nearby_conflict(c,roads,lines,tree)
+            reason = fixed_conflicts[id(c)]
         if not reason and _short_cycle(c,graph,lines):
             reason = 'short_redundant_cycle'
         if reason:
@@ -430,7 +449,7 @@ def _select(candidates,roads,lines,tree,graph,corridors=()):
         elif any(len(options[end])>1 and options[end][1].score-c.score<max(1.0,c.row['distance_m']*0.035) for end in endpoints):
             reason = 'ambiguous_continuation'
         else:
-            reason = _nearby_conflict(c,roads,lines,tree)
+            reason = fixed_conflicts[id(c)]
             if not reason and _short_cycle(c,graph,lines):
                 reason = 'short_redundant_cycle'
             if not reason:
@@ -451,6 +470,7 @@ def _select(candidates,roads,lines,tree,graph,corridors=()):
             continue
         accepted.append(c)
         used.update(endpoints)
+        graph.graph.pop('_shortest_cache', None)
         first,second = _key(c.first.point),_key(c.second.point if c.second else c.points[-1])
         graph.add_edge(first,second,weight=c.row['distance_m'])
         if c.second is None:
@@ -505,13 +525,17 @@ def retain_main_component(roads):
     return kept, removed
 
 
-def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=None,unit_size_m: float=1.0,*,max_gap_m: float=300.0,keep_main_component: bool=False):
+def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=None,unit_size_m: float=1.0,*,max_gap_m: float=300.0,keep_main_component: bool=False,evidence=None):
     """Recover a noded planar network with paired trajectory constraints.
     Replaced corridor segments are audited; elsewhere only endpoint tails may
     move, within 7 m and 20% of track length. Elevations are not inferred.
     """
     if not np.isfinite(unit_size_m) or unit_size_m<=0 or not np.isfinite(max_gap_m) or max_gap_m<=0:
         raise ValueError('Distances must be finite and positive')
+    import time
+    from collections import Counter
+    timing=Counter()
+    started=time.perf_counter()
     active = []
     for road in roads:
         points = _deduplicate_points(np.asarray(road.points)*unit_size_m)
@@ -522,35 +546,82 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
         from shapely.affinity import scale
         surface_geometry = scale(surface_geometry,xfact=unit_size_m,yfact=unit_size_m,origin=(0,0))
     surface = prep(surface_geometry) if surface_geometry is not None and not surface_geometry.is_empty else None
-    baseline = _metrics(_node_network(active))
+    noded = _node_network(active)
+    timing['network_initial_noding'] += time.perf_counter()-started
+    started=time.perf_counter()
+    baseline = _metrics(noded)
     corridors = infer_track_corridors(active,max_gap_m)
-    active,replaced,corridor_bridges,cleanup = restore_track_corridors(active,corridors,max_gap_m) if corridors else (active,LineString(),[],dict(connection_redundant_fragment_count=0,connection_redundant_length_m=0.))
-    active = _join_chains(_node_network(active))
-    audit = [dict(first_sources=list(sources),second_sources=[],distance_m=line.length,lateral_offset_m=0.,surface_support=_support(line.coords,surface),score=0.,kind='corridor_reconstruction',status='accepted',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=line) for line,sources in corridor_bridges]
+    from .road_connection_evidence import ConnectorPropagation
+    propagation = ConnectorPropagation()
+    bridge_audit = []
+    def accept_bridge(curve,sources):
+        row=dict(first_sources=list(sources),second_sources=[],distance_m=LineString(curve).length,
+                 lateral_offset_m=0.,score=0.,kind='corridor_reconstruction',status='candidate',
+                 needs_review=False,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=LineString(curve))
+        accepted=evidence.evaluate(curve,row)
+        row['propagation_depth']=1
+        row['status']='accepted' if accepted else 'image_evidence_rejected'
+        bridge_audit.append(row)
+        if accepted:propagation.add(curve,1)
+        return accepted
+    active,replaced,corridor_bridges,cleanup = restore_track_corridors(
+        active,corridors,max_gap_m,bridge_accept=accept_bridge if evidence is not None else None
+    ) if corridors else (active,LineString(),[],dict(connection_redundant_fragment_count=0,connection_redundant_length_m=0.))
+    active = _join_chains(_node_network(active) if corridors else noded)
+    audit = bridge_audit if evidence is not None else [dict(first_sources=list(sources),second_sources=[],distance_m=line.length,lateral_offset_m=0.,surface_support=_support(line.coords,surface),score=0.,kind='corridor_reconstruction',status='accepted',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=line) for line,sources in corridor_bridges]
+    def qualify(candidates):
+        if evidence is None:return candidates
+        qualified=[]
+        for c in candidates:
+            accepted=evidence.evaluate(c.points,c.row)
+            depth=propagation.depth(c.points)
+            c.row['propagation_depth']=depth
+            if depth>2 and c.row['gap_length_m']>evidence.short_gap_m:
+                accepted=False;c.row['decision_reason']='connector_propagation_limit'
+            if accepted:qualified.append(c)
+            else:c.row['status']='image_evidence_rejected'
+        return qualified
     if not replaced.is_empty:
         audit.append(dict(first_sources=[],second_sources=[],distance_m=replaced.length,lateral_offset_m=0.,surface_support=0.,score=0.,kind='corridor_replacement',status='replaced',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=replaced))
+    timing['network_corridor_recovery'] += time.perf_counter()-started
     additions,rounds = [],0
     # Every operation consumes dangling ends; stop at a fixed point, not after
     # an arbitrary small number of passes. Larger chains inform later gaps.
     while active:
+        started=time.perf_counter()
         graph = _graph(active)
         lines = [LineString(r.points) for r in active]
         tree = STRtree(lines)
         ports = _ports(active,lines,tree,graph)
+        timing['network_round_index_ports'] += time.perf_counter()-started
+        started=time.perf_counter()
         candidates = _continuations(ports,active,max_gap_m,surface)
-        selected = _select(candidates,active,lines,tree,graph,corridors)
+        timing['network_candidates'] += time.perf_counter()-started
+        started=time.perf_counter()
+        selected = _select(qualify(candidates),active,lines,tree,graph,corridors)
+        timing['network_selection'] += time.perf_counter()-started
         audit.extend({**c.row,'round':rounds,'geometry':LineString(c.points)} for c in candidates)
         if not selected:
+            started=time.perf_counter()
             candidates = _attachments(ports,active,lines,tree,min(150,max_gap_m),surface)
-            selected = _select(candidates,active,lines,tree,graph,corridors)
+            timing['network_candidates'] += time.perf_counter()-started
+            started=time.perf_counter()
+            selected = _select(qualify(candidates),active,lines,tree,graph,corridors)
+            timing['network_selection'] += time.perf_counter()-started
             audit.extend({**c.row,'round':rounds,'geometry':LineString(c.points)} for c in candidates)
         if not selected:
             break
         additions.extend(selected)
+        started=time.perf_counter()
+        if evidence is not None:
+            for c in selected:
+                propagation.add(c.points,c.row['propagation_depth'])
         active = _apply(active,selected)
+        timing['network_apply_noding'] += time.perf_counter()-started
         rounds += 1
         if rounds>2*len(roads)+1:
             raise RuntimeError('Connection did not converge')
+    print('[Fast timing] '+' '.join(f'{key}={value:.6f}s' for key,value in timing.items()),flush=True)
     components_before_filter = _metrics(active)['components']
     removed = []
     if keep_main_component:

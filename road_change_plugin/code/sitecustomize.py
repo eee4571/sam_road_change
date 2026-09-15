@@ -22,6 +22,17 @@ def _configure_gis_data() -> None:
         os.environ["GDAL_DATA"] = str(gdal_data)
 
 
+def _filesystem_path(path: str) -> str:
+    """Use extended Windows names for image I/O in deeply nested task roots."""
+    if sys.platform != 'win32':
+        return path
+    absolute = os.path.abspath(path)
+    prefix = chr(92) * 2 + '?' + chr(92)
+    if absolute.startswith(prefix) or len(absolute) < 240:
+        return path
+    return prefix + ('UNC' + absolute[1:] if absolute.startswith(chr(92) * 2) else absolute)
+
+
 def _patch_opencv() -> None:
     if sys.platform != "win32":
         return
@@ -37,7 +48,7 @@ def _patch_opencv() -> None:
     def imread(filename, flags=cv2.IMREAD_COLOR):
         path = os.fspath(filename)
         try:
-            with open(path, "rb") as stream:
+            with open(_filesystem_path(path), "rb") as stream:
                 encoded = np.frombuffer(stream.read(), dtype=np.uint8)
             if encoded.size:
                 image = cv2.imdecode(encoded, flags)
@@ -54,7 +65,7 @@ def _patch_opencv() -> None:
         try:
             ok, encoded = cv2.imencode(extension, image, encode_params)
             if ok:
-                with open(path, "wb") as stream:
+                with open(_filesystem_path(path), "wb") as stream:
                     stream.write(encoded.tobytes())
                 return True
         except (OSError, ValueError, cv2.error):

@@ -27,16 +27,17 @@ def read_results(path):
             results.append(dict(result_type=kind, name=name, path=str(target), metadata=metadata))
 
     for entry in manifest.get("final_period_results", manifest.get("period_results", [])):
-        products = {**entry, **entry.get("published", {})}
-        for key, kind in (("centerlines", "road_centerline"), ("surfaces", "road_surface"), ("width_segments", "road_width")):
+        products = entry.get("published") or entry
+        width_key=next((key for key in ('width_profiles','width_segments','road_width') if products.get(key)), 'width_segments')
+        for key, kind in (("centerlines", "road_centerline"), ("surfaces", "road_surface"), (width_key, "road_width")):
             add(kind, products.get(key), f"{entry.get('grid', '')} / {entry.get('period', '')} / {kind}", {"grid": entry.get("grid"), "period": entry.get("period")})
     for entry in manifest.get("change_results", []):
-        products = {**entry, **entry.get("layers", {}), **entry.get("published", {})}
+        products = entry.get("published") or {**entry, **entry.get("layers", {})}
         meta = {k: entry.get(k) for k in ("grid", "before_period", "after_period")}
         for key in ("changes", "added", "removed", "widened", "narrowed", "gpkg"):
             add("road_change", products.get(key), f"{meta['grid']} / {meta['before_period']} → {meta['after_period']} / {key}", meta)
     for entry in manifest.get("temporal_results", []):
-        products = {**entry, **entry.get("published", {})}
+        products = entry.get("published") or entry
         for key in ("life_shp", "observations_shp", "events_shp", "event_parts_shp", "lineage_shp"):
             add("road_temporal", products.get(key), f"{entry.get('grid', '')} / {key}", {"grid": entry.get("grid")})
     summary = manifest.get("evaluation_summary") or {}

@@ -5,6 +5,7 @@ from pathlib import Path
 from .runner import ROOT, Runner
 from .signals import TaskSignals, forward
 from .result_parser import read_results
+from .production_policy import task_arguments, configuration, check_existing_task
 
 
 class Controller(TaskSignals):
@@ -54,15 +55,16 @@ class Controller(TaskSignals):
                 if not data.get(key, "").strip():
                     raise ValueError("请选择期次或变化对")
                 args += ["--" + key.replace("_", "-"), data[key]]
+            check_existing_task(manifest)
             args += ["--update-related" if action == "rerun-period" else "--update-temporal"]
-            return args
+            return task_arguments(args)
         areas, periods = data.get("areas", []), data.get("periods", [])
         if not areas:
             raise ValueError("请添加至少一个验证区 SHP")
         names = [r[0].strip() for r in areas]
         if any(not n for n in names) or len(set(names)) != len(names):
             raise ValueError("区域名称不能为空或重复")
-        args = ["all", "--mode", "validation", "--execution-profile", data.get("profile", "full")]
+        args = ["all", "--mode", "validation", "--execution-profile", "fast"]
         for name, area in areas:
             args += ["--validation-area", name, self.input_file(area, ".shp")]
             rows = [r for r in periods if r[0] == name]
@@ -100,7 +102,11 @@ class Controller(TaskSignals):
             args += ["--resume"]
         if data.get("truth_type_field", "").strip():
             args += ["--truth-type-field", data["truth_type_field"].strip()]
-        return args
+        reference=configuration()['irmad_reference']
+        for name in names:
+            if not any(r[0]==name and r[1]==reference for r in periods):
+                raise ValueError(f'{name} 缺少归一化参考期 {reference}')
+        return task_arguments(args)
 
     def run(self, action, data):
         try:
@@ -108,7 +114,7 @@ class Controller(TaskSignals):
                 raise ValueError("当前任务尚未结束")
             args = self.build_command(action, data)
             self.manifest = data.get("manifest", "")
-            profile = data.get("profile", "full")
+            profile = "fast"
             if action != "all":
                 profile = json.loads(self.path(self.manifest).read_text(encoding="utf-8")).get("execution_profile", "full")
             self.runner.start(args, profile)

@@ -7,6 +7,7 @@ import uuid
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer
 from .signals import TaskSignals
+from .production_policy import task_arguments, configuration, check_existing_task
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "__SAMROAD_USER__"
@@ -55,13 +56,13 @@ class Runner(TaskSignals):
         paths = [self.python_path(), self.root / "runtime/config/samroad_inference.yaml",
                  self.root / "runtime/model/samroad/samroad.ckpt",
                  self.root / "runtime/model/samroad/sam_vit_b_01ec64.pth"]
-        if profile != "fast":
-            paths += [self.root / "runtime/model/sam_molra/sam_vit_b_01ec64.pth",
-                      self.root / "runtime/model/sam_molra/adapter.th"]
+        # MoLRA remains upstream recovery evidence, not a selectable final width backend.
+        paths += [self.root / "runtime/model/sam_molra/sam_vit_b_01ec64.pth",
+                  self.root / "runtime/model/sam_molra/adapter.th"]
         return [str(p.relative_to(self.root)) for p in paths if not p.is_file()]
 
     def command(self, args):
-        return str(self.python_path()), ["-u", str(self.root / "code/user_pipeline.py"), *map(str, args)]
+        return str(self.python_path()), ["-u", str(self.root / "code/user_pipeline.py"), *task_arguments(args, self.root)]
 
     def environment(self):
         env = QProcessEnvironment.systemEnvironment()
@@ -80,7 +81,7 @@ class Runner(TaskSignals):
                 env.insert(key, str(site / sub))
         return env
 
-    def start(self, args, profile="full"):
+    def start(self, args, profile="fast"):
         if self.running:
             raise ValueError("当前任务尚未结束")
         self.task_id = uuid.uuid4().hex
@@ -91,11 +92,22 @@ class Runner(TaskSignals):
         self._buffer = ""
         self._decoder.reset()
         self.state = "queued"
+        if args and args[0].startswith('rerun-'):
+            try:
+                check_existing_task(args[args.index('--pipeline-manifest')+1],self.root)
+            except (ValueError, OSError, IndexError) as exc:
+                self._fail(str(exc));return
         missing = self.missing_runtime(profile)
         if missing:
             self._fail("缺少运行资源，请手动复制：\n" + "\n".join(missing))
             return
-        program, arguments = self.command(args)
+        try:
+            settings=configuration(self.root)
+            program, arguments = self.command(args)
+        except (OSError, ValueError, TypeError) as exc:
+            self._fail('插件配置错误：'+str(exc))
+            return
+        self.task_log.emit(self._payload(level='INFO',message='[Plugin configuration] '+json.dumps(settings,ensure_ascii=False,sort_keys=True)))
         self.process.setWorkingDirectory(str(self.root / "code"))
         self.process.setProcessEnvironment(self.environment())
         self.process.start(program, arguments)

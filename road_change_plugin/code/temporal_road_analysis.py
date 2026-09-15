@@ -10,6 +10,7 @@ is the one-row-per-road wide table intended for direct GIS inspection, while
 import argparse
 import hashlib
 import json
+from engine.fast_timing import timed_stage
 import math
 import re
 from pathlib import Path
@@ -127,13 +128,37 @@ def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
     return result.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
 
+from functools import lru_cache, wraps
+
+
+@lru_cache(maxsize=16384)
+def _geometry_facts(geometry):
+    ends = tuple(Point(geometry.coords[i]) for i in (0,-1)) if geometry.geom_type == 'LineString' else ()
+    return geometry.length, geometry.bounds, ends
+
+
+@lru_cache(maxsize=16384)
+def _geometry_buffer(geometry, distance):
+    return geometry.buffer(distance)
+
+
+def _geometry_scope(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _geometry_facts.cache_clear(); _geometry_buffer.cache_clear(); _direction_vector.cache_clear()
+    return wrapped
+
+
 def _line_score(source: BaseGeometry, target: BaseGeometry, tolerance: float) -> tuple[float, float, float]:
     if source.is_empty or target.is_empty or source.length <= 0 or target.length <= 0:
         return 0.0, 0.0, float("inf")
     distance = float(source.distance(target))
     buffer_distance = max(float(tolerance), 0.1)
-    source_cover = float(source.intersection(target.buffer(buffer_distance)).length) / float(source.length)
-    target_cover = float(target.intersection(source.buffer(buffer_distance)).length) / float(target.length)
+    source_cover = float(source.intersection(_geometry_buffer(target,buffer_distance)).length) / _geometry_facts(source)[0]
+    target_cover = float(target.intersection(_geometry_buffer(source,buffer_distance)).length) / _geometry_facts(target)[0]
     overlap = min(max(source_cover, 0.0), max(target_cover, 0.0), 1.0)
     proximity = max(0.0, 1.0 - distance / buffer_distance)
     direction = _direction_similarity(source, target)
@@ -142,6 +167,7 @@ def _line_score(source: BaseGeometry, target: BaseGeometry, tolerance: float) ->
     return 0.65 * overlap + 0.20 * direction + 0.15 * proximity, overlap, distance
 
 
+@lru_cache(maxsize=16384)
 def _direction_vector(geometry: BaseGeometry) -> np.ndarray | None:
     """Return an orientation vector (sign-free) using sampled-point PCA."""
     if geometry is None or geometry.is_empty or geometry.length <= 0:
@@ -172,10 +198,12 @@ def _best_match(
     targets: list[BaseGeometry],
     tree: STRtree | None,
     tolerance: float,
+    indices=None,
 ) -> tuple[int | None, float, float, float, bool]:
     if tree is None or not targets:
         return None, 0.0, 0.0, float("inf"), False
-    indices = tree.query(geometry, predicate="dwithin", distance=max(tolerance, 0.1))
+    if indices is None:
+        indices = tree.query(geometry, predicate="dwithin", distance=max(tolerance, 0.1))
     ranked = []
     for raw_index in indices:
         index = int(raw_index)
@@ -185,7 +213,7 @@ def _best_match(
             continue
         # A continuous counterpart must explain the longitudinal axis, including
         # its endpoints. Direction alone cannot select an adjacent branch.
-        ends = [Point(geometry.coords[i]).distance(targets[index]) for i in (0,-1)]
+        ends = [point.distance(targets[index]) for point in _geometry_facts(geometry)[2]]
         continuity = float(np.mean(np.exp(-np.asarray(ends)/max(tolerance, .1))))
         total = .85*score + .15*continuity
         ranked.append((total, overlap, -distance, index))
@@ -203,25 +231,27 @@ def _build_reference(period_frames: dict[str, gpd.GeoDataFrame], tolerance: floa
         existing_geometries = [item["geometry"] for item in references]
         tree = STRtree(np.asarray(existing_geometries, dtype=object)) if existing_geometries else None
         new_references: list[dict] = []
-        new_geometries: list[BaseGeometry] = []
-        for _, row in frame.iterrows():
+        period_geometries = list(frame.geometry)
+        period_tree = STRtree(period_geometries)
+        accepted_indices = set()
+        for row_index, (_, row) in enumerate(frame.iterrows()):
             geometry = row.geometry
             index, score, overlap, _distance, _ambiguous = _best_match(
                 geometry, existing_geometries, tree, tolerance,
             )
             matched = index is not None and score >= 0.48 and overlap >= 0.35
-            if not matched and new_geometries:
+            if not matched and accepted_indices:
                 # Outside tolerance the overlap is zero and the maximum score
                 # is .20, below .48. Spatial pruning preserves the old decision
                 # exactly while avoiding a quadratic all-road buffer workload.
-                local_tree=STRtree(np.asarray(new_geometries,dtype=object))
-                local_index,local_score,local_overlap,_,_=_best_match(geometry,new_geometries,local_tree,tolerance)
+                indices = [int(i) for i in period_tree.query(geometry, predicate="dwithin", distance=max(tolerance, .1)) if int(i) in accepted_indices]
+                local_index,local_score,local_overlap,_,_=_best_match(geometry,period_geometries,period_tree,tolerance,indices=indices)
                 matched=local_index is not None and local_score>=.48 and local_overlap>=.35
             if matched:
                 continue
             item = {"geometry": geometry, "born_period": period}
             new_references.append(item)
-            new_geometries.append(geometry)
+            accepted_indices.add(row_index)
         references.extend(new_references)
     return references
 
@@ -250,6 +280,8 @@ def _assign_road_ids(references: list[dict], prior_path: Path, analysis_crs, tol
         prior_tree = STRtree(np.asarray(prior_geometries, dtype=object)) if prior_geometries else None
         candidates = []
         for ref_index, reference in enumerate(references):
+            if reference.get('road_id'):
+                continue
             prior_index, score, overlap, _distance, _ambiguous = _best_match(
                 reference["geometry"], prior_geometries, prior_tree, tolerance,
             )
@@ -421,15 +453,17 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
     states={str(entry['period']):gpd.read_file(entry['road_state'],layer='road_state').to_crs(analysis_crs)
             for entry in period_entries}
     track_ids=sorted({str(t) for frame in states.values() for t in frame.track_id})
+    state_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in states.items()}
+    road_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in period_frames.items()}
     references=[];observations=[]
     for track_id in track_ids:
-        first=next(frame.loc[frame.track_id==track_id].iloc[0] for frame in states.values() if frame.track_id.eq(track_id).any())
+        first=next(groups[track_id].iloc[0] for groups in state_groups.values() if track_id in groups)
         references.append(dict(road_id=track_id,born_period=next(iter(states)),geometry=first.geometry))
         for period,state in states.items():
-            rows=state.loc[state.track_id==track_id]
+            rows=state_groups[period].get(track_id,state.iloc[:0])
             if len(rows)!=1:raise ValueError(f'Reconciled road state incomplete: {track_id}/{period}')
             row=rows.iloc[0]; roads=period_frames[period]
-            actual=roads.loc[roads.track_id==track_id]
+            actual=road_groups[period].get(track_id,roads.iloc[:0])
             present=row.status=='present'
             if present != (not actual.empty):raise ValueError(f'Road state contradicts period centerline: {track_id}/{period}')
             width=float(np.average(actual.width_m,weights=actual.length)) if present else np.nan
@@ -626,7 +660,7 @@ def _apply_event_evidence(events: list[dict], event_parts: list[dict], has_pair_
         # Ambiguous observations and lifecycle conflicts retain their own QA.
 
 
-def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str) -> None:
+def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str, output_crs=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
         frame = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
@@ -637,11 +671,16 @@ def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geome
     else:
         data = {name: pd.Series(dtype=dtype) for name, dtype in columns.items()}
         frame = gpd.GeoDataFrame(data, geometry=gpd.GeoSeries([], crs=crs), crs=crs)
+    if output_crs is not None and frame.crs != output_crs:
+        frame = frame.to_crs(output_crs)
     pyogrio.write_dataframe(
         frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=geometry_type,
     )
 
 
+
+@timed_stage("temporal")
+@_geometry_scope
 def build_temporal_grid(
     grid_name: str,
     period_entries: list[dict],
@@ -696,40 +735,33 @@ def build_temporal_grid(
 
     _write_shp(output_dir / "road_life.shp", life,
                {name: ("str" if name not in {"present_n", "event_n", "max_conf", "min_conf"} and not name.startswith(("W", "C")) else "float64")
-                for name in life[0] if name != "geometry"}, analysis_crs, "LineString")
+                for name in life[0] if name != "geometry"}, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_obs.shp", observations, {
         "road_id": "str", "period": "str", "status": "str", "width_m": "float64",
         "length_m": "float64", "coverage": "float64", "match_sc": "float64",
         "extract_cf": "float64", "geom_dev_m": "float64", "source_fid": "str", "qa_state": "str",
         "qa_reason": "str", "dir_sim": "float64",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_event.shp", events, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "before_st": "str", "after_st": "str", "before_w": "float64",
         "after_w": "float64", "width_diff": "float64", "event_cf": "float64",
         "evidence": "str", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "event_parts.shp", event_parts, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "source_id": "str", "area_m2": "float64", "qa_state": "str",
-    }, analysis_crs, "Polygon")
+    }, analysis_crs, "Polygon", output_crs)
     _write_shp(output_dir / "road_lineage.shp", [], {
         "parent_id": "str", "child_id": "str", "period": "str", "relation": "str",
         "confidence": "float64", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     _write_shp(output_dir / "road_review.shp", reviews, {
         "road_id": "str", "period": "str", "reason": "str", "match_sc": "float64",
         "coverage": "float64", "qa_state": "str",
-    }, analysis_crs, "LineString")
+    }, analysis_crs, "LineString", output_crs)
     pd.DataFrame([{k:v for k,v in row.items() if k!='geometry'} for row in observations]).to_csv(
         output_dir/'width_evolution.csv',index=False,encoding='utf-8-sig')
-
-    if output_crs is not None and output_crs != analysis_crs:
-        for name in ("road_life.shp", "road_obs.shp", "road_event.shp", "event_parts.shp", "road_lineage.shp", "road_review.shp"):
-            path = output_dir / name
-            frame = gpd.read_file(path).to_crs(output_crs)
-            geometry_type = "Polygon" if name == "event_parts.shp" else "LineString"
-            pyogrio.write_dataframe(frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=geometry_type)
 
     result = {
         "grid": grid_name, "output": str(output_dir),

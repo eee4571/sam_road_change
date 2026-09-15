@@ -163,19 +163,23 @@ def network_surface(profiles, node_tolerance=.5):
 def change_surfaces(frame):
     """Render/dissolve each change class; preserve interval metadata in audit."""
     import geopandas as gpd
+    import pandas as pd
     from shapely import from_wkt
     rows=[]
-    for kind,group in frame.groupby('change_typ',sort=False):
+    from .gt_road_geometry import road_profile
+    work=frame.copy()
+    work['_full_road']=work.get('gt_geometry_role',pd.Series(index=work.index,dtype=str)).eq('full_road_change')
+    for (kind,full_road),group in work.groupby(['change_typ','_full_road'],sort=False):
         before=[];after=[]
         for row in group.itertuples():
             geometry=from_wkt(row.axis_wkt)
             axes=[geometry] if geometry.geom_type=='LineString' else list(geometry.geoms)
             for axis in axes:
-                s=[0.,axis.length]
-                if row.width_bef>0:before.append((axis,s,[row.width_bef]*2))
-                if row.width_aft>0:after.append((axis,s,[row.width_aft]*2))
+                record=row._asdict()
+                if row.width_bef>0:before.append((axis,*road_profile(record,axis,row.width_bef)))
+                if row.width_aft>0:after.append((axis,*road_profile(record,axis,row.width_aft)))
         b=network_surface(before);a=network_surface(after)
-        geometry=a if kind=='added' else b if kind=='removed' else a.difference(b) if kind=='widened' else b.difference(a)
+        geometry=a if kind=='added' or (full_road and kind=='widened') else b if kind=='removed' or (full_road and kind=='narrowed') else a.difference(b) if kind=='widened' else b.difference(a)
         from .auto_change_assembly import polygonal
         geometry=polygonal(geometry)
         parts=[geometry] if geometry.geom_type=='Polygon' else list(geometry.geoms)

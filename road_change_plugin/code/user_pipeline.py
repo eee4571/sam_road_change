@@ -12,6 +12,8 @@ import csv
 import hashlib
 import io
 import json
+from engine.fast_timing import timed_stage
+from engine.batch_runtime import batch_models, run_resident, plan_next_centerline, record_line, record_timing, normalization_lock
 import math
 import os
 import re
@@ -393,6 +395,8 @@ def _run_fast_change_result(
     truth_type_field: str = "BHBM",
     evaluation_tolerance: float = 5.0,
     defer_finalization: bool = False,
+    temporal_results: dict | None = None,
+    compensation=None,
 ) -> dict:
     """Finish the independent Auto detector before any GT reconciliation."""
     from engine.fast_pipeline import (
@@ -401,6 +405,9 @@ def _run_fast_change_result(
     )
 
     automatic_output = output / "_automatic"
+    from engine.fast2_compensation import Fast2CompensationConfig
+    compensation = Fast2CompensationConfig.resolve(compensation)
+    print('[Fast2 settings] ' + json.dumps(compensation.to_dict(), sort_keys=True), flush=True)
     automatic = detect_fast_changes(
         before_result,
         after_result,
@@ -410,7 +417,10 @@ def _run_fast_change_result(
         position_tolerance=float(position_tolerance),
         width_change_absolute=float(width_change_absolute),
         width_change_ratio=float(width_change_ratio),
-        internal_outputs=truth_path is not None,
+        # Both GT correction and the shared Final Changes publisher consume axes.
+        internal_outputs=True,
+        temporal_results=temporal_results,
+        compensation=compensation,
     )
     if truth_path is not None and not Path(truth_path).expanduser().is_file():
         raise FileNotFoundError(f"Fast 变化真值不存在：{truth_path}")
@@ -431,6 +441,10 @@ def _run_fast_change_result(
     result.update(truth=str(truth_path or ''),validation_area=str(validation_area or ''),
                   truth_type_field=truth_type_field,before_period=before_period,after_period=after_period,
                   execution_profile='fast',fast_finalization_state='pending')
+    from engine.fast_multitemporal import AUTO_REVISION
+    result['fast_auto_revision']=AUTO_REVISION
+    result['fast2_compensation']=compensation.to_dict()
+    result['fast2_compensation_identity']=compensation.cache_identity
     if defer_finalization:return result
     from engine.fast_pipeline import _load_fast_period_result
     periods=[{**_load_fast_period_result(p),'period':period,'grid':'pair'}
@@ -1120,8 +1134,20 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     prior = read_json(state_path) if resume and state_path.is_file() else {}
     if resume and not prior:
         raise FileNotFoundError(f"找不到可续跑的单期提取状态：{state_path}")
-    if prior and prior.get("input_spec") != input_spec:
+    from engine.irmad_preprocessing import configuration, workspace_for, prepare_period
+    selected=getattr(args,'irmad',None)
+    irmad_enabled=bool(selected if selected is not None else ((prior.get('input_spec') or {}).get('irmad') or {}).get('enabled',False))
+    irmad_reference=getattr(args,'irmad_reference',None) or ((prior.get('input_spec') or {}).get('irmad') or {}).get('reference_period','20250118')
+    raw_sources={item['period']:Path(item['source']) for item in area['periods']} if irmad_enabled else {args.period:Path(period_entry['source'])}
+    identities=_radiometric_requests({args.area_id:raw_sources},irmad_enabled,{args.area_id:area['validation_area']},reference_period=irmad_reference)
+    identity=identities[(str(args.area_id),str(args.period))]
+    workspace=workspace_for(workspace,identity)
+    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None);previous_spec.pop('width_method',None)
+    if prior and previous_spec != input_spec:
         raise ValueError("续跑输入或参数与原任务不一致，请恢复原设置或使用新的任务名称")
+    args.width_method=getattr(args,'width_method',None) or (prior.get('input_spec') or {}).get('width_method','sam_molra')
+    input_spec['width_method']=args.width_method
+    input_spec['irmad']=configuration(irmad_enabled,irmad_reference)
     if task_root.exists() and not resume:
         raise FileExistsError(f"单期提取任务已存在：{task_root}；请勾选续跑或更换任务名称")
     task_root.mkdir(parents=True, exist_ok=True)
@@ -1134,19 +1160,23 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     emit("pipeline", stage="项目期次扫描", status="complete", area_id=args.area_id, period=args.period, completed=0, total=6)
     try:
         result_path = workspace / "latest_result.json"
-        if resume and _period_result_ready({"result": str(result_path)}, require_current_network=True):
+        if resume and _period_result_ready({"result": str(result_path)}, require_current_network=True) and read_json(result_path).get("width_method","sam_molra")==args.width_method:
             result = read_json(result_path)
             emit("pipeline", stage="道路提取", status="skipped", reason="续跑复用已完成且完整的正式成果", completed=6, total=6)
         else:
-            source_map = {args.period: Path(period_entry["source"])}
-            ready = _normalized_sources_ready(source_map, normalized_root) if resume else None
+            source_map = raw_sources
+            same_normalized_input = not irmad_enabled or prior.get('normalized_input_identity') == identity
+            ready = _normalized_sources_ready(source_map, normalized_root) if resume and same_normalized_input else None
             if ready is None:
                 checked = validate_validation_inputs(
-                    [[args.period, period_entry["source"]]], area["validation_area"], minimum_periods=1,
+                    [[p,str(source)] for p,source in source_map.items()], area["validation_area"], minimum_periods=1,
                 )
                 ready = normalize_validation_sources(checked, area["validation_area"], normalized_root)
             else:
                 emit("pipeline", stage="验证区影像规范化", status="skipped", reason="续跑复用已完成的规范化影像", completed=1, total=6)
+            state['normalized_input_identity'] = identity
+            write_json(state_path, state)
+            prepared=prepare_period(args.period,ready,layout.cache_root/'irmad',enabled=irmad_enabled,origin=identity,reference_period=irmad_reference)
             if resume and (workspace / "period_state.json").is_file() and _prepared_workspace_complete(workspace):
                 emit(
                     "pipeline", stage="输入准备", status="skipped", grid=args.area_id,
@@ -1155,7 +1185,8 @@ def extract_project_period(args: argparse.Namespace) -> dict:
                     reason="续跑复用已完成的输入准备",
                 )
             else:
-                prepare(argparse.Namespace(source=str(ready[args.period]), workspace=str(workspace)))
+                prepare(argparse.Namespace(source=str(prepared.source), workspace=str(workspace),
+                    radiometric_identity=identity,radiometric_preprocessing=prepared.metadata))
             base_run_id = "roads"
             result = extract(argparse.Namespace(
                 workspace=str(workspace), source="", checkpoint=str(MODELS / "samroad" / "samroad.ckpt"),
@@ -1163,6 +1194,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
                 pixel_size=str(args.pixel_size), rescale=args.rescale, run_id=base_run_id,
                 junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                 grid=args.area_id, period=args.period, resume=resume,
+                width_method=getattr(args,"width_method",None),
                 pipeline_state=str(state_path),
             ))
         published = ResultPublisher(
@@ -1180,6 +1212,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
         raise
 
 
+@batch_models
 def extract_project_all(args: argparse.Namespace) -> dict:
     """Extract every selected project area/period without running change detection."""
     started = time.monotonic()
@@ -1222,8 +1255,16 @@ def extract_project_all(args: argparse.Namespace) -> dict:
     prior = read_json(state_path) if resume and state_path.is_file() else {}
     if resume and not prior:
         raise FileNotFoundError(f"找不到可续跑的批量提取状态：{state_path}")
-    if prior and prior.get("input_spec") != input_spec:
+    from engine.irmad_preprocessing import configuration
+    selected=getattr(args,'irmad',None)
+    irmad_enabled=bool(selected if selected is not None else ((prior.get('input_spec') or {}).get('irmad') or {}).get('enabled',False))
+    irmad_reference=getattr(args,'irmad_reference',None) or ((prior.get('input_spec') or {}).get('irmad') or {}).get('reference_period','20250118')
+    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None);previous_spec.pop('width_method',None)
+    if prior and previous_spec != input_spec:
         raise ValueError("续跑范围、输入或参数与原任务不一致，请恢复原设置或使用新的任务名称")
+    args.width_method=getattr(args,'width_method',None) or (prior.get('input_spec') or {}).get('width_method','sam_molra')
+    input_spec['width_method']=args.width_method
+    input_spec['irmad']=configuration(irmad_enabled,irmad_reference)
     if batch_root.exists() and not resume:
         raise FileExistsError(f"批量提取任务已存在：{batch_root}；请勾选续跑或更换任务名称")
     batch_root.mkdir(parents=True, exist_ok=True)
@@ -1251,6 +1292,9 @@ def extract_project_all(args: argparse.Namespace) -> dict:
     emit("pipeline", stage="批量道路提取", status="running", completed=0, total=len(units), run_id=run_id)
 
     def prior_unit_ready(entry: dict | None) -> tuple[bool, dict]:
+        if (prior.get("input_spec") or {}).get("width_method","sam_molra") != args.width_method:return False, {}
+        if irmad_enabled or bool(((prior.get("input_spec") or {}).get("irmad") or {}).get("enabled",False)):
+            return False, {}
         if not entry or entry.get("status") != "completed":
             return False, {}
         unit_state_path = Path(str(entry.get("state") or ""))
@@ -1294,7 +1338,8 @@ def extract_project_all(args: argparse.Namespace) -> dict:
                 unit_state = extract_project_period(argparse.Namespace(
                     project_root=discovered["project_root"], area_id=area_id, period=period,
                     run_id=run_id, device=args.device, pixel_size=args.pixel_size,
-                    rescale=args.rescale,
+                    rescale=args.rescale,irmad=irmad_enabled,irmad_reference=irmad_reference,
+                    width_method=getattr(args,"width_method",None),
                     junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                     resume=resume and unit_state_path.is_file(),
                 ))
@@ -1427,8 +1472,14 @@ def change_project_periods(args: argparse.Namespace) -> dict:
     prior = read_json(state_path) if resume and state_path.is_file() else {}
     if resume and not prior:
         raise FileNotFoundError(f"找不到可续跑的变化任务状态：{state_path}")
-    if prior and prior.get("input_spec") != input_spec:
+    from engine.fast2_compensation import Fast2CompensationConfig, cache_matches
+    compensation = Fast2CompensationConfig.resolve(getattr(args,'fast2_compensation',None)
+        or (prior.get('input_spec') or {}).get('fast2_compensation'))
+    previous_spec = dict(prior.get('input_spec') or {})
+    previous_spec.pop('fast2_compensation', None)
+    if prior and previous_spec != input_spec:
         raise ValueError("续跑输入或参数与原变化任务不一致，请恢复原设置或使用新的任务名称")
+    if fast_profile:input_spec['fast2_compensation']=compensation.to_dict()
     if task_root.exists() and not resume:
         raise FileExistsError(f"变化任务已存在：{task_root}；请勾选续跑或更换任务名称")
     task_root.mkdir(parents=True, exist_ok=True)
@@ -1455,7 +1506,8 @@ def change_project_periods(args: argparse.Namespace) -> dict:
             )
         )
         if (resume and prior_result and _change_result_ready(prior_result) and complete_layers
-                and (not fast_profile or prior_result.get('fast_finalization_state')=='completed')):
+                and (not fast_profile or (prior_result.get('fast_finalization_state')=='completed'
+                     and cache_matches(prior_result,compensation)))):
             result = dict(prior_result)
             emit("pipeline", stage="两期宽度变化检测", status="skipped", reason="续跑复用已完成且完整的变化成果", completed=3, total=3)
         elif fast_profile:
@@ -1463,6 +1515,7 @@ def change_project_periods(args: argparse.Namespace) -> dict:
                 before_result_path,
                 after_result_path,
                 products,
+                compensation=compensation,
                 before_period=args.before_period,
                 after_period=args.after_period,
                 position_tolerance=thresholds["tolerance"],
@@ -1526,9 +1579,11 @@ def change_project_periods(args: argparse.Namespace) -> dict:
         raise
 
 
+@timed_stage('normalization')
+@normalization_lock
 def normalize_validation_sources(
     periods: dict[str, Path], validation_area: str | Path, output_root: Path,
-    tile_size: int = 4096, strict_coverage: bool = False,
+    tile_size: int = 4096, strict_coverage: bool = False, cache_root: Path | None = None,
 ) -> dict[str, Path]:
     """Write every validation input onto one masked, common analysis grid.
 
@@ -1597,7 +1652,7 @@ def normalize_validation_sources(
     coverage_reports: dict[str, dict] = {}
     output_root.mkdir(parents=True, exist_ok=True)
     shared_signature = {
-        "version": 2,
+        "version": 3,
         "validation_geometry": validation_geometry.wkb_hex,
         "analysis_crs": str(analysis_crs),
         "transform": tuple(transform),
@@ -1616,18 +1671,38 @@ def normalize_validation_sources(
             for period, rasters in sources.items()
         },
     }
+    if cache_root is None:
+        work = next((p for p in output_root.resolve().parents if p.name == '_work'), None)
+        cache_root = work/'cache'/'normalized' if work else output_root
     for period, rasters in sources.items():
         signature_text = json.dumps(
-            {"shared": shared_signature, "period": period}, sort_keys=True, ensure_ascii=False,
+            {"shared": {**shared_signature, 'sources':shared_signature['sources'][period]}, "period": period}, sort_keys=True, ensure_ascii=False,
         )
         generation = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()[:16]
-        period_dir = output_root / clean_name(period) / generation
+        period_dir = cache_root / clean_name(period) / generation
         period_dir.mkdir(parents=True, exist_ok=True)
         state_path = period_dir / "normalization_state.json"
         try:
             state = read_json(state_path) if state_path.is_file() else {}
         except (OSError, UnicodeError, json.JSONDecodeError):
             state = {}
+        from engine.product_cache import read_completed, write_completed
+        cache_marker = period_dir/'normalized_cache.json'
+        cached = read_completed(cache_marker, [generation])
+        if cached is not None:
+            if strict_coverage and cached['coverage']['missing_pixels']:
+                raise ValueError(f'{period} 期验证区影像覆盖不足，缓存包含无效像素')
+            normalized[period] = period_dir.resolve()
+            tile_counts[period] = cached['tile_count']
+            coverage_reports[period] = cached['coverage']
+            print('[Fast batch timing] normalization_cache_hit=1', flush=True)
+            record_timing('normalization_cache_hit',1)
+            write_json(output_root/'normalization_complete.json', dict(version=2,
+                periods={k:str(v) for k,v in normalized.items()}, tile_counts=tile_counts,
+                coverage=coverage_reports, completed_at=now_text()))
+            continue
+        if cache_marker.is_file() and cached is None:
+            state = {}  # A completed cache was damaged; do not adopt stale window markers.
         if state.get("generation") != generation:
             state = {
                 "version": 2,
@@ -1854,6 +1929,12 @@ def normalize_validation_sources(
         write_json(state_path, state)
         normalized[period] = period_dir.resolve()
         tile_counts[period] = tile_index
+        paths = listed_rasters(period_dir)
+        if (period_dir/'valid_observation.shp').exists():
+            paths.append(period_dir/'valid_observation.shp')
+        write_completed(cache_marker, [generation], dict(tile_count=tile_index, coverage=coverage_reports[period]), paths)
+        print('[Fast batch timing] normalization_cache_hit=0', flush=True)
+        record_timing('normalization_cache_miss',1)
         write_json(output_root / "normalization_complete.json", {
             "version": 2,
             "periods": {name: str(path) for name, path in normalized.items()},
@@ -1894,7 +1975,10 @@ def prepare(args: argparse.Namespace) -> dict:
     if not source.exists():
         raise FileNotFoundError(f"找不到格网输入：{source}")
     workspace.mkdir(parents=True, exist_ok=True)
-    images = workspace / "images"
+    from engine.irmad_preprocessing import reserve_workspace_identity
+    reserve_workspace_identity(workspace,getattr(args,'radiometric_identity','raw'))
+    cached_normalization = (source/'normalized_cache.json').is_file()
+    images = source if cached_normalization else workspace / "images"
     images.mkdir(exist_ok=True)
     rasters = listed_rasters(source)
     if not rasters:
@@ -1907,7 +1991,8 @@ def prepare(args: argparse.Namespace) -> dict:
             name = f"{index:05d}_{name}"
         seen.add(name)
         target = images / name
-        import_raster(item, target)
+        if not cached_normalization:
+            import_raster(item, target)
         copied.append(str(target.resolve()))
         emit("prepare", index=index, total=len(rasters), name=item.name)
     txt = workspace / "batches" / "grid_tiles.txt"
@@ -1920,6 +2005,8 @@ def prepare(args: argparse.Namespace) -> dict:
         "elapsed_seconds": elapsed_seconds(started),
         "mode": "existing_grid",
     }
+    manifest['radiometric_identity']=getattr(args,'radiometric_identity','raw')
+    manifest['radiometric_preprocessing']=getattr(args,'radiometric_preprocessing',{'config':{'enabled':False}})
     write_json(workspace / "input_manifest.json", manifest)
     emit(
         "complete", stage="prepare", workspace=str(workspace), tile_count=len(copied),
@@ -2024,11 +2111,14 @@ def run_command(
     context = dict(event_context or {})
     defer_completion = bool(context.pop("_defer_completion", False))
     emit("stage", stage=label, status="running", started_at=started_at, **context)
-    process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line.rstrip(), flush=True)
-    code = process.wait()
+    code = run_resident(command, cwd, env)
+    if code is None:
+        process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line.rstrip(), flush=True)
+            record_line(line)
+        code = process.wait()
     if code != 0:
         emit(
             "stage", stage=label, status="failed", code=code,
@@ -2454,6 +2544,11 @@ def extract(args: argparse.Namespace) -> dict:
     resume = bool(getattr(args, "resume", False))
     period_state_path = workspace / "period_state.json"
     period_state = _load_period_state(period_state_path, grid, period, resume, execution_profile)
+    width_method=getattr(args,'width_method',None) or period_state.get('width_method','sam_molra')
+    if period_state.get('width_method','sam_molra')!=width_method:
+        period_state['stages']['export']='pending'
+    period_state['width_method']=width_method
+    print(f'[Width backend] {width_method}',flush=True)
     period_state.update({
         "status": "running",
         "workspace": str(workspace),
@@ -2550,6 +2645,7 @@ def extract(args: argparse.Namespace) -> dict:
             ], ROOT),
         }
         stage_definitions = FAST_PERIOD_STAGE_DEFINITIONS
+    stage_commands['export'][0].extend(['--width-method',width_method])
     if resume:
         stage_commands["centerline"][0].append("--resume-existing-images")
         if pipeline_state_path is not None:
@@ -2650,8 +2746,12 @@ def extract(args: argparse.Namespace) -> dict:
         "execution_profile": execution_profile,
         "road_extraction_source": "samroad_fast" if execution_profile == "fast" else "samroad",
         "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
-        "width_source": "fast_measured" if execution_profile == "fast" else "full_measured",
+        "width_source": "raw_image" if width_method=='raw_image' else "fast_measured" if execution_profile == "fast" else "full_measured",
+        "width_method":width_method,
     })
+    if width_method == 'raw_image':
+        result['regular_surface'] = True
+        result['analysis_surfaces'] = result['corridors']
     result["fusion"] = build_fusion_metadata(final_dir)
     profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
     if profile_decisions_path.is_file():
@@ -2668,6 +2768,8 @@ def extract(args: argparse.Namespace) -> dict:
             "decisions_path": str(profile_decisions_path.resolve()),
             "decisions": profile_payload.get("decisions", []),
         }
+    result['radiometric_identity']=manifest.get('radiometric_identity','raw')
+    result['radiometric_preprocessing']=manifest.get('radiometric_preprocessing',{'config':{'enabled':False}})
     result["stage_timings"] = stage_timings
     result["elapsed_seconds"] = elapsed_seconds(started)
     result["completed_at"] = now_text()
@@ -2684,6 +2786,7 @@ def change(args: argparse.Namespace) -> dict:
     if before.get('execution_profile') == 'fast' or after.get('execution_profile') == 'fast':
         result=_run_fast_change_result(Path(args.before_result),Path(args.after_result),output,
             before_period=args.before_period,after_period=args.after_period,
+            compensation=getattr(args,'fast2_compensation',None),
             position_tolerance=float(args.tolerance),width_change_absolute=float(args.absolute),
             width_change_ratio=float(args.ratio),truth_path=Path(args.truth) if getattr(args,'truth','') else None,
             validation_area=Path(args.validation_area) if getattr(args,'validation_area','') else None,
@@ -2952,32 +3055,57 @@ def _fast_assisted_evaluation_grid(
 
     grid = str(change_entry.get("grid") or "")
     before_period = str(change_entry.get("before_period") or "")
-    period_entry = next((
-        row for row in (manifest.get("period_results", []) or [])
-        if isinstance(row, dict)
-        and str(row.get("grid") or "") == grid
-        and str(row.get("period") or "") == before_period
-    ), None)
-    if period_entry is None:
-        raise ValueError(
-            f"无法定位 Fast 精度评价影像网格：{grid} / {before_period}"
-        )
-    probability_path = Path(str(
-        period_entry.get("road_probability") or ""
-    )).expanduser().resolve()
-    if not probability_path.is_file():
-        result_path = Path(str(period_entry.get("result") or "")).expanduser()
-        period_summary = read_json(result_path) if result_path.is_file() else {}
-        probability_path = Path(str(
-            period_summary.get("road_probability") or ""
-        )).expanduser().resolve()
-    if not probability_path.is_file():
+    entries = [row for key in ('period_results', 'auto_period_results')
+               for row in (manifest.get(key, []) or [])
+               if isinstance(row, dict) and str(row.get('grid') or '') == grid
+               and str(row.get('period') or '') == before_period]
+    candidates = []
+    for entry in entries:
+        value = entry.get('result')
+        result_path = Path(value).expanduser() if value else None
+        payload = read_json(result_path) if result_path is not None and result_path.is_file() else {}
+        for record in (entry, payload):
+            value = record.get('road_probability')
+            if value:
+                path = Path(value).expanduser()
+                if not path.is_absolute() and result_path is not None:
+                    path = result_path.parent / path
+                candidates.append(path.resolve())
+            if record.get('run_root'):
+                candidates.append(Path(record['run_root']).expanduser() / 'products' / 'road_probability.tif')
+    probability_path = next((path for path in candidates if path.is_file()), None)
+    if probability_path is None:
+        attempted = '; '.join(dict.fromkeys(str(path) for path in candidates)) or 'no raster reference in final or Auto period records'
         raise FileNotFoundError(
-            f"找不到 Fast 精度评价所需道路概率栅格：{probability_path}"
+            f"Fast evaluation probability raster missing: {grid} / {before_period}; {attempted}"
         )
     import rasterio
     with rasterio.open(probability_path) as dataset:
         return dataset.crs, dataset.transform, dataset.shape
+
+
+def _recover_completed_fast_change(manifest, entry):
+    """Recover only the old interruption between final generation and evaluation.
+
+    Dependency invalidation removes final period/temporal records, so old files
+    alone cannot authorize evaluation of a genuinely pending rerun.
+    """
+    if (manifest.get('temporal_status') != 'completed'
+            or not manifest.get('temporal_results') or not manifest.get('final_period_results')
+            or entry.get('status') in ('stale', 'failed') or not manifest.get('job_root')):
+        return False
+    from temporal_road_analysis import clean_name
+    directory = (Path(manifest['job_root'])/'final_changes'/clean_name(str(entry.get('grid', 'validation')))
+                 /f"{entry['before_period']}_to_{entry['after_period']}").resolve()
+    layer = (entry.get('layers') or {}).get('changes') or entry.get('road_changes')
+    if not layer or Path(layer).resolve() != directory/'road_changes.shp' or not Path(layer).is_file():
+        return False
+    periods = {str(row.get('period')) for row in manifest['final_period_results']
+               if str(row.get('grid', 'validation')) == str(entry.get('grid', 'validation'))}
+    if not {str(entry['before_period']), str(entry['after_period'])} <= periods:
+        return False
+    entry['fast_finalization_state'] = 'completed'
+    return True
 
 
 def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
@@ -3001,7 +3129,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             f"{args.before_period} → {args.after_period}"
         )
     entry = matches[0]
-    if entry.get('fast_finalization_state') == 'pending':
+    if entry.get('fast_finalization_state') == 'pending' and not _recover_completed_fast_change(manifest, entry):
         raise ValueError('Fast Final Changes 尚未生成，不能评价临时变化。')
     output = Path(str(entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
@@ -3015,6 +3143,12 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         str(entry.get("summary") or output / "change_summary.json")
     ).expanduser().resolve()
     summary = read_json(summary_path) if summary_path.is_file() else {}
+    is_current_gt_assisted = (
+        str(entry.get('execution_profile') or manifest.get('execution_profile') or summary.get('execution_profile') or '') == 'fast'
+        and bool(entry.get('ground_truth_used', summary.get('ground_truth_used', False)))
+        and bool(entry.get('correction_audit') or entry.get('truth_path')
+                 or summary.get('correction_audit') or summary.get('truth_path'))
+    )
     is_fast_gt_assisted = (
         entry.get('fast_finalization_state') != 'completed' and (
         str(entry.get('product_variant') or summary.get('product_variant') or '') == 'gt_assisted'
@@ -3133,19 +3267,26 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             **auto_metadata,
             "evaluation_source": "fast_automatic_vs_ground_truth",
         }
-        if str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted':
-            image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(
-                manifest, entry, summary,
-            )
-            rows[0].update(evaluate_fast_assisted_centerline_metrics(
-                predicted,truth,truth_type_field=evaluation_truth_type_field,
-                image_crs=image_crs,image_transform=image_transform,image_shape=image_shape,validation_area=validation,
-            ))
-            metadata["fast_assisted_centerline_metrics"] = True
-            metadata["centerline_offset_unit"] = "px"
-        else:
-            metadata['geometry_source']='regular_axis_width_corridors'
-            metadata['centerline_offset_unit']='m'
+        metadata['geometry_source']='regular_axis_width_corridors'
+        metadata['centerline_offset_unit']='m'
+
+    if is_current_gt_assisted or (is_fast_gt_assisted and
+            str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted'):
+        image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        centerline_predicted=predicted
+        final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
+        if is_current_gt_assisted and final_audit.is_file():
+            from engine.gt_road_geometry import matched_final_roads
+            centerline_predicted=matched_final_roads(predicted,final_audit)
+            metadata['centerline_association']='final_road_intervals_from_correction_identity'
+            metadata['centerline_matched_object_count']=len(centerline_predicted)
+        rows[0].update(evaluate_fast_assisted_centerline_metrics(
+            centerline_predicted, truth, truth_type_field=evaluation_truth_type_field,
+            image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
+            validation_area=validation,
+        ))
+        metadata['fast_assisted_centerline_metrics']=True
+        metadata['centerline_offset_unit']='px'
 
     for row in rows:
         if row.get("class") == "all":
@@ -3723,6 +3864,34 @@ def _normalized_sources_ready(periods: dict[str, Path], output_root: Path) -> di
     return ready
 
 
+def _radiometric_requests(grids, enabled, validation=None, *, reference_period="20250118"):
+    """Extraction identity from raw sources, fixed reference and existing grid request."""
+    from engine.irmad_preprocessing import fingerprint, request_identity
+    identities={}
+    for grid,periods in grids.items():
+        if enabled and reference_period not in periods:
+            raise ValueError(f'区域 {grid} 开启 IR-MAD 必须包含参考期 {reference_period}')
+        sources={p:[fingerprint(f) for f in listed_rasters(Path(source))] for p,source in periods.items()} if enabled else {}
+        geometry=(validation or {}).get(grid) if isinstance(validation,dict) else validation
+        geometry=stable_file_identity(geometry) if enabled and geometry else None
+        for period in periods:
+            identities[(str(grid),str(period))]=request_identity(enabled,period,sources.get(period),
+                sources.get(reference_period),dict(sources=sources,validation=geometry),reference_period=reference_period)
+    return identities
+
+
+def _radiometric_sources(periods, cache_root, *, enabled, identities, grid, reference_period="20250118"):
+    from engine.irmad_preprocessing import prepare_period
+    outputs={};metadata={}
+    for period in periods:
+        if enabled:emit('pipeline',stage='IR-MAD 辐射归一化',status='running',grid=grid,period=period)
+        prepared=prepare_period(period,periods,cache_root,enabled=enabled,
+                                origin=identities[(str(grid),str(period))],reference_period=reference_period)
+        outputs[period]=prepared.source;metadata[period]=prepared.metadata
+        if enabled:emit('pipeline',stage='IR-MAD 辐射归一化',status='complete',grid=grid,period=period)
+    return outputs,metadata
+
+
 def _task_input_spec(
     mode: str,
     grids: dict[str, dict[str, Path]],
@@ -3786,6 +3955,7 @@ def _task_input_spec(
         ),
         "device": str(args.device),
         "pixel_size": str(args.pixel_size),
+        "width_method":getattr(args,'width_method',None) or 'sam_molra',
         "rescale": str(args.rescale),
         "junction_node_mode": str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
         "absolute": str(args.absolute),
@@ -3812,7 +3982,7 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
     }
     scalar_extraction_keys = (
         "pipeline_version", "mode", "device", "pixel_size", "rescale",
-        "junction_node_mode", "execution_profile",
+        "junction_node_mode", "execution_profile", "width_method",
     )
 
     def identity_tree_equal(previous, latest) -> bool:
@@ -3830,6 +4000,7 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
         return previous == latest
 
     def scalar_value(payload: dict, key: str):
+        if key=='width_method':return payload.get(key) or 'sam_molra'
         if key == "execution_profile":
             return str(payload.get(key, "full") or "full")
         return payload.get(key)
@@ -4323,12 +4494,34 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
     ))).expanduser().resolve().parent
     analysis_source = _manifest_analysis_source(manifest, grid, period, old)
     input_spec = manifest.get("input_spec") or {}
+    from engine.irmad_preprocessing import prepare_period, workspace_for
+    irmad_enabled=bool((input_spec.get('irmad') or {}).get('enabled',False))
+    irmad_reference=(input_spec.get('irmad') or {}).get('reference_period','20250118')
+    radiometric_identity=old.get('radiometric_identity','raw')
+    radiometric_metadata=old.get('radiometric_preprocessing',{'config':{'enabled':False}})
+    if irmad_enabled:
+        sources={p:Path(_manifest_period_source(manifest,grid,p)) for p in plan[grid]}
+        validation=(manifest.get('validation_areas') or {}).get(grid) or manifest.get('validation_area') or ''
+        identities=_radiometric_requests({grid:sources},True,{grid:validation},reference_period=irmad_reference)
+        raw_inputs={}
+        if validation:
+            raw_inputs=normalize_validation_sources(sources,validation,job_root/'validation_inputs'/clean_name(grid))
+        else:
+            for p,source in sources.items():
+                raw_workspace=job_root/'irmad_raw_inputs'/clean_name(grid)/clean_name(p)
+                raw_inputs[p]=Path(prepare(argparse.Namespace(source=str(source),workspace=str(raw_workspace)))['images'])
+        radiometric_identity=identities[(grid,period)]
+        prepared=prepare_period(period,raw_inputs,project_layout(Path(manifest.get('output_root') or job_root)).cache_root/'irmad',
+                                enabled=True,origin=radiometric_identity,reference_period=irmad_reference)
+        analysis_source=prepared.source;radiometric_metadata=prepared.metadata
+        workspace=workspace_for(job_root/'grids'/clean_name(grid)/'periods'/clean_name(period),radiometric_identity)
     checkpoint = str((input_spec.get("checkpoint") or {}).get("path") or "")
     config = str((input_spec.get("config") or {}).get("path") or "")
     if not checkpoint or not config:
         raise ValueError("旧任务索引缺少模型或推理配置路径，无法局部重跑。")
     started = time.monotonic()
-    prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
+    prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace),
+        radiometric_identity=radiometric_identity,radiometric_preprocessing=radiometric_metadata))
     result = _ensure_extract_manifest_fields(extract(argparse.Namespace(
         workspace=str(workspace), source="", checkpoint=checkpoint, config=config,
         device=str(input_spec.get("device") or "auto"),
@@ -4337,12 +4530,14 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
         run_id=f"roads_rerun_{int(time.time())}",
         junction_node_mode=str(input_spec.get("junction_node_mode") or "sparse"),
         execution_profile=str(manifest.get("execution_profile") or input_spec.get("execution_profile") or "full"),
+        width_method=input_spec.get("width_method","sam_molra"),
         validation_area=str((manifest.get("validation_areas") or {}).get(grid) or manifest.get("validation_area") or ""),
     )))
     updated = {
         **old, **result, "grid": grid, "period": period,
         "source": _manifest_period_source(manifest, grid, period) or str(old.get("source") or analysis_source),
         "analysis_source": str(analysis_source),
+        "radiometric_identity":radiometric_identity,"radiometric_preprocessing":radiometric_metadata,
         "result": str(workspace / "latest_result.json"), "status": "completed",
         "rerun_at": now_text(), "elapsed_seconds": elapsed_seconds(started),
     }
@@ -4447,11 +4642,14 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
     )
     started = time.monotonic()
     if str(manifest.get("execution_profile") or "full") == "fast":
+        from engine.fast_multitemporal import neighbor_results
         result = _run_fast_change_result(
             Path(str(before_entry["result"])),
             Path(str(after_entry["result"])),
             output,
             defer_finalization=True,
+            temporal_results=neighbor_results(periods.values(),grid,before,after,_manifest_period_plan(manifest).get(grid)),
+            compensation=spec.get('fast2_compensation',old.get('fast2_compensation')),
             before_period=before,
             after_period=after,
             position_tolerance=float(
@@ -4508,7 +4706,10 @@ def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> d
 
 def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tuple[str, str]]:
     names = _manifest_period_plan(manifest).get(grid, [])
-    return [(before, after) for before, after in zip(names, names[1:]) if period in {before, after}]
+    from engine.fast_multitemporal import dependency_periods
+    return [(before, after) for before, after in zip(names, names[1:])
+            if period in (dependency_periods(names,before,after)
+                          if manifest.get('execution_profile')=='fast' else {before,after})]
 
 
 def _refresh_manifest_downstream(manifest: dict) -> None:
@@ -4538,6 +4739,8 @@ def _invalidate_fast_finalization(manifest: dict) -> None:
         entry['fast_finalization_state']='pending'
 
 
+
+@timed_stage("finalization_total")
 def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     """Production Fast barrier: final roads/changes/temporal, evaluation, publish later."""
     _invalidate_fast_finalization(manifest)
@@ -4548,6 +4751,9 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
         # A final summary belongs beside the final layer, never in the Auto cache.
         entry['summary']=str(Path(entry['output'])/'change_summary.json')
         write_json(Path(entry['summary']),entry)
+    # All final products exist before any evaluation can fail.
+    manifest['fast_finalization_state']='completed'
+    for entry in manifest.get('change_results',[]):
         truth,area,field=_manifest_change_context(manifest,str(entry.get('grid','pair')),
             str(entry['before_period']),str(entry['after_period']),entry)
         if not truth:
@@ -4568,9 +4774,21 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     manifest['downstream_updated_at']=now_text()
 
 
+def _apply_fast2_task_settings(manifest, args):
+    if getattr(args,'width_method',None) is not None:
+        manifest.setdefault('input_spec',{})['width_method']=args.width_method
+    from engine.fast2_compensation import Fast2CompensationConfig
+    value = getattr(args, 'fast2_compensation', None)
+    if value is not None:
+        config = Fast2CompensationConfig.resolve(value)
+        manifest.setdefault('input_spec', {})['fast2_compensation'] = config.to_dict()
+        print('[Fast2 settings] ' + json.dumps(config.to_dict(), sort_keys=True), flush=True)
+
+
 def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _apply_fast2_task_settings(manifest, args)
     if manifest.get('execution_profile') == 'fast':args.update_related=True
     _invalidate_fast_finalization(manifest)
     if manifest.get('execution_profile') == 'fast':
@@ -4622,6 +4840,7 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
 def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _apply_fast2_task_settings(manifest, args)
     if manifest.get('execution_profile') == 'fast':args.update_temporal=True
     _invalidate_fast_finalization(manifest)
     grid, before, after = str(args.grid), str(args.before_period), str(args.after_period)
@@ -4659,9 +4878,11 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     return result
 
 
+@batch_models
 def rerun_all_pipeline_periods(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _apply_fast2_task_settings(manifest, args)
     _invalidate_fast_finalization(manifest)
     if manifest.get('execution_profile') == 'fast':
         _persist_existing_pipeline(manifest,manifest_path)
@@ -4766,10 +4987,12 @@ def _all_manifest_change_pairs(manifest: dict) -> list[tuple[str, str, str]]:
     return pairs
 
 
+@batch_models
 def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
     """Rerun every adjacent change pair while reusing completed period results."""
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
+    _apply_fast2_task_settings(manifest, args)
     _invalidate_fast_finalization(manifest)
     change_keys = _all_manifest_change_pairs(manifest)
     continue_on_error = bool(getattr(args, "continue_on_error", False))
@@ -4863,7 +5086,7 @@ def rerun_all_pipeline_changes(args: argparse.Namespace) -> dict:
         "failure_count": len(failures),
         "total_change_count": len(change_keys),
     }
-    emit("complete", stage="rerun-all-changes", **result)
+    emit("complete", stage="rerun-all-changes", status=manifest["status"], **result)
     return result
 
 
@@ -4947,6 +5170,7 @@ def _write_task_report(manifest: dict, job_root: Path) -> None:
         writer.writerows(rows)
 
 
+@batch_models
 def run_all(args: argparse.Namespace) -> dict:
     """Extract every grid/period and detect every adjacent-period change.
 
@@ -5041,6 +5265,9 @@ def run_all(args: argparse.Namespace) -> dict:
         prior_input_spec = _enrich_relocated_input_spec(
             dict(prior.get("input_spec") or {}), job_root,
         )
+        if getattr(args,'width_method',None) is None:
+            args.width_method=prior_input_spec.get('width_method','sam_molra')
+            input_spec['width_method']=args.width_method
         comparison_input_spec = dict(prior_input_spec)
         if job_root == layout.legacy_full_run_root(run_id):
             # A storage-layout upgrade alone must not invalidate completed inference.
@@ -5056,23 +5283,51 @@ def run_all(args: argparse.Namespace) -> dict:
     if not resume:
         job_root.mkdir(parents=True, exist_ok=False)
 
+    from engine.fast2_compensation import Fast2CompensationConfig, cache_matches
+    compensation = Fast2CompensationConfig.resolve(getattr(args,'fast2_compensation',None)
+        or (prior_input_spec if resume else {}).get('fast2_compensation'))
+    if execution_profile == 'fast':input_spec['fast2_compensation']=compensation.to_dict()
+
+    from engine.irmad_preprocessing import configuration as irmad_configuration, extraction_matches, workspace_for
+    irmad_requested=getattr(args,'irmad',None)
+    irmad_enabled=bool(irmad_requested if irmad_requested is not None else
+                       ((prior_input_spec if resume else {}).get('irmad') or {}).get('enabled',False))
+    irmad_reference=getattr(args,'irmad_reference',None) or (((prior_input_spec if resume else {}).get('irmad') or {}).get('reference_period','20250118'))
+    input_spec['irmad']=irmad_configuration(irmad_enabled,irmad_reference)
+    radiometric_ids=_radiometric_requests(grids,irmad_enabled,validation_area,reference_period=irmad_reference)
+
     raw_prior_periods = {
         (str(entry.get("grid")), str(entry.get("period"))): entry
         for entry in prior.get('auto_period_results',prior.get("period_results", [])) if isinstance(entry, dict)
     }
+    radiometric_invalid={key for key,entry in raw_prior_periods.items()
+                         if key in radiometric_ids and not extraction_matches(entry,radiometric_ids[key])}
     frozen_periods = {
-        key for key, entry in raw_prior_periods.items() if _period_result_ready(entry, require_current_network=True)
+        key for key, entry in raw_prior_periods.items() if key not in radiometric_invalid
+        and _period_result_ready(entry, require_current_network=True)
     }
     invalid_periods = {
         tuple(value) for value in invalidation["periods"]
         if tuple(value) not in frozen_periods
     }
+    invalid_periods.update(radiometric_invalid)
     invalid_changes = {
         tuple(value) for value in invalidation["changes"]
         if invalidation["threshold_changed"] or invalidation["truth_changed"]
         or (tuple(value)[0], tuple(value)[1]) in invalid_periods
         or (tuple(value)[0], tuple(value)[2]) in invalid_periods
     }
+    if execution_profile == "fast":
+        # Apply implementation invalidation before the whole-task reuse shortcut,
+        # not only in the per-pair loop. Keep completed extraction caches intact.
+        invalid_changes.update(
+            (str(entry.get("grid")), str(entry.get("before_period")), str(entry.get("after_period")))
+            for entry in prior.get("change_results", []) if isinstance(entry, dict)
+            and not cache_matches(entry,compensation)
+        )
+    invalid_changes.update((str(g),str(b),str(a)) for g,ps in grids.items()
+                           for b,a in zip(list(ps),list(ps)[1:])
+                           if (str(g),str(b)) in radiometric_invalid or (str(g),str(a)) in radiometric_invalid)
     invalidation["periods"] = sorted(invalid_periods)
     invalidation["changes"] = sorted(invalid_changes)
     invalidation["frozen_periods"] = sorted(frozen_periods)
@@ -5260,14 +5515,33 @@ def run_all(args: argparse.Namespace) -> dict:
                 for period, source in ready.items():
                     analysis_sources[f"{area_id}\0{period}"] = source
 
+        radiometric_metadata={}
+        if irmad_enabled:
+            for g,ps in grids.items():
+                raw_inputs={}
+                for p,source in ps.items():
+                    raw_source=analysis_sources.get(f'{g}\0{p}')
+                    if raw_source is None:
+                        raw_workspace=job_root/'irmad_raw_inputs'/clean_name(g)/clean_name(p)
+                        raw_manifest=prepare(argparse.Namespace(source=str(source),workspace=str(raw_workspace)))
+                        raw_source=Path(raw_manifest['images'])
+                    raw_inputs[p]=raw_source
+                adjusted,details=_radiometric_sources(raw_inputs,layout.cache_root/'irmad',
+                    enabled=True,identities=radiometric_ids,grid=g,reference_period=irmad_reference)
+                for p,source in adjusted.items():
+                    analysis_sources[f'{g}\0{p}']=source
+                    radiometric_metadata[(g,p)]=details[p]
+
         result_by_period: dict[tuple[str, str], dict] = {}
         refreshed_periods = set()
+        period_plan = [(g,p,s) for g,periods in grids.items() for p,s in periods.items()]
         for grid_index, (grid_name, periods) in enumerate(grids.items(), start=1):
             safe_grid = clean_name(grid_name)
             for period_index, (period, source) in enumerate(periods.items(), start=1):
                 unit_started = time.monotonic()
                 safe_period = clean_name(period)
-                workspace = job_root / "grids" / safe_grid / "periods" / safe_period
+                workspace = workspace_for(job_root / "grids" / safe_grid / "periods" / safe_period,
+                                          radiometric_ids[(grid_name,period)])
                 prior_entry = prior_periods.get((grid_name, period))
                 if resume and prior_entry and _period_result_ready(prior_entry, require_current_network=True):
                     entry = dict(prior_entry)
@@ -5314,8 +5588,39 @@ def run_all(args: argparse.Namespace) -> dict:
                             reason="续跑复用已完成的输入准备",
                         )
                     else:
-                        prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace)))
+                        prepare(argparse.Namespace(source=str(analysis_source), workspace=str(workspace),
+                            radiometric_identity=radiometric_ids[(grid_name,period)],
+                            radiometric_preprocessing=radiometric_metadata.get((grid_name,period),{'config':irmad_configuration(False)})))
                     base_run_id = "roads"
+                    if execution_profile == 'fast':
+                        following = period_plan[period_plan.index((grid_name,period,source))+1:]
+                        following = next(((g,p,s) for g,p,s in following
+                                          if not (resume and prior_periods.get((g,p)) and
+                                                  _period_result_ready(prior_periods[(g,p)], require_current_network=True))), None)
+                        def next_command(command, following=following):
+                            if following is None:
+                                return None
+                            g,p,s = following
+                            target = workspace_for(job_root/'grids'/clean_name(g)/'periods'/clean_name(p),radiometric_ids[(g,p)])
+                            if not (resume and _prepared_workspace_complete(target)):
+                                prepare(argparse.Namespace(source=str(analysis_sources.get(f'{g}\0{p}',s)), workspace=str(target),
+                                    radiometric_identity=radiometric_ids[(g,p)],
+                                    radiometric_preprocessing=radiometric_metadata.get((g,p),{'config':irmad_configuration(False)})))
+                            result = list(command)
+                            changes = {'--input_txt_dir': target/'batches',
+                                       '--output_root': target/'runs'/'roads'/'inference',
+                                       '--output_dir': target/'runs'/'roads'/'inference'/'road_graphs'}
+                            for flag,value in changes.items():
+                                result[result.index(flag)+1] = str(value)
+                            if '--resume-existing-images' in result:
+                                result.remove('--resume-existing-images')
+                            if resume and (g,p) not in invalid_periods:
+                                result.append('--resume-existing-images')
+                            elif '--pipeline-state' in result:
+                                index = result.index('--pipeline-state')
+                                del result[index:index+2]
+                            return result
+                        plan_next_centerline(next_command)
                     result = _ensure_extract_manifest_fields(extract(
                         argparse.Namespace(
                             workspace=str(workspace), source="", checkpoint=args.checkpoint,
@@ -5323,6 +5628,7 @@ def run_all(args: argparse.Namespace) -> dict:
                             rescale=args.rescale, run_id=base_run_id,
                             junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                             execution_profile=execution_profile,
+                            width_method=getattr(args,"width_method",None),
                             validation_area=(validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area),
                             grid=grid_name, period=period,
                             resume=internal_resume,
@@ -5333,6 +5639,8 @@ def run_all(args: argparse.Namespace) -> dict:
                     entry = {
                         "grid": grid_name, "period": period, "source": str(source),
                         "analysis_source": str(analysis_source), "result": str(result_path), **result,
+                        "radiometric_identity":radiometric_ids[(grid_name,period)],
+                        "radiometric_preprocessing":radiometric_metadata.get((grid_name,period),{'config':irmad_configuration(False)}),
                     }
                     entry["extract_elapsed_seconds"] = result.get("elapsed_seconds")
                     entry["elapsed_seconds"] = elapsed_seconds(unit_started)
@@ -5356,12 +5664,15 @@ def run_all(args: argparse.Namespace) -> dict:
                     _persist_pipeline(manifest, job_root, output_root)
 
             period_names = list(periods)
+            from engine.fast_multitemporal import dependency_periods
             for before_period, after_period in zip(period_names, period_names[1:]):
                 unit_started = time.monotonic()
                 prior_entry = prior_changes.get((grid_name, before_period, after_period))
                 if (resume and prior_entry and _change_result_ready(prior_entry)
-                        and (grid_name, before_period) not in refreshed_periods
-                        and (grid_name, after_period) not in refreshed_periods):
+                        and (execution_profile!='fast' or cache_matches(prior_entry,compensation))
+                        and not any((grid_name,p) in refreshed_periods for p in
+                            (dependency_periods(period_names,before_period,after_period)
+                             if execution_profile=='fast' else {before_period,after_period}))):
                     manifest["change_results"].append(prior_entry)
                     manifest["processed_work"] += 1
                     progress(
@@ -5412,11 +5723,14 @@ def run_all(args: argparse.Namespace) -> dict:
                         validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area
                     )
                     if execution_profile == "fast":
+                        from engine.fast_multitemporal import neighbor_results
                         result = _run_fast_change_result(
                             Path(str(before_entry["result"])),
                             Path(str(after_entry["result"])),
                             change_output,
                             defer_finalization=True,
+                            temporal_results=neighbor_results(result_by_period.values(),grid_name,before_period,after_period,period_names),
+                            compensation=compensation,
                             before_period=before_period,
                             after_period=after_period,
                             position_tolerance=float(args.tolerance),
@@ -5658,6 +5972,15 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--data-check-only", action="store_true", help="只检查项目数据，不检查模型、设备、输出空间")
     a.add_argument("--runtime-preflight", action="store_true", help="完整流程开始前同时检查运行环境和输出空间")
     a.add_argument("--absolute", default="2.0"); a.add_argument("--ratio", default="0.2"); a.add_argument("--tolerance", default="3.0")
+    for command in ('all','extract-project-period','extract-project-all'):
+        sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
+                                         help='IR-MAD preprocessing before extraction')
+        sub.choices[command].add_argument('--irmad-reference',default=None,choices=['20250118'],help='Fast IR-MAD fixed reference 20250118')
+    for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-all-periods'):
+        sub.choices[command].add_argument('--width-method',choices=['sam_molra','raw_image'],default=None)
+    for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):
+        sub.choices[command].add_argument('--fast2-compensation', default=None,
+            help='raw_input / normalized_input / JSON object with preset=custom and boolean switches')
     return p
 
 

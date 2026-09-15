@@ -357,6 +357,7 @@ def _validate_active_task_json(job_root: Path) -> int:
     candidates = {job_root / "job_state.json", job_root / "pipeline_result.json"}
     for name in ("period_state.json", "latest_result.json", "input_manifest.json"):
         candidates.update(job_root.glob(f"grids/*/periods/*/{name}"))
+        candidates.update(job_root.glob(f"grids/*/periods/*/radiometric/*/{name}"))
     checked = 0
     for path in sorted(candidates, key=str):
         if not path.is_file():
@@ -372,7 +373,7 @@ def _validate_active_task_json(job_root: Path) -> int:
 
 
 def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
-    """Rebase current-run batch lists to their sibling ``images`` directory.
+    """Rebase lists to local period images or project normalization cache.
 
     Every list is preflighted before any file is changed, so a missing copied
     image cannot leave the task half migrated.  Lists remain UTF-8 with BOM and
@@ -382,9 +383,20 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
     if not root.is_dir():
         raise ValueError(f"当前任务目录不存在：{root}")
     checked_json = _validate_active_task_json(root)
+    # Derive ownership from the actual task location, never from old manifest
+    # paths. Fast prepare intentionally references this cache without copying
+    # GeoTIFFs into period/images.
+    cache_root = None
+    if (root.parent.name == 'runs' and root.parent.parent.name == 'tasks'
+            and root.parent.parent.parent.name == '_work'):
+        work_root = root.parent.parent.parent
+        candidate = (work_root / 'cache' / 'normalized').resolve()
+        if _relative_to(candidate, work_root) is not None:
+            cache_root = candidate
     plans: list[tuple[Path, str, str, int]] = []
     missing: list[Path] = []
     list_paths = sorted(root.glob("grids/*/periods/*/batches/*.txt"), key=str)
+    list_paths += sorted(root.glob("grids/*/periods/*/radiometric/*/batches/*.txt"), key=str)
     for list_path in list_paths:
         try:
             original = list_path.read_text(encoding="utf-8-sig")
@@ -406,7 +418,21 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
             if not filename or filename in {".", ".."}:
                 raise ValueError(f"影像清单包含无效路径：{list_path}：{text}")
             target = (images_root / filename).resolve()
-            if _relative_to(target, images_root) is None or _relative_to(target, root) is None:
+            cache_reference = False
+            # Preserve period/key/filename, not just basename: normalized cache
+            # entries routinely reuse names such as v0001.tif.
+            parts = PureWindowsPath(text).parts
+            lowered = tuple(part.lower() for part in parts)
+            for i in range(len(parts)-3):
+                if (lowered[i:i+2] == ('_work', 'cache') and lowered[i+2] in ('normalized','irmad')
+                        and cache_root is not None):
+                    target = cache_root.parent.joinpath(lowered[i+2],*parts[i+3:]).resolve()
+                    owned_cache_root = cache_root.parent / lowered[i+2]
+                    cache_reference = True
+                    break
+            owned = (_relative_to(target, owned_cache_root) is not None if cache_reference
+                     else _relative_to(target, images_root) is not None and _relative_to(target, root) is not None)
+            if not owned:
                 raise ValueError(f"影像清单映射目标逃出当前任务：{text} -> {target}")
             try:
                 valid = target.is_file() and target.stat().st_size > 0

@@ -315,7 +315,8 @@ class ResultPublisher:
                  'width_m','width_map','length_m','area_m2','change_id','change_typ','before_per','after_per',
                  'width_bef','width_aft','width_diff','period','status','event_id','event_typ','from_per','to_per',
                  'before_st','after_st','before_w','after_w','from_node','to_node','first_obs','last_obs',
-                 'life_state','present_n','event_n','grid_id','width_min','width_max','width_mean'}
+                 'life_state','present_n','event_n','grid_id','width_min','width_max','width_mean',
+                 'surface_id','final_left','final_righ','final_widt','final_conf','width_sour','outlier_re','quality_gr','width_qual'}
         for value in published.values():
             path=Path(value)
             if path.suffix.lower()=='.shp':
@@ -332,13 +333,41 @@ class ResultPublisher:
         target = (
             self.layout.results_root / safe_name(area) / "01_单期道路" / safe_name(period)
         )
-        published = self._copy_fields(result, target, (
-            ("centerlines", "road_centerlines.shp"),
-            ("surfaces", "road_surfaces.shp"),
-            ("width_segments", "road_width_segments.shp"),
-            ("corridors", "road_corridors.shp"),
-        ), base_dir=base_dir)
+        mapping = [("centerlines", "road_centerlines.shp"), ("surfaces", "road_surfaces.shp")]
+        if result.get('width_method') != 'raw_image':
+            mapping += [("width_segments", "road_width_segments.shp"), ("corridors", "road_corridors.shp")]
+        published = self._copy_fields(result, target, mapping, base_dir=base_dir)
+        if result.get('width_method') == 'raw_image':
+            # Fine profiles and facet corridors stay in the internal period
+            # products. Retire any previously published copies on resume.
+            import shutil
+            import uuid
+            target = target.resolve()
+            if not target.is_relative_to(self.layout.results_root.resolve()):
+                raise ValueError('Publication target outside results root')
+            old = [p for p in target.glob('*') if p.is_file() and p.stem in
+                   {'road_width_segments', 'road_corridors', 'road_width_profiles'}]
+            if old:
+                history = self.layout.tasks_root.resolve() / 'publication_history' / uuid.uuid4().hex
+                history.mkdir(parents=True, exist_ok=False)
+                for path in old:
+                    shutil.move(str(path), str(history / path.name))
         (target/'road_state.gpkg').unlink(missing_ok=True)
+        # Shapefile limits field names to 10 characters. Publish the same width
+        # product as a business-only GPKG as well, preserving requested names.
+        width_path=published.get('width_segments')
+        if width_path:
+            import geopandas as gpd
+            frame=gpd.read_file(width_path)
+            names={'final_left':'final_left_distance','final_righ':'final_right_distance',
+                   'final_widt':'final_width','final_conf':'final_confidence',
+                   'width_sour':'width_source','outlier_re':'outlier_reason'}
+            profile_path=target/'road_width_profiles.gpkg'
+            if set(names)<=set(frame):
+                fields=[f for f in ('segment_id','parent_id','width_m','width_qual','quality_gr',*names,'geometry') if f in frame]
+                frame[fields].rename(columns=names).to_file(profile_path,layer='width_profiles',driver='GPKG')
+                published['width_profiles']=str(profile_path)
+            else:profile_path.unlink(missing_ok=True)
         previews = result.get("previews") if isinstance(result.get("previews"), dict) else {}
         extraction_preview = result.get("road_extraction")
         if not extraction_preview:

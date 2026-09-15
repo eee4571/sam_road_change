@@ -6,7 +6,7 @@ from .widget import RoadChangeWidget
 class RoadChangePlugin(TaskSignals):
     plugin_id = "road_change"
     name = "道路变化检测"
-    version = "1.0.0"
+    version = "1.1.0"
     api_version = "1"
 
     def __init__(self):

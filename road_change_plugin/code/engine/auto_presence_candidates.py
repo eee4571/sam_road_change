@@ -80,18 +80,18 @@ class LongitudinalCoverage:
         return result
 
 
-def presence_seeds(axis, rows, source, coverage, kind, minimum_length, minimum_area):
+def presence_seeds(axis, rows, source, coverage, kind, minimum_length, minimum_area, *, intervals=None):
     """Emit entire admissible intervals irrespective of confidence transitions."""
-    intervals = coverage.uncovered(axis)
+    intervals = coverage.uncovered(axis) if intervals is None else intervals
     side = "after" if kind == "added" else "before"
     other = "before" if kind == "added" else "after"
-    spacing = axis.length/len(rows)
+    spacing = axis.length/max(1, int(np.ceil(axis.length/4)))
     records, audit = [], []
     counts = Counter({f"{kind}_source_axes": 1, f"{kind}_uncovered_intervals": len(intervals)})
     counts[f"{kind}_uncovered_length_m"] = sum(b-a for a, b in intervals)
     # No confidence label is used to split adjacent candidate cells. Only known
     # opposite-period presence is a barrier; in particular junctions are not.
-    admissible = merge_intervals([(i*spacing, (i+1)*spacing) for i, r in enumerate(rows)
+    admissible = merge_intervals([(r['station_m']-spacing/2, r['station_m']+spacing/2) for r in rows
                                  if r[f"{other}_state"] != "present" and not r[f"{other}_geometry"]])
     for interval_id, (start, end) in enumerate(intervals):
         accepted_spans = [(max(start, a), min(end, b)) for a, b in admissible
@@ -105,9 +105,9 @@ def presence_seeds(axis, rows, source, coverage, kind, minimum_length, minimum_a
                           geometry=substring(axis, start, end)))
         for a, b in accepted_spans:
             local_axis = substring(axis, a, b)
-            selected = [r for i, r in enumerate(rows) if min(b, (i+1)*spacing)-max(a, i*spacing) > 1e-7]
-            lengths = np.array([min(b, (i+1)*spacing)-max(a, i*spacing) for i, r in enumerate(rows)
-                                if min(b, (i+1)*spacing)-max(a, i*spacing) > 1e-7])
+            overlaps = np.array([min(b, r['station_m']+spacing/2)-max(a, r['station_m']-spacing/2) for r in rows])
+            selected = [r for r, length in zip(rows, overlaps) if length > 1e-7]
+            lengths = overlaps[overlaps > 1e-7]
             width = float(np.median([source.width(axis.interpolate(r["station_m"])) for r in selected]))
             geometry = local_axis.buffer(width/2, cap_style="flat")
             reasons = {r[f"{other}_reason"] for r in selected}
@@ -189,7 +189,8 @@ def qualify_presence_candidates(candidates, scenes, evidence, *, minimum_length=
             reasons.append("missing_source_evidence")
             valid = support = absent = absence_run = nonjunction_run = junction_ratio = 0.
         else:
-            spacing = source.lines[int(row.source_axis)].length/len(rows)
+            length = source.lines[int(row.source_axis)].length
+            spacing = length/max(1, int(np.ceil(length/4)))
             weight = np.maximum(0., np.minimum(float(row.end_m), rows.station_m.to_numpy()+spacing/2)
                                 - np.maximum(float(row.start_m), rows.station_m.to_numpy()-spacing/2))
             def mean(values):

@@ -28,7 +28,7 @@ def fixture(root):
         for suffix in (".shp", ".shx", ".dbf", ".prj"):
             (base / "01_验证区" / (area + suffix)).touch()
             (base / "03_变化真值" / ("2020_to_2022" + suffix)).touch()
-        for year in ("2020", "2022", "2024"):
+        for year in ("2020", "2022", "20250118"):
             (base / "02_影像" / (year + ".tif")).touch()
             (base / "02_影像" / (year + ".txt")).write_text(year + ".tif\n", encoding="utf-8")
     output = root / "成果输出"
@@ -38,9 +38,9 @@ def fixture(root):
         p = output / (key + (".csv" if key == "csv" else ".shp"))
         p.touch()
         products[key] = str(p)
-    manifest = {"run_id": "示例任务", "execution_profile": "fast", "status": "completed", "period_results": [
+    manifest = {"run_id": "示例任务", "execution_profile": "fast", "status": "completed", "input_spec": {"width_method": "raw_image", "irmad": {"enabled": True, "reference_period": "20250118"}}, "period_results": [
         {"grid": a, "period": y, "published": {k: products[k] for k in ("centerlines", "surfaces", "width_segments")}}
-        for a in ("北区", "南区") for y in ("2020", "2022", "2024")],
+        for a in ("北区", "南区") for y in ("2020", "2022", "20250118")],
         "change_results": [{"grid": "北区", "before_period": "2020", "after_period": "2022", "published": {"changes": products["changes"]}}],
         "temporal_results": [{"grid": "北区", "life_shp": products["life_shp"]}],
         "evaluation_summary": {"csv": products["csv"]}}

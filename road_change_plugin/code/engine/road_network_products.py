@@ -5,8 +5,9 @@ when exporting. Filtering is never performed separately for individual tiles.
 """
 from pathlib import Path
 import json
+from .fast_timing import timed_stage
 
-NETWORK_CONNECTION_VERSION = 1
+NETWORK_CONNECTION_VERSION = 4
 NETWORK_REPORT = 'road_network_report.json'
 
 
@@ -59,7 +60,8 @@ def network_products_current(directory):
         return False
 
 
-def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
+@timed_stage("regional_network_recovery")
+def recover_centerline_frame(frame, surfaces=None, *, authoritative=False, probability_sources=(), probability_arrays=(), molra_sources=()):
     """Recover one period/region; keep original CRS and trace every source row."""
     import geopandas as gpd
     import numpy as np
@@ -90,7 +92,17 @@ def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
     seeds = [_RegionalRoadSeed(np.asarray(row.geometry.coords),float(widths[i]),(i,))
              for i,row in metric.iterrows()]
     surface = unary_union(surfaces.to_crs(projected).geometry) if surfaces is not None and not surfaces.empty else None
-    connected, stats, audit = connect_clean_road_seeds(seeds,surface,unit,keep_main_component=True)
+    from .road_connection_evidence import ConnectionEvidence, RoadProbability, ArrayRoadProbability
+    from shapely.affinity import scale
+    probability=(ArrayRoadProbability(probability_arrays,frame.crs,projected,unit) if probability_arrays
+                 else RoadProbability(probability_sources,projected,unit))
+    evidence=ConnectionEvidence(scale(surface,xfact=unit,yfact=unit,origin=(0,0)) if surface is not None else None,
+                                probability,RoadProbability(molra_sources,projected,unit))
+    connected, stats, audit = connect_clean_road_seeds(seeds,surface,unit,keep_main_component=False,evidence=evidence)
+    for row in audit:
+        row.setdefault('decision_reason',row['status'])
+        if row['status'] not in ('accepted','image_evidence_rejected'):
+            row['decision_reason']=row['status']
     rows = []
     for index,road in enumerate(connected):
         source = max(road.source_ids,key=lambda i: metric.geometry.iloc[i].length)
@@ -117,7 +129,9 @@ def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
                 for row in audit if row['status'] not in categories]
     if rejected:
         audits['rejected_connections'] = gpd.GeoDataFrame(rejected,geometry='geometry',crs=projected).to_crs(frame.crs)
-    stats.update(policy='recovered_main_component',metric_crs=str(projected),
+    stats.update(policy='short_gap_continuity_long_gap_limited_keep_independent_roads',metric_crs=str(projected),
+                 connection_short_gap_m=evidence.short_gap_m,connection_maximum_gap_m=evidence.maximum_gap_m,
+                 connection_image_rejected_count=sum(row['status']=='image_evidence_rejected' for row in audit),
                  connection_total_added_count=sum(row['status']=='accepted' for row in audit),
                  width_policy='existing_observation_widths_inherited_on_connections')
     print(f"[Road network] Retained {len(result)} lines; removed "
@@ -142,9 +156,14 @@ def write_network_report(directory, stats, audits):
     return report
 
 
+@timed_stage("width_corridor_rebuild")
 def rebuild_network_width_products(centerlines, measured=None, source_tolerance=2.0,
                                    *, connection_input=None):
     """Use metre coordinates for segmentation and buffering, including lon/lat inputs."""
+    import time
+    import numpy as np
+    from shapely import covers
+    stage_started = time.perf_counter()
     from pyproj import CRS
     from shapely.ops import unary_union
     from .width.road_pair_matcher import build_width_segments, build_corridors
@@ -157,15 +176,34 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
             raise ValueError('Could not determine metric CRS for width products')
     metric = centerlines.to_crs(projected)
     observations = measured.to_crs(projected) if measured is not None else None
-    segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
-    if connection_input is not None and not segments.empty:
+    print(f'[Fast timing] width_rebuild_projection={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
+    raw_observations=observations is not None and 'final_width' in observations and 'width_backend' in observations
+    if raw_observations:
+        from .width.raw_image_backend import rebuild_observations
+        segments=rebuild_observations(observations)
+    else:
+        segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
+    print(f'[Fast timing] width_rebuild_segments={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
+    if connection_input is not None and not segments.empty and not raw_observations:
         observed_area = unary_union(connection_input.to_crs(projected).geometry).buffer(.25)
-        inferred = segments.geometry.map(lambda line: line.difference(observed_area).length > .05*line.length)
+        covered = covers(observed_area,segments.geometry.values)
+        inferred = np.zeros(len(segments),dtype=bool)
+        for i in np.flatnonzero(~covered):
+            line=segments.geometry.iloc[i]
+            inferred[i]=line.difference(observed_area).length > .05*line.length
         segments.loc[inferred, 'quality_grade'] = 'C'
         segments.loc[inferred, 'width_quality'] = 'C'
         segments.loc[inferred, 'line_source'] = 'connector'
         segments.loc[inferred, 'valid_ratio'] = 0.
         segments.loc[inferred, 'qa_state'] = 'review'
         segments.loc[inferred, 'qa_reason'] = 'connection_width_inherited'
+    print(f'[Fast timing] width_rebuild_inferred={time.perf_counter()-stage_started:.6f}s',flush=True)
+    stage_started=time.perf_counter()
     corridors = build_corridors(segments)
+    if raw_observations:
+        segments=segments.drop(columns=['raw_corridor_wkb'],errors='ignore')
+        corridors=corridors.drop(columns=['raw_corridor_wkb'],errors='ignore')
+    print(f'[Fast timing] width_rebuild_corridors={time.perf_counter()-stage_started:.6f}s',flush=True)
     return segments.to_crs(centerlines.crs), corridors.to_crs(centerlines.crs)

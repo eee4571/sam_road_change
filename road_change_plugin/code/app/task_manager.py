@@ -10,6 +10,7 @@ from pathlib import Path
 
 from input_catalog import period_order_manifest, period_sort_key
 from app.project_manager import USER_IMAGE_LIST_SUFFIX, USER_VECTOR_SUFFIX, atomic_write_json
+from app.fast_settings import compensation_arguments, width_arguments
 from app.result_publisher import ProjectLayout
 from app.project_relocation import build_relocation_plan
 
@@ -160,6 +161,7 @@ def build_pipeline_command(
     area_truths: list[tuple[str, str, str, str]] | None = None,
     area_periods: dict[str, list[tuple[str, str]]] | None = None,
     execution_profile: str = "full",
+    irmad: bool = False, irmad_reference: str = "20250118", fast2_compensation=None, width_method=None,
 ) -> list[str]:
     """Build the backend command for the default validation or backup grid mode."""
     mode = str(mode or "validation").strip().casefold()
@@ -273,6 +275,10 @@ def build_pipeline_command(
         args.append("--data-check-only")
     elif runtime_preflight and not preflight_only:
         args.append("--runtime-preflight")
+    args.append("--irmad" if irmad else "--no-irmad")
+    args.extend(["--irmad-reference", str(irmad_reference)])
+    args.extend(compensation_arguments(fast2_compensation))
+    args.extend(width_arguments(width_method))
     return args
 
 def build_apply_edits_command(item: dict[str, str], pipeline_manifest: Path | str | None = None) -> list[str]:
@@ -674,17 +680,19 @@ class TaskManager:
         return mark_task_cancelled(output_root, run_id)
 
     @staticmethod
-    def build_rerun_period(manifest, area_id, period, update_related=False) -> list[str]:
+    def build_rerun_period(manifest, area_id, period, update_related=False, *, fast2_compensation=None, width_method=None) -> list[str]:
         args = [
             "rerun-period", "--pipeline-manifest", str(manifest),
             "--grid", str(area_id), "--period", str(period),
         ]
         if update_related:
             args.append("--update-related")
+        args.extend(compensation_arguments(fast2_compensation))
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
-    def build_rerun_change(manifest, area_id, before, after, update_temporal=False) -> list[str]:
+    def build_rerun_change(manifest, area_id, before, after, update_temporal=False, *, fast2_compensation=None) -> list[str]:
         args = [
             "rerun-change", "--pipeline-manifest", str(manifest),
             "--grid", str(area_id), "--before-period", str(before),
@@ -692,27 +700,30 @@ class TaskManager:
         ]
         if update_temporal:
             args.append("--update-temporal")
+        args.extend(compensation_arguments(fast2_compensation))
         return args
 
     @staticmethod
-    def build_rerun_all_periods(manifest, continue_on_error=False) -> list[str]:
+    def build_rerun_all_periods(manifest, continue_on_error=False, *, fast2_compensation=None, width_method=None) -> list[str]:
         args = ["rerun-all-periods", "--pipeline-manifest", str(manifest)]
         if continue_on_error:
             args.append("--continue-on-error")
+        args.extend(compensation_arguments(fast2_compensation))
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
-    def build_rerun_all_changes(manifest, continue_on_error=False) -> list[str]:
+    def build_rerun_all_changes(manifest, continue_on_error=False, *, fast2_compensation=None) -> list[str]:
         args = ["rerun-all-changes", "--pipeline-manifest", str(manifest)]
         if continue_on_error:
             args.append("--continue-on-error")
+        args.extend(compensation_arguments(fast2_compensation))
         return args
 
     @staticmethod
     def build_extract_all(
         project_root, run_id, *, output_root, device, pixel_size, rescale,
-        junction_node_mode, continue_on_error=False,
-    ) -> list[str]:
+        junction_node_mode, continue_on_error=False, irmad=False, irmad_reference="20250118", width_method=None) -> list[str]:
         args = [
             "extract-project-all", "--project-root", str(project_root),
             "--run-id", str(run_id), "--device", str(device),
@@ -724,13 +735,15 @@ class TaskManager:
             args.append("--resume")
         if continue_on_error:
             args.append("--continue-on-error")
+        args.append("--irmad" if irmad else "--no-irmad")
+        args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
     def build_extract_period(
         project_root, area_id, period, run_id, *, output_root, device,
-        pixel_size, rescale, junction_node_mode,
-    ) -> list[str]:
+        pixel_size, rescale, junction_node_mode, irmad=False, irmad_reference="20250118", width_method=None) -> list[str]:
         args = [
             "extract-project-period", "--project-root", str(project_root),
             "--area-id", str(area_id), "--period", str(period),
@@ -743,13 +756,16 @@ class TaskManager:
         ) / "period_task.json"
         if state.is_file():
             args.append("--resume")
+        args.append("--irmad" if irmad else "--no-irmad")
+        args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
     def build_change_pair(
         project_root, area_id, before, after, run_id, *, output_root,
         manifest=None, area_truths=(), validation_areas=(), absolute="2.0",
-        ratio="0.20", tolerance="3.0", truth_type_field="",
+        ratio="0.20", tolerance="3.0", truth_type_field="", fast2_compensation=None,
     ) -> list[str]:
         if isinstance(manifest, dict):
             periods = {
@@ -792,6 +808,7 @@ class TaskManager:
                     args.extend(("--validation-area", str(validation)))
                 if str(truth_type_field).strip():
                     args.extend(("--truth-type-field", str(truth_type_field).strip()))
+                args.extend(compensation_arguments(fast2_compensation))
                 return args
         layout = ProjectLayout.from_output(output_root)
         before_state = layout.period_task_root(area_id, before, run_id) / "period_task.json"
@@ -809,6 +826,7 @@ class TaskManager:
         change_state = layout.change_task_root(area_id, before, after, run_id) / "change_task.json"
         if change_state.is_file():
             args.append("--resume")
+        args.extend(compensation_arguments(fast2_compensation))
         return args
 
     @staticmethod

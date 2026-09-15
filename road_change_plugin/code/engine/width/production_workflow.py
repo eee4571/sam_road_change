@@ -1694,6 +1694,7 @@ def export_final_products(
     centerline_shp: Path | None = None,
     surface_shp: Path | None = None,
     stitched_centerlines: Path | None = None,
+    width_method: str = 'sam_molra',
 ) -> dict:
     export_started = time.perf_counter()
     product_dir = (centerline_shp.parent if centerline_shp is not None else
@@ -2050,6 +2051,7 @@ def export_final_products(
         fused_centerline_frame,
         gpd.GeoDataFrame(fused_surfaces,geometry='geometry',crs=crs) if fused_surfaces else None,
         authoritative=canonical_is_authoritative,
+        probability_arrays=centerline_probability_sources,
     )
     exported_centerlines = fused_centerline_frame.to_dict('records')
     width_conversion_started = time.perf_counter()
@@ -2057,6 +2059,9 @@ def export_final_products(
         gpd.GeoDataFrame(width_segments, geometry="geometry", crs=crs)
         if width_segments else None
     )
+    if width_method=='raw_image':
+        from engine.width.raw_image_backend import measure_region
+        measured_segment_frame=measure_region(fused_centerline_frame,image_dir,product_dir/'raw_width')
     standardized_width_segments, standardized_corridors = rebuild_network_width_products(
         fused_centerline_frame,
         measured_segment_frame,
@@ -2065,6 +2070,10 @@ def export_final_products(
     )
     standardized_width_rows = standardized_width_segments.to_dict("records")
     standardized_corridor_rows = standardized_corridors.to_dict("records")
+    if width_method=='raw_image':
+        from engine.width.raw_image_backend import original_images
+        from engine.width.raw_road_surfaces import build_road_surfaces
+        fused_surfaces=build_road_surfaces(standardized_width_segments,image_path=original_images(image_dir)[0]).to_dict('records')
     width_sampling_segment_conversion_seconds += (
         time.perf_counter() - width_conversion_started
     )
@@ -2692,6 +2701,7 @@ def main() -> int:
     export_final = sub.add_parser("export-final")
     export_final.add_argument("--final-dir", required=True)
     export_final.add_argument("--image-dir", required=True)
+    export_final.add_argument('--width-method',choices=['sam_molra','raw_image'],default='sam_molra')
     export_final.add_argument("--output", default="", help="Optional GeoPackage output.")
     export_final.add_argument("--shp-dir", default="")
     export_final.add_argument("--centerline-shp", default="")
@@ -2744,6 +2754,7 @@ def main() -> int:
         Path(args.centerline_shp) if args.centerline_shp else None,
         Path(args.surface_shp) if args.surface_shp else None,
         Path(args.stitched_centerlines) if args.stitched_centerlines else None,
+        width_method=args.width_method,
     )
     elif args.command == "stitch-edit": result = stitch_edit_package(Path(args.input_gpkg), Path(args.review_dir), Path(args.edited_dir), Path(args.output), args.snap_tolerance)
     elif args.command == "stitch-edited": result = stitch_edited_directory(
