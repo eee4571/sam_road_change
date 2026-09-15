@@ -6,7 +6,8 @@ from pathlib import Path
 def scene_key(payload, crs):
     files=[]
     for field in ('centerlines','surfaces','width_segments','valid_observation','road_probability'):
-        path=Path(payload[field]).expanduser().resolve()
+        value = payload.get('analysis_surfaces') if field == 'surfaces' else None
+        path=Path(value or payload[field]).expanduser().resolve()
         family=([path.with_suffix(s) for s in ('.shp','.shx','.dbf','.prj','.cpg','.qix')]
                 if path.suffix.lower()=='.shp' else [path,Path(str(path)+'.msk'),Path(str(path)+'.aux.xml'),Path(str(path)+'.ovr')])
         for item in family:

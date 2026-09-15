@@ -3038,7 +3038,7 @@ def export_fast_products(
     )
     if width_method=='raw_image':
         from .width.raw_road_surfaces import build_road_surfaces
-        frames['surfaces']=build_road_surfaces(frames['corridors'],image_path=raw_inputs[0])
+        frames['surfaces']=build_road_surfaces(frames['width_segments'],image_path=raw_inputs[0])
         outputs['regular_surface']=True
     for index, (layer, filename) in enumerate(mapping.items()):
         frame = frames[layer]
@@ -3053,6 +3053,8 @@ def export_fast_products(
     outputs["road_width"] = outputs["previews"]["width"]
     outputs["execution_profile"] = "fast"
     outputs['width_method']=width_method
+    if width_method=='raw_image':
+        outputs['analysis_surfaces']=outputs['corridors']
     write_network_report(output_dir, connection_stats, connection_audits)
     write_completed(marker, inputs, outputs,
                     [outputs[key] for key in mapping] + [gpkg, output_dir/NETWORK_REPORT,
@@ -4972,6 +4974,9 @@ def _read_fast_change_layer(
     primary: str,
     *fallbacks: str,
 ) -> gpd.GeoDataFrame:
+    # Presentation-only smoothing must not become change-detection evidence.
+    if primary == 'surfaces' and result.get('analysis_surfaces'):
+        primary = 'analysis_surfaces'
     empty_frame = None
     for key in (primary, *fallbacks):
         value = str(result.get(key) or "").strip()

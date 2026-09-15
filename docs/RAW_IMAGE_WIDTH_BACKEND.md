@@ -69,3 +69,29 @@ Fast 输出标记 regular_surface，未受 GT 修改的最终汇总直接使用�
 细粒度记录、非几何属性及 WKB 不变；未重跑提取、测宽、GT 或 Temporal。
 对比文件：`20250118/surface_dissolve_validation/` 下 comparison.json、road_surfaces.shp、
 full_comparison.png、local_comparison.png。原 products 作为修改前基线保留。
+
+
+## 节点间等宽展示面（2026-09-15，替代上面的弱平滑方案）
+
+正式展示面改为直接读取细粒度线状 width_segments，不再消费 raw_corridor_wkb 或采样 polygon。
+按 parent_id 顺序还原最终中心线道路链，缺失宽度区间仍断开，不伪造观测。
+每条路口至路口链用长度加权中位数确定左右展示距离，链内保持基本等宽；只对展示边界坐标平滑。
+原始 final_width、final_left_distance、final_right_distance、质量及全部细粒度几何完全不写回。
+因此真实沿线宽度变化仍保存在分析数据中，但默认铺装展示面不再逐点表达这些起伏。
+
+只在重合端点形成的转弯/多支路节点附近做局部圆顺、融合；开放端部保留平口。
+路口处理保留延伸出路口的中央分隔及明显空洞，禁止向邻近独立道路扩张。
+移除无中心线支持的小碎片；make_valid 在米制工作 CRS 和最终输出 CRS 都执行。
+
+Fast、Full 导出均调用同一核心。内部新增 analysis_surfaces 指向未平滑的 corridors；
+正式 surfaces 用展示面，Fast2 读取 analysis_surfaces 及原宽度分段，场景缓存按实际分析输入建立身份。
+user_pipeline 传递 regular_surface，避免没有 GT 编辑时最终汇总再次重建展示宽度。
+CLI、GUI 参数不变；GT 校正及 Temporal 算法未修改。
+
+最终缓存实测（20250118）：2170个有效道路链，1131个局部节点区；171个有效输出面。
+仅道路面重建约45.95秒，输入宽度属性和 WKB 不变。原145个融合面仅作为对比基线，
+面对象个数变化不能直接解读为道路增删（等宽化会改变原先宽度鼓包造成的面重叠）。
+输出 `20250118/surface_presentation_validation/road_surfaces.shp`、road_surfaces.gpkg、
+comparison.json、full_comparison.png、local_comparison.png。原测宽缓存未覆盖。
+181项相关回归通过；几何核心后续等价索引调整后9项直接测试通过，语法检查通过。
+没有重新运行模型、测宽、Fast2变化对或GT/Temporal全流程。

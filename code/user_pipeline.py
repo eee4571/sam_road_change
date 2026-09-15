@@ -2749,6 +2749,9 @@ def extract(args: argparse.Namespace) -> dict:
         "width_source": "raw_image" if width_method=='raw_image' else "fast_measured" if execution_profile == "fast" else "full_measured",
         "width_method":width_method,
     })
+    if width_method == 'raw_image':
+        result['regular_surface'] = True
+        result['analysis_surfaces'] = result['corridors']
     result["fusion"] = build_fusion_metadata(final_dir)
     profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
     if profile_decisions_path.is_file():

@@ -11,15 +11,17 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('products',type=Path)
     parser.add_argument('output',type=Path)
+    parser.add_argument('--baseline',type=Path)
     args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
-    before=gpd.read_file(args.products/'roads.gpkg',layer='corridors')
-    fingerprint=list(before.geometry.to_wkb());attributes=before.drop(columns='geometry').copy(deep=True)
+    before=gpd.read_file(args.baseline) if args.baseline else gpd.read_file(args.products/'roads.gpkg',layer='surfaces')
+    widths=gpd.read_file(args.products/'roads.gpkg',layer='width_segments')
+    fingerprint=list(widths.geometry.to_wkb());attributes=widths.drop(columns='geometry').copy(deep=True)
     image=args.products/'raw_width'/'regional_rgb.tif'
     started=time.perf_counter()
-    after=build_road_surfaces(before,image_path=image)
+    after=build_road_surfaces(widths,image_path=image)
     elapsed=time.perf_counter()-started
-    assert fingerprint==list(before.geometry.to_wkb())
-    assert attributes.equals(before.drop(columns='geometry'))
+    assert fingerprint==list(widths.geometry.to_wkb())
+    assert attributes.equals(widths.drop(columns='geometry'))
     assert after.is_valid.all()
     after.to_file(args.output/'road_surfaces.gpkg',layer='surfaces',driver='GPKG')
     after.to_file(args.output/'road_surfaces.shp',encoding='UTF-8')
@@ -37,12 +39,12 @@ def main():
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig,axes=plt.subplots(1,2,figsize=(20,14))
-    for ax,frame,title in zip(axes,[before,after],['Before: sampling facets','After: connected road surfaces']):
+    for ax,frame,title in zip(axes,[before,after],['Before: dissolved interval boundaries','After: regular presentation surfaces']):
         frame.plot(ax=ax,color='#e4b82c',edgecolor='#3c3419',linewidth=.25)
         ax.set_title(title);ax.set_aspect('equal');ax.axis('off')
     fig.tight_layout();fig.savefig(args.output/'full_comparison.png',dpi=180);plt.close(fig)
     # Densest local corridor area for a readable close-up.
-    center=before.iloc[len(before)//2].geometry.centroid
+    center=widths.to_crs(metric).iloc[len(widths)//2].geometry.centroid
     fig,axes=plt.subplots(1,2,figsize=(16,9))
     for ax,frame,title in zip(axes,[before,after],['Before','After']):
         frame.cx[center.x-150:center.x+150,center.y-150:center.y+150].plot(ax=ax,color='#e4b82c',edgecolor='#3c3419',linewidth=.7)

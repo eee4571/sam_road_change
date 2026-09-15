@@ -2073,7 +2073,7 @@ def export_final_products(
     if width_method=='raw_image':
         from engine.width.raw_image_backend import original_images
         from engine.width.raw_road_surfaces import build_road_surfaces
-        fused_surfaces=build_road_surfaces(standardized_corridors,image_path=original_images(image_dir)[0]).to_dict('records')
+        fused_surfaces=build_road_surfaces(standardized_width_segments,image_path=original_images(image_dir)[0]).to_dict('records')
     width_sampling_segment_conversion_seconds += (
         time.perf_counter() - width_conversion_started
     )
