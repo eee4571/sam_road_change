@@ -2991,7 +2991,7 @@ def export_fast_products(
     raw_inputs=original_images(image_dir) if width_method=='raw_image' else []
     marker = output_dir/'fast_export_cache.json'
     inputs = signature([working, validation_area, __file__,*raw_inputs,
-                        WIDTH_ROOT/'raw_image_backend.py',WIDTH_ROOT/'raw_boundary_core.py',WIDTH_ROOT/'raw_width_reconstruction.py',
+                        WIDTH_ROOT/'raw_road_surfaces.py',WIDTH_ROOT/'raw_image_backend.py',WIDTH_ROOT/'raw_boundary_core.py',WIDTH_ROOT/'raw_width_reconstruction.py',
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
                         Path(__file__).with_name('road_network_connection.py'),
@@ -3037,7 +3037,9 @@ def export_fast_products(
         connection_input=connection_audits['connection_input'],
     )
     if width_method=='raw_image':
-        frames['surfaces']=frames['corridors'].copy()
+        from .width.raw_road_surfaces import build_road_surfaces
+        frames['surfaces']=build_road_surfaces(frames['corridors'],image_path=raw_inputs[0])
+        outputs['regular_surface']=True
     for index, (layer, filename) in enumerate(mapping.items()):
         frame = frames[layer]
         target = output_dir / filename

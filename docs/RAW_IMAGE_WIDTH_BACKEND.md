@@ -48,3 +48,24 @@ width observations 保存六个完整字段：final_left_distance、final_right_
 结果目录：`project/test_area/_work/tasks/runs/raw_width_backend_validation_20260915/`。产品和预览在 `20250118/products/`，正式发布结构样例在 `published/验证区1/01_单期道路/20250118/`，Fast2 输出在 `20250118/fast2_validation/`。
 
 测试：原实验14项；后端/Fast2/配置/路网41项；user_pipeline + fast_pipeline 165项；随后发布/设置7项均通过。迁移前后15+9个函数/类 AST完全一致。未重跑模型推理、GT后验和完整多期 Temporal；未覆盖原真实项目正式成果。Full 后端接入已做代码/回归检查，真实整期验证使用 Fast 模式。
+
+
+## 连续道路面输出（2026-09-15）
+
+正式 Fast / Full 导出调用 `engine.width.raw_road_surfaces.build_road_surfaces`：
+沿每条 chain 已有共享左右截面拼接完整边界，make_valid 后区域 union，按连通 Polygon 输出。
+不重新计算、平均或平滑宽度。异常修复单元保留其有效几何参与融合，缺失宽度不外推。
+清理只处理面积小于 1/16 像元的封闭小孔和 1/50 像元边界细节；不做全区 buffer closing、吸附或大范围填充。
+独立面不按面积删除，避免删除真实独立道路；保留超过清理尺度的缺口和孔洞。
+
+`surfaces` 为融合面；`width_segments` / `corridors` 保持原始细粒度记录，仅保存在内部任务产品中。
+raw_image 后端不再将采样分段 SHP、面片 SHP 或细粒度 profiles GPKG 复制到正式发布目录；
+已有公开副本转入内部 publication_history。SAM-MoLRA 发布方式不变。
+Fast 输出标记 regular_surface，未受 GT 修改的最终汇总直接使用此面，避免重复对称重建。
+导出缓存身份包含新道路面模块；测宽缓存及测宽算法不变。
+
+缓存对比：20250118 的 67,434 个细粒度面片 -> 145 个有效连通道路面，融合约 5.1 秒。
+原区域 union 面积 3,221,951.88 m²，融合后 3,221,870.50 m²，净差 -81.37 m²（约 -0.0025%）。
+细粒度记录、非几何属性及 WKB 不变；未重跑提取、测宽、GT 或 Temporal。
+对比文件：`20250118/surface_dissolve_validation/` 下 comparison.json、road_surfaces.shp、
+full_comparison.png、local_comparison.png。原 products 作为修改前基线保留。
