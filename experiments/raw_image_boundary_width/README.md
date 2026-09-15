@@ -4,6 +4,49 @@
 
 ## 实际结果
 
+### 第二层：全图连续宽度重建
+
+- [连续面矢量叠加前后 PNG](results/continuous_20250118_v2/continuous_overview_comparison.png)
+- [原始分辨率连续面 PNG](results/continuous_20250118_v2/continuous_overlay_native.png)
+- [连续宽度面和左右边界矢量](results/continuous_20250118_v2/continuous_surfaces.gpkg)
+- [五类 profile 对比](results/continuous_20250118_v2/profile_comparison.png)
+- [来源图](results/continuous_20250118_v2/width_source_map.png)、[实测报告及失败案例](results/continuous_20250118_v2/REPORT.md)
+
+本层在保存的 `samples.csv` 上运行，保留全部原始字段；不改变下述第一层的候选生成、Viterbi 和拒绝规则。全图 4,346 条链、76,863 点的重建覆盖率从 34.86% 到 91.33%；其余链至少一侧完全没有可靠支撑，保留空值。覆盖率不表示准确率，插值和传播不算新增实测证据。
+
+复现（输出目录必须尚不存在）：
+
+```powershell
+& runtime/env/samroad_env/python.exe experiments/raw_image_boundary_width/reconstruct_width.py experiments/raw_image_boundary_width/results/full_image_20250118 experiments/raw_image_boundary_width/results/continuous_new
+& runtime/env/samroad_env/python.exe experiments/raw_image_boundary_width/render_reconstruction.py experiments/raw_image_boundary_width/results/continuous_new
+& runtime/env/samroad_env/python.exe -m unittest discover -s experiments/raw_image_boundary_width -p 'test_*.py' -v
+```
+
+`reconstruct_width.py` 的 `ReconstructionConfig` 保存所有重建参数，写入新 manifest，并记录原观测 CSV 的 SHA-256。算法依次为：
+
+1. 左右侧分别寻找最长 30 m 的返回型异常，比较前后各 15 m 内至少 3 个支持点。两端中位数差须 ≤1.5 m、各自 MAD ≤0.9 m；中间至少 80% 的可用点同向偏离两端趋势超过 `max(2.5 m, 3×1.4826×MAD)`。既检测变宽也检测变窄，即使两侧相反误差使总宽不变也能检测。持续台阶和渐变没有返回两端，不按此规则删除。
+2. 对置信度 <0.20 的观测，检查 ±24 m 内可靠邻居支持的局部线性趋势；偏离超过 `max(3 m, 4×1.4826×残差MAD)` 的点标记趋势冲突。路口上述判异阈值加倍。影像边界、搜索端点、无状态和几何交叉观测不能作为锚点。
+3. 原始 accepted 点及置信度 ≥0.16 的非硬拒绝路口单侧观测作为锚点，删除该侧异常后独立拟合。优化目标为置信度加权 Huber 观测项（转折 1 m）+ 0.35×Huber 一阶距离差 + 2.5×Huber 二阶距离差；空间差按实际采样距离归一到 3 m，转折分别 0.6/0.4 m。L-BFGS-B 约束每侧 0.75–20 m，记录收敛状态；没有定宽目标或左右对称约束。
+4. 路口连续约束降到 0.25 倍，观测拟合权重降到 0.20 倍。这样允许快速变化，也避免把第一层原先拒绝的路口边缘当作强证据。
+5. 两锚点间 ≤18 m 缺口用平滑三次过渡，18–75 m 用保形三次插值恢复局部趋势；>75 m 用两端各 18 m 稳定邻域中位数保持并在中间过渡。链端采用附近稳定距离延续，避免无限延长斜率。这些曲线仅作较弱先验（权重 0.12），再与观测一起稳健优化。没有锚点的一侧不引入全图平均宽度。
+6. `final_width = final_left_distance + final_right_distance`；按存储法线重建最终左右边界坐标。插值置信度取两端较低值并衰减；传播置信度不超过 0.20，随距最近锚点距离按 120 m 尺度衰减；路口另乘 0.65。分数未经精度标定。
+
+新增字段：`final_left_distance`、`final_right_distance`、`final_width`、`final_left_x/y`、`final_right_x/y`、`final_confidence`、`width_source`、`outlier_reason`、`reconstruction_available`、`reconstruction_flags`、`solver_converged`；另有逐侧来源、锚点、异常原因和置信度。最终来源取两侧较弱的一类：
+
+| width_source | 含义 |
+|---|---|
+| measured | 原始有效观测，两侧各改动 ≤0.25 m |
+| smoothed | 观测稳健拟合，包含重新利用的路口观测 |
+| interpolated | 两端有支撑的短/中缺口 |
+| propagated | 长缺口或链端的稳定值延续，降低置信度 |
+| unresolved | 至少一侧整链无可靠锚点，最终宽度空值 |
+
+输出保留 CSV/JSON 原始观测与最终值、逐道路摘要、异常连续段清单、全图连续面/边界 GPKG、原生 PNG、来源图、五组真实影像与 profile 对比。面由最终左右横断面连接；交叉四边形拆分为合法面并降置信度，自交边界另行标记。不能把几何合法性当成边界准确性。
+
+实际结果：判异常 5,147 点 / 2,280 段；同一原始有效相邻点对的平均跳变 0.633→0.390 m，P95 2.000→1.272 m。所有可比较有限观测（含原始拒绝值）的相同点对平均跳变 4.603→0.709 m。短时异常下降，但持续错误边缘、中心线落在树带、长缺口推断仍是失败来源。短小真实停车湾也可能被返回型判据误删；无真值时不能声称精度或 SAM-MoLRA 替代性已获验证。
+
+### 第一层：原始影像观测
+
 全图面矢量成果：
 
 - [测宽面矢量叠加 PNG](results/full_image_20250118/width_surface_overview.png)
