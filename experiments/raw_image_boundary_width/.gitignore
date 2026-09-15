@@ -1,0 +1,6 @@
+# Publish only reproducible experiment source, tests, configuration and documentation.
+/*
+!/.gitignore
+!/*.py
+!/README.md
+!/cases.json

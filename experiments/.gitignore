@@ -1,0 +1,19 @@
+# Experiment inputs and generated artifacts stay local; publish source/configuration only.
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gpkg
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.npz
+*.npy
+*.bin
+*.pdf
+*.zip

@@ -1,0 +1,9 @@
+[
+  {"name":"01_uniform", "road_id":"road_063", "start_m":90, "end_m":240, "label":"Uniform narrow road: transient false edges suppressed"},
+  {"name":"02_width_change", "road_id":"road_094", "start_m":15, "end_m":165, "label":"Visible carriageway taper; estimated amplitude also includes roadside clutter"},
+  {"name":"03_offcenter", "road_id":"road_063", "start_m":0, "end_m":120, "label":"Asymmetric centerline: independent left/right distances"},
+  {"name":"04_shadow_buildings", "road_id":"road_064", "start_m":0, "end_m":270, "label":"Failure: building and shadow edges create false wide/narrow plateaus"},
+  {"name":"05_junction", "road_id":"road_094", "start_m":0, "end_m":90, "label":"Intersection approach: graph junction mask excludes the first samples"},
+  {"name":"06_offcenter_failure", "road_id":"road_031", "start_m":0, "end_m":120, "label":"Failure: centerline near road edge; one boundary follows vegetation"},
+  {"name":"07_image_boundary", "road_id":"road_014", "start_m":30, "end_m":180, "label":"Image/nodata boundary: all measurements remain diagnostic only"}
+]
