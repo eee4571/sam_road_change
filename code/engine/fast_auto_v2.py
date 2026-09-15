@@ -211,9 +211,28 @@ def _paired_profiles(axis,intervals,before,after,minimum_length):
         a=np.asarray(events[:-1]);b=np.asarray(events[1:]);valid=b-a>1e-6;a=a[valid];b=b[valid]
         if not len(a):continue
         points=line_interpolate_point(axis,(a+b)/2);target_positions=line_locate_point(other,points)
-        bw=before.widths_at(points);aw=after.widths_at(line_interpolate_point(other,target_positions))
+        target_points=line_interpolate_point(other,target_positions)
+        reliable=_reliable_width_at(before,points)&_reliable_width_at(after,target_points)
+        a=a[reliable];b=b[reliable];points=points[reliable];target_points=target_points[reliable]
+        if not len(a):continue
+        bw=before.widths_at(points);aw=after.widths_at(target_points)
         profiles.append((start,end,target_id,a,b,bw,aw))
     return profiles
+
+
+def _reliable_width_at(scene,points):
+    """C display/propagation widths are never temporal width evidence."""
+    from shapely import distance
+    field=next((f for f in ('quality_grade','width_quality','quality_gr','width_qual') if f in scene.widths),None)
+    if field is None:return np.ones(len(points),dtype=bool)
+    result=np.zeros(len(points),dtype=bool)
+    pairs=scene.width_tree.query(points,predicate='dwithin',distance=3.)
+    if not pairs.size:return result
+    order=np.argsort(distance(points[pairs[0]],scene.width_geometries[pairs[1]]),kind='stable')
+    _,first=np.unique(pairs[0,order],return_index=True);chosen=order[first]
+    ids=pairs[1,chosen]
+    result[pairs[0,chosen]]=scene.widths.iloc[ids][field].astype(str).str.upper().isin(['A','B']).to_numpy()
+    return result
 
 
 def _calibration_roads(profiles,before,after,tolerance):

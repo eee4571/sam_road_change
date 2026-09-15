@@ -178,10 +178,15 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
     observations = measured.to_crs(projected) if measured is not None else None
     print(f'[Fast timing] width_rebuild_projection={time.perf_counter()-stage_started:.6f}s',flush=True)
     stage_started=time.perf_counter()
-    segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
+    raw_observations=observations is not None and 'final_width' in observations and 'width_backend' in observations
+    if raw_observations:
+        from .width.raw_image_backend import rebuild_observations
+        segments=rebuild_observations(observations)
+    else:
+        segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
     print(f'[Fast timing] width_rebuild_segments={time.perf_counter()-stage_started:.6f}s',flush=True)
     stage_started=time.perf_counter()
-    if connection_input is not None and not segments.empty:
+    if connection_input is not None and not segments.empty and not raw_observations:
         observed_area = unary_union(connection_input.to_crs(projected).geometry).buffer(.25)
         covered = covers(observed_area,segments.geometry.values)
         inferred = np.zeros(len(segments),dtype=bool)
@@ -197,5 +202,8 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
     print(f'[Fast timing] width_rebuild_inferred={time.perf_counter()-stage_started:.6f}s',flush=True)
     stage_started=time.perf_counter()
     corridors = build_corridors(segments)
+    if raw_observations:
+        segments=segments.drop(columns=['raw_corridor_wkb'],errors='ignore')
+        corridors=corridors.drop(columns=['raw_corridor_wkb'],errors='ignore')
     print(f'[Fast timing] width_rebuild_corridors={time.perf_counter()-stage_started:.6f}s',flush=True)
     return segments.to_crs(centerlines.crs), corridors.to_crs(centerlines.crs)

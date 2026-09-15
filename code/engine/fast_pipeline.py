@@ -2973,6 +2973,7 @@ def export_fast_products(
     output_dir: Path,
     validation_area: Path | None = None,
     image_dir: Path | None = None,
+    width_method: str = 'sam_molra',
 ) -> dict:
     working = width_dir / "fast_products.gpkg"
     if not working.is_file():
@@ -2985,15 +2986,19 @@ def export_fast_products(
     from .road_connection_evidence import probability_sources, molra_sources
     connection_probability_sources=probability_sources(image_dir,width_dir)
     connection_molra_sources=molra_sources(width_dir)
+    if width_method not in ('sam_molra','raw_image'):raise ValueError(f'Unknown width method: {width_method}')
+    from .width.raw_image_backend import original_images
+    raw_inputs=original_images(image_dir) if width_method=='raw_image' else []
     marker = output_dir/'fast_export_cache.json'
-    inputs = signature([working, validation_area, __file__,
+    inputs = signature([working, validation_area, __file__,*raw_inputs,
+                        WIDTH_ROOT/'raw_image_backend.py',WIDTH_ROOT/'raw_boundary_core.py',WIDTH_ROOT/'raw_width_reconstruction.py',
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
                         Path(__file__).with_name('road_network_connection.py'),
                         Path(__file__).with_name('road_connection_evidence.py'),
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),
-                        WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py']) + [str(image_dir)]
+                        WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py']) + [str(image_dir),width_method]
     cached = read_completed(marker, inputs)
     if cached is not None:
         print('[Fast timing] period_export_reused=1', flush=True)
@@ -3024,10 +3029,15 @@ def export_fast_products(
         frames['centerlines'], frames['surfaces'],
         probability_sources=connection_probability_sources,molra_sources=connection_molra_sources,
     )
+    if width_method=='raw_image':
+        from .width.raw_image_backend import measure_region
+        frames['width_segments']=measure_region(frames['centerlines'],image_dir,output_dir/'raw_width')
     frames['width_segments'], frames['corridors'] = rebuild_network_width_products(
         frames['centerlines'], frames['width_segments'],
         connection_input=connection_audits['connection_input'],
     )
+    if width_method=='raw_image':
+        frames['surfaces']=frames['corridors'].copy()
     for index, (layer, filename) in enumerate(mapping.items()):
         frame = frames[layer]
         target = output_dir / filename
@@ -3040,6 +3050,7 @@ def export_fast_products(
     outputs["road_extraction"] = outputs["previews"]["fusion"]
     outputs["road_width"] = outputs["previews"]["width"]
     outputs["execution_profile"] = "fast"
+    outputs['width_method']=width_method
     write_network_report(output_dir, connection_stats, connection_audits)
     write_completed(marker, inputs, outputs,
                     [outputs[key] for key in mapping] + [gpkg, output_dir/NETWORK_REPORT,
@@ -6752,6 +6763,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--molra-threshold", type=float, default=0.5)
     command = sub.add_parser("export")
     command.add_argument("--width-dir", required=True); command.add_argument("--output-dir", required=True)
+    command.add_argument('--width-method',choices=['sam_molra','raw_image'],default='sam_molra')
     command.add_argument("--image-dir", default="")
     command.add_argument("--validation-area", default="")
     return root
@@ -6776,7 +6788,7 @@ def main(argv=None, *, model_pool=None) -> int:
     else:
         validation = Path(args.validation_area) if str(args.validation_area).strip() else None
         image_dir = Path(args.image_dir) if str(args.image_dir).strip() else None
-        export_fast_products(Path(args.width_dir), Path(args.output_dir), validation, image_dir)
+        export_fast_products(Path(args.width_dir), Path(args.output_dir), validation, image_dir,args.width_method)
     return 0
 
 

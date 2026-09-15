@@ -7,7 +7,7 @@ COMPENSATION_LABELS = (
     ('surface_probability_calibration', '道路面与概率跨期校正'),
     ('width_temporal_bias_correction', '道路宽度跨期偏差校正'),
 )
-SETTING_DEFAULTS = dict(irmad='0', irmad_reference='20250118',
+SETTING_DEFAULTS = dict(width_method='SAM-MoLRA',irmad='0', irmad_reference='20250118',
                         **{name: '1' for name, _ in COMPENSATION_LABELS})
 
 
@@ -29,3 +29,9 @@ def compensation_values(variables):
 
 def compensation_arguments(config):
     return [] if config is None else ['--fast2-compensation', json.dumps(config, sort_keys=True)]
+
+def width_arguments(value):
+    if value is None:return []
+    names={'SAM-MoLRA':'sam_molra','原始影像边界测宽':'raw_image','sam_molra':'sam_molra','raw_image':'raw_image'}
+    if value not in names:raise ValueError('未知宽度提取方法')
+    return ['--width-method',names[value]]

@@ -1142,9 +1142,11 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     identities=_radiometric_requests({args.area_id:raw_sources},irmad_enabled,{args.area_id:area['validation_area']},reference_period=irmad_reference)
     identity=identities[(str(args.area_id),str(args.period))]
     workspace=workspace_for(workspace,identity)
-    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None)
+    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None);previous_spec.pop('width_method',None)
     if prior and previous_spec != input_spec:
         raise ValueError("续跑输入或参数与原任务不一致，请恢复原设置或使用新的任务名称")
+    args.width_method=getattr(args,'width_method',None) or (prior.get('input_spec') or {}).get('width_method','sam_molra')
+    input_spec['width_method']=args.width_method
     input_spec['irmad']=configuration(irmad_enabled,irmad_reference)
     if task_root.exists() and not resume:
         raise FileExistsError(f"单期提取任务已存在：{task_root}；请勾选续跑或更换任务名称")
@@ -1158,7 +1160,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     emit("pipeline", stage="项目期次扫描", status="complete", area_id=args.area_id, period=args.period, completed=0, total=6)
     try:
         result_path = workspace / "latest_result.json"
-        if resume and _period_result_ready({"result": str(result_path)}, require_current_network=True):
+        if resume and _period_result_ready({"result": str(result_path)}, require_current_network=True) and read_json(result_path).get("width_method","sam_molra")==args.width_method:
             result = read_json(result_path)
             emit("pipeline", stage="道路提取", status="skipped", reason="续跑复用已完成且完整的正式成果", completed=6, total=6)
         else:
@@ -1192,6 +1194,7 @@ def extract_project_period(args: argparse.Namespace) -> dict:
                 pixel_size=str(args.pixel_size), rescale=args.rescale, run_id=base_run_id,
                 junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                 grid=args.area_id, period=args.period, resume=resume,
+                width_method=getattr(args,"width_method",None),
                 pipeline_state=str(state_path),
             ))
         published = ResultPublisher(
@@ -1256,9 +1259,11 @@ def extract_project_all(args: argparse.Namespace) -> dict:
     selected=getattr(args,'irmad',None)
     irmad_enabled=bool(selected if selected is not None else ((prior.get('input_spec') or {}).get('irmad') or {}).get('enabled',False))
     irmad_reference=getattr(args,'irmad_reference',None) or ((prior.get('input_spec') or {}).get('irmad') or {}).get('reference_period','20250118')
-    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None)
+    previous_spec=dict(prior.get('input_spec') or {});previous_spec.pop('irmad',None);previous_spec.pop('width_method',None)
     if prior and previous_spec != input_spec:
         raise ValueError("续跑范围、输入或参数与原任务不一致，请恢复原设置或使用新的任务名称")
+    args.width_method=getattr(args,'width_method',None) or (prior.get('input_spec') or {}).get('width_method','sam_molra')
+    input_spec['width_method']=args.width_method
     input_spec['irmad']=configuration(irmad_enabled,irmad_reference)
     if batch_root.exists() and not resume:
         raise FileExistsError(f"批量提取任务已存在：{batch_root}；请勾选续跑或更换任务名称")
@@ -1287,6 +1292,7 @@ def extract_project_all(args: argparse.Namespace) -> dict:
     emit("pipeline", stage="批量道路提取", status="running", completed=0, total=len(units), run_id=run_id)
 
     def prior_unit_ready(entry: dict | None) -> tuple[bool, dict]:
+        if (prior.get("input_spec") or {}).get("width_method","sam_molra") != args.width_method:return False, {}
         if irmad_enabled or bool(((prior.get("input_spec") or {}).get("irmad") or {}).get("enabled",False)):
             return False, {}
         if not entry or entry.get("status") != "completed":
@@ -1333,6 +1339,7 @@ def extract_project_all(args: argparse.Namespace) -> dict:
                     project_root=discovered["project_root"], area_id=area_id, period=period,
                     run_id=run_id, device=args.device, pixel_size=args.pixel_size,
                     rescale=args.rescale,irmad=irmad_enabled,irmad_reference=irmad_reference,
+                    width_method=getattr(args,"width_method",None),
                     junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                     resume=resume and unit_state_path.is_file(),
                 ))
@@ -2537,6 +2544,11 @@ def extract(args: argparse.Namespace) -> dict:
     resume = bool(getattr(args, "resume", False))
     period_state_path = workspace / "period_state.json"
     period_state = _load_period_state(period_state_path, grid, period, resume, execution_profile)
+    width_method=getattr(args,'width_method',None) or period_state.get('width_method','sam_molra')
+    if period_state.get('width_method','sam_molra')!=width_method:
+        period_state['stages']['export']='pending'
+    period_state['width_method']=width_method
+    print(f'[Width backend] {width_method}',flush=True)
     period_state.update({
         "status": "running",
         "workspace": str(workspace),
@@ -2633,6 +2645,7 @@ def extract(args: argparse.Namespace) -> dict:
             ], ROOT),
         }
         stage_definitions = FAST_PERIOD_STAGE_DEFINITIONS
+    stage_commands['export'][0].extend(['--width-method',width_method])
     if resume:
         stage_commands["centerline"][0].append("--resume-existing-images")
         if pipeline_state_path is not None:
@@ -2733,7 +2746,8 @@ def extract(args: argparse.Namespace) -> dict:
         "execution_profile": execution_profile,
         "road_extraction_source": "samroad_fast" if execution_profile == "fast" else "samroad",
         "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
-        "width_source": "fast_measured" if execution_profile == "fast" else "full_measured",
+        "width_source": "raw_image" if width_method=='raw_image' else "fast_measured" if execution_profile == "fast" else "full_measured",
+        "width_method":width_method,
     })
     result["fusion"] = build_fusion_metadata(final_dir)
     profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
@@ -3938,6 +3952,7 @@ def _task_input_spec(
         ),
         "device": str(args.device),
         "pixel_size": str(args.pixel_size),
+        "width_method":getattr(args,'width_method',None) or 'sam_molra',
         "rescale": str(args.rescale),
         "junction_node_mode": str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
         "absolute": str(args.absolute),
@@ -3964,7 +3979,7 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
     }
     scalar_extraction_keys = (
         "pipeline_version", "mode", "device", "pixel_size", "rescale",
-        "junction_node_mode", "execution_profile",
+        "junction_node_mode", "execution_profile", "width_method",
     )
 
     def identity_tree_equal(previous, latest) -> bool:
@@ -3982,6 +3997,7 @@ def dependency_invalidation_plan(prior: dict, current: dict) -> dict:
         return previous == latest
 
     def scalar_value(payload: dict, key: str):
+        if key=='width_method':return payload.get(key) or 'sam_molra'
         if key == "execution_profile":
             return str(payload.get(key, "full") or "full")
         return payload.get(key)
@@ -4511,6 +4527,7 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
         run_id=f"roads_rerun_{int(time.time())}",
         junction_node_mode=str(input_spec.get("junction_node_mode") or "sparse"),
         execution_profile=str(manifest.get("execution_profile") or input_spec.get("execution_profile") or "full"),
+        width_method=input_spec.get("width_method","sam_molra"),
         validation_area=str((manifest.get("validation_areas") or {}).get(grid) or manifest.get("validation_area") or ""),
     )))
     updated = {
@@ -4755,6 +4772,8 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
 
 
 def _apply_fast2_task_settings(manifest, args):
+    if getattr(args,'width_method',None) is not None:
+        manifest.setdefault('input_spec',{})['width_method']=args.width_method
     from engine.fast2_compensation import Fast2CompensationConfig
     value = getattr(args, 'fast2_compensation', None)
     if value is not None:
@@ -5243,6 +5262,9 @@ def run_all(args: argparse.Namespace) -> dict:
         prior_input_spec = _enrich_relocated_input_spec(
             dict(prior.get("input_spec") or {}), job_root,
         )
+        if getattr(args,'width_method',None) is None:
+            args.width_method=prior_input_spec.get('width_method','sam_molra')
+            input_spec['width_method']=args.width_method
         comparison_input_spec = dict(prior_input_spec)
         if job_root == layout.legacy_full_run_root(run_id):
             # A storage-layout upgrade alone must not invalidate completed inference.
@@ -5603,6 +5625,7 @@ def run_all(args: argparse.Namespace) -> dict:
                             rescale=args.rescale, run_id=base_run_id,
                             junction_node_mode=str(getattr(args, "junction_node_mode", "sparse") or "sparse"),
                             execution_profile=execution_profile,
+                            width_method=getattr(args,"width_method",None),
                             validation_area=(validation_area.get(grid_name, "") if isinstance(validation_area, dict) else validation_area),
                             grid=grid_name, period=period,
                             resume=internal_resume,
@@ -5950,6 +5973,8 @@ def parser() -> argparse.ArgumentParser:
         sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
                                          help='IR-MAD preprocessing before extraction')
         sub.choices[command].add_argument('--irmad-reference',default=None,choices=['20250118'],help='Fast IR-MAD fixed reference 20250118')
+    for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-all-periods'):
+        sub.choices[command].add_argument('--width-method',choices=['sam_molra','raw_image'],default=None)
     for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):
         sub.choices[command].add_argument('--fast2-compensation', default=None,
             help='raw_input / normalized_input / JSON object with preset=custom and boolean switches')

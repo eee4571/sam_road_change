@@ -167,6 +167,13 @@ class RunPage:
         self.irmad_reference_combo.pack(side=LEFT)
         self.irmad_reference_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_project_config())
         self.irmad_reference_combo.bind("<FocusOut>", lambda _e: self._save_project_config())
+        width_row=ttk.Frame(self.fast_settings_frame)
+        width_row.pack(fill=X,pady=6)
+        ttk.Label(width_row,text='宽度提取方法：').pack(side=LEFT)
+        width_combo=ttk.Combobox(width_row,textvariable=self.vars['width_method'],state='readonly',
+                                 values=('SAM-MoLRA','原始影像边界测宽'),width=24)
+        width_combo.pack(side=LEFT)
+        width_combo.bind('<<ComboboxSelected>>',lambda _e:self._save_project_config())
         compensation = ttk.LabelFrame(self.fast_settings_frame, text="Fast2 跨期补偿", padding=8)
         compensation.pack(fill=X, pady=(6, 0))
         for name, label in COMPENSATION_LABELS:
@@ -259,6 +266,7 @@ class RunPage:
             irmad=(self.vars["irmad"].get() == "1") if "irmad" in self.vars else False,
             irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
             fast2_compensation=compensation_values(self.vars),
+            width_method=self.vars["width_method"].get(),
         )
 
     def preflight_inputs(self) -> None:
@@ -411,7 +419,7 @@ class RunPage:
             if not region or not period:
                 raise ValueError("请选择需要重跑的区域和影像期次。")
             args = self.task_manager.build_rerun_period(
-                manifest, region, period, update_related, fast2_compensation=compensation_values(self.vars),
+                manifest, region, period, update_related, fast2_compensation=compensation_values(self.vars), width_method=self.vars["width_method"].get(),
             )
         except ValueError as exc:
             messagebox.showerror("无法局部重跑", str(exc), parent=self.root)
@@ -444,7 +452,7 @@ class RunPage:
             return
         self._show_step(1, force=True)
         self._command(self.task_manager.build_rerun_all_periods(
-            manifest, self.vars["continue_on_error"].get() == "1", fast2_compensation=compensation_values(self.vars),
+            manifest, self.vars["continue_on_error"].get() == "1", fast2_compensation=compensation_values(self.vars), width_method=self.vars["width_method"].get(),
         ))
 
     def run_change_all(self) -> None:
@@ -471,6 +479,7 @@ class RunPage:
                 continue_on_error=self.vars["continue_on_error"].get() == "1",
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
                 irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+                width_method=self.vars["width_method"].get(),
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)
@@ -493,6 +502,7 @@ class RunPage:
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
                 irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+                width_method=self.vars["width_method"].get(),
             )
         except ValueError as exc:
             messagebox.showerror("无法分步提取", str(exc), parent=self.root)

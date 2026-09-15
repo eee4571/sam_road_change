@@ -11,29 +11,14 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point
 
 from boundary_width import Config, ImageReader, digest, load_roads, measure_road, runs, save_json
+from engine.width.raw_width_records import rows_for_road, flag_crossings
 from visualize_results import plot_road, contact_sheet, plot_summary
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parent/'radiometric_normalization_ab'
 
 
-def rows_for_road(road_id, data):
-    result = []
-    for i, (s, xy, normal) in enumerate(zip(data['s'], data['xy'], data['normal'])):
-        row = dict(road_id=road_id, sample_id=i, s_m=s, center_x=xy[0], center_y=xy[1],
-                   normal_x=normal[0], normal_y=normal[1], flags=data['flags'][i],
-                   accepted=not data['flags'][i])
-        for method in ('baseline', 'optimized'):
-            left, right = data[method][i]
-            lxy, rxy = xy+normal*left, xy-normal*right
-            for key, value in dict(left_distance=left, right_distance=right, width=left+right,
-                left_x=lxy[0], left_y=lxy[1], right_x=rxy[0], right_y=rxy[1],
-                left_confidence=data[method+'_confidence'][i, 0], right_confidence=data[method+'_confidence'][i, 1],
-                confidence=data[method+'_confidence'][i].min(),
-                left_response=data[method+'_response'][i, 0], right_response=data[method+'_response'][i, 1]).items():
-                row[method+'_'+key] = value
-        result.append(row)
-    return result
+
 
 
 def flag_crossings(data):
@@ -52,22 +37,6 @@ def flag_crossings(data):
                 data['optimized'][i] = data['baseline'][i]
                 data['optimized_confidence'][i] = data['baseline_confidence'][i]
                 data['optimized_response'][i] = data['baseline_response'][i]
-
-
-def metrics(frame):
-    accepted = frame.accepted.to_numpy(bool)
-    adjacency = accepted[1:] & accepted[:-1]
-    out = dict(samples=len(frame), accepted=int(accepted.sum()), accepted_fraction=float(accepted.mean()))
-    for method in ('baseline', 'optimized'):
-        w = frame[method+'_width'].to_numpy()
-        jumps = np.abs(np.diff(w))[adjacency]
-        out[method+'_mean_abs_width_step_m'] = float(jumps.mean()) if len(jumps) else None
-        out[method+'_jumps_gt_3m'] = int((jumps > 3).sum())
-        out[method+'_median_width_m'] = float(np.nanmedian(w)) if np.isfinite(w).any() else None
-    return out
-
-
-def export_vectors(frame, crs, output):
     points = gpd.GeoDataFrame(frame, geometry=gpd.points_from_xy(frame.center_x, frame.center_y), crs=crs)
     points.to_file(output/'measurements.gpkg', layer='samples', driver='GPKG')
     sections, boundaries = [], []

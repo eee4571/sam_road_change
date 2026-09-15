@@ -10,7 +10,7 @@ from pathlib import Path
 
 from input_catalog import period_order_manifest, period_sort_key
 from app.project_manager import USER_IMAGE_LIST_SUFFIX, USER_VECTOR_SUFFIX, atomic_write_json
-from app.fast_settings import compensation_arguments
+from app.fast_settings import compensation_arguments, width_arguments
 from app.result_publisher import ProjectLayout
 from app.project_relocation import build_relocation_plan
 
@@ -161,7 +161,7 @@ def build_pipeline_command(
     area_truths: list[tuple[str, str, str, str]] | None = None,
     area_periods: dict[str, list[tuple[str, str]]] | None = None,
     execution_profile: str = "full",
-    irmad: bool = False, irmad_reference: str = "20250118", fast2_compensation=None,
+    irmad: bool = False, irmad_reference: str = "20250118", fast2_compensation=None, width_method=None,
 ) -> list[str]:
     """Build the backend command for the default validation or backup grid mode."""
     mode = str(mode or "validation").strip().casefold()
@@ -278,6 +278,7 @@ def build_pipeline_command(
     args.append("--irmad" if irmad else "--no-irmad")
     args.extend(["--irmad-reference", str(irmad_reference)])
     args.extend(compensation_arguments(fast2_compensation))
+    args.extend(width_arguments(width_method))
     return args
 
 def build_apply_edits_command(item: dict[str, str], pipeline_manifest: Path | str | None = None) -> list[str]:
@@ -679,7 +680,7 @@ class TaskManager:
         return mark_task_cancelled(output_root, run_id)
 
     @staticmethod
-    def build_rerun_period(manifest, area_id, period, update_related=False, *, fast2_compensation=None) -> list[str]:
+    def build_rerun_period(manifest, area_id, period, update_related=False, *, fast2_compensation=None, width_method=None) -> list[str]:
         args = [
             "rerun-period", "--pipeline-manifest", str(manifest),
             "--grid", str(area_id), "--period", str(period),
@@ -687,6 +688,7 @@ class TaskManager:
         if update_related:
             args.append("--update-related")
         args.extend(compensation_arguments(fast2_compensation))
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
@@ -702,11 +704,12 @@ class TaskManager:
         return args
 
     @staticmethod
-    def build_rerun_all_periods(manifest, continue_on_error=False, *, fast2_compensation=None) -> list[str]:
+    def build_rerun_all_periods(manifest, continue_on_error=False, *, fast2_compensation=None, width_method=None) -> list[str]:
         args = ["rerun-all-periods", "--pipeline-manifest", str(manifest)]
         if continue_on_error:
             args.append("--continue-on-error")
         args.extend(compensation_arguments(fast2_compensation))
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
@@ -720,8 +723,7 @@ class TaskManager:
     @staticmethod
     def build_extract_all(
         project_root, run_id, *, output_root, device, pixel_size, rescale,
-        junction_node_mode, continue_on_error=False, irmad=False, irmad_reference="20250118",
-    ) -> list[str]:
+        junction_node_mode, continue_on_error=False, irmad=False, irmad_reference="20250118", width_method=None) -> list[str]:
         args = [
             "extract-project-all", "--project-root", str(project_root),
             "--run-id", str(run_id), "--device", str(device),
@@ -735,13 +737,13 @@ class TaskManager:
             args.append("--continue-on-error")
         args.append("--irmad" if irmad else "--no-irmad")
         args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod
     def build_extract_period(
         project_root, area_id, period, run_id, *, output_root, device,
-        pixel_size, rescale, junction_node_mode, irmad=False, irmad_reference="20250118",
-    ) -> list[str]:
+        pixel_size, rescale, junction_node_mode, irmad=False, irmad_reference="20250118", width_method=None) -> list[str]:
         args = [
             "extract-project-period", "--project-root", str(project_root),
             "--area-id", str(area_id), "--period", str(period),
@@ -756,6 +758,7 @@ class TaskManager:
             args.append("--resume")
         args.append("--irmad" if irmad else "--no-irmad")
         args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(width_arguments(width_method))
         return args
 
     @staticmethod

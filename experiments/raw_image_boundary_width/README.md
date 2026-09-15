@@ -1,6 +1,6 @@
 # 原始影像道路边界测宽实验
 
-独立实验：只读取原始 RGB 影像和已提取的 SAMRoad 中心线。所有新增代码、诊断和成果均在本目录；不导入 `code/`，不调用 SAM-MoLRA，不修改正式测宽、道路面重建或 Fast2。
+实验入口调用正式 `code/engine/width/raw_boundary_core.py` 与 `raw_width_reconstruction.py`。算法只维护一份；本目录保留实验运行、可视化和对比工具。
 
 ## 实际结果
 
