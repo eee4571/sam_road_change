@@ -163,7 +163,7 @@ class RunPage:
         reference_row.pack(fill=X, padx=(20, 0), pady=4)
         ttk.Label(reference_row, text="参考期：").pack(side=LEFT)
         self.irmad_reference_combo = ttk.Combobox(reference_row, textvariable=self.vars["irmad_reference"],
-                                                width=16, postcommand=self._refresh_irmad_references)
+                                                width=16, state="readonly", values=("20250118",))
         self.irmad_reference_combo.pack(side=LEFT)
         self.irmad_reference_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_project_config())
         self.irmad_reference_combo.bind("<FocusOut>", lambda _e: self._save_project_config())
@@ -232,10 +232,8 @@ class RunPage:
         self._schedule_content_layout()
 
     def _refresh_irmad_references(self):
-        periods = {str(period) for rows in self.project_area_periods.values() for period, _ in rows}
-        periods.update(str(period) for period, _ in self._period_values())
-        periods.add(self.vars["irmad_reference"].get() or "20250118")
-        self.irmad_reference_combo.configure(values=sorted(periods))
+        self.vars["irmad_reference"].set("20250118")
+        self.irmad_reference_combo.configure(values=("20250118",))
 
     def _build_current_command(self, *, preflight_only: bool = False, data_check_only: bool = False) -> list[str]:
         return self.task_manager.build_pipeline(

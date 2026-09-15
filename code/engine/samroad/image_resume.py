@@ -45,6 +45,21 @@ def _path_text(path: Path | str) -> str:
     return os.path.normcase(str(_resolved(path)))
 
 
+def _resume_filesystem_path(path: Path) -> Path:
+    """Extended Windows paths for deep backup/marker I/O, without registry edits.
+
+    Keep the output root and its descendants in the same namespace so relative
+    output records and backup containment checks remain valid. Input identity
+    paths are deliberately unaffected.
+    """
+    text = str(path)
+    if os.name != 'nt' or text.startswith('\\\\?\\'):
+        return path
+    if text.startswith('\\\\'):
+        return Path('\\\\?\\UNC\\' + text[2:])
+    return Path('\\\\?\\' + text)
+
+
 def file_identity(path: Path | str, *, sha256: bool = False) -> dict:
     source = _resolved(path)
     stat = source.stat()
@@ -405,7 +420,7 @@ class ImageResumeManager:
         self, output_dir: Path | str, batch_identity: dict, *, enabled: bool,
         legacy_metadata: dict | None = None, pipeline_state: Path | str | None = None,
     ) -> None:
-        self.output_dir = _resolved(output_dir)
+        self.output_dir = _resume_filesystem_path(_resolved(output_dir))
         self.batch_identity = batch_identity
         self.execution_profile = str(
             batch_identity.get("parameters", {}).get("execution_profile", "full")

@@ -1968,6 +1968,8 @@ def prepare(args: argparse.Namespace) -> dict:
     if not source.exists():
         raise FileNotFoundError(f"找不到格网输入：{source}")
     workspace.mkdir(parents=True, exist_ok=True)
+    from engine.irmad_preprocessing import reserve_workspace_identity
+    reserve_workspace_identity(workspace,getattr(args,'radiometric_identity','raw'))
     cached_normalization = (source/'normalized_cache.json').is_file()
     images = source if cached_normalization else workspace / "images"
     images.mkdir(exist_ok=True)
@@ -5947,7 +5949,7 @@ def parser() -> argparse.ArgumentParser:
     for command in ('all','extract-project-period','extract-project-all'):
         sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
                                          help='IR-MAD preprocessing before extraction')
-        sub.choices[command].add_argument('--irmad-reference',default=None,help='IR-MAD reference period (default 20250118)')
+        sub.choices[command].add_argument('--irmad-reference',default=None,choices=['20250118'],help='Fast IR-MAD fixed reference 20250118')
     for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):
         sub.choices[command].add_argument('--fast2-compensation', default=None,
             help='raw_input / normalized_input / JSON object with preset=custom and boolean switches')

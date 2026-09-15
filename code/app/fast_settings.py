@@ -19,7 +19,7 @@ def settings_values(variables):
 def restore_settings(variables, settings):
     for key, default in SETTING_DEFAULTS.items():
         if key in variables:
-            variables[key].set(str(settings.get(key, default)))
+            variables[key].set(default if key == "irmad_reference" else str(settings.get(key, default)))
 
 
 def compensation_values(variables):

@@ -35,7 +35,7 @@ class IRMADTests(unittest.TestCase):
         nodes=lambda s:{n.name:ast.dump(n,include_attributes=False) for n in ast.parse(s).body
                         if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
         before=nodes(original.read_text(encoding='utf8'));after=nodes(Path(core.__file__).read_text(encoding='utf8'))
-        self.assertEqual(set(after),{'windows','paired_blocks','Moments','cca','ncp','fit_irmad','tls','write_normalized'})
+        self.assertEqual(set(after),{'windows','paired_blocks','Moments','cca','ncp','fit_irmad','tls','write_normalized','uniform_iteration_sample'})
         for name in after:self.assertEqual(after[name],before[name],name)
 
     def test_independent_pairs_reference_identity_and_cache(self):
@@ -68,18 +68,60 @@ class IRMADTests(unittest.TestCase):
         self.assertEqual(result.source,self.sources['20260203']);self.assertFalse((self.root/'cache').exists())
         self.assertEqual(rrn.workspace_for(self.root/'workspace','raw'),self.root/'workspace')
 
-    def test_selected_reference_is_raw_and_changes_pair_identity_and_metadata(self):
-        with patch.object(core,'fit_irmad',wraps=core.fit_irmad) as fit:
-            reference=rrn.prepare_period('20240106',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
-            self.assertEqual(reference.source,self.sources['20240106']);fit.assert_not_called()
-            first=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True)
-            second=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
-            self.assertEqual(fit.call_count,2)
-        self.assertNotEqual(first.metadata['cache_identity'],second.metadata['cache_identity'])
-        audit=json.loads(Path(second.metadata['audit']).read_text())
-        self.assertEqual(audit['config']['reference_period'],'20240106')
-        with rasterio.open(second.source/'v0001.tif') as ds:
-            self.assertEqual(ds.tags()['RRN_REFERENCE'],'20240106')
+    def test_short_workspace_retains_full_identity_and_rejects_collision(self):
+        identity='a'*64
+        base=self.root/'new_task'/'workspace'
+        short=rrn.workspace_for(base,identity)
+        self.assertEqual(len(short.name),16)
+        self.assertFalse(base.exists())
+        rrn.reserve_workspace_identity(short,identity)
+        self.assertEqual(rrn.workspace_for(base,identity),short)
+        marker=json.loads((short/'workspace_identity.json').read_text())
+        self.assertEqual(marker['radiometric_identity'],identity)
+        with self.assertRaisesRegex(ValueError,'身份冲突'):
+            rrn.workspace_for(base,'a'*16+'b'*48)
+
+    def test_fixed_reference_and_old_full_cache_invalidation(self):
+        with self.assertRaisesRegex(ValueError,'固定为 20250118'):
+            rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
+        current=rrn.request_identity(True,'20260203',{'source':'same'})
+        with patch.object(rrn,'VERSION','irmad_pif_tls_v1'):
+            old=rrn.request_identity(True,'20260203',{'source':'same'})
+        self.assertNotEqual(current,old)
+        self.assertEqual(rrn.PARAMETERS['fit_sample_limit'],4_000_000)
+
+    def test_deterministic_sample_cap_matches_experiment_indices(self):
+        n=4_000_123;limit=4_000_000
+        values=np.arange(n,dtype=np.int64)
+        sampled=core.uniform_iteration_sample(values,limit)
+        indices=((2*np.arange(limit,dtype=np.int64)+1)*n)//(2*limit)
+        np.testing.assert_array_equal(sampled,indices)
+        np.testing.assert_array_equal(sampled,core.uniform_iteration_sample(values,limit))
+        small=values[:100]
+        self.assertIs(core.uniform_iteration_sample(small,limit),small)
+
+    def test_only_iterations_sampled_final_pif_and_tls_use_full_population(self):
+        # Reduced cap exercises the production split using small real GeoTIFFs.
+        # The public production configuration above remains fixed at four million.
+        with patch.dict(rrn.PARAMETERS,fit_sample_limit=1024), \
+             patch.object(core,'fit_irmad',wraps=core.fit_irmad) as fit, \
+             patch.object(core,'ncp',wraps=core.ncp) as ncp:
+            result=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True)
+        self.assertEqual(len(fit.call_args.args[0]),1024)
+        audit=json.loads(Path(result.metadata['audit']).read_text())
+        self.assertEqual(audit['iteration_pixels'],1024)
+        self.assertEqual(audit['pixels'],64*80-2)
+        # Iterative NCP sees <=1024, both final PIF passes see all 5118 pixels.
+        full_calls=[c for c in ncp.call_args_list if len(c.args[0])>1024]
+        self.assertEqual([len(c.args[0]) for c in full_calls],[audit['pixels']]*2)
+        model={k:np.array(v) for k,v in audit['model'].items()}
+        moments=core.Moments(6)
+        for _,_,block in core.paired_blocks(self.sources['20250118']/'v0001.tif',self.sources['20260203']/'v0001.tif'):
+            block=block.astype('float64');moments.add(block[core.ncp(block,model)>.95])
+        gain,offset,_=core.tls(*moments.result())
+        self.assertEqual(int(moments.n),audit['pif_pixels'])
+        np.testing.assert_array_equal(gain,audit['gain'])
+        np.testing.assert_array_equal(offset,audit['offset'])
 
     def test_grid_mismatch_missing_reference_and_failure_never_fall_back(self):
         with self.assertRaisesRegex(ValueError,'参考期'):

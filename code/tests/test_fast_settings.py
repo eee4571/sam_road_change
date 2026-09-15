@@ -26,7 +26,7 @@ class FastSettingsTests(unittest.TestCase):
         variables={k:Variable(v) for k,v in SETTING_DEFAULTS.items()}
         variables['output_root']=Variable('out')
         variables['patch_radiometric_normalization'].set('0')
-        variables['irmad'].set('1');variables['irmad_reference'].set('20240106')
+        variables['irmad'].set('1');variables['irmad_reference'].set('20250118')
         page=SimpleNamespace(vars=variables,project_config={},project_root_path='',project_data_sources=[],
             project_scan_cache={},project_txt_encodings={},project_path_relocations={},project_validation_areas=[],
             project_area_periods={},project_area_truths=[],project_area_truth_field_configs={},project_candidates={},
@@ -47,7 +47,7 @@ class FastSettingsTests(unittest.TestCase):
         config=Fast2CompensationConfig(False,True,False,True).to_dict()
         base=dict(mode='grid',source_root=str(Path.cwd()),output_root='out',checkpoint='m',config='c',
                   device='cpu',pixel_size='0',rescale='off',absolute='2',ratio='.2',tolerance='3')
-        commands=[build_pipeline_command(**base,irmad=True,irmad_reference='20240106',fast2_compensation=config),
+        commands=[build_pipeline_command(**base,irmad=True,irmad_reference='20250118',fast2_compensation=config),
                   TaskManager.build_rerun_change('manifest','g','a','b',fast2_compensation=config),
                   TaskManager.build_rerun_period('manifest','g','a',fast2_compensation=config),
                   TaskManager.build_rerun_all_changes('manifest',fast2_compensation=config),
@@ -56,7 +56,7 @@ class FastSettingsTests(unittest.TestCase):
             args=pipeline.parser().parse_args(command)
             self.assertEqual(Fast2CompensationConfig.resolve(args.fast2_compensation).to_dict(),config)
         args=pipeline.parser().parse_args(commands[0])
-        self.assertTrue(args.irmad);self.assertEqual(args.irmad_reference,'20240106')
+        self.assertTrue(args.irmad);self.assertEqual(args.irmad_reference,'20250118')
 
     def test_selected_pair_rerun_receives_settings_and_invalidates_identity(self):
         config=Fast2CompensationConfig(False,True,True,False)
@@ -80,7 +80,7 @@ class FastSettingsTests(unittest.TestCase):
     def test_gui_defaults_and_no_automatic_coupling(self):
         variables={k:Variable(v) for k,v in SETTING_DEFAULTS.items()}
         expected=compensation_values(variables)
-        variables['irmad'].set('1');variables['irmad_reference'].set('20240106')
+        variables['irmad'].set('1');variables['irmad_reference'].set('20250118')
         self.assertEqual(compensation_values(variables),expected)
         variables['width_temporal_bias_correction'].set('0')
         self.assertEqual(variables['irmad'].get(),'1')

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import shutil
 import struct
 import tempfile
 import unittest
@@ -60,6 +61,23 @@ def write_required_outputs(output: Path, image: Path, *, seconds: float = 1.0) -
 
 
 class ImageResumeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows long-path regression')
+    def test_long_path_prepare_and_interrupted_backup_restore(self):
+        # Reproduce a >260-character backup path without model inference.
+        output=self.root/('a'*80)/('b'*80)/('c'*50)/'road_graphs'/'grid_tiles'
+        manager=ImageResumeManager(output,self.identity,enabled=True)
+        image=self.image('v000001')
+        self.assertGreater(len(str(manager.backup_root)),260)
+        recovery=write_required_outputs(manager.output_dir,image)
+        manager.prepare_for_processing(image)
+        backups=list(manager.backup_root.iterdir())
+        self.assertEqual(len(backups),1)
+        self.assertTrue((backups[0]/'backup_manifest.json').is_file())
+        restored=ImageResumeManager(output,self.identity,enabled=True)
+        for spec in required_image_outputs(restored.output_dir,image.stem):
+            self.assertTrue(Path(spec['path']).is_file())
+        self.assertFalse(any(restored.backup_root.iterdir()))
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -78,6 +96,11 @@ class ImageResumeTests(unittest.TestCase):
         self.identity = build_batch_identity(self.checkpoint, self.config, self.parameters)
 
     def tearDown(self) -> None:
+        if os.name == 'nt':
+            from engine.samroad.image_resume import _resume_filesystem_path
+            # Only remove this test's exact generated temporary directory.
+            self.assertEqual(self.root.resolve(),Path(self.temporary.name).resolve())
+            shutil.rmtree(_resume_filesystem_path(self.root.resolve()))
         self.temporary.cleanup()
 
     def image(self, stem: str) -> Path:

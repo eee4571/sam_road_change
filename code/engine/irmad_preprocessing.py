@@ -17,8 +17,10 @@ from threadpoolctl import threadpool_limits
 from . import irmad_core as core
 
 REFERENCE = '20250118'
-VERSION = 'irmad_pif_tls_v1'
+VERSION = 'fast_irmad_pif_tls_v2'
 PARAMETERS = dict(max_iterations=30, tolerance=.01, ncp_threshold=.95, chunk=262144,
+                  fit_sample_limit=4_000_000,
+                  sampling='equal-bin midpoints of all common-valid pixels in original tile/row order',
                   minimum_common_pixels=1000, regression='orthogonal_TLS', threads=1,
                   output='uint8_rint_clip_valid_range_deflate', grid='strict_identity_no_warp')
 
@@ -30,6 +32,8 @@ def digest(value):
 def configuration(enabled=False, reference_period=REFERENCE):
     reference_period = str(reference_period).strip()
     if not reference_period: raise ValueError("IR-MAD 参考期不能为空")
+    if enabled and reference_period != REFERENCE:
+        raise ValueError(f'Fast IR-MAD 参考期固定为 {REFERENCE}，请更新任务参考期设置')
     return dict(enabled=bool(enabled),reference_period=reference_period,version=VERSION,parameters=PARAMETERS.copy())
 
 
@@ -51,7 +55,28 @@ def extraction_matches(entry,identity):
 def workspace_for(base,identity):
     # A switched input never reuses old model intermediates, even after interruption.
     base=Path(base)
-    return base if identity=='raw' else base/'radiometric'/identity
+    if identity=='raw':return base
+    workspace=base/'radiometric'/identity[:16]
+    marker=workspace/'workspace_identity.json'
+    if marker.is_file() and json.loads(marker.read_text(encoding='utf8')).get('radiometric_identity')!=identity:
+        raise ValueError(f'归一化工作目录身份冲突，禁止复用：{workspace}')
+    return workspace
+
+
+def reserve_workspace_identity(workspace,identity):
+    if identity=='raw':return
+    workspace=Path(workspace)
+    workspace.mkdir(parents=True,exist_ok=True)
+    # The short directory is only a locator, never the cache identity. Reserve
+    # it with the entire digest, including before input preparation completes.
+    marker=workspace/'workspace_identity.json'
+    try:
+        with marker.open('x',encoding='utf8') as handle:
+            json.dump({'radiometric_identity':identity},handle)
+    except FileExistsError:
+        recorded=json.loads(marker.read_text(encoding='utf8'))
+        if recorded.get('radiometric_identity')!=identity:
+            raise ValueError(f'归一化工作目录身份冲突，禁止复用：{workspace}')
 
 
 def save(path,value):
@@ -75,7 +100,8 @@ def pair_tiles(reference,target):
 
 
 def normalize_pair(pairs,out,*,reference_period=REFERENCE):
-    """Promoted experiment run: full population -> IR-MAD -> NCP>.95 -> TLS."""
+    """Fast iteration sample; final NCP/PIF/TLS still use the entire population."""
+    config=configuration(True,reference_period)
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     tick=time.perf_counter();path=out/'paired_valid_rgb.bin';counts=[]
     with path.open('xb') as handle:
@@ -89,15 +115,29 @@ def normalize_pair(pairs,out,*,reference_period=REFERENCE):
     z=np.memmap(path,mode='r',dtype='uint8',shape=(n,6))
     try:
         with threadpool_limits(limits=1):
-            model,trace,selected,converged=core.fit_irmad(z,max_iterations=30,tolerance=.01)
+            sampling_start=time.perf_counter()
+            sample=core.uniform_iteration_sample(z,PARAMETERS['fit_sample_limit'])
+            iteration_pixels=len(sample)
+            sampling_seconds=time.perf_counter()-sampling_start
+            print(f'[Fast IR-MAD] iteration_pixels={iteration_pixels} / valid_pixels={n}; final PIF/TLS=all',flush=True)
+            fit_start=time.perf_counter()
+            model,trace,selected,converged=core.fit_irmad(sample,max_iterations=30,tolerance=.01)
+            iterations_seconds=time.perf_counter()-fit_start
+            del sample
+            pif_start=time.perf_counter()
             moments=core.Moments(6)
             for i in range(0,len(z),core.CHUNK):
                 block=np.asarray(z[i:i+core.CHUNK],dtype='float64')
                 moments.add(block[core.ncp(block,model)>.95])
             gain,offset,correlations=core.tls(*moments.result())
+            pif_tls_seconds=time.perf_counter()-pif_start
     finally:
         z._mmap.close()
-    result=dict(config=configuration(True,reference_period),selected_iteration=selected,converged=converged,
+    result=dict(config=config,selected_iteration=selected,converged=converged,
+                iteration_pixels=iteration_pixels,fit_sample_limit=PARAMETERS['fit_sample_limit'],
+                sampling=PARAMETERS['sampling'],
+                timings=dict(sampling_seconds=sampling_seconds,iterations_seconds=iterations_seconds,
+                             full_population_pif_tls_seconds=pif_tls_seconds),
                 pixels=n,pif_pixels=int(moments.n),pif_fraction=moments.n/n,
                 gain=gain.tolist(),offset=offset.tolist(),pif_correlation=correlations,
                 trace=trace,model={k:v.tolist() for k,v in model.items()},pif_by_tile=[])

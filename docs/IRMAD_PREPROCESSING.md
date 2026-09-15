@@ -1,6 +1,6 @@
 # 正式 IR-MAD 影像预处理
 
-GUI 运行页 → 变化检测 → **Fast2 / 变化检测高级设置** 提供 **跨时相辐射归一化（IR-MAD）**，默认关闭，参考期默认 **20250118**，可以从当前项目期次中选择或输入。
+GUI 运行页 → 变化检测 → **Fast2 / 变化检测高级设置** 提供 **跨时相辐射归一化（IR-MAD）**，默认关闭，参考期固定 **20250118**。
 
 `--irmad-reference 20250118` 指定参考期，未指定时续跑沿用任务设置，新任务默认 20250118。
 
@@ -8,9 +8,9 @@ CLI `all`、`extract-project-period`、`extract-project-all` 支持 `--irmad` / 
 
 流程：原有分析网格准备 → 可选 IR-MAD → 道路提取 → 原有变化检测、GT 后验和 Temporal。IR-MAD 本身不重投影、不插值、不增加几何重采样。它保留输入分析瓦片的 CRS、transform、shape、dtype、NoData 与有效 mask；原有验证区网格准备仍按原流程执行。
 
-## 选定参考与独立拟合
+## 固定参考与独立拟合
 
-- 每个区域必须有选定参考期，参考期直接使用未做辐射归一化的分析影像。
+- 每个区域必须有固定参考期，参考期直接使用未做辐射归一化的分析影像。
 - 每个其他期次与原始参考期独立计算 IR-MAD、PIF 和 TLS；不使用上一目标期的 PIF、参数或 normalized 影像。
 - 与实验一致：一个目标期的全部配对瓦片共同参与该期的全像元统计，期内共享其 TLS 参数。不同目标期独立拟合。
 - 瓦片必须同名、严格共网格，且为三个 uint8 RGB 波段。不满足条件时报错，不隐式转换或回退原图。
@@ -19,7 +19,8 @@ CLI `all`、`extract-project-period`、`extract-project-all` 支持 `--irmad` / 
 
 `code/engine/irmad_core.py` 原样迁入实验中的数学及 TIFF 写出函数；回归测试逐函数比较 AST，防止改变算法。
 
-- 全共同有效像元，float64 流式矩，chunk=262144；SVD CCA。
+- IR-MAD 迭代最多使用 4,000,000 个共同有效像元，按原瓦片/行顺序的有效像元流等分取中点；与实验 Fast IR-MAD 抽样完全一致。float64 流式矩，chunk=262144；SVD CCA。
+- 最终 NCP、NCP > 0.95 的 PIF 筛选和 orthogonal/TLS 均使用全部共同有效像元。正式流程不提供 Full 全像元迭代选项。
 - 最多 30 次迭代，相关系数变化收敛阈值 0.01。
 - NCP > 0.95 为 PIF；每波段 orthogonal/TLS：reference = gain × target + offset。
 - 保留实验未收敛时选择最小 delta 迭代的处理，并在 audit 记录 `converged=false`；没有改成另一种模型。
@@ -37,4 +38,8 @@ CLI `all`、`extract-project-period`、`extract-project-all` 支持 `--irmad` / 
 
 验证使用三期合成 GeoTIFF 和调度桩：参考期零拟合，两目标期独立拟合；输出网格/逐波段 mask/NoData/原文件哈希不变；开关、缓存命中与失效、续跑、GPU 预取输入、任务复制后的缓存路径和错误传播。未运行真实区域模型推理。
 
-Fast2 四项跨期补偿在同一面板独立勾选，默认全开；不会随 IR-MAD 启停自动改变。设置保存在项目 `fast_settings`，变化重跑使用界面当前补偿选项，期次局部重跑的 IR-MAD 沿用原任务配置。修改 IR-MAD 参考期后，请通过完整运行/续跑重新协调相关期次输入。
+Fast2 四项跨期补偿在同一面板独立勾选，默认全开；不会随 IR-MAD 启停自动改变。设置保存在项目 `fast_settings`，变化重跑使用界面当前补偿选项，期次局部重跑的 IR-MAD 沿用原任务配置。Fast IR-MAD 参考期固定 20250118，旧任务若保存了其他参考期会明确报错；请更新参考期后续跑。
+
+Fast IR-MAD 缓存版本为 `fast_irmad_pif_tls_v2`，身份包含 4,000,000 抽样上限及确定性抽样方式；不会命中旧 Full 缓存。审计记录 `iteration_pixels`、`pixels`、采样/迭代/全量 PIF-TLS 耗时。
+
+Windows 路径长度：归一化模型工作目录使用 `radiometric/<identity 前16位>/`，完整身份保存在 `workspace_identity.json` 与输入 manifest，冲突明确拒绝复用。历史64位目录保留；未完成的期次使用新短目录继续，IR-MAD 影像缓存不变。SAMRoad 的续跑标记/备份文件操作使用 Windows 扩展路径，不要求更改注册表。

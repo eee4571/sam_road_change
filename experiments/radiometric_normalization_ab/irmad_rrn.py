@@ -52,10 +52,10 @@ def paired_blocks(ref, target):
             yield w, valid, np.concatenate([x[:, valid].T, y[:, valid].T], axis=1)
 
 
-def prepare_pixels(pairs):
+def prepare_pixels(pairs, output_dir=OUT):
     """Cache every mutually valid RGB pair, without spatial or semantic sampling."""
-    OUT.mkdir(parents=True, exist_ok=True)
-    path = OUT / 'paired_valid_rgb.bin'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / 'paired_valid_rgb.bin'
     if path.exists():
         raise FileExistsError(path)
     counts = []
@@ -70,7 +70,7 @@ def prepare_pixels(pairs):
     n = sum(c['valid_pairs'] for c in counts)
     if n < 1000:
         raise ValueError('Insufficient common valid pixels')
-    save(OUT/'paired_tiles.json', counts)
+    save(output_dir/'paired_tiles.json', counts)
     return np.memmap(path, mode='r', dtype='uint8', shape=(n, 6))
 
 
@@ -200,36 +200,55 @@ def write_normalized(source, dest, gain, offset):
     return dict(source=str(source), output=str(dest), valid_pixels=valid_count, clipped_low_high_per_band=clips.tolist(), grid_mask_nodata_verified=True)
 
 
-def run():
+def uniform_iteration_sample(z, limit):
+    """One deterministic midpoint per equal-sized bin in the valid-pixel stream."""
+    if limit is None or len(z)<=limit:
+        return z
+    if limit<1:raise ValueError('Sample limit must be positive')
+    indices=((2*np.arange(limit,dtype=np.int64)+1)*len(z))//(2*limit)
+    return z[indices]
+
+
+def run(output_dir=OUT, fit_sample_limit=None):
     start = time.perf_counter()
     pairs = list(paired_tiles())
-    z = prepare_pixels(pairs)
+    z = prepare_pixels(pairs, output_dir)
     cache_seconds = time.perf_counter()-start
     tick = time.perf_counter()
     with threadpool_limits(limits=1):
-        model, trace, selected, converged = fit_irmad(z)
+        sample = uniform_iteration_sample(z, fit_sample_limit)
+        sampling_seconds = time.perf_counter()-tick
+        fit_start = time.perf_counter()
+        model, trace, selected, converged = fit_irmad(sample)
         fit_seconds = time.perf_counter()-tick
+        iterations_seconds = time.perf_counter()-fit_start
+        pif_start = time.perf_counter()
         moments = Moments(6)
         for i in range(0, len(z), CHUNK):
             block = np.asarray(z[i:i+CHUNK], dtype='float64')
             moments.add(block[ncp(block, model)>.95])
         gain, offset, correlation = tls(*moments.result())
-    config = dict(method='IR-MAD full-population CCA + NCP PIF + orthogonal TLS',
+        pif_tls_seconds = time.perf_counter()-pif_start
+    config = dict(method='IR-MAD CCA + full-population NCP PIF + orthogonal TLS',
                   reference='20250118', target='20260203', ncp_threshold=.95, max_iterations=30,
                   convergence_delta=.01, selected_iteration=selected, converged=converged,
                   pixels=len(z), pif_pixels=int(moments.n), pif_fraction=moments.n/len(z),
+                  iteration_pixels=len(sample), fit_sample_limit=fit_sample_limit,
+                  sampling='equal-bin midpoints of all common-valid pixels in original tile/row order',
                   gain=gain.tolist(), offset=offset.tolist(), pif_correlation=correlation,
                   trace=trace, model={k:v.tolist() for k,v in model.items()},
                   grid_strategy='Reuse strictly aligned RAW baseline analysis tiles; no new warp',
                   source='https://github.com/SMByC/ArrNorm', gt_or_road_inputs=False,
-                  timings=dict(cache_seconds=cache_seconds, irmad_fit_seconds=fit_seconds))
-    save(OUT/'normalization.json', config)
+                  timings=dict(cache_seconds=cache_seconds, irmad_fit_seconds=fit_seconds,
+                               sampling_seconds=sampling_seconds, iterations_seconds=iterations_seconds,
+                               full_population_pif_tls_seconds=pif_tls_seconds))
+    save(output_dir/'normalization.json', config)
     print('TLS', config['gain'], config['offset'], 'PIF', moments.n, flush=True)
     pif_counts = []
     tick = time.perf_counter()
     with threadpool_limits(limits=1):
         for ref, target in pairs:
-            path = OUT/'pif'/target.name
+            path = output_dir/'pif'/target.name
             path.parent.mkdir(exist_ok=True)
             with rasterio.open(target) as ds:
                 profile = ds.profile.copy()
@@ -248,13 +267,13 @@ def run():
     config['pif_by_tile'] = pif_counts
     config['timings']['pif_map_seconds'] = time.perf_counter()-tick
     tick = time.perf_counter()
-    config['outputs'] = [write_normalized(t, OUT/'normalized_tiles'/t.name, gain, offset) for _, t in pairs]
-    save(OUT/'normalization.json', config)
+    config['outputs'] = [write_normalized(t, output_dir/'normalized_tiles'/t.name, gain, offset) for _, t in pairs]
+    save(output_dir/'normalization.json', config)
     # Full original T2 output for GIS use; inference uses the unchanged baseline grid above.
-    config['outputs'].append(write_normalized(ROOT/'inputs/raw/20260203.tif', OUT/'normalized_native/20260203.tif', gain, offset))
+    config['outputs'].append(write_normalized(ROOT/'inputs/raw/20260203.tif', output_dir/'normalized_native/20260203.tif', gain, offset))
     config['timings']['write_verify_seconds'] = time.perf_counter()-tick
     config['timings']['normalization_total_seconds'] = time.perf_counter()-start
-    save(OUT/'normalization.json', config)
+    save(output_dir/'normalization.json', config)
     print('NORMALIZATION COMPLETE', config['timings'], flush=True)
 
 

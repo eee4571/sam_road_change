@@ -11,6 +11,14 @@ import time
 
 CHUNK = 262144
 
+def uniform_iteration_sample(z, limit):
+    """One deterministic midpoint per equal-sized bin in the valid-pixel stream."""
+    if limit is None or len(z)<=limit:
+        return z
+    if limit<1:raise ValueError('Sample limit must be positive')
+    indices=((2*np.arange(limit,dtype=np.int64)+1)*len(z))//(2*limit)
+    return z[indices]
+
 def windows(ds):
     for row in range(0, ds.height, 128):
         yield Window(0, row, ds.width, min(128, ds.height-row))
