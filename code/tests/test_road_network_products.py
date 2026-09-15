@@ -24,13 +24,14 @@ class NetworkProductTests(unittest.TestCase):
                                           LineString([(130,0),(230,0)]),
                                           LineString([(1000,1000),(1020,1000)])],crs=32650)
 
-    def test_region_connects_across_tiles_and_audits_island(self):
-        result,stats,audits = recover_centerline_frame(self.frame())
-        self.assertEqual(stats['connection_components_after'],1)
-        self.assertEqual(stats['connection_isolated_removed_count'],1)
-        self.assertAlmostEqual(result.length.sum(),230)
+    def test_region_connects_supported_gap_and_preserves_independent_road(self):
+        surface=gpd.GeoDataFrame(geometry=[box(-10,-10,240,10)],crs=32650)
+        result,stats,audits = recover_centerline_frame(self.frame(),surface)
+        self.assertEqual(stats['connection_components_after'],2)
+        self.assertEqual(stats['connection_isolated_removed_count'],0)
+        self.assertAlmostEqual(result.length.sum(),250)
         self.assertEqual(len(audits['connection_input']),3)
-        self.assertEqual(len(audits['removed_isolated_roads']),1)
+        self.assertNotIn('removed_isolated_roads',audits)
         self.assertEqual(result.iloc[0].src_ids,'0,1')
 
     def test_manual_authoritative_and_empty_inputs_preserved(self):
@@ -56,7 +57,8 @@ class NetworkProductTests(unittest.TestCase):
     def test_new_gap_width_is_not_marked_as_a_direct_measurement(self):
         source = self.frame()
         source['quality_grade'] = 'A'
-        final,_,audits = recover_centerline_frame(source)
+        surface=gpd.GeoDataFrame(geometry=[box(-10,-10,240,10)],crs=32650)
+        final,_,audits = recover_centerline_frame(source,surface)
         segments,_ = rebuild_network_width_products(final,source,
                           connection_input=audits['connection_input'])
         gap = segments[segments.geometry.map(lambda g: 103<g.centroid.x<127)]
@@ -80,7 +82,7 @@ class NetworkProductTests(unittest.TestCase):
                 final=gpd.read_file(output/'roads.gpkg',layer='centerlines')
                 measured=gpd.read_file(output/'roads.gpkg',layer='width_segments')
                 self.assertLess(unary_union(final.geometry).symmetric_difference(unary_union(measured.geometry)).length,.001)
-                self.assertAlmostEqual(final.length.sum(),230)
+                self.assertAlmostEqual(final.length.sum(),250)
                 first=list(final.geometry.to_wkb())
                 with patch("engine.road_network_products.recover_centerline_frame", side_effect=AssertionError("repeated recovery")):
                     export_fast_products(width,output)

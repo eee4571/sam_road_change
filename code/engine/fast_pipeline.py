@@ -2982,10 +2982,15 @@ def export_fast_products(
         NETWORK_REPORT, recover_centerline_frame, write_network_report, rebuild_network_width_products,
     )
     from .product_cache import signature, read_completed, write_completed
+    from .road_connection_evidence import probability_sources, molra_sources
+    connection_probability_sources=probability_sources(image_dir,width_dir)
+    connection_molra_sources=molra_sources(width_dir)
     marker = output_dir/'fast_export_cache.json'
     inputs = signature([working, validation_area, __file__,
+                        *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
                         Path(__file__).with_name('road_network_connection.py'),
+                        Path(__file__).with_name('road_connection_evidence.py'),
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),
                         WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py']) + [str(image_dir)]
@@ -3017,6 +3022,7 @@ def export_fast_products(
             frames[layer] = gpd.clip(frame, masks[key])
     frames['centerlines'], connection_stats, connection_audits = recover_centerline_frame(
         frames['centerlines'], frames['surfaces'],
+        probability_sources=connection_probability_sources,molra_sources=connection_molra_sources,
     )
     frames['width_segments'], frames['corridors'] = rebuild_network_width_products(
         frames['centerlines'], frames['width_segments'],

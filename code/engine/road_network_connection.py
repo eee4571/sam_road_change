@@ -276,6 +276,7 @@ def _continuations(ports,roads,maximum,surface):
                 continue
             score = distance+16*lateral+distance*(2*(1-facing)+(1-turn))-8*support
             row = _row(a,b.road,roads,distance,lateral,support,score,'continuation')
+            row['direction_cosine']=float(facing)
             row['second_trim_wkt'] = _trim_wkt(b,roads)
             result.append(_Candidate(a,b,b.road,curve,score,row))
     return result
@@ -316,6 +317,7 @@ def _attachments(ports,roads,lines,tree,maximum,surface):
                 support = _support(curve,surface)
                 score = distance*(1+2*(1-facing))-5*support
                 candidate = _Candidate(port,None,j,curve,score,_row(port,j,roads,distance,0,support,score,'junction_attachment'))
+                candidate.row['direction_cosine']=float(facing)
                 if best is None or score<best.score:
                     best = candidate
             if best is not None:
@@ -523,7 +525,7 @@ def retain_main_component(roads):
     return kept, removed
 
 
-def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=None,unit_size_m: float=1.0,*,max_gap_m: float=300.0,keep_main_component: bool=False):
+def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=None,unit_size_m: float=1.0,*,max_gap_m: float=300.0,keep_main_component: bool=False,evidence=None):
     """Recover a noded planar network with paired trajectory constraints.
     Replaced corridor segments are audited; elsewhere only endpoint tails may
     move, within 7 m and 20% of track length. Elevations are not inferred.
@@ -549,9 +551,36 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
     started=time.perf_counter()
     baseline = _metrics(noded)
     corridors = infer_track_corridors(active,max_gap_m)
-    active,replaced,corridor_bridges,cleanup = restore_track_corridors(active,corridors,max_gap_m) if corridors else (active,LineString(),[],dict(connection_redundant_fragment_count=0,connection_redundant_length_m=0.))
+    from .road_connection_evidence import ConnectorPropagation
+    propagation = ConnectorPropagation()
+    bridge_audit = []
+    def accept_bridge(curve,sources):
+        row=dict(first_sources=list(sources),second_sources=[],distance_m=LineString(curve).length,
+                 lateral_offset_m=0.,score=0.,kind='corridor_reconstruction',status='candidate',
+                 needs_review=False,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=LineString(curve))
+        accepted=evidence.evaluate(curve,row)
+        row['propagation_depth']=1
+        row['status']='accepted' if accepted else 'image_evidence_rejected'
+        bridge_audit.append(row)
+        if accepted:propagation.add(curve,1)
+        return accepted
+    active,replaced,corridor_bridges,cleanup = restore_track_corridors(
+        active,corridors,max_gap_m,bridge_accept=accept_bridge if evidence is not None else None
+    ) if corridors else (active,LineString(),[],dict(connection_redundant_fragment_count=0,connection_redundant_length_m=0.))
     active = _join_chains(_node_network(active) if corridors else noded)
-    audit = [dict(first_sources=list(sources),second_sources=[],distance_m=line.length,lateral_offset_m=0.,surface_support=_support(line.coords,surface),score=0.,kind='corridor_reconstruction',status='accepted',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=line) for line,sources in corridor_bridges]
+    audit = bridge_audit if evidence is not None else [dict(first_sources=list(sources),second_sources=[],distance_m=line.length,lateral_offset_m=0.,surface_support=_support(line.coords,surface),score=0.,kind='corridor_reconstruction',status='accepted',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=line) for line,sources in corridor_bridges]
+    def qualify(candidates):
+        if evidence is None:return candidates
+        qualified=[]
+        for c in candidates:
+            accepted=evidence.evaluate(c.points,c.row)
+            depth=propagation.depth(c.points)
+            c.row['propagation_depth']=depth
+            if depth>2 and c.row['gap_length_m']>evidence.short_gap_m:
+                accepted=False;c.row['decision_reason']='connector_propagation_limit'
+            if accepted:qualified.append(c)
+            else:c.row['status']='image_evidence_rejected'
+        return qualified
     if not replaced.is_empty:
         audit.append(dict(first_sources=[],second_sources=[],distance_m=replaced.length,lateral_offset_m=0.,surface_support=0.,score=0.,kind='corridor_replacement',status='replaced',needs_review=True,first_trim_wkt='',second_trim_wkt='',round=-1,geometry=replaced))
     timing['network_corridor_recovery'] += time.perf_counter()-started
@@ -569,7 +598,7 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
         candidates = _continuations(ports,active,max_gap_m,surface)
         timing['network_candidates'] += time.perf_counter()-started
         started=time.perf_counter()
-        selected = _select(candidates,active,lines,tree,graph,corridors)
+        selected = _select(qualify(candidates),active,lines,tree,graph,corridors)
         timing['network_selection'] += time.perf_counter()-started
         audit.extend({**c.row,'round':rounds,'geometry':LineString(c.points)} for c in candidates)
         if not selected:
@@ -577,13 +606,16 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
             candidates = _attachments(ports,active,lines,tree,min(150,max_gap_m),surface)
             timing['network_candidates'] += time.perf_counter()-started
             started=time.perf_counter()
-            selected = _select(candidates,active,lines,tree,graph,corridors)
+            selected = _select(qualify(candidates),active,lines,tree,graph,corridors)
             timing['network_selection'] += time.perf_counter()-started
             audit.extend({**c.row,'round':rounds,'geometry':LineString(c.points)} for c in candidates)
         if not selected:
             break
         additions.extend(selected)
         started=time.perf_counter()
+        if evidence is not None:
+            for c in selected:
+                propagation.add(c.points,c.row['propagation_depth'])
         active = _apply(active,selected)
         timing['network_apply_noding'] += time.perf_counter()-started
         rounds += 1

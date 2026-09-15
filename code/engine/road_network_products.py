@@ -7,7 +7,7 @@ from pathlib import Path
 import json
 from .fast_timing import timed_stage
 
-NETWORK_CONNECTION_VERSION = 1
+NETWORK_CONNECTION_VERSION = 4
 NETWORK_REPORT = 'road_network_report.json'
 
 
@@ -61,7 +61,7 @@ def network_products_current(directory):
 
 
 @timed_stage("regional_network_recovery")
-def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
+def recover_centerline_frame(frame, surfaces=None, *, authoritative=False, probability_sources=(), probability_arrays=(), molra_sources=()):
     """Recover one period/region; keep original CRS and trace every source row."""
     import geopandas as gpd
     import numpy as np
@@ -92,7 +92,17 @@ def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
     seeds = [_RegionalRoadSeed(np.asarray(row.geometry.coords),float(widths[i]),(i,))
              for i,row in metric.iterrows()]
     surface = unary_union(surfaces.to_crs(projected).geometry) if surfaces is not None and not surfaces.empty else None
-    connected, stats, audit = connect_clean_road_seeds(seeds,surface,unit,keep_main_component=True)
+    from .road_connection_evidence import ConnectionEvidence, RoadProbability, ArrayRoadProbability
+    from shapely.affinity import scale
+    probability=(ArrayRoadProbability(probability_arrays,frame.crs,projected,unit) if probability_arrays
+                 else RoadProbability(probability_sources,projected,unit))
+    evidence=ConnectionEvidence(scale(surface,xfact=unit,yfact=unit,origin=(0,0)) if surface is not None else None,
+                                probability,RoadProbability(molra_sources,projected,unit))
+    connected, stats, audit = connect_clean_road_seeds(seeds,surface,unit,keep_main_component=False,evidence=evidence)
+    for row in audit:
+        row.setdefault('decision_reason',row['status'])
+        if row['status'] not in ('accepted','image_evidence_rejected'):
+            row['decision_reason']=row['status']
     rows = []
     for index,road in enumerate(connected):
         source = max(road.source_ids,key=lambda i: metric.geometry.iloc[i].length)
@@ -119,7 +129,9 @@ def recover_centerline_frame(frame, surfaces=None, *, authoritative=False):
                 for row in audit if row['status'] not in categories]
     if rejected:
         audits['rejected_connections'] = gpd.GeoDataFrame(rejected,geometry='geometry',crs=projected).to_crs(frame.crs)
-    stats.update(policy='recovered_main_component',metric_crs=str(projected),
+    stats.update(policy='short_gap_continuity_long_gap_limited_keep_independent_roads',metric_crs=str(projected),
+                 connection_short_gap_m=evidence.short_gap_m,connection_maximum_gap_m=evidence.maximum_gap_m,
+                 connection_image_rejected_count=sum(row['status']=='image_evidence_rejected' for row in audit),
                  connection_total_added_count=sum(row['status']=='accepted' for row in audit),
                  width_policy='existing_observation_widths_inherited_on_connections')
     print(f"[Road network] Retained {len(result)} lines; removed "

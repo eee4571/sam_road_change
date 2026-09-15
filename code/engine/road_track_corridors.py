@@ -234,7 +234,7 @@ def infer_track_corridors(roads, maximum_gap=300.0):
     return result
 
 
-def restore_track_corridors(roads, corridors, maximum_gap=300.0):
+def restore_track_corridors(roads, corridors, maximum_gap=300.0, *, bridge_accept=None):
     """Retain supported axial pieces and fill gaps in their longitudinal order.
 
     Unstable pieces between the two trajectories are replaced, including old
@@ -409,8 +409,13 @@ def restore_track_corridors(roads, corridors, maximum_gap=300.0):
                         curve = model.point(ss,lane)
                         blend = np.linspace(0,1,len(ss))
                         curve += (1-blend)[:,None]*(points[-1]-curve[0])+blend[:,None]*(xy[0]-curve[-1])
-                    points.extend(curve[1:])
-                    bridges.append((LineString(curve),tuple(sorted(sources | set(source_ids)))))
+                    bridge_sources=tuple(sorted(sources | set(source_ids)))
+                    if bridge_accept is None or bridge_accept(curve,bridge_sources):
+                        points.extend(curve[1:])
+                        bridges.append((LineString(curve),bridge_sources))
+                    else:
+                        finish()
+                        points, sources, widths = [], set(), []
             if not points:
                 points.append(xy[0])
             points.append(xy[1])

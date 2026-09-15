@@ -2050,6 +2050,7 @@ def export_final_products(
         fused_centerline_frame,
         gpd.GeoDataFrame(fused_surfaces,geometry='geometry',crs=crs) if fused_surfaces else None,
         authoritative=canonical_is_authoritative,
+        probability_arrays=centerline_probability_sources,
     )
     exported_centerlines = fused_centerline_frame.to_dict('records')
     width_conversion_started = time.perf_counter()
