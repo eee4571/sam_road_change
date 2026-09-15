@@ -18,7 +18,8 @@ def main():
     import engine.fast_auto_v2
     import app.fast_settings
     names=['test_irmad_preprocessing','test_raw_image_width_backend','test_raw_road_surfaces',
-           'test_fast_auto_v2','test_fast2_compensation','test_fast_production_finalization']
+           'test_fast_auto_v2','test_fast2_compensation','test_fast_production_finalization',
+           'test_rgb_production_chain','test_fast_batch_runtime','test_user_pipeline']
     suite=unittest.defaultTestLoader.loadTestsFromNames(names)
     result=unittest.TextTestRunner(verbosity=1).run(suite)
     for name,module in list(sys.modules.items()):

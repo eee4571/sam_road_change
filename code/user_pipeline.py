@@ -72,7 +72,8 @@ PERIOD_STAGE_DEFINITIONS = (
 FAST_PERIOD_STAGE_DEFINITIONS = (
     ("centerline", "道路概率推理"),
     ("surface", "Final Fast Mask"),
-    ("width", "快速道路宽度"),
+    ("width", "中心线后处理"),
+    ("regional", "区域路网恢复与RGB影像边界测宽"),
     ("export", "道路产品导出"),
 )
 ATOMIC_REPLACE_ATTEMPTS = 12
@@ -1138,6 +1139,8 @@ def extract_project_period(args: argparse.Namespace) -> dict:
     selected=getattr(args,'irmad',None)
     irmad_enabled=bool(selected if selected is not None else ((prior.get('input_spec') or {}).get('irmad') or {}).get('enabled',False))
     irmad_reference=getattr(args,'irmad_reference',None) or ((prior.get('input_spec') or {}).get('irmad') or {}).get('reference_period','20250118')
+    from engine.irmad_preprocessing import reference_for
+    irmad_reference=reference_for(irmad_reference,args.area_id) if irmad_enabled else irmad_reference
     raw_sources={item['period']:Path(item['source']) for item in area['periods']} if irmad_enabled else {args.period:Path(period_entry['source'])}
     identities=_radiometric_requests({args.area_id:raw_sources},irmad_enabled,{args.area_id:area['validation_area']},reference_period=irmad_reference)
     identity=identities[(str(args.area_id),str(args.period))]
@@ -2292,6 +2295,8 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             return False
+    if stage_key == "regional":
+        return (context["centerline"].parent / "regional_products.gpkg").is_file() and (context["centerline"].parent / "regional_products.json").is_file()
     if stage_key == "finalize":
         return (
             (context["final_dir"] / "batch_optimized_summary.json").is_file()
@@ -2548,6 +2553,9 @@ def extract(args: argparse.Namespace) -> dict:
     if period_state.get('width_method','sam_molra')!=width_method:
         period_state['stages']['export']='pending'
     period_state['width_method']=width_method
+    if execution_profile=='fast' and width_method=='raw_image' and period_state.get('rgb_pipeline_revision')!=2:
+        for stage in ('surface','width','regional','export'):period_state['stages'][stage]='pending'
+        period_state['rgb_pipeline_revision']=2
     print(f'[Width backend] {width_method}',flush=True)
     period_state.update({
         "status": "running",
@@ -2645,6 +2653,11 @@ def extract(args: argparse.Namespace) -> dict:
             ], ROOT),
         }
         stage_definitions = FAST_PERIOD_STAGE_DEFINITIONS
+    if execution_profile == 'fast':
+        stage_commands['width'][0].extend(['--width-method',width_method])
+        regional=list(stage_commands['export'][0]);regional[3]='regional'
+        regional.extend(['--width-method',width_method])
+        stage_commands['regional']=(regional,ROOT)
     stage_commands['export'][0].extend(['--width-method',width_method])
     if resume:
         stage_commands["centerline"][0].append("--resume-existing-images")
@@ -2737,8 +2750,8 @@ def extract(args: argparse.Namespace) -> dict:
     result = _ensure_extract_manifest_fields({
         "workspace": str(workspace), "run_id": run_id, "run_root": str(run_root),
         "centerlines": str(centerline), "surfaces": str(surface), "gpkg": str(gpkg),
-        "width_segments": str(products / "road_width_segments.shp"),
-        "corridors": str(products / "road_corridors.shp"),
+        "width_segments": str(products / ("road_width_segments.gpkg" if execution_profile=="fast" else "road_width_segments.shp")),
+        "corridors": str(products / ("road_corridors.gpkg" if execution_profile=="fast" else "road_corridors.shp")),
         "valid_observation": valid_observation,
         "road_probability": road_probability,
         "width_review": str(width_dir), "final_dir": str(final_dir),
@@ -3867,8 +3880,11 @@ def _normalized_sources_ready(periods: dict[str, Path], output_root: Path) -> di
 def _radiometric_requests(grids, enabled, validation=None, *, reference_period="20250118"):
     """Extraction identity from raw sources, fixed reference and existing grid request."""
     from engine.irmad_preprocessing import fingerprint, request_identity
+    from engine.irmad_preprocessing import reference_for
+    references=reference_period
     identities={}
     for grid,periods in grids.items():
+        reference_period=reference_for(references,grid) if enabled else str(references)
         if enabled and reference_period not in periods:
             raise ValueError(f'区域 {grid} 开启 IR-MAD 必须包含参考期 {reference_period}')
         sources={p:[fingerprint(f) for f in listed_rasters(Path(source))] for p,source in periods.items()} if enabled else {}
@@ -3882,6 +3898,8 @@ def _radiometric_requests(grids, enabled, validation=None, *, reference_period="
 
 def _radiometric_sources(periods, cache_root, *, enabled, identities, grid, reference_period="20250118"):
     from engine.irmad_preprocessing import prepare_period
+    from engine.irmad_preprocessing import reference_for
+    reference_period=reference_for(reference_period,grid) if enabled else reference_period
     outputs={};metadata={}
     for period in periods:
         if enabled:emit('pipeline',stage='IR-MAD 辐射归一化',status='running',grid=grid,period=period)
@@ -4168,7 +4186,8 @@ def check_runtime_environment(args: argparse.Namespace, output_root: Path) -> di
     missing = [str(path) for path in (checkpoint, config) if not path.is_file()]
     if missing:
         raise FileNotFoundError("运行所需模型或配置不存在：\n" + "\n".join(missing))
-    required = (SAMROAD / "inferencer.py", MOLRA / "infer_img.py", WIDTH / "road_change_detection.py")
+    required = (SAMROAD / "inferencer.py", WIDTH / "road_change_detection.py")
+    if getattr(args,"width_method",None)!="raw_image":required += (MOLRA / "infer_img.py",)
     engine_missing = [str(path) for path in required if not path.is_file()]
     if engine_missing:
         raise FileNotFoundError("运行引擎文件不完整：\n" + "\n".join(engine_missing))
@@ -4278,6 +4297,11 @@ def build_preflight_report(
                 if covered is None or not covered.intersects(area_geometry):
                     raise ValueError(f"{area_id} / {period} 期影像与验证区没有空间交集。")
                 missing_area = max(0.0, float(area_geometry.area - covered.intersection(area_geometry).area))
+                ratio=1.-missing_area/max(float(area_geometry.area),1e-9)
+                for detail in details:
+                    if detail['grid']==area_id and detail['period']==period:
+                        detail['footprint_coverage_ratio']=ratio
+                print(f'[数据检查] {area_id}/{period} 影像范围覆盖率={ratio:.1%}；有效像元覆盖率在统一网格阶段记录',flush=True)
                 if area_geometry.area > 0 and missing_area / float(area_geometry.area) > 0.01:
                     warnings.append(f"{area_id}/{period} 的影像边界未覆盖约 {missing_area / float(area_geometry.area):.1%} 验证区；请确认 NoData 和实际覆盖。")
 
@@ -4496,7 +4520,8 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
     input_spec = manifest.get("input_spec") or {}
     from engine.irmad_preprocessing import prepare_period, workspace_for
     irmad_enabled=bool((input_spec.get('irmad') or {}).get('enabled',False))
-    irmad_reference=(input_spec.get('irmad') or {}).get('reference_period','20250118')
+    from engine.irmad_preprocessing import reference_for
+    irmad_reference=reference_for((input_spec.get('irmad') or {}).get('reference_period','20250118'),grid) if irmad_enabled else '20250118'
     radiometric_identity=old.get('radiometric_identity','raw')
     radiometric_metadata=old.get('radiometric_preprocessing',{'config':{'enabled':False}})
     if irmad_enabled:
@@ -5293,6 +5318,8 @@ def run_all(args: argparse.Namespace) -> dict:
     irmad_enabled=bool(irmad_requested if irmad_requested is not None else
                        ((prior_input_spec if resume else {}).get('irmad') or {}).get('enabled',False))
     irmad_reference=getattr(args,'irmad_reference',None) or (((prior_input_spec if resume else {}).get('irmad') or {}).get('reference_period','20250118'))
+    if isinstance(irmad_reference,str) and irmad_reference.lstrip().startswith('{'):
+        irmad_reference=json.loads(irmad_reference)
     input_spec['irmad']=irmad_configuration(irmad_enabled,irmad_reference)
     radiometric_ids=_radiometric_requests(grids,irmad_enabled,validation_area,reference_period=irmad_reference)
 
@@ -5534,6 +5561,7 @@ def run_all(args: argparse.Namespace) -> dict:
 
         result_by_period: dict[tuple[str, str], dict] = {}
         refreshed_periods = set()
+        prepared_inputs=set()
         period_plan = [(g,p,s) for g,periods in grids.items() for p,s in periods.items()]
         for grid_index, (grid_name, periods) in enumerate(grids.items(), start=1):
             safe_grid = clean_name(grid_name)
@@ -5580,7 +5608,7 @@ def run_all(args: argparse.Namespace) -> dict:
                 analysis_source = analysis_sources.get(f"{grid_name}\0{period}", source)
                 try:
                     internal_resume = resume and (grid_name, period) not in invalid_periods
-                    if internal_resume and (workspace / "period_state.json").is_file() and _prepared_workspace_complete(workspace):
+                    if ((grid_name,period) in prepared_inputs or internal_resume and (workspace / "period_state.json").is_file()) and _prepared_workspace_complete(workspace):
                         emit(
                             "pipeline", stage="输入准备", status="skipped", grid=grid_name,
                             period=period, stage_key="prepare", stage_index=0,
@@ -5606,6 +5634,7 @@ def run_all(args: argparse.Namespace) -> dict:
                                 prepare(argparse.Namespace(source=str(analysis_sources.get(f'{g}\0{p}',s)), workspace=str(target),
                                     radiometric_identity=radiometric_ids[(g,p)],
                                     radiometric_preprocessing=radiometric_metadata.get((g,p),{'config':irmad_configuration(False)})))
+                            prepared_inputs.add((g,p))
                             result = list(command)
                             changes = {'--input_txt_dir': target/'batches',
                                        '--output_root': target/'runs'/'roads'/'inference',
@@ -5975,7 +6004,7 @@ def parser() -> argparse.ArgumentParser:
     for command in ('all','extract-project-period','extract-project-all'):
         sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
                                          help='IR-MAD preprocessing before extraction')
-        sub.choices[command].add_argument('--irmad-reference',default=None,choices=['20250118'],help='Fast IR-MAD fixed reference 20250118')
+        sub.choices[command].add_argument('--irmad-reference',default=None,help='IR-MAD reference period or JSON area-to-period map')
     for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-all-periods'):
         sub.choices[command].add_argument('--width-method',choices=['sam_molra','raw_image'],default=None)
     for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):

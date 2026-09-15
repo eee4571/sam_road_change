@@ -86,6 +86,13 @@ class DataPage:
         self.project_validation_field = PathDisplay(area_row, textvariable=self.project_validation_path)
         self.project_validation_field.pack(side=LEFT, fill=X, expand=True)
         ttk.Button(area_row, text="选择...", command=self.replace_project_validation_area).pack(side=LEFT, padx=(5, 0))
+        ref_row=ttk.Frame(area_row)
+        ref_row.pack(side=LEFT,padx=8)
+        ttk.Label(ref_row,text='IR-MAD参考期：').pack(side=LEFT)
+        self.area_irmad_reference=StringVar()
+        self.area_irmad_combo=ttk.Combobox(ref_row,textvariable=self.area_irmad_reference,state='readonly',width=14)
+        self.area_irmad_combo.pack(side=LEFT)
+        self.area_irmad_combo.bind('<<ComboboxSelected>>',self._store_area_reference)
         self.project_config_container = ttk.Frame(config_card)
         self.project_config_container.grid(
             row=2, column=0, sticky="ew",
@@ -439,6 +446,10 @@ class DataPage:
         if self.data_region.get() not in names:
             self.data_region.set(names[0] if names else "")
         region = self._selected_project_region()
+        if hasattr(self,'area_irmad_combo'):
+            values=[str(p) for p,_ in self.project_area_periods.get(region,[])]
+            self.area_irmad_combo.configure(values=values)
+            self.area_irmad_reference.set(self.area_irmad_references.get(region,''))
         area_path = next((path for name, path in self.project_validation_areas if name == region), "")
         self.project_validation_path.set(area_path or "尚未选择验证区。")
         for tree in (self.project_period_tree, self.project_truth_tree):
@@ -511,6 +522,17 @@ class DataPage:
     def _stage_region_changed(self, _event=None) -> None:
         self._refresh_stage_selectors()
 
+    def _store_area_reference(self,_event=None):
+        area=self._selected_project_region()
+        if area:
+            self.area_irmad_references[area]=self.area_irmad_reference.get()
+            self._save_project_config()
+
+    def _reference_settings(self):
+        if self.project_area_periods:
+            return {area:self.area_irmad_references.get(area,'') for area in self.project_area_periods}
+        return self.vars['irmad_reference'].get()
+
     def _project_payload(self) -> dict:
         self._store_truth_field_controls()
         payload = dict(self.project_config)
@@ -523,6 +545,7 @@ class DataPage:
             "txt_encodings": self.project_txt_encodings,
             "path_relocations": self.project_path_relocations,
             "validation_areas": [list(row) for row in self.project_validation_areas],
+            "area_irmad_references": dict(self.area_irmad_references),
             "area_periods": {
                 area: [list(row) for row in rows]
                 for area, rows in self.project_area_periods.items()
@@ -581,6 +604,7 @@ class DataPage:
         self.project_area_truths = [(*key, path) for key, path in truths.items()]
 
     def _apply_project_config(self, payload: dict) -> None:
+        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
         self._truth_field_config_area = ""
         self.project_config = dict(payload)
         self.project_data_sources = [str(Path(value).expanduser().resolve()) for value in payload.get("external_data_sources", []) if str(value).strip()]
@@ -602,6 +626,7 @@ class DataPage:
         self.project_validation_areas = [
             (str(name), str(path)) for name, path in payload.get("validation_areas", [])
         ]
+        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
         self.project_area_periods = {
             str(area): [(str(period), str(source)) for period, source in rows]
             for area, rows in (payload.get("area_periods") or {}).items()
@@ -1110,6 +1135,7 @@ class DataPage:
             "truths": self._truth_values(),
             "validation_areas": self.project_validation_areas,
             "area_truths": self.project_area_truths,
+            "area_irmad_references": dict(self.area_irmad_references),
             "area_periods": self.project_area_periods,
         }
         try:
@@ -1158,6 +1184,7 @@ class DataPage:
             (str(area), str(before), str(after), str(truth))
             for area, before, after, truth in (payload.get("area_truths") or [])
         ]
+        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
         self.project_area_periods = {
             str(area): [(str(period), str(source)) for period, source in rows]
             for area, rows in (payload.get("area_periods") or {}).items()

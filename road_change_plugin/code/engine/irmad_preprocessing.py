@@ -30,11 +30,22 @@ def digest(value):
 
 
 def configuration(enabled=False, reference_period=REFERENCE):
+    if isinstance(reference_period, dict):
+        return dict(enabled=bool(enabled),reference_period=reference_period.copy(),version=VERSION,parameters=PARAMETERS.copy())
     reference_period = str(reference_period).strip()
     if not reference_period: raise ValueError("IR-MAD 参考期不能为空")
-    if enabled and reference_period != REFERENCE:
-        raise ValueError(f'Fast IR-MAD 参考期固定为 {REFERENCE}，请更新任务参考期设置')
     return dict(enabled=bool(enabled),reference_period=reference_period,version=VERSION,parameters=PARAMETERS.copy())
+
+
+def reference_for(value, area):
+    """Resolve a saved per-validation-area reference, or a CLI scalar."""
+    if isinstance(value,str) and value.lstrip().startswith('{'):
+        value=json.loads(value)
+    if isinstance(value,dict):
+        if str(area) not in value or not value[str(area)]:
+            raise ValueError(f'验证区 {area} 尚未选择 IR-MAD 参考期')
+        return str(value[str(area)])
+    return str(value)
 
 
 def fingerprint(path):

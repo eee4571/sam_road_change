@@ -288,8 +288,9 @@ def build_corridors(segments: gpd.GeoDataFrame, period: str = "") -> gpd.GeoData
         if row.get('width_backend')=='raw_image':
             from shapely import from_wkb
             encoded=row.get('raw_corridor_wkb','')
-            if not encoded:continue
-            geometry=from_wkb(encoded)
+            geometry=(from_wkb(encoded) if encoded else row.geometry.buffer(
+                float(row.final_left_distance),single_sided=True).union(row.geometry.buffer(
+                -float(row.final_right_distance),single_sided=True)))
         else:
             geometry = row.geometry.buffer(width * 0.5, cap_style="flat", join_style="round")
         if geometry.is_empty:

@@ -7,8 +7,8 @@ COMPENSATION_LABELS = (
     ('surface_probability_calibration', '道路面与概率跨期校正'),
     ('width_temporal_bias_correction', '道路宽度跨期偏差校正'),
 )
-SETTING_DEFAULTS = dict(width_method='SAM-MoLRA',irmad='0', irmad_reference='20250118',
-                        **{name: '1' for name, _ in COMPENSATION_LABELS})
+SETTING_DEFAULTS = dict(width_method='RGB影像边界测宽',irmad='1', irmad_reference='',
+                        **{name: ('0' if name=='patch_radiometric_normalization' else '1') for name, _ in COMPENSATION_LABELS})
 
 
 def settings_values(variables):
@@ -19,7 +19,9 @@ def settings_values(variables):
 def restore_settings(variables, settings):
     for key, default in SETTING_DEFAULTS.items():
         if key in variables:
-            variables[key].set(default if key == "irmad_reference" else str(settings.get(key, default)))
+            value=str(settings.get(key, default))
+            if key=="width_method" and value=="原始影像边界测宽":value="RGB影像边界测宽"
+            variables[key].set(value)
 
 
 def compensation_values(variables):
@@ -32,6 +34,6 @@ def compensation_arguments(config):
 
 def width_arguments(value):
     if value is None:return []
-    names={'SAM-MoLRA':'sam_molra','原始影像边界测宽':'raw_image','sam_molra':'sam_molra','raw_image':'raw_image'}
+    names={'RGB影像边界测宽':'raw_image','SAM-MoLRA':'sam_molra','原始影像边界测宽':'raw_image','sam_molra':'sam_molra','raw_image':'raw_image'}
     if value not in names:raise ValueError('未知宽度提取方法')
     return ['--width-method',names[value]]

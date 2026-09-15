@@ -56,9 +56,7 @@ class Runner(TaskSignals):
         paths = [self.python_path(), self.root / "runtime/config/samroad_inference.yaml",
                  self.root / "runtime/model/samroad/samroad.ckpt",
                  self.root / "runtime/model/samroad/sam_vit_b_01ec64.pth"]
-        # MoLRA remains upstream recovery evidence, not a selectable final width backend.
-        paths += [self.root / "runtime/model/sam_molra/sam_vit_b_01ec64.pth",
-                  self.root / "runtime/model/sam_molra/adapter.th"]
+        # RGB pipeline requires no MoLRA model resources.
         return [str(p.relative_to(self.root)) for p in paths if not p.is_file()]
 
     def command(self, args):

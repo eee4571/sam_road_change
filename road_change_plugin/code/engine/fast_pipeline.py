@@ -2420,10 +2420,13 @@ def measure_fast_widths(
     molra_threshold: float = 0.5,
     molra_surface_provider=None,
     model_pool=None,
+    width_method='sam_molra',
 ) -> dict:
     if str(WIDTH_ROOT) not in sys.path:
         sys.path.insert(0, str(WIDTH_ROOT))
-    from molra_centerline_width import sample_widths_by_normal
+    sample_widths_by_normal=None
+    if width_method != 'raw_image':
+        from molra_centerline_width import sample_widths_by_normal
 
     batch_started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2468,9 +2471,8 @@ def measure_fast_widths(
             molra_started = time.perf_counter()
             molra_probability_path = molra_probability_cache_dir / f"{image_path.stem}_probability.npy"
             molra_surface_path = molra_cache_dir / f"{image_path.stem}_enhanced_mask.png"
-            molra_probability = _cached_fast_molra_probability(
-                molra_probability_path, binary.shape,
-            )
+            molra_probability = (_cached_fast_molra_probability(
+                molra_probability_path, binary.shape) if width_method!='raw_image' else None)
             molra_cache_hit = molra_probability is not None
             molra_error = ""
             molra_diagnostics = {
@@ -2488,7 +2490,7 @@ def measure_fast_widths(
                     FAST_MLORA_CENTERLINE_NEAR_DISTANCE_M, pixel_size,
                 )),
             }
-            if len(edges) and molra_probability is None:
+            if width_method!='raw_image' and len(edges) and molra_probability is None:
                 try:
                     if molra_surface_provider is not None:
                         molra_probability = _probability01(molra_surface_provider(image_path))
@@ -2528,7 +2530,8 @@ def measure_fast_widths(
                     )
                     molra_probability = None
             valid = dataset.dataset_mask() > 0
-            print(f'[Fast batch timing] molra_inference={time.perf_counter()-molra_started:.6f}s molra_cache_hit={int(molra_cache_hit)}', flush=True)
+            if width_method!='raw_image':
+                print(f'[Fast batch timing] molra_inference={time.perf_counter()-molra_started:.6f}s molra_cache_hit={int(molra_cache_hit)}', flush=True)
         return (image_path, tile_started, mask_path, centerline_path, probability_path, topology_path, nodes, edges, binary, transform, pixel_size, map_pixel_size, molra_started, molra_probability_path, molra_surface_path, molra_probability, molra_cache_hit, molra_error, molra_diagnostics, valid)
 
     from .bounded_pipeline import Prefetch
@@ -2574,11 +2577,10 @@ def measure_fast_widths(
             if not cv2.imwrite(str(mask_path), cleaned_surface * 255):
                 raise OSError(f"Cannot write cleaned Fast surface mask: {mask_path}")
             molra_seconds = time.perf_counter() - molra_started
-            width_rows = measure_fast_path_widths(
-                final_paths, cleaned_surface, pixel_size,
-                molra_binary=molra_binary,
-                sample_function=sample_widths_by_normal,
-            )
+            width_rows = ([dict(width_units=6.,width_source='topology_placeholder') for _ in final_paths]
+                          if width_method=='raw_image' else measure_fast_path_widths(
+                              final_paths, cleaned_surface, pixel_size,
+                              molra_binary=molra_binary,sample_function=sample_widths_by_normal))
             for path_id, path in enumerate(final_paths):
                 line = _world_path(transform, _simplify_path_pixels(path))
                 width = float(width_rows[path_id]["width_units"])
@@ -2685,29 +2687,9 @@ def measure_fast_widths(
             tile_summary["abnormal_width_over_30m_count"] = int(sum(
                 float(row.get("width_units", 0.0)) > 30.0 for row in width_rows
             ))
-            print(
-                f"[Fast Centerline] {image_path.stem}: "
-                f"paths={tile_summary['final_centerline_path_count']}, "
-                f"length={tile_summary['final_centerline_length']:.3f}, "
-                f"width_sources={tile_summary['width_source_counts']}, "
-                f"molra_pixels={tile_summary['raw_molra_mask_pixel_count']}->"
-                f"{tile_summary['enhanced_molra_surface_pixel_count']}, "
-                f"centerline_coverage={tile_summary['raw_molra_centerline_coverage']:.3f}->"
-                f"{tile_summary['enhanced_molra_centerline_coverage']:.3f}, "
-                f"cleanup=centerline-{tile_summary['removed_centerline_component_count']}"
-                f"/{tile_summary['removed_centerline_length_px']:.1f}px, "
-                f"bridge={tile_summary['bridged_gap_count']}"
-                f"/{tile_summary['bridged_gap_length_px']:.1f}px, "
-                f"regularization={tile_summary['regularization_original_path_count']}->"
-                f"{tile_summary['regularization_final_path_count']} paths/"
-                f"{tile_summary['regularization_intersection_count']} intersections/"
-                f"{tile_summary['regularization_seconds']:.3f}s, "
-                f"surface-{tile_summary['removed_surface_component_count']}"
-                f"/{tile_summary['removed_surface_pixel_count']}px, "
-                f"width_over_30m={tile_summary['abnormal_width_over_30m_count']}, "
-                f"molra={molra_seconds:.3f}s, "
-                f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s"
-            )
+            print(f"[Fast Centerline] {image_path.stem}: paths={len(final_paths)}, "
+                  f"length={tile_summary['final_centerline_length']:.1f}m, "
+                  f"elapsed={tile_summary['fast_width_elapsed_seconds']:.3f}s",flush=True)
             image_rows.append(tile_summary)
             (output_dir / f"{image_path.stem}_summary.json").write_text(json.dumps(tile_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -2739,7 +2721,7 @@ def measure_fast_widths(
         "regional_regularization_seconds": 0.0,
     }
     comparison_path = output_dir / "before_after_visualization.png"
-    if layer_records["centerlines"]:
+    if layer_records["centerlines"] and width_method != "raw_image":
         tile_frame = gpd.GeoDataFrame(
             layer_records["centerlines"], geometry="geometry", crs=target_crs,
         )
@@ -2832,7 +2814,7 @@ def measure_fast_widths(
         )
         frame.to_file(working, layer=layer, driver="GPKG", mode="w" if index == 0 else "a")
     summary = {
-        "execution_profile": "fast", "width_source": "enhanced_molra_surface_normal",
+        "execution_profile": "fast", "width_source": "RGB_pending" if width_method=="raw_image" else "enhanced_molra_surface_normal",
         "working_gpkg": str(working), "images": image_rows,
         "before_after_visualization": str(comparison_path),
         **regional_diagnostics,
@@ -2967,8 +2949,8 @@ def _write_fast_period_previews(
     }
 
 
-@timed_stage("period_export")
-def export_fast_products(
+@timed_stage("regional_products")
+def prepare_regional_products(
     width_dir: Path,
     output_dir: Path,
     validation_area: Path | None = None,
@@ -2989,7 +2971,7 @@ def export_fast_products(
     if width_method not in ('sam_molra','raw_image'):raise ValueError(f'Unknown width method: {width_method}')
     from .width.raw_image_backend import original_images
     raw_inputs=original_images(image_dir) if width_method=='raw_image' else []
-    marker = output_dir/'fast_export_cache.json'
+    marker = output_dir/'regional_cache.json'
     inputs = signature([working, validation_area, __file__,*raw_inputs,
                         WIDTH_ROOT/'raw_road_surfaces.py',WIDTH_ROOT/'raw_image_backend.py',WIDTH_ROOT/'raw_boundary_core.py',WIDTH_ROOT/'raw_width_reconstruction.py',
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
@@ -3008,7 +2990,7 @@ def export_fast_products(
         "centerlines": "road_centerlines.shp", "surfaces": "road_surfaces.shp",
         "width_segments": "road_width_segments.shp", "corridors": "road_corridors.shp",
     }
-    gpkg = output_dir / "roads.gpkg"
+    gpkg = output_dir / "regional_products.gpkg"
     gpkg.unlink(missing_ok=True)
     outputs = {}
     frames = {layer: gpd.read_file(working, layer=layer) for layer in mapping}
@@ -3039,26 +3021,48 @@ def export_fast_products(
     if width_method=='raw_image':
         from .width.raw_road_surfaces import build_road_surfaces
         frames['surfaces']=build_road_surfaces(frames['width_segments'],image_path=raw_inputs[0])
+        frames['centerlines']=frames['width_segments'].copy()
         outputs['regular_surface']=True
-    for index, (layer, filename) in enumerate(mapping.items()):
-        frame = frames[layer]
-        target = output_dir / filename
-        frame.to_file(target, driver="ESRI Shapefile", encoding="UTF-8")
-        frame.to_file(gpkg, layer=layer, driver="GPKG", mode="w" if index == 0 else "a")
-        outputs[layer] = str(target.resolve())
-        frames[layer] = frame
-    outputs["gpkg"] = str(gpkg.resolve())
-    outputs["previews"] = _write_fast_period_previews(frames, output_dir, image_dir)
-    outputs["road_extraction"] = outputs["previews"]["fusion"]
-    outputs["road_width"] = outputs["previews"]["width"]
-    outputs["execution_profile"] = "fast"
-    outputs['width_method']=width_method
-    if width_method=='raw_image':
-        outputs['analysis_surfaces']=outputs['corridors']
-    write_network_report(output_dir, connection_stats, connection_audits)
-    write_completed(marker, inputs, outputs,
-                    [outputs[key] for key in mapping] + [gpkg, output_dir/NETWORK_REPORT,
-                     output_dir/'road_network_audit.gpkg', *outputs['previews'].values()])
+    for index,layer in enumerate(mapping):
+        frames[layer].to_file(gpkg,layer=layer,driver='GPKG',mode='w' if index==0 else 'a')
+    write_network_report(output_dir,connection_stats,connection_audits)
+    outputs.update(width_method=width_method,gpkg=str(gpkg.resolve()))
+    (output_dir/'regional_products.json').write_text(json.dumps(outputs),encoding='utf8')
+    write_completed(marker,inputs,outputs,[gpkg,output_dir/'regional_products.json',
+        output_dir/NETWORK_REPORT,output_dir/'road_network_audit.gpkg'])
+    return outputs
+
+
+@timed_stage("period_export")
+def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=None, width_method='sam_molra'):
+    """Serialize completed regional products. No reconstruction or measurement."""
+    from .product_cache import signature,read_completed,write_completed
+    output_dir=Path(output_dir)
+    source=output_dir/'regional_products.gpkg'
+    if not source.is_file():raise FileNotFoundError(f'Regional products must be prepared before export: {source}')
+    identity=signature([source,__file__])+[width_method,str(image_dir)]
+    marker=output_dir/'fast_export_cache.json';cached=read_completed(marker,identity)
+    if cached:return cached
+    mapping={'centerlines':'road_centerlines.shp','surfaces':'road_surfaces.shp',
+             'width_segments':'road_width_segments.gpkg','corridors':'road_corridors.gpkg'}
+    frames={key:gpd.read_file(source,layer=key) for key in mapping}
+    outputs={};gpkg=output_dir/'roads.gpkg';gpkg.unlink(missing_ok=True)
+    for i,(key,filename) in enumerate(mapping.items()):
+        frame=frames[key];target=output_dir/filename
+        if target.suffix=='.gpkg':
+            target.unlink(missing_ok=True);frame.to_file(target,layer=key,driver='GPKG')
+            for old in output_dir.glob(target.stem+'.*'):
+                if old.suffix.lower() in ('.shp','.shx','.dbf','.prj','.cpg','.qix'):old.unlink()
+        else:
+            public=frame[[c for c in ('parent_id','segment_id','width_m','length_m','area_m2','geometry') if c in frame]]
+            public.to_file(target,driver='ESRI Shapefile',encoding='UTF-8')
+        frame.to_file(gpkg,layer=key,driver='GPKG',mode='w' if i==0 else 'a')
+        outputs[key]=str(target.resolve())
+    outputs.update(gpkg=str(gpkg.resolve()),execution_profile='fast',width_method=width_method)
+    outputs['previews']=_write_fast_period_previews(frames,output_dir,image_dir)
+    outputs['road_extraction']=outputs['previews']['fusion'];outputs['road_width']=outputs['previews']['width']
+    if width_method=='raw_image':outputs.update(regular_surface=True,analysis_surfaces=outputs['corridors'])
+    write_completed(marker,identity,outputs,[*map(Path,(outputs[k] for k in mapping)),gpkg,*outputs['previews'].values()])
     return outputs
 
 
@@ -6768,11 +6772,13 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--molra-tile", type=int, default=1024)
     command.add_argument("--molra-overlap", type=int, default=256)
     command.add_argument("--molra-threshold", type=float, default=0.5)
-    command = sub.add_parser("export")
-    command.add_argument("--width-dir", required=True); command.add_argument("--output-dir", required=True)
     command.add_argument('--width-method',choices=['sam_molra','raw_image'],default='sam_molra')
-    command.add_argument("--image-dir", default="")
-    command.add_argument("--validation-area", default="")
+    for action in ('regional','export'):
+        command = sub.add_parser(action)
+        command.add_argument("--width-dir", required=True); command.add_argument("--output-dir", required=True)
+        command.add_argument('--width-method',choices=['sam_molra','raw_image'],default='sam_molra')
+        command.add_argument("--image-dir", default="")
+        command.add_argument("--validation-area", default="")
     return root
 
 
@@ -6790,12 +6796,13 @@ def main(argv=None, *, model_pool=None) -> int:
             molra_tile=int(args.molra_tile),
             molra_overlap=int(args.molra_overlap),
             molra_threshold=float(args.molra_threshold),
-            model_pool=model_pool,
+            model_pool=model_pool,width_method=args.width_method,
         )
     else:
         validation = Path(args.validation_area) if str(args.validation_area).strip() else None
         image_dir = Path(args.image_dir) if str(args.image_dir).strip() else None
-        export_fast_products(Path(args.width_dir), Path(args.output_dir), validation, image_dir,args.width_method)
+        function=prepare_regional_products if args.command=='regional' else export_fast_products
+        function(Path(args.width_dir), Path(args.output_dir), validation, image_dir,args.width_method)
     return 0
 
 

@@ -82,8 +82,8 @@ class IRMADTests(unittest.TestCase):
             rrn.workspace_for(base,'a'*16+'b'*48)
 
     def test_fixed_reference_and_old_full_cache_invalidation(self):
-        with self.assertRaisesRegex(ValueError,'固定为 20250118'):
-            rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
+        changed=rrn.prepare_period('20260203',self.sources,self.root/'cache',enabled=True,reference_period='20240106')
+        self.assertNotEqual(changed.source,self.sources['20260203'])
         current=rrn.request_identity(True,'20260203',{'source':'same'})
         with patch.object(rrn,'VERSION','irmad_pif_tls_v1'):
             old=rrn.request_identity(True,'20260203',{'source':'same'})

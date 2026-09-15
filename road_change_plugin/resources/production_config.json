@@ -2,7 +2,6 @@
   "execution_profile": "fast",
   "width_method": "raw_image",
   "irmad": true,
-  "irmad_reference": "20250118",
   "fast2_compensation": {
     "patch_radiometric_normalization": false,
     "stable_appearance_calibration": true,

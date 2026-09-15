@@ -604,7 +604,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     if edited_corridors:
         _frame(edited_corridors,metric).to_file(directory/'road_geometry_audit.gpkg',layer='track_corridors',driver='GPKG')
     for key,frame in frames.items():
-        path=directory/f'road_{key if key!="centerlines" else "centerlines"}.shp'
+        path=directory/f'road_{key}.{"gpkg" if key in ("width_segments","corridors") else "shp"}'
         exported=frame.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs)
         if key in ('surfaces','corridors'):exported=_export_polygons(exported)
         if '_original_row' in exported:

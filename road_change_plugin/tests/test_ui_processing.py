@@ -54,10 +54,12 @@ class ProcessingUiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         fixture(self.root)
+        check=patch('plugin.controller.Controller.inspect_data',return_value={'periods':[]});check.start();self.addCleanup(check.stop)
         self.plugin = create_plugin()
         self.widget = self.plugin.create_widget()
         self.widget.project.edit.setText(str(self.root))
-        self.widget._scanned(scan_project(self.root))
+        model=scan_project(self.root);model['area_irmad_references']={'北区':'2020','南区':'2022'}
+        self.widget._scanned(model)
 
     def tearDown(self):
         self.widget.close()
@@ -231,6 +233,20 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget._failed({"message": "测试错误", "detail": "错误详情"})
         self.assertIn("测试错误", self.widget.task_line.text())
         self.assertFalse(self.widget.failure_details.isHidden())
+
+    def test_area_reference_selection_persists_independently(self):
+        self.widget.reference_area.setCurrentText('北区')
+        self.widget.reference_period.setCurrentText('2022')
+        restored=scan_project(self.root)
+        self.assertEqual(restored['area_irmad_references'],{'北区':'2022','南区':'2022'})
+        self.widget.reference_area.setCurrentText('南区')
+        self.widget.reference_period.setCurrentText('2020')
+        restored=scan_project(self.root)
+        self.assertEqual(restored['area_irmad_references'],{'北区':'2022','南区':'2020'})
+        command=self.widget.controller.build_command('all',self.widget._data())
+        references=json.loads(command[command.index('--irmad-reference')+1])
+        self.assertEqual(references,restored['area_irmad_references'])
+        self.assertEqual(restored['truths'],self.widget.model['truths'])
 
     def test_host_can_override_local_appearance(self):
         application_style = APP.styleSheet()

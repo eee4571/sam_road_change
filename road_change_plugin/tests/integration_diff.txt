@@ -1,0 +1,387 @@
+diff --git a/code/engine/width/raw_image_backend.py b/code/engine/width/raw_image_backend.py
+index 42f9f44..480ab09 100644
+--- a/code/engine/width/raw_image_backend.py
++++ b/code/engine/width/raw_image_backend.py
+@@ -14,31 +14,16 @@ from .raw_boundary_core import Config, ImageReader, load_roads, measure_road
+ from .raw_width_reconstruction import ReconstructionConfig, reconstruct_chain
+ from .raw_width_records import rows_for_road, flag_crossings
+ 
+-VERSION=1
++VERSION=2
+ FIELDS=('final_left_distance','final_right_distance','final_width','final_confidence','width_source','outlier_reason')
+ 
+ def original_images(image_dir):
+-    """Follow the existing IR-MAD provenance, never measure its normalized RGB."""
+-    directory=Path(image_dir).resolve()
+-    workspace=directory.parent/'input_manifest.json'
+-    if workspace.is_file():
+-        source=Path(json.loads(workspace.read_text(encoding='utf8')).get('source',''))
+-        if source.is_dir() and source.resolve()!=directory and (source/'normalized_cache.json').is_file():
+-            return original_images(source)
+-    marker=directory/'normalized_cache.json'
+-    if marker.is_file():
+-        data=json.loads(marker.read_text(encoding='utf8'))
+-        if data.get('irmad_identity'):
+-            directory=Path(data['source']).resolve()
+-    files=sorted(directory.glob('*.tif'))
+-    if not files:raise FileNotFoundError(f'Raw boundary width requires original images: {directory}')
+-    # Workspaces may use links to the normalized cache. Check resolved parent.
+-    parents={p.resolve().parent for p in files}
+-    if len(parents)==1 and next(iter(parents))!=directory:
+-        parent=next(iter(parents))
+-        if (parent/'normalized_cache.json').is_file():return original_images(parent)
++    """Read the exact tiles used by inference, including IR-MAD RGB."""
++    files=sorted(Path(image_dir).glob('*.tif'))
++    if not files:raise FileNotFoundError(f'RGB width requires inference tiles: {image_dir}')
+     return files
+ 
++
+ def quality(row):
+     source=row['width_source']
+     if source=='measured':return 'A'
+@@ -80,14 +65,11 @@ def observation_segments(samples,roads,crs):
+ def measure_region(centerlines,image_dir,output_dir):
+     """One regional chain solve, including chains crossing source image tiles."""
+     from ..product_cache import signature,read_completed,write_completed
+-    from contextlib import ExitStack
+-    import rasterio
+-    from rasterio.merge import merge
+     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
+     files=original_images(image_dir)
+     c=Config(max_roads=0,min_length=0);rc=ReconstructionConfig()
+     identities=signature([*files,__file__,Path(__file__).with_name('raw_boundary_core.py'),
+-        Path(__file__).with_name('raw_width_reconstruction.py'),Path(__file__).with_name('raw_width_records.py')])
++        Path(__file__).with_name('raw_width_reconstruction.py'),Path(__file__).with_name('raw_width_records.py'),Path(__file__).with_name('raw_feature_cache.py')])
+     import hashlib
+     identities += [str(VERSION),str(centerlines.crs),hashlib.sha256(b''.join(centerlines.geometry.to_wkb())).hexdigest(),
+                    json.dumps(asdict(c),sort_keys=True),json.dumps(asdict(rc),sort_keys=True)]
+@@ -96,39 +78,57 @@ def measure_region(centerlines,image_dir,output_dir):
+     started=time.perf_counter();source=output/'final_centerline_input.gpkg'
+     centerlines.to_file(source,layer='centerlines',driver='GPKG')
+     roads,junctions,crs,_=load_roads(source,'centerlines',c)
+-    image=files[0]
+-    if len(files)>1:
+-        image=output/'regional_rgb.tif'
+-        with ExitStack() as stack:
+-            datasets=[stack.enter_context(rasterio.open(p)) for p in files]
+-            first=datasets[0]
+-            for ds in datasets:
+-                if ds.crs!=first.crs or ds.res!=first.res:raise ValueError('Raw boundary images must share CRS and pixel resolution')
+-            merge(datasets,dst_path=image,mem_limit=64,dst_kwds={'compress':'LZW','tiled':True,'BIGTIFF':'IF_SAFER'})
+-    reader=ImageReader(image,crs);tree=cKDTree(junctions) if len(junctions) else None
+-    frames=[];road_map={}
++    from concurrent.futures import ThreadPoolExecutor
++    import os
++    reader=ImageReader(files,crs);tree=cKDTree(junctions) if len(junctions) else None
++    road_map={f'road_{i:05d}':line for i,line in enumerate(roads)}
++    def solve(item):
++        road_id,line=item
++        data=measure_road(reader,line,tree,c);flag_crossings(data)
++        return reconstruct_chain(pd.DataFrame(rows_for_road(road_id,data)),rc)
+     try:
+-        for i,line in enumerate(roads):
+-            road_id=f'road_{i:05d}';road_map[road_id]=line
+-            data=measure_road(reader,line,tree,c);flag_crossings(data)
+-            frame=pd.DataFrame(rows_for_road(road_id,data))
+-            frames.append(reconstruct_chain(frame,rc))
+-            if i%100==0:print(f'[Raw width] regional chains {i+1}/{len(roads)}',flush=True)
+-    finally:reader.ds.close()
++        with ThreadPoolExecutor(max_workers=min(4,os.cpu_count() or 1)) as pool:
++            frames=list(pool.map(solve,road_map.items()))
++    finally:reader.close()
+     if not frames:raise ValueError('No regional roads available for raw boundary width')
+-    samples=pd.concat(frames,ignore_index=True);samples.to_csv(output/'samples.csv',index=False)
++    samples=pd.concat(frames,ignore_index=True)
+     observations=observation_segments(samples,road_map,crs).to_crs(centerlines.crs)
+     path=output/'width_observations.gpkg';observations.to_file(path,layer='width_observations',driver='GPKG')
++    profile=gpd.GeoDataFrame(samples,geometry=gpd.points_from_xy(samples.center_x,samples.center_y),crs=crs)
++    profile.to_file(path,layer='point_profiles',driver='GPKG')
++    (output/'samples.csv').unlink(missing_ok=True)
+     manifest=dict(observations=str(path.resolve()),backend='raw_image',version=VERSION,
+         config=asdict(c),reconstruction=asdict(rc),images=[str(p) for p in files],
++        feature_cache=dict(hits=reader.feature_cache.hits,misses=reader.feature_cache.misses,evictions=reader.feature_cache.evictions,bytes=reader.feature_cache.bytes,max_bytes=reader.feature_cache.max_bytes),
+         chains=len(roads),samples=len(samples),quality=observations.quality_grade.value_counts().to_dict(),
+         seconds=time.perf_counter()-started)
+     (output/'summary.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf8')
+-    write_completed(marker,identities,manifest,[path,output/'samples.csv',output/'summary.json'])
+-    print(f'[Raw width] completed: {manifest}',flush=True)
++    write_completed(marker,identities,manifest,[path,output/'summary.json'])
++    print(f'[RGB width] chains={len(roads)} samples={len(samples)} seconds={manifest["seconds"]:.3f}',flush=True)
+     return observations
+ 
+ def rebuild_observations(measured):
+-    # Preserve continuous C-grade display profiles instead of reclassifying
+-    # them through the legacy robust A/B-only estimator.
+-    return measured.copy()
++    """One robust A/B-supported representative width per junction-to-junction chain."""
++    from shapely.geometry import LineString
++    records=[]
++    for parent,group in measured.groupby('parent_id',sort=False):
++        group=group.sort_values('segment_id',kind='stable')
++        usable=group[group.quality_grade.isin(['A','B']) & np.isfinite(group.final_width)]
++        evidence=usable if len(usable) else group[np.isfinite(group.final_width)]
++        if evidence.empty:continue
++        weights=evidence.geometry.length.to_numpy()
++        def median(field):
++            values=evidence[field].to_numpy();order=np.argsort(values,kind='stable')
++            return float(values[order[min(len(order)-1,np.searchsorted(np.cumsum(weights[order]),weights.sum()/2))]])
++        left,right=median('final_left_distance'),median('final_right_distance')
++        coords=[]
++        for line in group.geometry:coords.extend(list(line.coords)[1:] if coords else list(line.coords))
++        row=group.iloc[0].to_dict();row.pop('raw_corridor_wkb',None)
++        grade=('A' if (usable.quality_grade=='A').all() else 'B') if len(usable) else 'C'
++        row.update(geometry=LineString(coords),final_left_distance=left,final_right_distance=right,
++            final_width=left+right,width_m=left+right,final_confidence=median('final_confidence'),quality_grade=grade,width_quality=grade,
++            valid_ratio=float(usable.geometry.length.sum()/max(group.geometry.length.sum(),1e-9)),
++            width_source='representative',width_std=float(usable.final_width.std(ddof=0)) if len(usable) else 0.,
++            length_m=float(group.geometry.length.sum()))
++        records.append(row)
++    return gpd.GeoDataFrame(records,geometry='geometry',crs=measured.crs) if records else measured.iloc[:0].copy()
+diff --git a/code/gui/data_page.py b/code/gui/data_page.py
+index 2cc31b5..89dfc74 100644
+--- a/code/gui/data_page.py
++++ b/code/gui/data_page.py
+@@ -86,6 +86,13 @@ class DataPage:
+         self.project_validation_field = PathDisplay(area_row, textvariable=self.project_validation_path)
+         self.project_validation_field.pack(side=LEFT, fill=X, expand=True)
+         ttk.Button(area_row, text="选择...", command=self.replace_project_validation_area).pack(side=LEFT, padx=(5, 0))
++        ref_row=ttk.Frame(area_row)
++        ref_row.pack(side=LEFT,padx=8)
++        ttk.Label(ref_row,text='IR-MAD参考期：').pack(side=LEFT)
++        self.area_irmad_reference=StringVar()
++        self.area_irmad_combo=ttk.Combobox(ref_row,textvariable=self.area_irmad_reference,state='readonly',width=14)
++        self.area_irmad_combo.pack(side=LEFT)
++        self.area_irmad_combo.bind('<<ComboboxSelected>>',self._store_area_reference)
+         self.project_config_container = ttk.Frame(config_card)
+         self.project_config_container.grid(
+             row=2, column=0, sticky="ew",
+@@ -439,6 +446,10 @@ class DataPage:
+         if self.data_region.get() not in names:
+             self.data_region.set(names[0] if names else "")
+         region = self._selected_project_region()
++        if hasattr(self,'area_irmad_combo'):
++            values=[str(p) for p,_ in self.project_area_periods.get(region,[])]
++            self.area_irmad_combo.configure(values=values)
++            self.area_irmad_reference.set(self.area_irmad_references.get(region,''))
+         area_path = next((path for name, path in self.project_validation_areas if name == region), "")
+         self.project_validation_path.set(area_path or "尚未选择验证区。")
+         for tree in (self.project_period_tree, self.project_truth_tree):
+@@ -511,6 +522,17 @@ class DataPage:
+     def _stage_region_changed(self, _event=None) -> None:
+         self._refresh_stage_selectors()
+ 
++    def _store_area_reference(self,_event=None):
++        area=self._selected_project_region()
++        if area:
++            self.area_irmad_references[area]=self.area_irmad_reference.get()
++            self._save_project_config()
++
++    def _reference_settings(self):
++        if self.project_area_periods:
++            return {area:self.area_irmad_references.get(area,'') for area in self.project_area_periods}
++        return self.vars['irmad_reference'].get()
++
+     def _project_payload(self) -> dict:
+         self._store_truth_field_controls()
+         payload = dict(self.project_config)
+@@ -523,6 +545,7 @@ class DataPage:
+             "txt_encodings": self.project_txt_encodings,
+             "path_relocations": self.project_path_relocations,
+             "validation_areas": [list(row) for row in self.project_validation_areas],
++            "area_irmad_references": dict(self.area_irmad_references),
+             "area_periods": {
+                 area: [list(row) for row in rows]
+                 for area, rows in self.project_area_periods.items()
+@@ -581,6 +604,7 @@ class DataPage:
+         self.project_area_truths = [(*key, path) for key, path in truths.items()]
+ 
+     def _apply_project_config(self, payload: dict) -> None:
++        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
+         self._truth_field_config_area = ""
+         self.project_config = dict(payload)
+         self.project_data_sources = [str(Path(value).expanduser().resolve()) for value in payload.get("external_data_sources", []) if str(value).strip()]
+@@ -602,6 +626,7 @@ class DataPage:
+         self.project_validation_areas = [
+             (str(name), str(path)) for name, path in payload.get("validation_areas", [])
+         ]
++        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
+         self.project_area_periods = {
+             str(area): [(str(period), str(source)) for period, source in rows]
+             for area, rows in (payload.get("area_periods") or {}).items()
+@@ -1110,6 +1135,7 @@ class DataPage:
+             "truths": self._truth_values(),
+             "validation_areas": self.project_validation_areas,
+             "area_truths": self.project_area_truths,
++            "area_irmad_references": dict(self.area_irmad_references),
+             "area_periods": self.project_area_periods,
+         }
+         try:
+@@ -1158,6 +1184,7 @@ class DataPage:
+             (str(area), str(before), str(after), str(truth))
+             for area, before, after, truth in (payload.get("area_truths") or [])
+         ]
++        self.area_irmad_references=dict(payload.get("area_irmad_references") or {})
+         self.project_area_periods = {
+             str(area): [(str(period), str(source)) for period, source in rows]
+             for area, rows in (payload.get("area_periods") or {}).items()
+diff --git a/code/user_pipeline.py b/code/user_pipeline.py
+index 5bd1adc..8cd9116 100644
+--- a/code/user_pipeline.py
++++ b/code/user_pipeline.py
+@@ -72,7 +72,8 @@ PERIOD_STAGE_DEFINITIONS = (
+ FAST_PERIOD_STAGE_DEFINITIONS = (
+     ("centerline", "道路概率推理"),
+     ("surface", "Final Fast Mask"),
+-    ("width", "快速道路宽度"),
++    ("width", "中心线后处理"),
++    ("regional", "区域路网恢复与RGB影像边界测宽"),
+     ("export", "道路产品导出"),
+ )
+ ATOMIC_REPLACE_ATTEMPTS = 12
+@@ -1138,6 +1139,8 @@ def extract_project_period(args: argparse.Namespace) -> dict:
+     selected=getattr(args,'irmad',None)
+     irmad_enabled=bool(selected if selected is not None else ((prior.get('input_spec') or {}).get('irmad') or {}).get('enabled',False))
+     irmad_reference=getattr(args,'irmad_reference',None) or ((prior.get('input_spec') or {}).get('irmad') or {}).get('reference_period','20250118')
++    from engine.irmad_preprocessing import reference_for
++    irmad_reference=reference_for(irmad_reference,args.area_id) if irmad_enabled else irmad_reference
+     raw_sources={item['period']:Path(item['source']) for item in area['periods']} if irmad_enabled else {args.period:Path(period_entry['source'])}
+     identities=_radiometric_requests({args.area_id:raw_sources},irmad_enabled,{args.area_id:area['validation_area']},reference_period=irmad_reference)
+     identity=identities[(str(args.area_id),str(args.period))]
+@@ -2292,6 +2295,8 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
+             )
+         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+             return False
++    if stage_key == "regional":
++        return (context["centerline"].parent / "regional_products.gpkg").is_file() and (context["centerline"].parent / "regional_products.json").is_file()
+     if stage_key == "finalize":
+         return (
+             (context["final_dir"] / "batch_optimized_summary.json").is_file()
+@@ -2548,6 +2553,9 @@ def extract(args: argparse.Namespace) -> dict:
+     if period_state.get('width_method','sam_molra')!=width_method:
+         period_state['stages']['export']='pending'
+     period_state['width_method']=width_method
++    if execution_profile=='fast' and width_method=='raw_image' and period_state.get('rgb_pipeline_revision')!=2:
++        for stage in ('surface','width','regional','export'):period_state['stages'][stage]='pending'
++        period_state['rgb_pipeline_revision']=2
+     print(f'[Width backend] {width_method}',flush=True)
+     period_state.update({
+         "status": "running",
+@@ -2645,6 +2653,11 @@ def extract(args: argparse.Namespace) -> dict:
+             ], ROOT),
+         }
+         stage_definitions = FAST_PERIOD_STAGE_DEFINITIONS
++    if execution_profile == 'fast':
++        stage_commands['width'][0].extend(['--width-method',width_method])
++        regional=list(stage_commands['export'][0]);regional[3]='regional'
++        regional.extend(['--width-method',width_method])
++        stage_commands['regional']=(regional,ROOT)
+     stage_commands['export'][0].extend(['--width-method',width_method])
+     if resume:
+         stage_commands["centerline"][0].append("--resume-existing-images")
+@@ -2737,8 +2750,8 @@ def extract(args: argparse.Namespace) -> dict:
+     result = _ensure_extract_manifest_fields({
+         "workspace": str(workspace), "run_id": run_id, "run_root": str(run_root),
+         "centerlines": str(centerline), "surfaces": str(surface), "gpkg": str(gpkg),
+-        "width_segments": str(products / "road_width_segments.shp"),
+-        "corridors": str(products / "road_corridors.shp"),
++        "width_segments": str(products / ("road_width_segments.gpkg" if execution_profile=="fast" else "road_width_segments.shp")),
++        "corridors": str(products / ("road_corridors.gpkg" if execution_profile=="fast" else "road_corridors.shp")),
+         "valid_observation": valid_observation,
+         "road_probability": road_probability,
+         "width_review": str(width_dir), "final_dir": str(final_dir),
+@@ -3867,8 +3880,11 @@ def _normalized_sources_ready(periods: dict[str, Path], output_root: Path) -> di
+ def _radiometric_requests(grids, enabled, validation=None, *, reference_period="20250118"):
+     """Extraction identity from raw sources, fixed reference and existing grid request."""
+     from engine.irmad_preprocessing import fingerprint, request_identity
++    from engine.irmad_preprocessing import reference_for
++    references=reference_period
+     identities={}
+     for grid,periods in grids.items():
++        reference_period=reference_for(references,grid) if enabled else str(references)
+         if enabled and reference_period not in periods:
+             raise ValueError(f'区域 {grid} 开启 IR-MAD 必须包含参考期 {reference_period}')
+         sources={p:[fingerprint(f) for f in listed_rasters(Path(source))] for p,source in periods.items()} if enabled else {}
+@@ -3882,6 +3898,8 @@ def _radiometric_requests(grids, enabled, validation=None, *, reference_period="
+ 
+ def _radiometric_sources(periods, cache_root, *, enabled, identities, grid, reference_period="20250118"):
+     from engine.irmad_preprocessing import prepare_period
++    from engine.irmad_preprocessing import reference_for
++    reference_period=reference_for(reference_period,grid) if enabled else reference_period
+     outputs={};metadata={}
+     for period in periods:
+         if enabled:emit('pipeline',stage='IR-MAD 辐射归一化',status='running',grid=grid,period=period)
+@@ -4168,7 +4186,8 @@ def check_runtime_environment(args: argparse.Namespace, output_root: Path) -> di
+     missing = [str(path) for path in (checkpoint, config) if not path.is_file()]
+     if missing:
+         raise FileNotFoundError("运行所需模型或配置不存在：\n" + "\n".join(missing))
+-    required = (SAMROAD / "inferencer.py", MOLRA / "infer_img.py", WIDTH / "road_change_detection.py")
++    required = (SAMROAD / "inferencer.py", WIDTH / "road_change_detection.py")
++    if getattr(args,"width_method",None)!="raw_image":required += (MOLRA / "infer_img.py",)
+     engine_missing = [str(path) for path in required if not path.is_file()]
+     if engine_missing:
+         raise FileNotFoundError("运行引擎文件不完整：\n" + "\n".join(engine_missing))
+@@ -4278,6 +4297,11 @@ def build_preflight_report(
+                 if covered is None or not covered.intersects(area_geometry):
+                     raise ValueError(f"{area_id} / {period} 期影像与验证区没有空间交集。")
+                 missing_area = max(0.0, float(area_geometry.area - covered.intersection(area_geometry).area))
++                ratio=1.-missing_area/max(float(area_geometry.area),1e-9)
++                for detail in details:
++                    if detail['grid']==area_id and detail['period']==period:
++                        detail['footprint_coverage_ratio']=ratio
++                print(f'[数据检查] {area_id}/{period} 影像范围覆盖率={ratio:.1%}；有效像元覆盖率在统一网格阶段记录',flush=True)
+                 if area_geometry.area > 0 and missing_area / float(area_geometry.area) > 0.01:
+                     warnings.append(f"{area_id}/{period} 的影像边界未覆盖约 {missing_area / float(area_geometry.area):.1%} 验证区；请确认 NoData 和实际覆盖。")
+ 
+@@ -4496,7 +4520,8 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
+     input_spec = manifest.get("input_spec") or {}
+     from engine.irmad_preprocessing import prepare_period, workspace_for
+     irmad_enabled=bool((input_spec.get('irmad') or {}).get('enabled',False))
+-    irmad_reference=(input_spec.get('irmad') or {}).get('reference_period','20250118')
++    from engine.irmad_preprocessing import reference_for
++    irmad_reference=reference_for((input_spec.get('irmad') or {}).get('reference_period','20250118'),grid) if irmad_enabled else '20250118'
+     radiometric_identity=old.get('radiometric_identity','raw')
+     radiometric_metadata=old.get('radiometric_preprocessing',{'config':{'enabled':False}})
+     if irmad_enabled:
+@@ -5293,6 +5318,8 @@ def run_all(args: argparse.Namespace) -> dict:
+     irmad_enabled=bool(irmad_requested if irmad_requested is not None else
+                        ((prior_input_spec if resume else {}).get('irmad') or {}).get('enabled',False))
+     irmad_reference=getattr(args,'irmad_reference',None) or (((prior_input_spec if resume else {}).get('irmad') or {}).get('reference_period','20250118'))
++    if isinstance(irmad_reference,str) and irmad_reference.lstrip().startswith('{'):
++        irmad_reference=json.loads(irmad_reference)
+     input_spec['irmad']=irmad_configuration(irmad_enabled,irmad_reference)
+     radiometric_ids=_radiometric_requests(grids,irmad_enabled,validation_area,reference_period=irmad_reference)
+ 
+@@ -5534,6 +5561,7 @@ def run_all(args: argparse.Namespace) -> dict:
+ 
+         result_by_period: dict[tuple[str, str], dict] = {}
+         refreshed_periods = set()
++        prepared_inputs=set()
+         period_plan = [(g,p,s) for g,periods in grids.items() for p,s in periods.items()]
+         for grid_index, (grid_name, periods) in enumerate(grids.items(), start=1):
+             safe_grid = clean_name(grid_name)
+@@ -5580,7 +5608,7 @@ def run_all(args: argparse.Namespace) -> dict:
+                 analysis_source = analysis_sources.get(f"{grid_name}\0{period}", source)
+                 try:
+                     internal_resume = resume and (grid_name, period) not in invalid_periods
+-                    if internal_resume and (workspace / "period_state.json").is_file() and _prepared_workspace_complete(workspace):
++                    if ((grid_name,period) in prepared_inputs or internal_resume and (workspace / "period_state.json").is_file()) and _prepared_workspace_complete(workspace):
+                         emit(
+                             "pipeline", stage="输入准备", status="skipped", grid=grid_name,
+                             period=period, stage_key="prepare", stage_index=0,
+@@ -5606,6 +5634,7 @@ def run_all(args: argparse.Namespace) -> dict:
+                                 prepare(argparse.Namespace(source=str(analysis_sources.get(f'{g}\0{p}',s)), workspace=str(target),
+                                     radiometric_identity=radiometric_ids[(g,p)],
+                                     radiometric_preprocessing=radiometric_metadata.get((g,p),{'config':irmad_configuration(False)})))
++                            prepared_inputs.add((g,p))
+                             result = list(command)
+                             changes = {'--input_txt_dir': target/'batches',
+                                        '--output_root': target/'runs'/'roads'/'inference',
+@@ -5975,7 +6004,7 @@ def parser() -> argparse.ArgumentParser:
+     for command in ('all','extract-project-period','extract-project-all'):
+         sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
+                                          help='IR-MAD preprocessing before extraction')
+-        sub.choices[command].add_argument('--irmad-reference',default=None,choices=['20250118'],help='Fast IR-MAD fixed reference 20250118')
++        sub.choices[command].add_argument('--irmad-reference',default=None,help='IR-MAD reference period or JSON area-to-period map')
+     for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-all-periods'):
+         sub.choices[command].add_argument('--width-method',choices=['sam_molra','raw_image'],default=None)
+     for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):

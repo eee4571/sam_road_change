@@ -115,7 +115,7 @@ class PluginTests(unittest.TestCase):
                 (root/name).touch()
             manifest = root/"pipeline_result.json"
             manifest.write_text(json.dumps(dict(execution_profile='fast',input_spec=dict(width_method='raw_image',irmad=dict(enabled=True,reference_period='20250118')))))
-            data = dict(areas=[["区1", str(root/"area.shp")]], periods=[["区1", "2020", str(root/"a.txt")], ["区1", "20250118", str(root/"b.txt")]], output=str(root/"成果"), profile="fast", run_id="run_1", resume=True,
+            data = dict(area_irmad_references={"区1":"20250118"},areas=[["区1", str(root/"area.shp")]], periods=[["区1", "2020", str(root/"a.txt")], ["区1", "20250118", str(root/"b.txt")]], output=str(root/"成果"), profile="fast", run_id="run_1", resume=True,
                         manifest=str(manifest), grid="区1", period="2020", before_period="2020", after_period="2021")
             args = controller.build_command("all", data)
             self.assertIn("--resume", args)

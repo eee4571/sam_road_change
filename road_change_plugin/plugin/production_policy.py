@@ -18,7 +18,7 @@ def task_arguments(args, root=ROOT):
         return list(args)
     if action not in {'all','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'}:
         raise ValueError('插件只支持当前正式流程任务')
-    remove={'--execution-profile','--width-method','--fast2-compensation','--irmad-reference'}
+    remove={'--execution-profile','--width-method','--fast2-compensation'}
     result=[action];i=1
     while i<len(args):
         key=str(args[i]).split('=',1)[0]
@@ -29,7 +29,7 @@ def task_arguments(args, root=ROOT):
         else:
             result.append(str(args[i]));i+=1
     if action=='all':
-        result += ['--execution-profile','fast','--irmad','--irmad-reference',settings['irmad_reference']]
+        result += ['--execution-profile','fast','--irmad']
     if action in {'all','rerun-period','rerun-all-periods'}:
         result += ['--width-method','raw_image']
     result += ['--fast2-compensation',json.dumps(settings['fast2_compensation'],sort_keys=True)]
@@ -42,5 +42,5 @@ def check_existing_task(path, root=ROOT):
     settings=configuration(root);spec=data.get('input_spec') or {}
     irmad=spec.get('irmad') or {}
     if (data.get('execution_profile')!='fast' or spec.get('width_method')!='raw_image' or
-            not irmad.get('enabled') or irmad.get('reference_period')!=settings['irmad_reference']):
+            not irmad.get('enabled')):
         raise ValueError('历史任务的影像预处理或测宽方法与当前插件不同，请新建完整任务；不能直接复用旧道路缓存')

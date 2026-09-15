@@ -29,7 +29,7 @@ class FastSettingsTests(unittest.TestCase):
         variables['irmad'].set('1');variables['irmad_reference'].set('20250118')
         page=SimpleNamespace(vars=variables,project_config={},project_root_path='',project_data_sources=[],
             project_scan_cache={},project_txt_encodings={},project_path_relocations={},project_validation_areas=[],
-            project_area_periods={},project_area_truths=[],project_area_truth_field_configs={},project_candidates={},
+            area_irmad_references={},project_area_periods={},project_area_truths=[],project_area_truth_field_configs={},project_candidates={},
             _store_truth_field_controls=lambda:None)
         with tempfile.TemporaryDirectory() as temp:
             page.project_root_path=temp
@@ -41,7 +41,7 @@ class FastSettingsTests(unittest.TestCase):
             self.assertEqual(settings_values(reopened),settings_values(variables))
             restore_settings(reopened,{})
             self.assertEqual(settings_values(reopened),SETTING_DEFAULTS)
-            self.assertEqual(compensation_values(reopened),Fast2CompensationConfig().to_dict())
+            self.assertEqual(compensation_values(reopened),Fast2CompensationConfig(False,True,True,True).to_dict())
 
     def test_all_command_and_every_rerun_builder_forward_custom_flags(self):
         config=Fast2CompensationConfig(False,True,False,True).to_dict()

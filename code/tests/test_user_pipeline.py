@@ -368,7 +368,7 @@ class ProjectPeriodExtractionTests(unittest.TestCase):
                     patch.object(user_pipeline, "_write_probability_mosaic", return_value=None):
                 user_pipeline.extract(args)
 
-            for label in ("Final Fast Mask", "快速道路宽度", "道路产品导出"):
+            for label in ("Final Fast Mask", "中心线后处理", "区域路网恢复与RGB影像边界测宽", "道路产品导出"):
                 command, cwd = commands[label]
                 self.assertEqual(command[1:3], ["-m", "engine.fast_pipeline"])
                 self.assertEqual(cwd, user_pipeline.ROOT)

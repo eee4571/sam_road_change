@@ -90,14 +90,21 @@ class Worker:
             centerline, self.centerline_command = self.centerline_command, None
             planner, self.planner = self.planner, None
             try:
+                preparation_started=time.perf_counter()
                 following = planner(centerline)
+                self.metrics['next_period_preparation']+=time.perf_counter()-preparation_started
             except Exception as exc:
                 # Preparation failure belongs to the following period's normal
                 # execution/retry, never to the already completed current stage.
                 print(f'[Fast batch] prefetch preparation deferred: {exc}', flush=True)
                 return
             if following:
-                self.pending = (command_key(following), self.executor.submit(self._execute, following, cwd, env))
+                self.pending = (command_key(following), self.executor.submit(self._execute_prefetch, following, cwd, env))
+
+    def _execute_prefetch(self,command,cwd,env):
+        started=time.perf_counter()
+        try:return self._execute(command,cwd,env)
+        finally:self.metrics['next_period_prefetch']+=time.perf_counter()-started
 
     def _execute(self, command, cwd, env):
         if self.process is None:

@@ -13,7 +13,7 @@ from plugin.production_policy import configuration,task_arguments,check_existing
 class FixedPolicyTests(unittest.TestCase):
     def test_full_and_reruns_force_current_policy(self):
         for action in ('all','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):
-            args=task_arguments([action,'--execution-profile','full','--width-method=sam_molra',
+            args=task_arguments([action,'--irmad-reference','{"area":"2024"}','--execution-profile','full','--width-method=sam_molra',
                                  '--no-irmad','--fast2-compensation','normalized_input'])
             config=json.loads(args[args.index('--fast2-compensation')+1])
             self.assertFalse(config['patch_radiometric_normalization'])
@@ -21,7 +21,7 @@ class FixedPolicyTests(unittest.TestCase):
             self.assertNotIn('full',args);self.assertNotIn('sam_molra',args)
             if action=='all':
                 self.assertIn('--irmad',args)
-                self.assertEqual(args[args.index('--irmad-reference')+1],'20250118')
+                self.assertEqual(json.loads(args[args.index('--irmad-reference')+1]),{'area':'2024'})
             self.assertEqual(args,task_arguments(args))
 
     def test_old_extraction_cannot_be_relabelled(self):

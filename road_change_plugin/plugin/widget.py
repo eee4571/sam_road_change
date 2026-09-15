@@ -1,5 +1,6 @@
 """Compact processing dock; only UI input selection and presentation live here."""
 import copy
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -220,6 +221,11 @@ class RoadChangeWidget(QWidget):
         self.project.edit.textChanged.connect(self._directory_changed)
         self.scan_button = self._button("扫描数据", self.scan)
         form.addRow(ResponsiveRow("项目 / 数据", self.project, self.scan_button))
+        self.reference_area=QComboBox();self.reference_period=QComboBox()
+        form.addRow('IR-MAD验证区',self.reference_area)
+        form.addRow('IR-MAD参考期',self.reference_period)
+        self.reference_area.currentTextChanged.connect(self._refresh_reference_periods)
+        self.reference_period.currentTextChanged.connect(self._save_reference)
         self.summary = label("尚未扫描", "secondary")
         self.data_tree = QTreeWidget()
         self.data_tree.setHeaderLabels(["区域 / 期次", "识别结果"])
@@ -441,7 +447,33 @@ class RoadChangeWidget(QWidget):
         self.check_note.setText("修正已应用，请重新检查数据")
         self._update_controls()
 
+    def _refresh_reference_periods(self):
+        area=self.reference_area.currentText()
+        self.reference_period.blockSignals(True);self.reference_period.clear();self.reference_period.addItem('')
+        self.reference_period.addItems(sorted({p for a,p,_ in self.model['periods'] if a==area},key=natural))
+        self.reference_period.setCurrentText(self.model.get('area_irmad_references',{}).get(area,''))
+        self.reference_period.blockSignals(False)
+
+    def _save_reference(self):
+        area=self.reference_area.currentText();value=self.reference_period.currentText()
+        if not area:return
+        self.model.setdefault('area_irmad_references',{})[area]=value
+        root=self.model.get('root')
+        if root:
+            path=Path(root)/'project_config.json'
+            try:
+                config=json.loads(path.read_text(encoding='utf8')) if path.is_file() else {}
+                config.update(area_irmad_references=self.model['area_irmad_references'],
+                    project_root=root,output_root=self.model.get('output',''),area_truths=self.model['truths'],
+                    validation_areas=self.model['areas'],area_periods={a:[[p,f] for g,p,f in self.model['periods'] if g==a] for a,_ in self.model['areas']})
+                temporary=path.with_suffix('.json.tmp');temporary.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf8');temporary.replace(path)
+            except (OSError,ValueError) as exc:self.status.setText(f'参考期保存失败：{exc}')
+
     def _draw_catalog(self):
+        old=self.reference_area.currentText()
+        self.reference_area.clear();self.reference_area.addItems([a for a,_ in self.model['areas']])
+        if old:self.reference_area.setCurrentText(old)
+        self._refresh_reference_periods()
         self.data_tree.clear()
         change_pairs = pairs(self.model["periods"])
         gt = {tuple(r[:3]) for r in self.model["truths"] if Path(r[-1]).is_file()}
@@ -462,16 +494,26 @@ class RoadChangeWidget(QWidget):
 
     def check_data(self):
         self.status.setText("正在检查输入文件…")
-        self._background(check_files, (copy.deepcopy(self.model),), self._checked)
+        model=copy.deepcopy(self.model);data=self._data()
+        def inspect():
+            issues=check_files(model)
+            if issues:return {'issues':issues,'coverage':[]}
+            report=self.controller.inspect_data(data)
+            return {'issues':[], 'coverage':[
+                f"{row['grid']}/{row['period']} 影像范围覆盖率 {row['footprint_coverage_ratio']:.1%}"
+                for row in report.get('periods',[]) if 'footprint_coverage_ratio' in row]}
+        self._background(inspect, (), self._checked)
 
     def _checked(self, issues):
+        coverage=[]
+        if isinstance(issues,dict):coverage=issues.get('coverage',[]);issues=issues.get('issues',[])
         issues = self.model.get("issues", []) + issues
         try:
             self.controller.build_command("all", self._data())
         except (ValueError, OSError, TypeError) as exc:
             issues.append(str(exc))
         self.checked = not issues
-        self.check_details.setText("\n".join(issues) if issues else "输入文件与清单检查通过。空间参考与影像内容在正式运行前检查。")
+        self.check_details.setText("\n".join(issues) if issues else "数据检查通过。\n"+'\n'.join(coverage)+"\n有效像元覆盖率将在统一网格阶段记录。")
         self.check_note.setText(f"检查失败 · {len(issues)} 项待修正" if issues else "数据已就绪")
         self.status.setText("检查失败，请展开数据详情修正" if issues else "数据已就绪，可以运行")
         self.state_text.setText("待修正" if issues else "数据已就绪")
@@ -525,7 +567,7 @@ class RoadChangeWidget(QWidget):
         task = self.task.currentData()
         pair = self.pair.currentData() or ("", "")
         run_id = task["id"] if self.resume.isChecked() and task else self.run_id.text()
-        return dict(areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
+        return dict(area_irmad_references=self.model.get("area_irmad_references",{}),areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
                     output=self.output.text(), profile="fast", evaluate=any(Path(row[-1]).is_file() for row in self.model["truths"]),
                     truth_type_field="", run_id=run_id, resume=self.resume.isChecked(),
                     manifest=task["path"] if task else "", grid=self.grid.currentText(), period=self.period.currentText(),

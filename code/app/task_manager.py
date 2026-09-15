@@ -276,7 +276,7 @@ def build_pipeline_command(
     elif runtime_preflight and not preflight_only:
         args.append("--runtime-preflight")
     args.append("--irmad" if irmad else "--no-irmad")
-    args.extend(["--irmad-reference", str(irmad_reference)])
+    args.extend(["--irmad-reference", json.dumps(irmad_reference,ensure_ascii=False) if isinstance(irmad_reference,dict) else str(irmad_reference)])
     args.extend(compensation_arguments(fast2_compensation))
     args.extend(width_arguments(width_method))
     return args
@@ -736,7 +736,7 @@ class TaskManager:
         if continue_on_error:
             args.append("--continue-on-error")
         args.append("--irmad" if irmad else "--no-irmad")
-        args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(["--irmad-reference", json.dumps(irmad_reference,ensure_ascii=False) if isinstance(irmad_reference,dict) else str(irmad_reference)])
         args.extend(width_arguments(width_method))
         return args
 
@@ -757,7 +757,7 @@ class TaskManager:
         if state.is_file():
             args.append("--resume")
         args.append("--irmad" if irmad else "--no-irmad")
-        args.extend(["--irmad-reference", str(irmad_reference)])
+        args.extend(["--irmad-reference", json.dumps(irmad_reference,ensure_ascii=False) if isinstance(irmad_reference,dict) else str(irmad_reference)])
         args.extend(width_arguments(width_method))
         return args
 

@@ -96,7 +96,9 @@ def sample_line(line, c):
 
 class ImageReader:
     def __init__(self, path, metric_crs):
-        self.ds = rasterio.open(path)
+        from .raw_feature_cache import TileMosaic,FeatureCache
+        self.ds = TileMosaic(path if isinstance(path,(list,tuple)) else [path])
+        self.feature_cache=FeatureCache(self.ds)
         if self.ds.count < 3 or self.ds.dtypes[:3] != ('uint8',)*3:
             raise ValueError('Experiment requires three uint8 RGB bands in order 1,2,3')
         if self.ds.crs is None:
@@ -117,9 +119,19 @@ class ImageReader:
         if np.any(hi <= lo):
             raise ValueError('Centerline does not overlap image')
         window = Window(*lo, *(hi-lo))
-        rgb = self.ds.read([1, 2, 3], window=window).transpose(1, 2, 0)
-        valid = (self.ds.read_masks([1, 2, 3], window=window) > 0).all(0)
+        with self.feature_cache.lock:
+            rgb,valid=self.ds.read_window(window)
         return rgb, valid, pix-lo, lo
+
+    def close(self):
+        self.ds.close()
+
+    def features(self,xy,pad=5):
+        pix=self.pixels(xy)
+        lo=np.maximum(np.floor(pix.reshape(-1,2).min(0)-pad),0).astype(int)
+        hi=np.minimum(np.ceil(pix.reshape(-1,2).max(0)+pad+1),[self.ds.width,self.ds.height]).astype(int)
+        if np.any(hi<=lo):raise ValueError('Centerline does not overlap image')
+        return (*self.feature_cache.features(lo,hi),pix-lo)
 
 
 def normalize_feature(a, scale):
@@ -131,21 +143,11 @@ def extract_profiles(reader, xy, normal, c):
     radius = c.search_radius + 2.0
     offsets = np.arange(-radius, radius+c.cross_step/2, c.cross_step)
     points = xy[:, None, :] + normal[:, None, :]*offsets[None, :, None]
-    rgb, mask, pix, _ = reader.crop(points)
-    rgbf = rgb.astype(np.float32)/255
-    lab = cv2.cvtColor(rgbf, cv2.COLOR_RGB2LAB)
-    gray = cv2.cvtColor(rgbf, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (0, 0), 0.8)
-    gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)/8
-    gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)/8
-    edge = np.hypot(gx, gy)
-    canny = cv2.dilate(cv2.Canny((blurred*255).astype('uint8'), 40, 100), np.ones((3, 3), 'uint8'))/255
-    variance = cv2.boxFilter(gray*gray, -1, (7, 7))-cv2.boxFilter(gray, -1, (7, 7))**2
-    texture = np.sqrt(np.maximum(variance, 0))
+    rgbf,lab,edge,canny,texture,valid_mask,pix=reader.features(points)
     coordinates = [pix[..., 1], pix[..., 0]]
     def sample(a, order=1, fill=np.nan):
         return map_coordinates(a, coordinates, order=order, mode='constant', cval=fill)
-    valid = sample(cv2.erode(mask.astype('uint8'), np.ones((3, 3), 'uint8')).astype(float), fill=0) > .99
+    valid = sample(valid_mask, fill=0) > .99
     rgb_profile = np.stack([sample(rgbf[..., k]) for k in range(3)], -1)
     lp = np.stack([sample(lab[..., k]) for k in range(3)], -1)
     lp = np.nan_to_num(lp)

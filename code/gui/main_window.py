@@ -221,6 +221,7 @@ class UserApp(DataPage, RunPage, EditPage, ResultPage):
         self.result_change_items: list[dict] = []
         self.project_validation_areas: list[tuple[str, str]] = []
         self.project_area_truths: list[tuple[str, str, str, str]] = []
+        self.area_irmad_references = {}
         self.project_area_periods: dict[str, list[tuple[str, str]]] = {}
         self.project_data_sources: list[str] = []
         self.project_scan_cache: dict[str, dict] = {}

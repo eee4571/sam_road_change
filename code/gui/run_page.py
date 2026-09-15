@@ -163,7 +163,7 @@ class RunPage:
         reference_row.pack(fill=X, padx=(20, 0), pady=4)
         ttk.Label(reference_row, text="参考期：").pack(side=LEFT)
         self.irmad_reference_combo = ttk.Combobox(reference_row, textvariable=self.vars["irmad_reference"],
-                                                width=16, state="readonly", values=("20250118",))
+                                                width=16, state="readonly", values=())
         self.irmad_reference_combo.pack(side=LEFT)
         self.irmad_reference_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_project_config())
         self.irmad_reference_combo.bind("<FocusOut>", lambda _e: self._save_project_config())
@@ -171,7 +171,7 @@ class RunPage:
         width_row.pack(fill=X,pady=6)
         ttk.Label(width_row,text='宽度提取方法：').pack(side=LEFT)
         width_combo=ttk.Combobox(width_row,textvariable=self.vars['width_method'],state='readonly',
-                                 values=('SAM-MoLRA','原始影像边界测宽'),width=24)
+                                 values=('SAM-MoLRA','RGB影像边界测宽'),width=24)
         width_combo.pack(side=LEFT)
         width_combo.bind('<<ComboboxSelected>>',lambda _e:self._save_project_config())
         compensation = ttk.LabelFrame(self.fast_settings_frame, text="Fast2 跨期补偿", padding=8)
@@ -239,8 +239,7 @@ class RunPage:
         self._schedule_content_layout()
 
     def _refresh_irmad_references(self):
-        self.vars["irmad_reference"].set("20250118")
-        self.irmad_reference_combo.configure(values=("20250118",))
+        self.irmad_reference_combo.configure(values=tuple(p for p,_ in self._period_values()))
 
     def _build_current_command(self, *, preflight_only: bool = False, data_check_only: bool = False) -> list[str]:
         return self.task_manager.build_pipeline(
@@ -264,7 +263,7 @@ class RunPage:
             area_periods=(self.project_area_periods or None),
             execution_profile=self.vars["execution_profile"].get(),
             irmad=(self.vars["irmad"].get() == "1") if "irmad" in self.vars else False,
-            irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+            irmad_reference=self._reference_settings(),
             fast2_compensation=compensation_values(self.vars),
             width_method=self.vars["width_method"].get(),
         )
@@ -478,7 +477,7 @@ class RunPage:
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 continue_on_error=self.vars["continue_on_error"].get() == "1",
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
-                irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+                irmad_reference=self._reference_settings(),
                 width_method=self.vars["width_method"].get(),
             )
         except ValueError as exc:
@@ -501,7 +500,7 @@ class RunPage:
                 rescale=self.vars["rescale"].get(),
                 junction_node_mode=self.vars["junction_node_mode"].get(),
                 irmad=self.vars["irmad"].get() == "1" if "irmad" in self.vars else False,
-                irmad_reference=self.vars["irmad_reference"].get() if "irmad_reference" in self.vars else "20250118",
+                irmad_reference=self._reference_settings(),
                 width_method=self.vars["width_method"].get(),
             )
         except ValueError as exc:

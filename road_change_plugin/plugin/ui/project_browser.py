@@ -64,6 +64,7 @@ def scan_project(directory):
     config_path = root / "project_config.json"
     if config_path.is_file():
         config = read_object(config_path)
+        model["area_irmad_references"]=dict(config.get("area_irmad_references") or {})
         old_root = Path(str(config.get("project_root", ".")))
 
         def configured(value):

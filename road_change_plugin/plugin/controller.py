@@ -102,10 +102,11 @@ class Controller(TaskSignals):
             args += ["--resume"]
         if data.get("truth_type_field", "").strip():
             args += ["--truth-type-field", data["truth_type_field"].strip()]
-        reference=configuration()['irmad_reference']
+        references=data.get('area_irmad_references',{})
         for name in names:
-            if not any(r[0]==name and r[1]==reference for r in periods):
-                raise ValueError(f'{name} 缺少归一化参考期 {reference}')
+            if references.get(name) not in [r[1] for r in periods if r[0]==name]:
+                raise ValueError(f'{name} 请选择已有期次作为 IR-MAD 参考期')
+        args += ['--irmad-reference',json.dumps(references,ensure_ascii=False)]
         return task_arguments(args)
 
     def run(self, action, data):
@@ -146,3 +147,21 @@ class Controller(TaskSignals):
     def runtime_message(self):
         missing = self.runner.missing_runtime()
         return "缺少运行资源：\n" + "\n".join(missing) if missing else "运行资源已就绪"
+
+    def inspect_data(self, data):
+        """Read-only GIS inspection in the independent backend interpreter."""
+        import subprocess
+        args=self.build_command('all',data)+['--data-check-only']
+        executable,command=self.runner.command(args)
+        environment=self.runner.environment()
+        process=subprocess.run([executable,*command],cwd=self.runner.root/'code',
+            env={k:environment.value(k) for k in environment.keys()},capture_output=True,
+            text=True,encoding='utf8',errors='replace',timeout=180,
+            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if process.returncode:
+            raise ValueError((process.stderr or process.stdout)[-2500:])
+        for line in process.stdout.splitlines():
+            if line.startswith('__SAMROAD_USER__'):
+                value=json.loads(line[len('__SAMROAD_USER__'):])
+                if value.get('stage')=='data-check':return value
+        raise ValueError('数据检查未返回报告')

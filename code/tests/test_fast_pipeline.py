@@ -1104,6 +1104,8 @@ class FastWidthTests(unittest.TestCase):
                 images, surfaces, probabilities, widths,
                 molra_surface_provider=lambda _path: molra_mask,
             )
+            from engine.fast_pipeline import prepare_regional_products
+            prepare_regional_products(widths,products,image_dir=images)
             exported = export_fast_products(widths, products, image_dir=images)
             for key in ("centerlines", "surfaces", "width_segments", "corridors", "gpkg"):
                 self.assertTrue(Path(exported[key]).is_file(), key)

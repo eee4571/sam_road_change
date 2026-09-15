@@ -12,26 +12,23 @@ QWidget → Controller → Runner → 插件 runtime/env/samroad_env/python.exe 
 PYTHONPATH、模型、GIS 数据库和子进程全部使用插件目录。主工作台可以移走，插件代码不引用其目录。
 外部影像和用户选择的成果目录仍按输入路径使用。
 
-仅在开发同步时执行 `python tools/sync_backend.py <主工作台目录>`。
-该工具覆盖当前生产副本并移除已废弃的模块，生成 `resources/backend_snapshot.json` 的逐文件 SHA-256。
-运行时不会执行同步工具，也不需要主工作台或其 experiments/tests/_profiling 目录。
-源树中的共用类/函数按原样复制；独立 baseline 不作为插件运行选项或 fallback。
+两套源代码独立维护，不再提供自动覆盖工作台代码的同步脚本。`resources/backend_snapshot.json` 仅记录本插件自己的 SHA-256 校验值。
 
 ## 固定正式配置
 
 `resources/production_config.json`：
 
 - 正式 Fast2 流程；无 Full/Fast1 入口。
-- Fast IR-MAD 开启，参考期 20250118。各目标期独立拟合，参考期使用原图。
+- Fast IR-MAD 开启，参考期由用户在数据页为每个验证区独立选择并保存。各目标期独立拟合，参考期仅使用统一网格原影像。
 - IR-MAD 迭代最多 4,000,000 个确定性抽样像元；最终 NCP、PIF > 0.95、TLS 仍使用全部有效像元。
-- 最终测宽仅使用原始影像边界后端，含异常剔除、连续重建、代表宽度和规则展示面。
+- 最终测宽仅使用 RGB影像边界后端（IR-MAD 后影像），含异常剔除、连续重建、代表宽度和规则展示面。
 - 候选影像局部辐射校正关闭；其余三项补偿开启。
-- 原始细粒度测宽数据继续用于 Fast2，规则展示面不替代分析证据。
+- Fast2 与规则道路面使用路口间稳健代表性宽度；细粒度观测与逐点 profile 仅保存在内部 GPKG。
 
 命令边界统一应用固定配置，忽略旧模式/测宽/补偿参数覆盖。任务日志记录配置；正式后端将其写入 input_spec、诊断和缓存身份。
 完整流程仍为：影像规范化 → 各目标期 IR-MAD → 道路提取和区域后处理 → 原始影像测宽/道路面 → Fast2 → 有真值时后验处理 → 最终道路/变化/长时序 → 有真值时评价。
 
-SAM-MoLRA 仍提供主工作台现有区域恢复所需的辅助证据，因此模型必须安装；它不再是插件可选择的最终测宽方法。
+RGB 正式流程完全跳过 SAM-MoLRA 加载、推理与旧测宽，不需要安装 MoLRA 模型。区域构造在独立 regional 阶段完成，export 只写成果。
 
 ## 安装资源
 
@@ -39,8 +36,6 @@ SAM-MoLRA 仍提供主工作台现有区域恢复所需的辅助证据，因此�
 runtime/env/samroad_env/          完整、可移动的算法 Python 环境
 runtime/model/samroad/samroad.ckpt
 runtime/model/samroad/sam_vit_b_01ec64.pth
-runtime/model/sam_molra/adapter.th
-runtime/model/sam_molra/sam_vit_b_01ec64.pth
 runtime/config/samroad_inference.yaml
 ```
 
@@ -69,6 +64,10 @@ plugin.shutdown()
 同配置完整任务可正常续跑；期次重跑更新相邻变化和长时序，变化重跑更新关联最终成果。
 旧 Raw/SAM-MoLRA/Full 任务允许查看，不自动改写为当前配置。局部重跑发现上游配置不符时明确报错，要求新建完整任务，避免误用旧道路缓存。
 部分失败、子进程异常、取消维持原信号；失败不会误报成功。
+
+## 测宽缓存与验证
+
+RGB/Lab/灰度按块缓存；Gaussian/Sobel/Canny/texture 按完整窗口精确缓存，保留 Canny 的窗口连接语义。共用 128 MiB LRU 上限，最多 4 个 road-chain 求解线程，不写整区 RGB 拼接图。
 
 ## 验证
 
