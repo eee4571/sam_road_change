@@ -243,7 +243,8 @@ class RoadChangeWidget(QWidget):
         form.addRow(self.project_details)
         self.check_note = label('')
         form.addRow(self.check_note)
-        self.configuration = DataConfiguration(self._edited, self._back_to_main, self._save_and_check)
+        self.configuration = DataConfiguration(self._edited, self._back_to_main, self._save_and_check,
+                                                lambda: self._save_and_check(return_to_main=False))
         self.creation = ProjectCreation(self._back_to_main, self._create_project)
         self.check_button = self.configuration.save_button
 
@@ -515,8 +516,8 @@ class RoadChangeWidget(QWidget):
                                           for value in row[-1].splitlines() if value.strip())
         self.checked = False
 
-    def _save_and_check(self):
-        if self.busy or self.browsing or not self.model.get("root") or not self.configuration.period_editor.isHidden():
+    def _save_and_check(self, *, return_to_main=True):
+        if self.busy or self.browsing or not self.model.get("root") or self.configuration.has_pending_edit:
             return
         self._project_revision += 1
         self._apply_corrections()
@@ -531,7 +532,7 @@ class RoadChangeWidget(QWidget):
             return
         self._draft_dirty = False
         self._processing_dirty = False
-        self._return_after_check = True
+        self._return_after_check = return_to_main
         self.check_data()
 
     def _show_problems(self, issues):
@@ -623,7 +624,7 @@ class RoadChangeWidget(QWidget):
         self.creation.body.setEnabled(available)
         self.creation.save_button.setEnabled(available)
         self.configuration.body.setEnabled(available)
-        self.check_button.setEnabled(available and opened and self.configuration.period_editor.isHidden())
+        self.check_button.setEnabled(available and opened and not self.configuration.has_pending_edit)
         self.configure_button.setEnabled(available and opened)
         self.advanced.setEnabled(available)
         self.output.setEnabled(available)

@@ -10,6 +10,8 @@ from .forms import PathField, form_layout
 from .presentation import inline
 from .project_pages import ProjectPage, note
 from .project_browser import natural, pairs, resolve
+from .image_import import FILE_FILTER, folder_files, import_periods
+from .import_confirmation import ImportConfirmation, ImportActions
 
 
 def problem_for(message, prefix):
@@ -37,9 +39,10 @@ def image_count(source, root):
 
 
 class DataConfiguration(ProjectPage):
-    def __init__(self, changed, back, save):
+    def __init__(self, changed, back, save, imported=None):
         super().__init__('数据配置', back, '保存并检查', save)
         self.changed = changed
+        self.imported = imported
         self._loading = False
         self._model = dict(areas=[], periods=[], truths=[], area_irmad_references={})
         self._issues = []
@@ -73,12 +76,17 @@ class DataConfiguration(ProjectPage):
         self.reference.currentIndexChanged.connect(self._reference_changed)
         form.addRow('IR-MAD 参考期', self.reference)
         self.periods = self._table(['期次', '影像', ''])
-        form.addRow('影像期次', self.periods)
-        self.add_period_button = QPushButton('添加期次')
+        self.periods_label = QLabel('影像期次')
+        form.addRow(self.periods_label, self.periods)
+        self.add_period_button = QPushButton('添加文件')
+        self.add_period_button.setToolTip('添加影像期次：批量选择 TXT 或影像')
+        self.add_period_button.setAccessibleName('添加影像期次：添加文件')
+        self.add_folder_button = QPushButton('添加文件夹')
         self.delete_period_button = QPushButton('删除所选期次')
-        self.add_period_button.clicked.connect(lambda: self.edit_period(None))
+        self.add_period_button.clicked.connect(self._import_files)
+        self.add_folder_button.clicked.connect(self._import_folder)
         self.delete_period_button.clicked.connect(self._ask_delete_period)
-        form.addRow(inline(self.add_period_button, self.delete_period_button, stretch_first=False))
+        form.addRow(ImportActions(self.add_period_button, self.add_folder_button, self.delete_period_button))
         self.period_editor = QWidget()
         editor = form_layout(self.period_editor)
         editor.setContentsMargins(0, 8, 0, 8)
@@ -99,6 +107,9 @@ class DataConfiguration(ProjectPage):
         editor.addRow(inline(note(), cancel, self.apply_period_button))
         form.addRow(self.period_editor)
         self.period_editor.hide()
+        self.import_confirmation = ImportConfirmation(self._confirm_import, self._cancel_import, self)
+        form.addRow(self.import_confirmation)
+        self.import_confirmation.hide()
         self.truths = self._table(['变化对', '真值数据', ''])
         form.addRow('变化真值（可选）', self.truths)
         self.form.addRow(self.area_body)
@@ -189,6 +200,7 @@ class DataConfiguration(ProjectPage):
                 table.setRowHeight(row, 32)
             table.setMinimumHeight(min(180, table.horizontalHeader().height() + max(1, min(4, table.rowCount())) * 32 + 4))
         self._editing = None
+        self._cancel_import()
         self._cancel_period()
         self._loading = False
         self.show_issues(self._issues)
@@ -271,6 +283,67 @@ class DataConfiguration(ProjectPage):
         self.scroll.ensureWidgetVisible(self.period_editor)
         self.save_button.setEnabled(False)
 
+    @property
+    def has_pending_edit(self):
+        return not self.period_editor.isHidden() or not self.import_confirmation.isHidden()
+
+    def _import_files(self):
+        paths = QFileDialog.getOpenFileNames(self, '添加影像期次', '', FILE_FILTER)[0]
+        if paths:
+            self.begin_import(paths)
+
+    def _import_folder(self):
+        directory = QFileDialog.getExistingDirectory(self, '添加文件夹（含一级子目录）')
+        if directory:
+            try:
+                self.begin_import(folder_files(directory))
+            except OSError as exc:
+                self.show_issues([f'影像目录无法读取：{exc}'])
+            except ValueError as exc:
+                self.show_issues([str(exc)])
+
+    def begin_import(self, paths):
+        if not self.area.currentText():
+            return
+        drafts, notices = import_periods(paths)
+        if not drafts:
+            self.show_issues(notices or ['未找到支持的影像或 TXT 清单（仅扫描所选目录及一级子目录）'])
+            return
+        self._cancel_period()
+        area = self.area.currentText()
+        self.import_confirmation.heading.setText(f'添加影像期次 · {area}')
+        self.import_confirmation.load(drafts, [p for a, p, _ in self._model['periods'] if a == area], notices)
+        self.import_confirmation.show()
+        self.periods.hide()
+        self.periods_label.hide()
+        for field in self._other_inputs():
+            field.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.scroll.ensureWidgetVisible(self.import_confirmation)
+
+    def _cancel_import(self):
+        self.import_confirmation.hide()
+        self.periods.show()
+        self.periods_label.show()
+        self.save_button.setEnabled(True)
+        for field in self._other_inputs():
+            field.setEnabled(True)
+        self.rename_area_button.setEnabled(bool(self.area.count()))
+        self.delete_area_button.setEnabled(bool(self.area.count()))
+
+    def _confirm_import(self):
+        panel = self.import_confirmation
+        if panel.isHidden() or not panel.validate():
+            return
+        area = self.area.currentText()
+        rows = [[area, row['name'], row['source']] for row in panel.values()]
+        self._model['periods'].extend(rows)
+        self._prune_truths()
+        self._show_area()
+        self.changed()
+        if self.imported:
+            self.imported()
+
     def _cancel_period(self):
         self.period_editor.hide()
         self.save_button.setEnabled(True)
@@ -281,7 +354,8 @@ class DataConfiguration(ProjectPage):
 
     def _other_inputs(self):
         return (self.area, self.add_area_button, self.rename_area_button, self.delete_area_button,
-                self.boundary, self.reference, self.periods, self.truths, self.add_period_button, self.delete_period_button)
+                self.boundary, self.reference, self.periods, self.truths, self.add_period_button,
+                self.add_folder_button, self.delete_period_button)
 
     def _source_caption(self):
         self.source_summary.setText(image_count(self._source, Path(self._model.get('root', '.'))))
@@ -312,6 +386,10 @@ class DataConfiguration(ProjectPage):
         self._model['periods'].append([area, name, source])
         if self._model['area_irmad_references'].get(area) == old:
             self._model['area_irmad_references'][area] = name
+        if old and old != name:
+            for row in self._model['truths']:
+                if row[0] == area:
+                    row[1:3] = [name if value == old else value for value in row[1:3]]
         self._prune_truths()
         self._show_area()
         self.save_button.setEnabled(True)

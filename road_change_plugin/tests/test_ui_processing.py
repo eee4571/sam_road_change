@@ -154,6 +154,33 @@ class ProcessingUiTests(unittest.TestCase):
         page._cancel_period()
         self.assertTrue(page.area.isEnabled())
 
+    def test_batch_import_confirms_once_saves_and_stays_on_configuration_page(self):
+        from plugin.ui.project_browser import save_configuration
+        page = self.widget.configuration
+        self.widget._show_configuration()
+        images = []
+        for name in ('A_20300118_01.tif', 'B_20300118_02.tif', 'C_20310203.tif'):
+            path = self.root / name
+            path.touch()
+            images.append(path)
+        before = (self.root / 'project_config.json').read_bytes()
+        page.begin_import(images)
+        self.widget._save_and_check()
+        self.assertEqual((self.root / 'project_config.json').read_bytes(), before)
+        with patch('plugin.widget.save_configuration', wraps=save_configuration) as save:
+            page.import_confirmation.apply_button.click()
+            self.wait_ready()
+            save.assert_called_once()
+        self.assertEqual(self.widget.pages.currentWidget(), page)
+        periods = scan_project(self.root)['periods']
+        imported = {p: source for area, p, source in periods if area == '北区' and p.startswith('203')}
+        self.assertEqual(set(imported), {'20300118', '20310203'})
+        self.assertEqual(len(Path(imported['20300118']).read_text(encoding='utf8').splitlines()), 2)
+        self.assertTrue(self.widget.checked)
+        self.widget._load_project(self.root)
+        self.wait_ready()
+        self.assertEqual(len([p for a, p, _ in self.widget.model['periods'] if a == '北区']), 5)
+
     def test_reference_selection_is_scoped_and_persists(self):
         page = self.widget.configuration
         self.widget._show_configuration()
