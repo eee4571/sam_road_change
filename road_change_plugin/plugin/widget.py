@@ -1,6 +1,5 @@
 """Compact processing dock; only UI input selection and presentation live here."""
 import copy
-import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -9,13 +8,14 @@ from PySide6.QtCore import Qt, QEvent, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
     QComboBox, QScrollArea, QLabel, QPushButton, QLineEdit,
-    QCheckBox, QProgressBar, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QHeaderView, QGridLayout, QToolButton, QMenu, QGroupBox)
-from .ui.forms import PathField, Rows, Fold, form_layout
-from .ui.presentation import SectionHeader, inline, primary_button, result_menu
+    QCheckBox, QProgressBar, QPlainTextEdit,
+    QGridLayout, QToolButton, QMenu, QGroupBox, QStackedWidget)
+from .ui.forms import PathField, Fold, form_layout
+from .ui.presentation import inline, primary_button, result_menu
 from .ui.appearance import dock_style
+from .ui.data_configuration import DataConfiguration
 from .ui.desktop import ResponsiveRow, ResultChooser
-from .ui.project_browser import ROOT, scan_project, check_files, pairs, discover_tasks, natural, resolve
+from .ui.project_browser import ROOT, scan_project, check_files, pairs, discover_tasks, natural, resolve, save_configuration
 from .ui.background import BrowseJob
 from .ui.evaluation_summary import metrics_text
 from .result_parser import read_results
@@ -59,8 +59,23 @@ class RoadChangeWidget(QWidget):
         self._active_record = "session"
         self._result_keys = set()
         self._project_revision = 0
+        self._jobs = {}
+        self._return_after_check = False
+        self._restoring = False
+        self._draft_dirty = False
+        self._resume_task = None
+        self.open_timer = QTimer(self)
+        self.open_timer.setSingleShot(True)
+        self.open_timer.setInterval(350)
+        self.open_timer.timeout.connect(self.scan)
         self.setObjectName("roadChangeDock")
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.pages = QStackedWidget()
+        outer.addWidget(self.pages)
+        self.main_page = QWidget()
+        self.pages.addWidget(self.main_page)
+        layout = QVBoxLayout(self.main_page)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         logs_button = self._tool_button("记录", lambda: self._reveal(self.records_fold))
@@ -72,6 +87,8 @@ class RoadChangeWidget(QWidget):
         menu = QMenu(more)
         menu.addAction("局部重跑", lambda: self._reveal(self.local))
         menu.addAction("检查运行资源", self._runtime)
+        self.rescan_action = menu.addAction("重新扫描", self.scan)
+        self.recheck_action = menu.addAction("重新检查", self.check_data)
         more.setMenu(menu)
         layout.addWidget(inline(label("道路变化检测", "title"), logs_button, more))
         self.scroll = QScrollArea()
@@ -90,7 +107,7 @@ class RoadChangeWidget(QWidget):
         self._history_section()
         for fold in (self.local, self.records_fold):
             form.addRow(fold)
-        for fold in (self.corrections, self.advanced, self.local, self.records_fold):
+        for fold in (self.advanced, self.local, self.records_fold):
             fold.toggle.hide()
             fold.setVisible(False)
         self.status = label("选择项目目录，开始扫描数据", "secondary")
@@ -99,6 +116,8 @@ class RoadChangeWidget(QWidget):
         self.status.setWordWrap(True)
 
         self._footer(layout)
+        self.pages.addWidget(self.configuration)
+        self.pages.setCurrentWidget(self.main_page)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._tick)
@@ -177,7 +196,7 @@ class RoadChangeWidget(QWidget):
         elif state == "失败":
             self.task_line.setText("失败 · " + getattr(self, "_failure_reason", "请查看详情")[:120])
         else:
-            self.task_line.setText("可以开始处理" if self.checked else "请扫描并检查数据" if self.model["areas"] else "选择项目目录，开始扫描数据")
+            self.task_line.setText("正在准备项目…" if self.browsing else "" if self.checked or self.model["areas"] else "选择项目目录开始")
 
     def _refresh_appearance(self):
         if getattr(self, "_styling", False):
@@ -217,49 +236,39 @@ class RoadChangeWidget(QWidget):
 
     def _data_section(self, form):
         self.project = PathField(directory=True)
-        self.project.edit.setPlaceholderText("选择项目 / 数据目录")
+        self.project.edit.setPlaceholderText("选择项目目录，自动读取和检查数据")
         self.project.edit.textChanged.connect(self._directory_changed)
-        self.scan_button = self._button("扫描数据", self.scan)
-        form.addRow(ResponsiveRow("项目 / 数据", self.project, self.scan_button))
-        self.reference_area=QComboBox();self.reference_period=QComboBox()
-        form.addRow('IR-MAD验证区',self.reference_area)
-        form.addRow('IR-MAD参考期',self.reference_period)
-        self.reference_area.currentTextChanged.connect(self._refresh_reference_periods)
-        self.reference_period.currentTextChanged.connect(self._save_reference)
-        self.summary = label("尚未扫描", "secondary")
-        self.data_tree = QTreeWidget()
-        self.data_tree.setHeaderLabels(["区域 / 期次", "识别结果"])
-        self.data_tree.setMinimumWidth(0)
-        self.data_tree.setMinimumHeight(190)
-        self.data_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.data_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.corrections = Fold("数据详情与修正")
-        self.corrections.form.addRow(self.data_tree)
-        self.check_details = label("暂无检查详情")
-        self.corrections.form.addRow(self.check_details)
-        self.check_note = label("尚未检查")
-        self.check_button = self._button("检查", self.check_data)
-        details = self._button("数据详情", lambda: self._reveal(self.corrections))
-        info = QWidget()
-        info_layout = QGridLayout(info)
-        info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(6)
-        info_layout.addWidget(self.summary, 0, 0, 1, 3)
-        info_layout.addWidget(self.check_note, 1, 0)
-        info_layout.addWidget(self.check_button, 1, 1)
-        info_layout.addWidget(details, 1, 2)
-        info_layout.setColumnStretch(0, 1)
-        form.addRow(ResponsiveRow("", info))
-        form.addRow(self.corrections)
-        self.areas = Rows(["区域", "验证区 SHP"], "Shapefile (*.shp)")
-        self.periods = Rows(["区域", "期次", "影像 TXT"], "影像清单 (*.txt)")
-        self.truths = Rows(["区域", "前期", "后期", "真值文件"], "Shapefile (*.shp)")
-        for title, rows in (("验证区", self.areas), ("影像期次", self.periods), ("可选真值数据", self.truths)):
-            self.corrections.form.addRow(title, rows)
-            rows.table.itemChanged.connect(self._edited)
-            rows.table.model().rowsRemoved.connect(self._edited)
-        self.corrections.form.addRow(self._button("应用修正", self._apply_corrections))
-        self.corrections.form.addRow(label("目录结构：01_验证区 / 02_影像 / 03_变化真值（可选）。也支持 project_config.json。"))
+        self.summary = label("尚未打开项目")
+        self.check_note = label("")
+        self.configure_button = self._button("配置数据", self._show_configuration)
+        self.scan_button = self._button("重新扫描", self.scan)
+        form.addRow(self.project)
+        form.addRow(self.summary)
+        actions = inline(self.configure_button, self.scan_button, stretch_first=False)
+        actions.layout().addStretch(1)
+        form.addRow(actions)
+        form.addRow(self.check_note)
+        self.configuration = DataConfiguration(self._edited, self._back_to_main, self._save_and_check)
+        self.areas, self.periods, self.truths = self.configuration.areas, self.configuration.periods, self.configuration.truths
+        self.check_button = self.configuration.save_button
+        self.resume_button = self._button("继续任务", self._continue_task)
+        form.addRow(self.resume_button)
+
+    def _show_configuration(self):
+        self.pages.setCurrentWidget(self.configuration)
+
+    def _back_to_main(self):
+        self.pages.setCurrentWidget(self.main_page)
+
+    def _continue_task(self):
+        if not self._resume_task or not self.checked or self.busy or self.browsing:
+            return
+        for index in range(self.task.count()):
+            if self.task.itemData(index) and self.task.itemData(index)["id"] == self._resume_task["id"]:
+                self.task.setCurrentIndex(index)
+                break
+        self.resume.setChecked(True)
+        self._run("all")
 
     def _processing_section(self, form):
         self.run_button = self._button("运行完整流程", lambda: self._run("all"))
@@ -296,6 +305,7 @@ class RoadChangeWidget(QWidget):
         self.advanced = Fold("高级设置")
         self.output = PathField(directory=True)
         self.output.edit.textChanged.connect(self._invalidate_check)
+        self.output.edit.editingFinished.connect(self.check_data)
         form.addRow(ResponsiveRow("成果目录", self.output))
         advanced_button = self._button("高级设置", lambda: self._reveal(self.advanced))
         form.addRow(inline(label("道路变化检测"), advanced_button))
@@ -310,6 +320,8 @@ class RoadChangeWidget(QWidget):
                                   ("ratio", "宽度变化比例", "0.2"), ("tolerance", "匹配容差", "3.0")):
             field = QLineEdit(value)
             self.parameters[key] = field
+            field.textChanged.connect(self._invalidate_check)
+            field.editingFinished.connect(self.check_data)
             self.advanced.form.addRow(title, field)
         self.advanced.form.addRow(self._button("检查运行资源", self._runtime))
 
@@ -376,148 +388,161 @@ class RoadChangeWidget(QWidget):
     def _directory_changed(self):
         self._project_revision += 1
         self.checked = False
-        if hasattr(self, "run_button"):
-            if not self.busy:
-                self.state_text.setText("待就绪")
-                self._reset_results()
-                self.result_summary.setText("请扫描当前项目以发现成果")
+        self._draft_dirty = False
+        self._return_after_check = False
+        if not self.busy and hasattr(self, "run_button"):
+            self.model = {"areas": [], "periods": [], "truths": [], "tasks": [], "issues": []}
+            self._resume_task = None
+            self.state_text.setText("待就绪")
+            self._reset_results()
+            self._set_tasks([])
+            self.configuration.load(self.model)
+            self._show_problems([])
             self._update_controls()
-            self.check_note.setText("目录已改变，请重新扫描")
+            self.open_timer.start()
 
     def _invalidate_check(self):
+        if self._restoring:
+            return
+        self._project_revision += 1
         self.checked = False
         if hasattr(self, "status"):
             self._update_controls()
 
     def _edited(self, *args):
+        if self._restoring:
+            return
+        self._draft_dirty = True
+        self._return_after_check = False
         self._invalidate_check()
-        self.check_note.setText("修正尚未应用，请点击“应用修正”后重新检查")
+        self._show_problems(["数据配置已修改，请保存并检查"])
 
     def _background(self, function, args, callback):
         self.browsing = True
-        self._update_controls()
         job = BrowseJob(function, *args)
         self._job = job
+        self._jobs[id(job)] = job
         revision = self._project_revision
-
-        def done(value):
+        self._update_controls()
+        def complete(value=None, error=None):
+            self._jobs.pop(id(job), None)
+            if self._job is not job:
+                return
             self.browsing = False
             if revision == self._project_revision:
-                callback(value)
+                if error is None:
+                    callback(value)
+                else:
+                    self._return_after_check = False
+                    self._show_problems([error])
             self._update_controls()
-
-        def failed(message):
-            self.browsing = False
-            self.status.setText(message)
-            self.check_note.setText(message)
-            self._update_controls()
-
-        job.signals.completed.connect(done)
-        job.signals.failed.connect(failed)
+        job.signals.completed.connect(lambda value: complete(value=value))
+        job.signals.failed.connect(lambda message: complete(error=message))
         QThreadPool.globalInstance().start(job)
 
     def scan(self):
-        if not self.project.text():
-            self.status.setText("请先选择项目 / 数据目录")
+        self.open_timer.stop()
+        if self.busy:
             return
+        if not self.project.text():
+            self._show_problems([])
+            return
+        self._project_revision += 1
         self.checked = False
-        self.status.setText("正在识别项目文件…")
+        self._return_after_check = False
         self._background(scan_project, (self.project.text(),), self._scanned)
 
     def _scanned(self, model):
+        self.open_timer.stop()
+        self._restoring = True
         self.model = model
         self.output.edit.setText(model["output"])
-        for rows, key in ((self.areas, "areas"), (self.periods, "periods"), (self.truths, "truths")):
-            rows.set_values(model[key])
-        self._draw_catalog()
+        saved = model.get("config", {}).get("plugin_processing_parameters", {})
+        for key, field in self.parameters.items():
+            field.setText(str(saved.get(key, {"pixel-size": "0.0", "absolute": "2.0", "ratio": "0.2", "tolerance": "3.0"}[key])))
+        self.configuration.load(model)
+        self._draft_dirty = False
+        self.resume.setChecked(False)
+        self.run_id.clear()
         self._set_tasks(model["tasks"])
-        self.check_note.setText("\n".join(model["issues"]) or "识别完成，请检查数据文件")
-        self.status.setText("扫描完成")
         self._refresh_results()
+        self._resume_task = next((task for task in model["tasks"] if task["status"] in {"running", "failed", "cancelled", "completed_with_errors"}
+                                  and task["data"].get("execution_profile") == "fast"), None)
+        self._restoring = False
+        self.check_data()
 
     def _apply_corrections(self):
-        self.model.update(areas=self.areas.values(), periods=self.periods.values(), truths=self.truths.values(), issues=[])
+        self.model.update(areas=self.areas.values(), periods=self.periods.values(), truths=self.truths.values(),
+                          area_irmad_references=self.configuration.reference_values(), issues=[], output=self.output.text())
         for key in ("areas", "periods", "truths"):
             for row in self.model[key]:
                 if row[-1]:
                     row[-1] = str(resolve(row[-1], Path(self.model.get("root", ROOT))))
         self.checked = False
-        self._draw_catalog()
         self._task_changed()
-        self.check_note.setText("修正已应用，请重新检查数据")
-        self._update_controls()
 
-    def _refresh_reference_periods(self):
-        area=self.reference_area.currentText()
-        self.reference_period.blockSignals(True);self.reference_period.clear();self.reference_period.addItem('')
-        self.reference_period.addItems(sorted({p for a,p,_ in self.model['periods'] if a==area},key=natural))
-        self.reference_period.setCurrentText(self.model.get('area_irmad_references',{}).get(area,''))
-        self.reference_period.blockSignals(False)
+    def _save_and_check(self):
+        if self.busy or self.browsing or not self.model.get("root"):
+            return
+        self._project_revision += 1
+        self._apply_corrections()
+        try:
+            save_configuration(self.model, {key: field.text() for key, field in self.parameters.items()})
+        except (OSError, ValueError, TypeError) as exc:
+            self._show_problems([f"项目配置保存失败：{exc}"])
+            return
+        self._draft_dirty = False
+        self._return_after_check = True
+        self.check_data()
 
-    def _save_reference(self):
-        area=self.reference_area.currentText();value=self.reference_period.currentText()
-        if not area:return
-        self.model.setdefault('area_irmad_references',{})[area]=value
-        root=self.model.get('root')
-        if root:
-            path=Path(root)/'project_config.json'
-            try:
-                config=json.loads(path.read_text(encoding='utf8')) if path.is_file() else {}
-                config.update(area_irmad_references=self.model['area_irmad_references'],
-                    project_root=root,output_root=self.model.get('output',''),area_truths=self.model['truths'],
-                    validation_areas=self.model['areas'],area_periods={a:[[p,f] for g,p,f in self.model['periods'] if g==a] for a,_ in self.model['areas']})
-                temporary=path.with_suffix('.json.tmp');temporary.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf8');temporary.replace(path)
-            except (OSError,ValueError) as exc:self.status.setText(f'参考期保存失败：{exc}')
-
-    def _draw_catalog(self):
-        old=self.reference_area.currentText()
-        self.reference_area.clear();self.reference_area.addItems([a for a,_ in self.model['areas']])
-        if old:self.reference_area.setCurrentText(old)
-        self._refresh_reference_periods()
-        self.data_tree.clear()
-        change_pairs = pairs(self.model["periods"])
-        gt = {tuple(r[:3]) for r in self.model["truths"] if Path(r[-1]).is_file()}
-        for area, path in self.model["areas"]:
-            node = QTreeWidgetItem([area, "验证区" if Path(path).is_file() else "缺少 SHP"])
-            node.setToolTip(0, path)
-            self.data_tree.addTopLevelItem(node)
-            for _, period, source in sorted((r for r in self.model["periods"] if r[0] == area), key=lambda r: natural(r[1])):
-                child = QTreeWidgetItem([period, "影像清单" if Path(source).is_file() else "缺少 TXT"])
-                child.setToolTip(0, source)
-                node.addChild(child)
-            for a, before, after in change_pairs:
-                if a == area:
-                    node.addChild(QTreeWidgetItem([f"{before} → {after}", "有真值数据" if (a, before, after) in gt else "无真值数据"]))
-            node.setExpanded(True)
-        text = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次\n{len(change_pairs)} 个变化对 · {len(gt)} 份真值数据"
-        self.summary.setText(text)
+    def _show_problems(self, issues):
+        self.check_note.setText(issues[0] if issues else "")
+        self.check_note.setVisible(bool(issues))
+        self.configuration.show_issues(issues)
 
     def check_data(self):
-        self.status.setText("正在检查输入文件…")
-        model=copy.deepcopy(self.model);data=self._data()
+        if self.busy or not self.model.get("root"):
+            return
+        if self._draft_dirty:
+            self._show_problems(["数据配置已修改，请保存并检查"])
+            return
+        self.checked = False
+        model = copy.deepcopy(self.model)
+        data = self._data()
         def inspect():
-            issues=check_files(model)
-            if issues:return {'issues':issues,'coverage':[]}
-            report=self.controller.inspect_data(data)
-            return {'issues':[], 'coverage':[
-                f"{row['grid']}/{row['period']} 影像范围覆盖率 {row['footprint_coverage_ratio']:.1%}"
-                for row in report.get('periods',[]) if 'footprint_coverage_ratio' in row]}
+            try:
+                local_issues = model.get("issues", []) + check_files(model)
+                if local_issues:
+                    return local_issues
+                self.controller.build_command("all", data)
+                report = self.controller.inspect_data(data)
+                return report.get("issues", [])
+            except Exception as exc:
+                # The existing check adapter can return stderr; expose its reason,
+                # not an entire traceback in the compact project area.
+                lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+                reason = lines[-1] if lines else "数据检查未返回报告"
+                for prefix in ("ValueError: ", "RuntimeError: ", "FileNotFoundError: "):
+                    reason = reason.removeprefix(prefix)
+                return [reason]
         self._background(inspect, (), self._checked)
 
     def _checked(self, issues):
-        coverage=[]
-        if isinstance(issues,dict):coverage=issues.get('coverage',[]);issues=issues.get('issues',[])
-        issues = self.model.get("issues", []) + issues
-        try:
-            self.controller.build_command("all", self._data())
-        except (ValueError, OSError, TypeError) as exc:
-            issues.append(str(exc))
+        if isinstance(issues, dict):
+            issues = issues.get("issues", [])
+        issues = list(dict.fromkeys(issues))
         self.checked = not issues
-        self.check_details.setText("\n".join(issues) if issues else "数据检查通过。\n"+'\n'.join(coverage)+"\n有效像元覆盖率将在统一网格阶段记录。")
-        self.check_note.setText(f"检查失败 · {len(issues)} 项待修正" if issues else "数据已就绪")
-        self.status.setText("检查失败，请展开数据详情修正" if issues else "数据已就绪，可以运行")
-        self.state_text.setText("待修正" if issues else "数据已就绪")
+        self._show_problems(issues)
+        self.state_text.setText("待配置" if issues else "")
         self._update_controls()
+        if self._return_after_check:
+            self._return_after_check = False
+            if self.checked:
+                self._back_to_main()
+            else:
+                self._show_configuration()
+                if issues:
+                    self.configuration.locate(issues[0])
 
     def _set_tasks(self, tasks):
         selected = self.task.currentData()
@@ -583,8 +608,11 @@ class RoadChangeWidget(QWidget):
         self.run_button.setEnabled(available and self.checked)
         self.scan_button.setEnabled(available)
         self.check_button.setEnabled(available and has_data)
-        self.project.setEnabled(available)
-        self.corrections.setEnabled(available)
+        self.project.setEnabled(not self.busy)
+        self.rescan_action.setEnabled(available)
+        self.recheck_action.setEnabled(available and has_data)
+        self.configuration.body.setEnabled(available)
+        self.configure_button.setEnabled(bool(self.model.get("root")))
         self.advanced.setEnabled(available)
         self.output.setEnabled(available)
         self.cancel_button.setEnabled(self.busy)
@@ -595,11 +623,13 @@ class RoadChangeWidget(QWidget):
             self.resume.setChecked(False)
         self.rerun_period.setEnabled(available and has_task and self.period.count() > 0)
         self.rerun_pair.setEnabled(available and has_task and self.pair.count() > 0)
-        summary = f"{len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次 · {len(pairs(self.model['periods']))} 个变化对 · 真值数据 {len(self.model['truths'])}/{len(pairs(self.model['periods']))}"
-        self.summary.setText(summary)
-        self.check_note.setVisible(True)
-        if self.checked:
-            self.check_note.setText("● 数据已就绪")
+        project_name = Path(self.model["root"]).name if same_root else "尚未打开项目"
+        self.summary.setText(f"项目：{project_name}  {len(self.model['areas'])} 个区域  {len(self.model['periods'])} 个期次" if same_root else project_name)
+        self.resume_button.setVisible(bool(self._resume_task))
+        self.resume_button.setEnabled(available and self.checked and bool(self._resume_task))
+        if self._resume_task:
+            self.resume_button.setText("继续任务：" + self._resume_task["id"])
+        self.check_note.setVisible(bool(self.check_note.text()))
         self._render_task_state()
 
     def _run(self, action):
@@ -751,6 +781,8 @@ class RoadChangeWidget(QWidget):
         if not root:
             return
         tasks = discover_tasks(Path(root), self.output.text())
+        self._resume_task = next((task for task in tasks if task["status"] in {"running", "failed", "cancelled", "completed_with_errors"}
+                                  and task["data"].get("execution_profile") == "fast"), None)
         self._set_tasks(tasks)
         if latest and tasks:
             self.task.setCurrentIndex(0)

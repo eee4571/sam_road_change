@@ -56,6 +56,7 @@ class Rows(QWidget):
             button = QPushButton(title)
             button.clicked.connect(callback)
             bar.addWidget(button)
+        bar.addStretch(1)
         layout.addLayout(bar)
 
     def add(self):

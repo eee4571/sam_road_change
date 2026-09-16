@@ -1,6 +1,8 @@
 """Read-only file selection model for the UI. No GIS or processing imports."""
 import json
 import re
+import os
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,10 +62,11 @@ def scan_project(directory):
     root = resolve(directory, ROOT)
     if not root.is_dir():
         raise ValueError("请选择存在的项目或数据目录")
-    model = dict(root=str(root), areas=[], periods=[], truths=[], issues=[], output=str(root / "成果输出"))
+    model = dict(root=str(root), areas=[], periods=[], truths=[], issues=[], area_irmad_references={}, config={}, output=str(root / "成果输出"))
     config_path = root / "project_config.json"
     if config_path.is_file():
         config = read_object(config_path)
+        model["config"] = config
         model["area_irmad_references"]=dict(config.get("area_irmad_references") or {})
         old_root = Path(str(config.get("project_root", ".")))
 
@@ -130,6 +133,9 @@ def check_files(model):
         issues.append("区域名称为空或重复，请修正")
     for name in names:
         rows = [r for r in model["periods"] if r[0] == name]
+        reference = model.get("area_irmad_references", {}).get(name)
+        if reference not in {r[1] for r in rows}:
+            issues.append(f"{name}：请选择 IR-MAD 参考期")
         if len(rows) < 2 or len({r[1] for r in rows}) != len(rows):
             issues.append(f"{name} 需要至少两个不同期次")
     for kind, rows in (("验证区", model["areas"]), ("影像清单", model["periods"]), ("真值数据", model["truths"])):
@@ -166,3 +172,29 @@ def check_files(model):
     if any(k not in expected for k in gt_keys):
         issues.append("真值数据的期次未对应相邻变化对")
     return issues
+
+
+def save_configuration(model, settings):
+    """Atomically update known input fields, preserving unrelated project keys."""
+    root = Path(model["root"])
+    target = root / "project_config.json"
+    config = read_object(target) if target.is_file() else {}
+    def portable(value):
+        path = resolve(value, root)
+        return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+    config.update(project_root=str(root), output_root=portable(model["output"]),
+                  validation_areas=[[a, portable(p)] for a, p in model["areas"]],
+                  area_periods={a: [[p, portable(f)] for g, p, f in model["periods"] if g == a] for a, _ in model["areas"]},
+                  area_truths=[[a, b, c, portable(p)] for a, b, c, p in model["truths"]],
+                  area_irmad_references=model["area_irmad_references"],
+                  plugin_processing_parameters=settings)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            json.dump(config, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, target)
+    finally:
+        if temporary and Path(temporary).exists():
+            Path(temporary).unlink()
+    return config

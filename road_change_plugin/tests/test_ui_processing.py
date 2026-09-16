@@ -47,6 +47,7 @@ def fixture(root):
     target = root / "_work/tasks/latest_pipeline.json"
     target.parent.mkdir(parents=True)
     target.write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "project_config.json").write_text(json.dumps({"area_irmad_references": {"北区": "2020", "南区": "2022"}, "custom_key": "preserve"}), encoding="utf-8")
 
 
 class ProcessingUiTests(unittest.TestCase):
@@ -60,6 +61,14 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget.project.edit.setText(str(self.root))
         model=scan_project(self.root);model['area_irmad_references']={'北区':'2020','南区':'2022'}
         self.widget._scanned(model)
+        self.wait_ready()
+
+    def wait_ready(self):
+        deadline = time.monotonic() + 5
+        while (self.widget.browsing or self.widget.open_timer.isActive()) and time.monotonic() < deadline:
+            APP.processEvents()
+            time.sleep(.01)
+        self.assertFalse(self.widget.browsing)
 
     def tearDown(self):
         self.widget.close()
@@ -76,8 +85,8 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(check_files(self.widget.model), [])
         self.widget._checked([])
         self.assertTrue(self.widget.run_button.isEnabled())
-        self.assertIn("已就绪", self.widget.check_note.text())
-        self.assertIn("真值数据 2/4", self.widget.summary.text())
+        self.assertEqual(self.widget.check_note.text(), "")
+        self.assertIn("2 个区域", self.widget.summary.text())
 
     def test_fixed_processing_and_automatic_evaluation(self):
         self.assertFalse(hasattr(self.widget, "profile"))
@@ -105,7 +114,7 @@ class ProcessingUiTests(unittest.TestCase):
             APP.processEvents()
             time.sleep(.01)
         self.assertFalse(self.widget.browsing)
-        self.assertEqual(self.widget.data_tree.topLevelItemCount(), 2)
+        self.assertEqual(self.widget.areas.table.rowCount(), 2)
 
     def test_corrections_invalidate_and_apply(self):
         self.widget._checked([])
@@ -161,12 +170,11 @@ class ProcessingUiTests(unittest.TestCase):
             APP.processEvents()
             self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
             self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
-        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 1)
+        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 2)
         self.assertFalse(self.widget.findChildren(QTabBar))
-        self.assertFalse(self.widget.findChildren(QStackedWidget))
+        self.assertEqual(self.widget.pages.count(), 2)
         self.assertFalse(self.widget.local.toggle.isChecked())
         self.assertFalse(self.widget.advanced.toggle.isChecked())
-        self.assertFalse(self.widget.corrections.toggle.isChecked())
         self.assertFalse(self.widget.records_fold.toggle.isChecked())
 
     def test_group_open_and_automatic_completion_results(self):
@@ -186,7 +194,7 @@ class ProcessingUiTests(unittest.TestCase):
         with patch.object(self.widget.controller, "cancel") as cancel:
             self.widget._started({"task_id": "hidden-test"})
             self.widget.hide()
-            for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+            for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
                 fold.toggle.setChecked(True)
                 fold.toggle.setChecked(False)
             self.widget._progress({"stage": "道路提取", "event": {"kind": "pipeline", "progress": .25}})
@@ -210,14 +218,14 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(self.widget.run_button.property("role"), "primary")
         self.assertIn("#roadChangeDock", self.widget.styleSheet())
         self.assertEqual(self.widget.scan_button.styleSheet(), "")
-        for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+        for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
             self.assertTrue(fold.toggle.autoRaise())
 
     def test_footer_stays_visible_with_expanded_tools(self):
         self.widget.show()
         for width in (300, 360, 680):
             self.widget.resize(width, 600)
-            for fold in (self.widget.corrections, self.widget.advanced, self.widget.local, self.widget.records_fold):
+            for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
                 self.widget._reveal(fold)
                 APP.processEvents()
                 APP.processEvents()
@@ -235,18 +243,123 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertFalse(self.widget.failure_details.isHidden())
 
     def test_area_reference_selection_persists_independently(self):
-        self.widget.reference_area.setCurrentText('北区')
-        self.widget.reference_period.setCurrentText('2022')
-        restored=scan_project(self.root)
-        self.assertEqual(restored['area_irmad_references'],{'北区':'2022','南区':'2022'})
-        self.widget.reference_area.setCurrentText('南区')
-        self.widget.reference_period.setCurrentText('2020')
-        restored=scan_project(self.root)
-        self.assertEqual(restored['area_irmad_references'],{'北区':'2022','南区':'2020'})
-        command=self.widget.controller.build_command('all',self.widget._data())
-        references=json.loads(command[command.index('--irmad-reference')+1])
-        self.assertEqual(references,restored['area_irmad_references'])
-        self.assertEqual(restored['truths'],self.widget.model['truths'])
+        self.widget._show_configuration()
+        self.widget.configuration.reference_boxes['北区'].setCurrentText('2022')
+        self.assertFalse(self.widget.checked)
+        self.assertEqual(scan_project(self.root)['area_irmad_references']['北区'], '2020')
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+        restored = scan_project(self.root)
+        self.assertEqual(restored['area_irmad_references'], {'北区': '2022', '南区': '2022'})
+        self.assertEqual(restored['config']['custom_key'], 'preserve')
+        self.assertEqual(restored['periods'], self.widget.model['periods'])
+
+    def test_auto_open_missing_reference_and_save(self):
+        path = self.root / 'project_config.json'
+        path.write_text('{}')
+        self.widget.scan()
+        self.wait_ready()
+        self.assertFalse(self.widget.checked)
+        self.assertEqual(self.widget.check_note.text(), '北区：请选择 IR-MAD 参考期')
+        self.assertTrue(self.widget.group_buttons['单期道路'].isEnabled())
+        self.widget._show_configuration()
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
+        self.widget.configuration.reference_boxes['北区'].setCurrentText('2020')
+        self.widget.configuration.reference_boxes['南区'].setCurrentText('2022')
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertTrue(self.widget.run_button.isEnabled())
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+
+    def test_auto_open_and_continue_task(self):
+        manifest = self.root / '_work/tasks/latest_pipeline.json'
+        data = json.loads(manifest.read_text())
+        data['status'] = 'cancelled'
+        manifest.write_text(json.dumps(data))
+        self.widget.project.edit.setText('')
+        self.widget.project.edit.setText(str(self.root))
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertFalse(self.widget.resume_button.isHidden())
+        with patch.object(self.widget.controller, 'run') as run:
+            self.widget.resume_button.click()
+            action, payload = run.call_args.args
+            self.assertEqual(action, 'all')
+            self.assertTrue(payload['resume'])
+            self.assertEqual(payload['run_id'], '示例任务')
+
+    def test_configuration_scroll_positions_and_wheel(self):
+        from PySide6.QtCore import QPoint, QPointF
+        from PySide6.QtGui import QWheelEvent
+        self.widget.show()
+        for width in (300, 360, 680):
+            self.widget.resize(width, 600)
+            self.widget._show_configuration()
+            APP.processEvents()
+            APP.processEvents()
+            panel = self.widget.configuration
+            self.assertEqual(panel.scroll.horizontalScrollBar().maximum(), 0)
+            bar = panel.scroll.verticalScrollBar()
+            bar.setValue(min(120, bar.maximum()))
+            value = bar.value()
+            self.widget._back_to_main()
+            self.widget._show_configuration()
+            APP.processEvents()
+            self.assertEqual(bar.value(), value)
+            bottom = panel.save_button.mapTo(self.widget, panel.save_button.rect().bottomRight())
+            self.assertLess(bottom.y(), self.widget.height())
+            viewport = panel.periods.table.viewport()
+            before = panel.periods.table.verticalScrollBar().value()
+            event = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, -120),
+                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.MouseButton.NoButton,
+                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.KeyboardModifier.NoModifier,
+                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.ScrollPhase.NoScrollPhase, False)
+            APP.sendEvent(viewport, event)
+            self.assertGreaterEqual(bar.value(), value)
+            self.assertEqual(panel.periods.table.verticalScrollBar().value(), before)
+
+    def test_stale_check_cannot_overwrite_changed_project(self):
+        from threading import Event
+        entered, release = Event(), Event()
+        def delayed(data):
+            entered.set()
+            release.wait(3)
+            return {'periods': []}
+        with patch.object(self.widget.controller, 'inspect_data', side_effect=delayed):
+            self.widget.check_data()
+            self.assertTrue(entered.wait(1))
+            self.widget.project.edit.setText(str(self.root / 'missing-project'))
+            release.set()
+            self.wait_ready()
+        self.assertFalse(self.widget.checked)
+        self.assertFalse(self.widget.group_buttons['单期道路'].isEnabled())
+        self.assertIn('存在的项目', self.widget.check_note.text())
+
+    def test_save_error_stays_in_configuration_and_preserves_file(self):
+        self.widget._show_configuration()
+        target = self.root / 'project_config.json'
+        before = target.read_bytes()
+        with patch('plugin.ui.project_browser.os.replace', side_effect=OSError('文件被占用')):
+            self.widget._save_and_check()
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
+        self.assertIn('文件被占用', self.widget.check_note.text())
+
+    def test_missing_image_targets_its_table_row(self):
+        self.widget._show_configuration()
+        self.widget.periods.table.item(0, 2).setText('missing-images.txt')
+        self.widget._save_and_check()
+        self.wait_ready()
+        message = self.widget.check_note.text()
+        self.assertIn('北区 / 2020', message)
+        self.assertIn('文件不存在', message)
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
+        self.widget.configuration.locate(message)
+        self.assertEqual(self.widget.periods.table.currentRow(), 0)
+        self.assertEqual(self.widget.periods.table.item(0, 2).toolTip(), message)
 
     def test_host_can_override_local_appearance(self):
         application_style = APP.styleSheet()

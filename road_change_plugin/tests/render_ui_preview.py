@@ -52,14 +52,17 @@ def main():
             data["evaluation_summary"]["json"] = str(report)
             manifest.write_text(json.dumps(data))
             plugin = original()
+            plugin._controller.inspect_data = lambda data: {"periods": []}  # UI-only fixture
             create = plugin.create_widget
 
             def widget_factory(parent=None):
                 widget = create(parent)
                 widget.project.edit.setText(str(project))
                 widget._scanned(scan_project(project))
-                widget._checked([])
                 def capture():
+                    if widget.browsing:
+                        QTimer.singleShot(20, capture)
+                        return
                     widget.resize(680, 600)
                     def save(name):
                         QApplication.processEvents()
@@ -81,7 +84,17 @@ def main():
                     save("ui_completed_680")
                     widget.resize(360, 600)
                     save("ui_narrow_360")
-                    print("Captured idle, running, completed (680 × 600), narrow (360 × 600)")
+                    widget.resize(680, 600)
+                    widget._show_configuration()
+                    QApplication.processEvents()
+                    widget.grab().save(str(ROOT / "resources/ui_configuration_680.png"))
+                    widget.configuration.reference_boxes["北区"].setCurrentIndex(0)
+                    widget.configuration.show_issues(["北区：请选择 IR-MAD 参考期"])
+                    widget.resize(360, 600)
+                    QApplication.processEvents()
+                    QApplication.processEvents()
+                    widget.grab().save(str(ROOT / "resources/ui_configuration_360.png"))
+                    print("Captured main and data configuration pages with simulated states")
                     QApplication.instance().quit()
 
                 QTimer.singleShot(100, capture)

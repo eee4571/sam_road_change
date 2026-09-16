@@ -30,6 +30,7 @@ def dock_style(palette, font):
         #roadChangeDock QLineEdit:hover, #roadChangeDock QComboBox:hover {{ border-color: {mix(.30)}; }}
         #roadChangeDock QLineEdit:disabled, #roadChangeDock QComboBox:disabled {{ background: {mix(.035)}; color: {mix(.44)}; border-color: {mix(.12)}; }}
         #roadChangeDock QLineEdit:focus, #roadChangeDock QComboBox:focus {{ border-color: {accent}; }}
+        #roadChangeDock QComboBox[inputProblem="true"] {{ border-color: {mix(.55)}; }}
         #roadChangeDock QComboBox::drop-down {{ border: none; width: 24px; }}
         #roadChangeDock QComboBox::down-arrow {{ image: url("{arrow}"); width: 12px; height: 8px; }}
         #roadChangeDock QPushButton, #roadChangeDock QToolButton {{
