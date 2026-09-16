@@ -304,6 +304,56 @@ class ProjectLifecycleTests(unittest.TestCase):
             actual = [f'{a}_to_{b}' for i, (a, b) in enumerate(zip(names, names[1:])) if period in names[max(0, i-1):i+3]]
             self.assertEqual(actual, expected)
 
+    def test_configuration_change_is_not_cleared_by_local_update(self):
+        self.existing()
+        self.assertEqual(self.store.configuration_status(), 'current')
+        write_json(self.root / 'project_config.json', {'area_irmad_references': {'南区': '2024'}})
+        self.assertEqual(self.store.configuration_status(), 'changed')
+        self.controller.run('rerun-change', self.data)
+        self.controller.runner.complete()
+        self.assertEqual(self.store.configuration_status(), 'changed')
+        self.controller.run('all', self.data)
+        self.checkpoint(True)
+        self.controller.runner.complete()
+        self.assertEqual(self.store.configuration_status(), 'current')
+
+    def test_resume_keeps_original_inputs_after_configuration_change(self):
+        self.controller.run('all', self.data)
+        self.checkpoint()
+        self.controller.cancel()
+        self.controller.run('all', {**self.data, 'resume': True, 'areas': [], 'periods': []})
+        self.assertFalse(self.errors)
+        self.assertIn('--resume', self.controller.runner.commands[-1])
+        self.assertIn('--validation-area', self.controller.runner.commands[-1])
+
+    def test_publication_filter_keeps_internal_width_and_unrelated_snapshot(self):
+        from plugin.result_parser import formal_results
+        manifest = self.existing()
+        products = self.store.results()
+        width = file(self.output / 'width.shp')
+        added = file(self.output / 'added.shp')
+        manifest['period_results'][0]['published']['width_segments'] = width
+        manifest['change_results'][0]['published']['added'] = added
+        write_json(self.store.manifest(), manifest)
+        write_json(self.store.results_path, products + [dict(result_type='road_width', path=width, metadata={}),
+                                                      dict(result_type='road_change', path=added, metadata={})])
+        delivered = formal_results(self.store)
+        self.assertNotIn(width, [p['path'] for p in delivered])
+        self.assertNotIn(added, [p['path'] for p in delivered])
+        self.assertTrue(Path(width).exists())
+        self.controller.run('rerun-period', self.data)
+        manifest = read_json(self.store.manifest())
+        manifest['fast_finalization_state'] = 'pending'
+        write_json(self.store.manifest(), manifest)
+        self.assertTrue(formal_results(self.store))
+        self.assertTrue(all(not self.store.in_scope(p, self.store.state()['scope']) for p in formal_results(self.store)))
+
+    def test_local_update_uses_processed_output_when_new_directory_is_configured(self):
+        self.existing()
+        self.controller.run('rerun-change', {**self.data, 'output': str(self.root / 'new-output')})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.store.state()['output'], str(self.output))
+
 
 if __name__ == '__main__':
     unittest.main()

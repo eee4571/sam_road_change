@@ -1,5 +1,6 @@
 """One current project operation and publication snapshot; no algorithm imports."""
 import copy
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,27 @@ class ProjectState:
         self.current = self.work / 'current'
         self.path = self.work / 'project_state.json'
         self.results_path = self.work / 'current_results.json'
+
+    def configuration_signature(self):
+        path = self.root / 'project_config.json'
+        config = read_json(path) if path.is_file() else {}
+        keys = ('validation_areas', 'area_periods', 'area_truths',
+                'area_irmad_references', 'output_root', 'plugin_processing_parameters')
+        content = {key: config.get(key) for key in keys}
+        return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode('utf8')).hexdigest()
+
+    def configuration_status(self):
+        signature = self.state().get('configuration_signature')
+        if not signature:
+            return 'unknown'
+        return 'current' if signature == self.configuration_signature() else 'changed'
+
+    def remember_configuration(self):
+        """Before the first edit of a legacy project, retain its old configuration."""
+        state = self.state()
+        if state and not state.get('configuration_signature'):
+            state['configuration_signature'] = self.configuration_signature()
+            write_json(self.path, state)
 
     def state(self):
         if self.path.is_file():
@@ -193,6 +215,7 @@ class ProjectState:
         state = dict(status='running', action='all', manifest=str(self.current / 'pipeline_result.json'),
                      run_id='current_' + uuid.uuid4().hex[:12], output=str(self.output), scope=None,
                      last_error='', parameters=copy.deepcopy(data))
+        state['configuration_signature'] = self.configuration_signature()
         write_json(self.results_path, [])
         write_json(self.path, state)
         return state
@@ -281,6 +304,7 @@ class ProjectState:
             write_json(index_path, index)
         state = dict(status='running', action=action, manifest=descriptor['path'], run_id=descriptor['id'],
                      scope=scope, parameters=copy.deepcopy(data), output=str(self.output), last_error='')
+        state['configuration_signature'] = self.state().get('configuration_signature')
         write_json(self.results_path, [p for p in products if not self.in_scope(p, scope)])
         write_json(self.path, state)
         return state

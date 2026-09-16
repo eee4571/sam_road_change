@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QLockFile
 from .runner import ROOT, Runner
 from .signals import TaskSignals
-from .result_parser import read_results
+from .result_parser import read_results, formal_results
 from .project_state import ProjectState
 from .production_policy import task_arguments, configuration, check_existing_task
 
@@ -131,6 +131,10 @@ class Controller(TaskSignals):
                     raise ValueError("当前项目没有可继续的处理断点")
                 state = store.state()
                 action = state.get("action", "all")
+                # Continue the saved processing inputs, even if the current configuration changed.
+                data.update(state.get("parameters", {}))
+                store.output = Path(state.get("output") or data["output"]).resolve()
+                data["output"] = str(store.output)
                 if action != "all":
                     data.update({k: v for k, v in state.get("parameters", {}).items()
                                  if k in {"grid", "period", "before_period", "after_period"}})
@@ -139,6 +143,12 @@ class Controller(TaskSignals):
             elif action != "all":
                 if store.resumable():
                     raise ValueError("请先继续未完成处理，或重新运行完整流程")
+                previous_output = store.state().get('output')
+                if not previous_output and store.descriptor():
+                    previous_output = store.descriptor()['data'].get('output_root')
+                if previous_output:
+                    store.output = Path(previous_output).resolve()
+                    data['output'] = str(store.output)
                 data["manifest"] = str(store.manifest())
             else:
                 data.update(run_id="current", resume=False)
@@ -196,7 +206,7 @@ class Controller(TaskSignals):
                 self.project_state.finish(payload.get('status', 'failed'))
                 self.manifest = str(self.project_state.manifest())
                 if payload.get('status') == 'completed':
-                    for result in self.project_state.results():
+                    for result in formal_results(self.project_state):
                         self.result_ready.emit({"plugin_id": "road_change", "task_id": payload.get('task_id', ''), **result})
             except (OSError, ValueError) as exc:
                 self._operation_failed({**payload, "message": f"当前成果更新失败：{exc}", "detail": "项目成果发布", "status": "failed"})

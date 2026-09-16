@@ -55,16 +55,17 @@ def main():
             data['job_root'] = str(manifest.parent)
             manifest.write_text(json.dumps(data))
             (manifest.parent / 'job_state.json').write_text(json.dumps(data))
+            from plugin.project_state import ProjectState
+            ProjectState(project).remember_configuration()
             plugin = original()
             plugin._controller.inspect_data = lambda data: {"periods": []}  # UI-only fixture
             create = plugin.create_widget
 
             def widget_factory(parent=None):
                 widget = create(parent)
-                widget._project_directory = str(project)
-                widget._scanned(scan_project(project))
+                widget._load_project(project)
                 def capture():
-                    if widget.browsing:
+                    if widget.browsing or widget.open_timer.isActive():
                         QTimer.singleShot(20, capture)
                         return
                     widget.resize(680, 600)
@@ -73,7 +74,7 @@ def main():
                         QApplication.processEvents()
                         assert widget.scroll.horizontalScrollBar().maximum() == 0
                         if widget.pages.currentWidget() is widget.main_page and widget.model.get('root'):
-                            action = widget.cancel_button if widget.busy else widget.run_button
+                            action = widget.cancel_button if widget.busy else widget.locate_button if widget.ui_state == 'completed' else widget.run_button
                             assert action.isVisible()
                             assert action.mapTo(widget, action.rect().bottomRight()).y() < widget.height()
                         widget.grab().save(str(ROOT / ("resources/" + name + ".png")))
@@ -110,10 +111,6 @@ def main():
                     widget.resize(300, 600)
                     save('ui_update_300')
                     widget.resize(680, 600)
-                    widget._show_results()
-                    save('ui_results_680')
-                    widget.resize(300, 600)
-                    save('ui_results_300')
                     widget._back_to_main()
                     widget.resize(360, 600)
                     save("ui_narrow_360")

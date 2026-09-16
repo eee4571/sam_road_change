@@ -79,7 +79,8 @@ class ProcessingUiTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_project_entry_and_current_state(self):
-        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        self.assertTrue(self.widget.run_button.isHidden())
+        self.assertTrue(self.widget.locate_button.isEnabled())
         self.assertTrue(self.widget.project_entry.isHidden())
         self.assertFalse(self.widget.project_details.isHidden())
         self.assertEqual(self.widget.project_path.text(), str(self.root))
@@ -112,7 +113,7 @@ class ProcessingUiTests(unittest.TestCase):
             self.assertFalse(hasattr(self.widget, name))
         self.widget._current['data']['execution_profile'] = 'full'
         self.widget._update_controls()
-        self.assertFalse(self.widget.update_action.isEnabled())
+        self.assertFalse(self.widget.update_button.isEnabled())
 
     def test_background_rescan(self):
         self.widget.rescan_action.trigger()
@@ -283,7 +284,8 @@ class ProcessingUiTests(unittest.TestCase):
 
     def test_full_restart_requires_confirmation_and_cancel_does_nothing(self):
         from PySide6.QtWidgets import QMessageBox
-        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        self.assertTrue(self.widget.run_button.isHidden())
+        self.assertTrue(self.widget.locate_button.isEnabled())
         with patch('plugin.widget.QMessageBox.question', return_value=QMessageBox.StandardButton.No) as question, patch.object(self.widget.controller, 'run') as run:
             self.widget.restart_action.trigger()
             run.assert_not_called()
@@ -332,7 +334,7 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(self.widget.run_button.text(), '继续更新')
         self.assertIn('上次更新尚未完成', self.widget.processing_hint.text())
         self.assertIn('北区 / 2022', self.widget.processing_hint.text())
-        self.assertFalse(self.widget.update_action.isEnabled())
+        self.assertFalse(self.widget.update_button.isEnabled())
         with patch.object(self.widget.controller, 'run') as run:
             self.widget.run_button.click()
             self.assertEqual(run.call_args.args[0], 'rerun-period')
@@ -340,7 +342,7 @@ class ProcessingUiTests(unittest.TestCase):
 
     def test_update_preview_uses_exact_shared_scope_and_starts_single_command(self):
         from plugin.project_state import ProjectState
-        self.widget.update_action.trigger()
+        self.widget.update_button.click()
         page = self.widget.update_page
         self.assertEqual(self.widget.pages.currentWidget(), page)
         self.assertFalse(page.save_button.isEnabled())
@@ -376,32 +378,47 @@ class ProcessingUiTests(unittest.TestCase):
             self.assertEqual(action, 'rerun-change')
             self.assertIn('--update-temporal', self.widget.controller.build_command(action, data))
 
-    def test_result_browser_explicit_open_signal_only(self):
+    def test_summary_opens_local_output_without_reemitting_results(self):
         received = []
         self.plugin.result_ready.connect(received.append)
         self.widget._refresh_results()
-        self.widget.group_buttons['单期道路'].click()
-        page = self.widget.results_page
-        self.assertEqual(self.widget.pages.currentWidget(), page)
+        with patch('plugin.widget.QDesktopServices.openUrl', return_value=True) as open_url:
+            self.widget.locate_button.click()
+        self.assertEqual(Path(open_url.call_args.args[0].toLocalFile()), Path(self.widget.output.text()))
         self.assertFalse(received)
-        self.assertFalse(hasattr(self.widget, 'chooser'))
-        self.assertFalse(hasattr(self.widget, 'result_menus'))
-        button = next(b for b in page.open_buttons if b.payload['result_type'] == 'road_centerline')
-        button.click()
-        self.assertEqual(len(received), 1)
-        self.assertEqual(received[0]['path'], button.payload['path'])
-        self.assertEqual(received[0]['result_type'], 'road_centerline')
-        self.assertTrue(page.tree.topLevelItem(0).isExpanded())
-        self.assertEqual(page.tree.topLevelItem(0).text(0), '单期道路')
-        Path(button.payload['path']).unlink()
-        button.click()
-        self.assertEqual(len(received), 1)
-        self.assertIn('已不存在', page.message.text())
+        self.assertFalse(hasattr(self.widget, 'results_page'))
+        self.assertFalse(hasattr(self.widget, 'group_buttons'))
+        self.assertIn('1 个期次', self.widget.result_summary.text())
+
+    def test_saved_configuration_marks_results_outdated_after_successful_check(self):
+        self.widget.configuration.area.setCurrentText('北区')
+        self.widget.configuration.reference.setCurrentText('2022')
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertIn('当前成果尚未更新', self.widget.configuration_note.text())
+
+    def test_checked_parameter_change_is_saved_and_does_not_refresh_results(self):
+        self.widget.parameters['absolute'].setText('4.0')
+        self.widget.check_data()
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertEqual(json.loads((self.root / 'project_config.json').read_text(encoding='utf8'))['plugin_processing_parameters']['absolute'], '4.0')
+        self.assertIn('当前成果尚未更新', self.widget.configuration_note.text())
+        self.widget._show_update()
+        self.assertIn('上次已处理的数据', self.widget.update_page.configuration_note.text())
+        self.widget._load_project(self.root)
+        self.wait_ready()
+        self.assertIn('当前成果尚未更新', self.widget.configuration_note.text())
 
     def test_evaluation_summary(self):
         report = self.root / 'metrics.json'
         report.write_text(json.dumps({'metrics': [{'class': 'all', 'precision': .9, 'recall': .8, 'f1': .847}]}))
-        self.widget._result({'result_type': 'road_evaluation', 'path': str(report), 'name': '评价报告', 'metadata': {}})
+        manifest = self.root / '_work/tasks/latest_pipeline.json'
+        data = json.loads(manifest.read_text())
+        data['evaluation_summary']['json'] = str(report)
+        manifest.write_text(json.dumps(data))
+        self.widget._refresh_results()
         self.assertIn('P 90%', self.widget.metrics.text())
         self.assertIn('F1 85%', self.widget.metrics.text())
 
@@ -412,7 +429,7 @@ class ProcessingUiTests(unittest.TestCase):
             self.assertFalse(self.widget.cancel_button.isHidden())
             self.widget._progress({'stage': '道路提取', 'progress': .8, 'event': {'kind': 'stage', 'grid': '北区', 'period': '2022'}})
             self.assertEqual(self.widget.progress.maximum(), 0)
-            self.widget._show_results()
+            self.widget._show_configuration()
             self.widget.hide()
             self.widget._progress({'stage': '变化检测', 'event': {'kind': 'pipeline', 'grid': '南区', 'before_period': '2020', 'after_period': '2022', 'progress': .4}})
             self.assertEqual(self.widget.progress.value(), 400)
@@ -427,11 +444,11 @@ class ProcessingUiTests(unittest.TestCase):
 
     def test_narrow_pages_and_fixed_actions(self):
         self.widget.show()
-        self.widget._show_results()
+        self.widget._show_configuration()
         self.widget._show_update()
         for width in (300, 360, 450, 680):
             self.widget.resize(width, 600)
-            for page in (self.widget.main_page, self.widget.configuration, self.widget.creation, self.widget.results_page, self.widget.update_page):
+            for page in (self.widget.main_page, self.widget.configuration, self.widget.creation, self.widget.update_page):
                 self.widget.pages.setCurrentWidget(page)
                 APP.processEvents()
                 APP.processEvents()
@@ -439,13 +456,11 @@ class ProcessingUiTests(unittest.TestCase):
                 scroll = getattr(page, 'scroll', self.widget.scroll if page is self.widget.main_page else None)
                 if isinstance(scroll, QScrollArea):
                     self.assertEqual(scroll.horizontalScrollBar().maximum(), 0, (width, type(page)))
-                if page is self.widget.results_page:
-                    self.assertGreater(page.area.width(), 150)
                 button = self.widget.run_button if page is self.widget.main_page else getattr(page, 'save_button', None)
-                if button:
+                if button and not button.isHidden():
                     self.assertLess(button.mapTo(self.widget, button.rect().bottomRight()).y(), self.widget.height())
         self.assertFalse(self.widget.findChildren(QTabBar))
-        self.assertEqual(self.widget.pages.count(), 5)
+        self.assertEqual(self.widget.pages.count(), 4)
 
     def test_configuration_scroll_wheel_and_page_position(self):
         from PySide6.QtCore import QPoint, QPointF, Qt
@@ -479,12 +494,15 @@ class ProcessingUiTests(unittest.TestCase):
         with patch.object(self.widget.controller, 'inspect_data', side_effect=delayed):
             self.widget.check_data()
             self.assertTrue(entered.wait(1))
-            self.widget._load_project(self.root / 'missing-project')
+            empty = self.root / 'empty-project'
+            empty.mkdir()
+            (empty / 'project_config.json').write_text('{"validation_areas": []}')
+            self.widget._load_project(empty)
             release.set()
             self.wait_ready()
         self.assertFalse(self.widget.checked)
-        self.assertFalse(self.widget.group_buttons['单期道路'].isEnabled())
-        self.assertIn('存在的项目', self.widget.check_note.text())
+        self.assertFalse(self.widget.locate_button.isEnabled())
+        self.assertIn('请添加验证区', self.widget.check_note.text())
 
     def test_save_error_keeps_configuration_and_existing_config(self):
         self.widget._show_configuration()
@@ -526,7 +544,8 @@ class ProcessingUiTests(unittest.TestCase):
         with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(self.root)):
             self.widget.switch_button.click()
         self.wait_ready()
-        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        self.assertTrue(self.widget.run_button.isHidden())
+        self.assertTrue(self.widget.locate_button.isEnabled())
         with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(target)):
             self.widget.switch_button.click()
         self.wait_ready()

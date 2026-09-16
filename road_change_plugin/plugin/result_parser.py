@@ -5,12 +5,24 @@ from pathlib import Path
 RESULT_TYPES = ("road_centerline", "road_surface", "road_width", "road_change", "road_temporal", "road_evaluation")
 
 
-def read_results(path):
+def formal_results(store):
+    """Filter old snapshots to the current formal products; keep internal data intact."""
+    manifest = store.manifest()
+    allowed = {(p['result_type'], p['path']): p for p in read_results(manifest, include_pending=True)} if manifest.is_file() else {}
+    result = []
+    for item in store.results():
+        key = (item['result_type'], item['path'])
+        if key in allowed:
+            result.append({**item, 'metadata': allowed[key]['metadata']})
+    return list({(p['result_type'], p['path']): p for p in result}.values())
+
+
+def read_results(path, *, include_pending=False):
     path = Path(path).resolve()
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("成果索引必须为 JSON 对象")
-    if manifest.get("fast_finalization_state") == "pending":
+    if manifest.get("fast_finalization_state") == "pending" and not include_pending:
         return []
     results, seen = [], set()
 
@@ -28,14 +40,15 @@ def read_results(path):
 
     for entry in manifest.get("final_period_results", manifest.get("period_results", [])):
         products = entry.get("published") or entry
-        width_key=next((key for key in ('width_profiles','width_segments','road_width') if products.get(key)), 'width_segments')
-        for key, kind in (("centerlines", "road_centerline"), ("surfaces", "road_surface"), (width_key, "road_width")):
+        for key, kind in (("centerlines", "road_centerline"), ("surfaces", "road_surface")):
             add(kind, products.get(key), f"{entry.get('grid', '')} / {entry.get('period', '')} / {kind}", {"grid": entry.get("grid"), "period": entry.get("period")})
     for entry in manifest.get("change_results", []):
         products = entry.get("published") or {**entry, **entry.get("layers", {})}
         meta = {k: entry.get(k) for k in ("grid", "before_period", "after_period")}
-        for key in ("changes", "added", "removed", "widened", "narrowed", "gpkg"):
-            add("road_change", products.get(key), f"{meta['grid']} / {meta['before_period']} → {meta['after_period']} / {key}", meta)
+        value = products.get('changes')
+        if isinstance(value, str) and Path(value).suffix.lower() == '.shp':
+            add("road_change", value, f"{meta['grid']} / {meta['before_period']} → {meta['after_period']}",
+                {**meta, 'classification_field': 'change_typ'})
     for entry in manifest.get("temporal_results", []):
         products = entry.get("published") or entry
         for key in ("life_shp", "observations_shp", "events_shp", "event_parts_shp", "lineage_shp"):

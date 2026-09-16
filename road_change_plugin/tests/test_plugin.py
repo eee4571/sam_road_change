@@ -68,7 +68,8 @@ class PluginTests(unittest.TestCase):
             self.assertLessEqual(widget.minimumSizeHint().width(), 300)
         self.assertIsNot(widget.pages.currentWidget(), widget.update_page)
         self.assertFalse(widget.advanced.toggle.isChecked())
-        self.assertEqual(set(widget.group_buttons), {"单期道路", "变化检测", "长时序", "精度评价"})
+        self.assertEqual(widget.pages.count(), 4)
+        self.assertFalse(hasattr(widget, "results_page"))
         widget.close()
         plugin.shutdown()
 
@@ -206,7 +207,7 @@ class PluginTests(unittest.TestCase):
             data = dict(final_period_results=[dict(grid="a", period="1", published=dict(centerlines="center.shp", surfaces="surface.shp", width_segments="width.shp"))], change_results=[dict(published=dict(changes="change.shp"))], temporal_results=[dict(life_shp="life.shp")], evaluation_summary=dict(csv="score.csv"))
             path = root/"pipeline_result.json"
             path.write_text(json.dumps(data))
-            self.assertEqual({r['result_type'] for r in read_results(path)}, set(RESULT_TYPES))
+            self.assertEqual({r['result_type'] for r in read_results(path)}, set(RESULT_TYPES) - {'road_width'})
             data['fast_finalization_state'] = 'pending'
             path.write_text(json.dumps(data))
             self.assertEqual(read_results(path), [])

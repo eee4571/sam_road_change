@@ -64,6 +64,8 @@ class UpdatePage(ProjectPage):
         self.area.setMinimumWidth(0)
         self.area.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.form.addRow('区域', self.area)
+        self.configuration_note = note('更新针对上次已处理的数据；开始后受影响的旧成果将失效。')
+        self.form.addRow(self.configuration_note)
         self.options = QWidget()
         self.option_layout = QVBoxLayout(self.options)
         self.option_layout.setContentsMargins(0, 0, 0, 0)
@@ -77,6 +79,8 @@ class UpdatePage(ProjectPage):
 
     def load(self, store):
         self.store = store
+        self.configuration_note.setText('数据配置已修改。本次局部更新仍使用上次已处理的数据；要应用新配置，请完整重算。'
+            if store.configuration_status() == 'changed' else '更新针对上次已处理的数据；开始后受影响的旧成果将失效。')
         descriptor = store.descriptor()
         self.manifest = descriptor['data'] if descriptor else {}
         areas = set(self.manifest.get('period_orders', {}))
