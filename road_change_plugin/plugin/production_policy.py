@@ -43,4 +43,4 @@ def check_existing_task(path, root=ROOT):
     irmad=spec.get('irmad') or {}
     if (data.get('execution_profile')!='fast' or spec.get('width_method')!='raw_image' or
             not irmad.get('enabled')):
-        raise ValueError('历史任务的影像预处理或测宽方法与当前插件不同，请新建完整任务；不能直接复用旧道路缓存')
+        raise ValueError('当前项目成果与本插件的处理配置不兼容，请重新运行完整流程')

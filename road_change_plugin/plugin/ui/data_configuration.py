@@ -2,14 +2,14 @@
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QBrush
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QScrollArea, QLabel, QPushButton,
-    QComboBox, QListWidget, QAbstractItemView, QToolButton)
-from .forms import Rows, form_layout
+    QComboBox, QListWidget, QAbstractItemView, QToolButton, QLineEdit)
+from .forms import Rows, PathField, form_layout
 from .presentation import inline
 from .project_browser import natural
 
 
 class DataConfiguration(QWidget):
-    def __init__(self, changed, back, save):
+    def __init__(self, changed, back, save, *, creating=False):
         super().__init__()
         self.changed = changed
         self._loading = False
@@ -19,7 +19,7 @@ class DataConfiguration(QWidget):
         back_button.setText("返回")
         back_button.setProperty("role", "toolbarAction")
         back_button.clicked.connect(back)
-        layout.addWidget(inline(QLabel("数据配置"), back_button))
+        layout.addWidget(inline(QLabel("新建项目" if creating else "数据配置"), back_button))
         self.scroll = QScrollArea()
         self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self.scroll.setWidgetResizable(True)
@@ -33,8 +33,20 @@ class DataConfiguration(QWidget):
         self.issues.setWordWrap(True)
         self.issues.itemClicked.connect(lambda item: self.locate(item.text()))
         form.addRow(self.issues)
+        if creating:
+            self.project_name = QLineEdit()
+            self.project_name.setPlaceholderText("项目名称")
+            self.project_location = PathField(directory=True)
+            self.project_location.edit.setPlaceholderText("选择保存项目的目录")
+            form.addRow("项目名称", self.project_name)
+            form.addRow("项目保存位置", self.project_location)
+            note = QLabel("成果目录：项目内的成果输出；数据默认保留在原位置。")
+            note.setWordWrap(True)
+            note.setMinimumWidth(0)
+            note.setProperty("role", "secondary")
+            form.addRow(note)
         self.areas = Rows(["验证区", "边界文件"], "Shapefile (*.shp)")
-        self.periods = Rows(["验证区", "期次", "影像清单"], "影像清单 (*.txt)")
+        self.periods = Rows(["验证区", "期次", "影像 TXT / 影像"], "影像数据 (*.txt *.tif *.tiff *.img *.jp2 *.vrt)", multiple_files=True)
         self.truths = Rows(["验证区", "前期", "后期", "真值文件"], "Shapefile (*.shp)")
         form.addRow("验证区", self.areas)
         self.references = QWidget()
@@ -53,9 +65,10 @@ class DataConfiguration(QWidget):
             rows.table.itemChanged.connect(self._edited)
             rows.table.model().rowsRemoved.connect(self._edited)
         self.issues.viewport().installEventFilter(self)
-        self.save_button = QPushButton("保存并检查")
+        self.save_button = QPushButton("创建项目" if creating else "保存并检查")
         self.save_button.clicked.connect(save)
         layout.addWidget(inline(QLabel(""), self.save_button))
+        self._size_tables()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Wheel:
@@ -109,6 +122,10 @@ class DataConfiguration(QWidget):
         self._rebuild_references(self.reference_values())
         self._size_tables()
         self.changed()
+
+    def inputs(self):
+        return dict(areas=self.areas.values(), periods=self.periods.values(), truths=self.truths.values(),
+                    area_irmad_references=self.reference_values())
 
     def reference_values(self):
         return {area: box.currentData() or "" for area, box in self.reference_boxes.items()}

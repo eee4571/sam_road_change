@@ -1,8 +1,11 @@
 """Read-only file selection model for the UI. No GIS or processing imports."""
 import json
+import copy
+import hashlib
 import re
 import os
 import tempfile
+from ..project_state import ProjectState
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,27 +38,9 @@ def pairs(periods):
     return result
 
 
-def discover_tasks(root, output=None):
-    """Only inspect formal task-index locations, never recurse into products."""
-    root = Path(root)
-    candidates = [root / "_work/tasks/latest_pipeline.json"]
-    candidates += list((root / "_work/tasks/runs").glob("*/pipeline_result.json"))
-    for out in {root / "成果输出", root / "04_成果输出", Path(output) if output else root / "成果输出"}:
-        candidates += [out / "latest_pipeline.json"]
-        candidates += list((out / "runs").glob("*/pipeline_result.json"))
-    tasks, seen = [], set()
-    for path in sorted((p for p in candidates if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            data = read_object(path)
-            task_id = str(data.get("run_id") or path.parent.name)
-            if task_id in seen:
-                continue
-            seen.add(task_id)
-            tasks.append({"path": str(path.resolve()), "id": task_id, "data": data,
-                          "status": data.get("status", "unknown")})
-        except (OSError, ValueError):
-            continue
-    return tasks
+def current_project(root, output=None):
+    store = ProjectState(root, output)
+    return store.descriptor()
 
 
 def scan_project(directory):
@@ -71,6 +56,8 @@ def scan_project(directory):
         old_root = Path(str(config.get("project_root", ".")))
 
         def configured(value):
+            if not str(value).strip():
+                return ""
             path = Path(str(value))
             if path.is_absolute() and old_root.is_absolute() and path.is_relative_to(old_root):
                 return str((root / path.relative_to(old_root)).resolve())
@@ -120,7 +107,7 @@ def scan_project(directory):
                     collect(child, True)
     if not model["areas"]:
         model["issues"].append("未识别到验证区。支持项目配置，或 01_验证区 / 02_影像 / 03_变化真值 目录。")
-    model["tasks"] = discover_tasks(root, model["output"])
+    model["current"] = current_project(root, model["output"])
     return model
 
 
@@ -179,7 +166,10 @@ def save_configuration(model, settings):
     root = Path(model["root"])
     target = root / "project_config.json"
     config = read_object(target) if target.is_file() else {}
+    model = prepare_image_lists(model)
     def portable(value):
+        if not str(value).strip():
+            return ""
         path = resolve(value, root)
         return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
     config.update(project_root=str(root), output_root=portable(model["output"]),
@@ -198,3 +188,70 @@ def save_configuration(model, settings):
         if temporary and Path(temporary).exists():
             Path(temporary).unlink()
     return config
+
+
+RASTER_SUFFIXES = {".tif", ".tiff", ".img", ".jp2", ".vrt"}
+PROJECT_FOLDERS = ("01_验证区", "02_影像", "03_变化真值", "成果输出", "_work")
+
+
+def prepare_image_lists(model):
+    """Adapt selected raster references to the existing TXT input contract."""
+    result = copy.deepcopy(model)
+    root = Path(model["root"])
+    for row in result["periods"]:
+        sources = [line.strip() for line in row[-1].splitlines() if line.strip()]
+        if not sources or (len(sources) == 1 and Path(sources[0]).suffix.lower() not in RASTER_SUFFIXES):
+            continue
+        if any(Path(source).suffix.lower() not in RASTER_SUFFIXES for source in sources):
+            raise ValueError(f"{row[0]} / {row[1]}：请选择一份影像 TXT 或多幅影像文件")
+        content = "".join(str(resolve(source, root)) + "\n" for source in sources)
+        directory = root / "02_影像" / "_lists"
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / (hashlib.sha256(content.encode("utf-8")).hexdigest()[:24] + ".txt")
+        if target.exists():
+            if target.read_text(encoding="utf-8") != content:
+                raise ValueError(f"影像清单文件冲突：{target.name}")
+        else:
+            with target.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+        row[-1] = str(target)
+    return result
+
+
+def create_project(parent_directory, name, inputs):
+    """Create an unpublished project in staging; never overwrite an existing path."""
+    name = name.strip()
+    invalid = '<>:"/\\|?*'
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"{prefix}{i}" for prefix in ("COM", "LPT") for i in range(1, 10)}
+    if not name or name in {".", ".."} or any(c in invalid or ord(c) < 32 for c in name) or name.endswith((".", " ")) or name.split('.')[0].upper() in reserved:
+        raise ValueError("项目名称：请输入有效的目录名称，不要包含路径分隔符")
+    if not str(parent_directory).strip():
+        raise ValueError("项目保存位置：请选择一个已有目录")
+    parent = Path(parent_directory).expanduser().resolve()
+    if not parent.is_dir():
+        raise ValueError("项目保存位置：目录不存在")
+    target = parent / name
+    if target.exists():
+        raise ValueError(f"项目名称：{name} 已存在，请改名或打开已有项目")
+    with tempfile.TemporaryDirectory(prefix=".road-change-new-", dir=parent) as temporary:
+        staging_parent = Path(temporary).resolve()
+        if not staging_parent.is_relative_to(parent):
+            raise ValueError("项目临时目录超出保存位置")
+        staging = staging_parent / "project"
+        staging.mkdir()
+        for folder in PROJECT_FOLDERS:
+            (staging / folder).mkdir()
+        model = copy.deepcopy(inputs)
+        for key in ("areas", "periods", "truths"):
+            for row in model[key]:
+                if row[-1]:
+                    row[-1] = "\n".join(str(resolve(value, parent)) for value in row[-1].splitlines() if value.strip())
+        model.update(root=str(staging), output=str(staging / "成果输出"))
+        config = save_configuration(model, {})
+        config.update(project_name=name, project_root=str(target))
+        (staging / "project_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        # rename is atomic on the same volume and fails on Windows if target exists.
+        if target.exists():
+            raise ValueError(f"项目名称：{name} 已存在")
+        staging.rename(target)
+    return target

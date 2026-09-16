@@ -100,12 +100,13 @@ class ProcessingUiTests(unittest.TestCase):
         data = self.widget._data()
         self.assertFalse(data["evaluate"])
         self.assertIn("--no-evaluation", self.widget.controller.build_command("all", data))
-        task = self.widget.task.currentData()
+        task = self.widget._current
         task["data"]["execution_profile"] = "full"
-        self.widget.task.setItemData(self.widget.task.currentIndex(), task)
         self.widget._update_controls()
         self.assertFalse(self.widget.rerun_period.isEnabled())
-        self.assertFalse(self.widget.resume.isEnabled())
+        self.assertFalse(hasattr(self.widget, "task"))
+        self.assertFalse(hasattr(self.widget, "run_id"))
+        self.assertFalse(hasattr(self.widget, "recent"))
 
     def test_background_scan(self):
         self.widget.scan()
@@ -170,9 +171,9 @@ class ProcessingUiTests(unittest.TestCase):
             APP.processEvents()
             self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
             self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
-        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 2)
+        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 3)
         self.assertFalse(self.widget.findChildren(QTabBar))
-        self.assertEqual(self.widget.pages.count(), 2)
+        self.assertEqual(self.widget.pages.count(), 3)
         self.assertFalse(self.widget.local.toggle.isChecked())
         self.assertFalse(self.widget.advanced.toggle.isChecked())
         self.assertFalse(self.widget.records_fold.toggle.isChecked())
@@ -279,6 +280,7 @@ class ProcessingUiTests(unittest.TestCase):
         data = json.loads(manifest.read_text())
         data['status'] = 'cancelled'
         manifest.write_text(json.dumps(data))
+        (manifest.parent / 'job_state.json').write_text(json.dumps(data))
         self.widget.project.edit.setText('')
         self.widget.project.edit.setText(str(self.root))
         self.wait_ready()
@@ -289,7 +291,7 @@ class ProcessingUiTests(unittest.TestCase):
             action, payload = run.call_args.args
             self.assertEqual(action, 'all')
             self.assertTrue(payload['resume'])
-            self.assertEqual(payload['run_id'], '示例任务')
+            self.assertNotIn('run_id', payload)
 
     def test_configuration_scroll_positions_and_wheel(self):
         from PySide6.QtCore import QPoint, QPointF
@@ -360,6 +362,102 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget.configuration.locate(message)
         self.assertEqual(self.widget.periods.table.currentRow(), 0)
         self.assertEqual(self.widget.periods.table.item(0, 2).toolTip(), message)
+
+    def create_from_inputs(self, name, inputs):
+        self.widget._show_creation()
+        page = self.widget.creation
+        page.project_name.setText(name)
+        page.project_location.edit.setText(str(self.root))
+        page.load(inputs)
+        page.save_button.click()
+        self.wait_ready()
+        return self.root / name
+
+    def test_create_empty_project_then_configure(self):
+        source = self.widget.configuration.inputs()
+        root = self.create_from_inputs('空项目', dict(areas=[], periods=[], truths=[], area_irmad_references={}))
+        for folder in ('01_验证区', '02_影像', '03_变化真值', '成果输出', '_work'):
+            self.assertTrue((root / folder).is_dir())
+        self.assertTrue((root / 'project_config.json').is_file())
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
+        self.assertFalse(self.widget.checked)
+        self.assertTrue(self.widget.configuration.save_button.isEnabled())
+        self.widget.configuration.load(source)
+        self.widget.configuration.save_button.click()
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+        self.widget.project.edit.setText(str(self.root))
+        self.wait_ready()
+        self.widget.project.edit.setText(str(root))
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertEqual(len(self.widget.model['periods']), 6)
+
+    def test_create_complete_project_with_external_images(self):
+        source = self.widget.configuration.inputs()
+        source['periods'][0][-1] = str(self.root / '北区/02_影像/2020.tif')
+        source['periods'][1][-1] = '\n'.join([str(self.root / '北区/02_影像/2022.tif'), str(self.root / '北区/02_影像/20250118.tif')])
+        root = self.create_from_inputs('完整项目', source)
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+        self.assertTrue(self.widget.run_button.isEnabled())
+        model = scan_project(root)
+        self.assertEqual(model['areas'], source['areas'])
+        self.assertEqual(model['area_irmad_references'], source['area_irmad_references'])
+        self.assertEqual(model['output'], str(root / '成果输出'))
+        self.assertFalse(list((root / '02_影像').rglob('*.tif')))
+        first = Path(model['periods'][0][-1])
+        self.assertTrue(first.is_relative_to(root))
+        self.assertEqual(first.read_text(encoding='utf-8').strip(), source['periods'][0][-1])
+        self.assertEqual(len(Path(model['periods'][1][-1]).read_text(encoding='utf-8').splitlines()), 2)
+        self.assertEqual(check_files(model), [])
+        self.widget._show_configuration()
+        self.widget.configuration.reference_boxes['北区'].setCurrentText('2022')
+        self.widget.configuration.save_button.click()
+        self.wait_ready()
+        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(self.root)):
+            self.widget.open_button.click()
+        self.wait_ready()
+        self.assertTrue(self.widget.group_buttons['单期道路'].isEnabled())
+        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(root)):
+            self.widget.open_button.click()
+        self.wait_ready()
+        self.assertEqual(self.widget.model['area_irmad_references']['北区'], '2022')
+
+    def test_creation_collision_and_failed_write_preserve_existing_project(self):
+        from plugin.ui.project_browser import create_project
+        source = self.widget.configuration.inputs()
+        config = (self.root / 'project_config.json').read_bytes()
+        with self.assertRaises(ValueError):
+            create_project(self.root.parent, self.root.name, source)
+        self.assertEqual((self.root / 'project_config.json').read_bytes(), config)
+        for name in ('../outside', 'bad/name', 'CON', ''):
+            with self.assertRaises(ValueError):
+                create_project(self.root, name, source)
+        with patch('plugin.ui.project_browser.os.replace', side_effect=OSError('写入失败')):
+            with self.assertRaises(OSError):
+                create_project(self.root, '失败项目', source)
+        self.assertFalse((self.root / '失败项目').exists())
+        self.assertFalse(list(self.root.glob('.road-change-new-*')))
+
+    def test_creation_draft_and_narrow_page(self):
+        self.widget.show()
+        self.widget._show_creation()
+        page = self.widget.creation
+        page.project_name.setText('草稿')
+        for width in (300, 360, 450, 680):
+            self.widget.resize(width, 600)
+            APP.processEvents()
+            APP.processEvents()
+            self.assertEqual(page.scroll.horizontalScrollBar().maximum(), 0)
+            page.scroll.verticalScrollBar().setValue(100)
+            value = page.scroll.verticalScrollBar().value()
+            self.widget._back_to_main()
+            self.widget._show_creation()
+            APP.processEvents()
+            self.assertEqual(page.project_name.text(), '草稿')
+            self.assertEqual(page.scroll.verticalScrollBar().value(), value)
+            self.assertLess(page.save_button.mapTo(self.widget, page.save_button.rect().bottomRight()).y(), self.widget.height())
 
     def test_host_can_override_local_appearance(self):
         application_style = APP.styleSheet()

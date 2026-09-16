@@ -69,7 +69,7 @@ class ProjectLayout:
         results = _resolved(output_root)
         # The GUI normally supplies 成果输出.  For custom CLI output names the
         # containing directory is still the project root and receives _work/_logs.
-        return cls(results.parent, results)
+        return cls(_resolved(os.environ["SAMROAD_PROJECT_ROOT"]) if os.environ.get("SAMROAD_PROJECT_ROOT") else results.parent, results)
 
     @property
     def work_root(self) -> Path:
@@ -77,7 +77,7 @@ class ProjectLayout:
 
     @property
     def tasks_root(self) -> Path:
-        return self.work_root / "tasks"
+        return self.work_root
 
     @property
     def cache_root(self) -> Path:
@@ -103,10 +103,10 @@ class ProjectLayout:
 
     @property
     def latest_pipeline_path(self) -> Path:
-        return self.tasks_root / "latest_pipeline.json"
+        return self.work_root / "current" / "pipeline_result.json"
 
     def full_run_root(self, run_id: object) -> Path:
-        return self.tasks_root / "runs" / safe_name(run_id)
+        return self.work_root / "current"
 
     def legacy_full_run_root(self, run_id: object) -> Path:
         return self.legacy_results_root / safe_name(run_id)
@@ -115,7 +115,7 @@ class ProjectLayout:
         """Return the resumable run root, preferring the current task layout."""
         current = self.full_run_root(run_id)
         legacy = self.legacy_full_run_root(run_id)
-        for candidate in (current, legacy):
+        for candidate in (current, self.work_root / "tasks" / "runs" / safe_name(run_id), legacy):
             if (candidate / "job_state.json").is_file():
                 return candidate
         return None
@@ -326,10 +326,32 @@ class ResultPublisher:
             elif path.name=='width_evolution.csv':
                 frame=pd.read_csv(path);frame[[c for c in frame if c in allowed]].to_csv(path,index=False,encoding='utf-8-sig')
 
+    def _preserved(self, area, kind, key=None):
+        operation = self.layout.work_root / "project_state.json"
+        if not operation.is_file():
+            return None
+        state = json.loads(operation.read_text(encoding="utf-8"))
+        scope = state.get("scope")
+        if not scope or state.get("status") not in {"running", "cancelled", "failed"}:
+            return None
+        replace = str(area) == scope.get("grid")
+        if kind == "periods":
+            replace = replace and str(key) in scope.get("periods", [])
+        elif kind == "changes":
+            replace = replace and str(key) in scope.get("changes", [])
+        if replace:
+            return None
+        node = self.index.get("areas", {}).get(str(area), {}).get(kind, {})
+        record = node.get(str(key), {}) if key is not None else node
+        return {k: v for k, v in record.items() if isinstance(v, str) and Path(v).is_file()}
+
     def publish_period(
         self, area: object, period: object, result: dict,
         *, run_id: object = "", base_dir: Path | None = None, save: bool = True,
     ) -> dict[str, str]:
+        preserved = self._preserved(area, "periods", period)
+        if preserved is not None:
+            return preserved
         target = (
             self.layout.results_root / safe_name(area) / "01_单期道路" / safe_name(period)
         )
@@ -413,6 +435,9 @@ class ResultPublisher:
         *, run_id: object = "", base_dir: Path | None = None, save: bool = True,
     ) -> dict[str, str]:
         if result.get('fast_finalization_state') == 'pending':return {}
+        preserved = self._preserved(area, "changes", f"{before}_to_{after}")
+        if preserved is not None:
+            return preserved
         pair = f"{safe_name(before)}_to_{safe_name(after)}"
         target = self.layout.results_root / safe_name(area) / "02_变化检测" / pair
         layers = dict(result.get("layers") or {})
@@ -474,6 +499,9 @@ class ResultPublisher:
         self, area: object, result: dict, *, base_dir: Path | None = None,
         save: bool = True,
     ) -> dict[str, str]:
+        preserved = self._preserved(area, "temporal")
+        if preserved is not None:
+            return preserved
         target = self.layout.results_root / safe_name(area) / "03_长时序"
         published = self._copy_fields(result, target, (
             ("life_shp", "road_life.shp"),

@@ -65,6 +65,9 @@ class Runner(TaskSignals):
     def environment(self):
         env = QProcessEnvironment.systemEnvironment()
         env.remove("PYTHONHOME")
+        env.remove("SAMROAD_PROJECT_ROOT")
+        if getattr(self, "project_root", None):
+            env.insert("SAMROAD_PROJECT_ROOT", str(self.project_root))
         env.insert("PYTHONPATH", str(self.root / "code"))
         env.insert("PYTHONUTF8", "1")
         env.insert("PYTHONIOENCODING", "utf-8")

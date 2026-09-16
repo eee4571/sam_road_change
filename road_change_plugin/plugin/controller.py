@@ -2,9 +2,11 @@
 import json
 import re
 from pathlib import Path
+from PySide6.QtCore import QLockFile
 from .runner import ROOT, Runner
-from .signals import TaskSignals, forward
+from .signals import TaskSignals
 from .result_parser import read_results
+from .project_state import ProjectState
 from .production_policy import task_arguments, configuration, check_existing_task
 
 
@@ -12,8 +14,12 @@ class Controller(TaskSignals):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.runner = Runner(self)
-        forward(self.runner, self)
+        self.project_state = None
+        self._project_lock = None
         self.runner.task_finished.connect(self._completed)
+        self.runner.task_failed.connect(self._operation_failed)
+        for name in ('task_started', 'task_progress', 'task_log', 'result_ready'):
+            getattr(self.runner, name).connect(getattr(self, name).emit)
         self.manifest = ""
         self.history = []
         self.task_log.connect(self._record)
@@ -94,11 +100,11 @@ class Controller(TaskSignals):
         run_id = data.get("run_id", "").strip()
         if run_id:
             if not re.fullmatch(r"[\w-]+", run_id):
-                raise ValueError("任务名称仅使用文字、数字、下划线和连字符")
+                raise ValueError("内部运行标识无效，请重新运行完整流程")
             args += ["--run-id", run_id]
         if data.get("resume"):
             if not run_id:
-                raise ValueError("续跑需填写原任务名称")
+                raise ValueError("未找到当前处理断点，请重新运行完整流程")
             args += ["--resume"]
         if data.get("truth_type_field", "").strip():
             args += ["--truth-type-field", data["truth_type_field"].strip()]
@@ -110,25 +116,93 @@ class Controller(TaskSignals):
         return task_arguments(args)
 
     def run(self, action, data):
+        if self.runner.running:
+            self.task_log.emit({'level': 'WARNING', 'message': '当前处理尚未结束'})
+            return
+        prepared = False
+        store = None
         try:
-            if self.runner.running:
-                raise ValueError("当前任务尚未结束")
+            data = dict(data)
+            root = self.path(data.get("project_root") or self.path(data["output"]).parent)
+            store = ProjectState(root, self.path(data["output"]))
+            resuming = bool(data.get("resume"))
+            if resuming:
+                if not store.resumable():
+                    raise ValueError("当前项目没有可继续的处理断点")
+                state = store.state()
+                action = state.get("action", "all")
+                if action != "all":
+                    data.update({k: v for k, v in state.get("parameters", {}).items()
+                                 if k in {"grid", "period", "before_period", "after_period"}})
+                data.update(manifest=str(store.manifest()), run_id=state.get("run_id", ""))
+                check_existing_task(store.manifest())
+            elif action != "all":
+                if store.resumable():
+                    raise ValueError("请先继续未完成处理，或重新运行完整流程")
+                data["manifest"] = str(store.manifest())
+            else:
+                data.update(run_id="current", resume=False)
+            # Validate all inputs and runtime before any destructive preparation.
+            self.build_command(action, data)
+            missing = self.runner.missing_runtime("fast")
+            if missing:
+                raise ValueError("缺少运行资源：" + "、".join(missing))
+            configuration()
+            store.work.mkdir(parents=True, exist_ok=True)
+            lock = QLockFile(str(store.work / 'current.lock'))
+            lock.setStaleLockTime(0)  # long processing is not a stale lock
+            if not lock.tryLock(0):
+                self.task_failed.emit({'plugin_id': 'road_change', 'task_id': '', 'status': 'failed',
+                                       'message': '当前项目正在其他窗口处理中，请等待处理结束', 'detail': '项目运行锁'})
+                return
+            self._project_lock = lock
+            self.project_state = store
+            self.runner.project_root = root
+            state = store.resume() if resuming else store.fresh(data) if action == "all" else store.local(action, data)
+            prepared = True
+            data.update(manifest=str(store.manifest()), run_id=state['run_id'], resume=resuming and action == "all")
+            self.manifest = str(store.manifest())
             args = self.build_command(action, data)
-            self.manifest = data.get("manifest", "")
-            profile = "fast"
-            if action != "all":
-                profile = json.loads(self.path(self.manifest).read_text(encoding="utf-8")).get("execution_profile", "full")
-            self.runner.start(args, profile)
+            self.history.clear()
+            self.runner.start(args, "fast")
         except (OSError, ValueError, TypeError) as exc:
-            self.task_failed.emit({"plugin_id": "road_change", "task_id": "", "message": str(exc), "detail": "输入检查", "status": "failed"})
+            try:
+                if prepared and store:
+                    store.finish('failed', str(exc))
+                elif store and store.root.is_dir():
+                    store.note_error(str(exc))
+            except (OSError, ValueError) as save_error:
+                self.task_log.emit({'level': 'ERROR', 'message': f'运行状态保存失败：{save_error}'})
+            self._unlock_project()
+            self.task_failed.emit({"plugin_id": "road_change", "task_id": "", "message": str(exc), "detail": "项目运行准备", "status": "failed"})
+
+    def _unlock_project(self):
+        if self._project_lock:
+            self._project_lock.unlock()
+            self._project_lock = None
+
+    def _operation_failed(self, payload):
+        if self.project_state:
+            try:
+                self.project_state.finish('failed', '\n'.join(str(payload[k]) for k in ('message', 'detail') if payload.get(k)))
+            except (OSError, ValueError) as exc:
+                self.task_log.emit({"message": f"运行状态保存失败：{exc}", "level": "ERROR"})
+        self._unlock_project()
+        self.task_failed.emit(payload)
 
     def _completed(self, payload):
-        if payload.get("status") != "completed":
-            return
-        event = payload.get("event", {})
-        manifest = event.get("manifest") or event.get("pipeline_manifest") or self.manifest
-        if manifest:
-            self.load_results(manifest, payload.get("task_id", ""))
+        if self.project_state:
+            try:
+                self.project_state.finish(payload.get('status', 'failed'))
+                self.manifest = str(self.project_state.manifest())
+                if payload.get('status') == 'completed':
+                    for result in self.project_state.results():
+                        self.result_ready.emit({"plugin_id": "road_change", "task_id": payload.get('task_id', ''), **result})
+            except (OSError, ValueError) as exc:
+                self._operation_failed({**payload, "message": f"当前成果更新失败：{exc}", "detail": "项目成果发布", "status": "failed"})
+                return
+        self._unlock_project()
+        self.task_finished.emit(payload)
 
     def load_results(self, manifest, task_id=""):
         try:
@@ -140,6 +214,7 @@ class Controller(TaskSignals):
 
     def shutdown(self):
         self.runner.shutdown()
+        self._unlock_project()
 
     def cancel(self):
         self.runner.cancel()
@@ -154,6 +229,8 @@ class Controller(TaskSignals):
         args=self.build_command('all',data)+['--data-check-only']
         executable,command=self.runner.command(args)
         environment=self.runner.environment()
+        if data.get('project_root'):
+            environment.insert('SAMROAD_PROJECT_ROOT', str(self.path(data['project_root'])))
         process=subprocess.run([executable,*command],cwd=self.runner.root/'code',
             env={k:environment.value(k) for k in environment.keys()},capture_output=True,
             text=True,encoding='utf8',errors='replace',timeout=180,

@@ -23,6 +23,7 @@ htmlcov/
 
 # Generated application output and diagnostics
 /_profiling/
+_work/
 outputs/
 runs/
 logs/

@@ -1,24 +1,23 @@
 """Compact processing dock; only UI input selection and presentation live here."""
 import copy
 import time
-from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QEvent, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
     QComboBox, QScrollArea, QLabel, QPushButton, QLineEdit,
-    QCheckBox, QProgressBar, QPlainTextEdit,
-    QGridLayout, QToolButton, QMenu, QGroupBox, QStackedWidget)
+    QProgressBar, QPlainTextEdit,
+    QGridLayout, QToolButton, QMenu, QGroupBox, QStackedWidget, QFileDialog)
 from .ui.forms import PathField, Fold, form_layout
 from .ui.presentation import inline, primary_button, result_menu
 from .ui.appearance import dock_style
 from .ui.data_configuration import DataConfiguration
 from .ui.desktop import ResponsiveRow, ResultChooser
-from .ui.project_browser import ROOT, scan_project, check_files, pairs, discover_tasks, natural, resolve, save_configuration
+from .ui.project_browser import ROOT, scan_project, check_files, pairs, natural, resolve, save_configuration, create_project
 from .ui.background import BrowseJob
 from .ui.evaluation_summary import metrics_text
-from .result_parser import read_results
+from .project_state import ProjectState
 
 RESULT_LABELS = {"road_centerline": "道路中心线", "road_surface": "道路面",
                  "road_width": "道路宽度", "road_change": "变化检测",
@@ -30,8 +29,6 @@ DETAIL_LABELS = {"changes": "全部变化", "added": "新增道路", "removed": 
                  "life_shp": "道路生命周期", "observations_shp": "逐期观测",
                  "events_shp": "变化事件", "event_parts_shp": "事件分段",
                  "lineage_shp": "道路沿革", "csv": "评价表格", "json": "评价报告"}
-STATUS = {"completed": "已完成", "running": "运行中", "failed": "失败",
-          "cancelled": "已取消", "completed_with_errors": "部分失败", "unknown": "历史任务"}
 
 
 def label(text, role=None):
@@ -47,7 +44,7 @@ class RoadChangeWidget(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self.model = {"areas": [], "periods": [], "truths": [], "tasks": [], "issues": []}
+        self.model = {"areas": [], "periods": [], "truths": [], "issues": []}
         self.checked = False
         self.busy = False
         self.browsing = False
@@ -55,7 +52,9 @@ class RoadChangeWidget(QWidget):
         self._action = "all"
         self._job = None
         self._task_log_path = None
-        self._records = {}
+        self._log_lines = []
+        self._last_error = ""
+        self._current = None
         self._active_record = "session"
         self._result_keys = set()
         self._project_revision = 0
@@ -64,6 +63,7 @@ class RoadChangeWidget(QWidget):
         self._restoring = False
         self._draft_dirty = False
         self._resume_task = None
+        self._created_root = None
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
         self.open_timer.setInterval(350)
@@ -117,6 +117,7 @@ class RoadChangeWidget(QWidget):
 
         self._footer(layout)
         self.pages.addWidget(self.configuration)
+        self.pages.addWidget(self.creation)
         self.pages.setCurrentWidget(self.main_page)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -153,7 +154,7 @@ class RoadChangeWidget(QWidget):
         fold.setVisible(visible)
         fold.toggle.setChecked(visible)
         if visible:
-            self.scroll.ensureWidgetVisible(fold)
+            QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(fold) if fold.isVisible() else None)
 
     def _footer(self, layout):
         self.footer = QGroupBox("任务状态")
@@ -242,6 +243,11 @@ class RoadChangeWidget(QWidget):
         self.check_note = label("")
         self.configure_button = self._button("配置数据", self._show_configuration)
         self.scan_button = self._button("重新扫描", self.scan)
+        self.new_button = self._button("新建项目", self._show_creation)
+        self.open_button = self._button("打开项目", self._open_project)
+        entry = inline(self.new_button, self.open_button, stretch_first=False)
+        entry.layout().addStretch(1)
+        form.addRow(entry)
         form.addRow(self.project)
         form.addRow(self.summary)
         actions = inline(self.configure_button, self.scan_button, stretch_first=False)
@@ -249,10 +255,41 @@ class RoadChangeWidget(QWidget):
         form.addRow(actions)
         form.addRow(self.check_note)
         self.configuration = DataConfiguration(self._edited, self._back_to_main, self._save_and_check)
+        self.creation = DataConfiguration(lambda: None, self._back_to_main, self._create_project, creating=True)
+        self.creation.show_issues([])
         self.areas, self.periods, self.truths = self.configuration.areas, self.configuration.periods, self.configuration.truths
         self.check_button = self.configuration.save_button
-        self.resume_button = self._button("继续任务", self._continue_task)
+        self.resume_button = self._button("继续未完成处理", self._continue_task)
         form.addRow(self.resume_button)
+
+    def _show_creation(self):
+        if self.busy or self.browsing:
+            return
+        if not self.creation.project_location.text():
+            base = Path(self.model["root"]).parent if self.model.get("root") else ROOT.parent
+            self.creation.project_location.edit.setText(str(base))
+        self.pages.setCurrentWidget(self.creation)
+
+    def _open_project(self):
+        directory = QFileDialog.getExistingDirectory(self, "打开项目", self.project.text())
+        if directory:
+            if directory == self.project.text():
+                self.scan()
+            else:
+                self.project.edit.setText(directory)
+
+    def _create_project(self):
+        if self.busy or self.browsing:
+            return
+        try:
+            root = create_project(self.creation.project_location.text(), self.creation.project_name.text(), self.creation.inputs())
+        except (OSError, ValueError, TypeError) as exc:
+            self.creation.show_issues([str(exc)])
+            return
+        self.creation.show_issues([])
+        self.project.edit.setText(str(root))
+        self._created_root = str(root)
+        self.scan()
 
     def _show_configuration(self):
         self.pages.setCurrentWidget(self.configuration)
@@ -261,14 +298,8 @@ class RoadChangeWidget(QWidget):
         self.pages.setCurrentWidget(self.main_page)
 
     def _continue_task(self):
-        if not self._resume_task or not self.checked or self.busy or self.browsing:
-            return
-        for index in range(self.task.count()):
-            if self.task.itemData(index) and self.task.itemData(index)["id"] == self._resume_task["id"]:
-                self.task.setCurrentIndex(index)
-                break
-        self.resume.setChecked(True)
-        self._run("all")
+        if self._resume_task and self.checked and not self.busy and not self.browsing:
+            self._run("all", resume=True)
 
     def _processing_section(self, form):
         self.run_button = self._button("运行完整流程", lambda: self._run("all"))
@@ -288,13 +319,8 @@ class RoadChangeWidget(QWidget):
         self.progress_note = label("等待任务开始", "secondary")
         self.cancel_button = self._button("取消", self.controller.cancel)
         self.local = Fold("局部重跑")
-        self.task = QComboBox()
-        self.task.setMinimumWidth(0)
-        self.task.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.task.currentIndexChanged.connect(self._task_changed)
         self.grid, self.period, self.pair = QComboBox(), QComboBox(), QComboBox()
         self.grid.currentIndexChanged.connect(self._grid_changed)
-        self.local.form.addRow("当前项目任务", self.task)
         self.local.form.addRow("区域", self.grid)
         self.local.form.addRow("期次", self.period)
         self.rerun_period = self._button("重跑该期并更新相关成果", lambda: self._run("rerun-period"))
@@ -310,11 +336,6 @@ class RoadChangeWidget(QWidget):
         advanced_button = self._button("高级设置", lambda: self._reveal(self.advanced))
         form.addRow(inline(label("道路变化检测"), advanced_button))
         form.addRow(self.advanced)
-        self.run_id = QLineEdit()
-        self.run_id.setPlaceholderText("留空自动命名")
-        self.advanced.form.addRow("任务名称", self.run_id)
-        self.resume = QCheckBox("继续所选的未完成任务")
-        self.advanced.form.addRow(self.resume)
         self.parameters = {}
         for key, title, value in (("pixel-size", "像元大小（0 自动）", "0.0"), ("absolute", "宽度变化阈值", "2.0"),
                                   ("ratio", "宽度变化比例", "0.2"), ("tolerance", "匹配容差", "3.0")):
@@ -369,11 +390,6 @@ class RoadChangeWidget(QWidget):
     def _history_section(self):
         self.records_fold = Fold("运行记录")
         form = self.records_fold.form
-        self.recent = QComboBox()
-        self.recent.setMinimumWidth(0)
-        self.recent.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.recent.currentIndexChanged.connect(self._show_record)
-        form.addRow("当前 / 最近任务", self.recent)
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(2000)
@@ -386,16 +402,21 @@ class RoadChangeWidget(QWidget):
         form.addRow(self._button("打开日志目录", self._open_logs))
 
     def _directory_changed(self):
+        self._created_root = None
         self._project_revision += 1
         self.checked = False
         self._draft_dirty = False
         self._return_after_check = False
         if not self.busy and hasattr(self, "run_button"):
-            self.model = {"areas": [], "periods": [], "truths": [], "tasks": [], "issues": []}
+            self.model = {"areas": [], "periods": [], "truths": [], "issues": []}
             self._resume_task = None
             self.state_text.setText("待就绪")
             self._reset_results()
-            self._set_tasks([])
+            self._set_current(None)
+            self._log_lines.clear()
+            self._last_error = ""
+            self._task_log_path = None
+            self._show_record()
             self.configuration.load(self.model)
             self._show_problems([])
             self._update_controls()
@@ -462,13 +483,18 @@ class RoadChangeWidget(QWidget):
             field.setText(str(saved.get(key, {"pixel-size": "0.0", "absolute": "2.0", "ratio": "0.2", "tolerance": "3.0"}[key])))
         self.configuration.load(model)
         self._draft_dirty = False
-        self.resume.setChecked(False)
-        self.run_id.clear()
-        self._set_tasks(model["tasks"])
+        self._set_current(model.get("current"))
+        log = Path(model['root']) / '_logs/plugin_ui/current.log'
+        self._task_log_path = None
+        try:
+            self._log_lines = log.read_text(encoding='utf-8').splitlines()[-2000:] if log.is_file() else []
+        except OSError:
+            self._log_lines = []
         self._refresh_results()
-        self._resume_task = next((task for task in model["tasks"] if task["status"] in {"running", "failed", "cancelled", "completed_with_errors"}
-                                  and task["data"].get("execution_profile") == "fast"), None)
         self._restoring = False
+        if self._created_root == model["root"]:
+            self._return_after_check = True
+            self._created_root = None
         self.check_data()
 
     def _apply_corrections(self):
@@ -488,6 +514,9 @@ class RoadChangeWidget(QWidget):
         self._apply_corrections()
         try:
             save_configuration(self.model, {key: field.text() for key, field in self.parameters.items()})
+            self.model = scan_project(self.model["root"])
+            self.configuration.load(self.model)
+            self._task_changed()
         except (OSError, ValueError, TypeError) as exc:
             self._show_problems([f"项目配置保存失败：{exc}"])
             return
@@ -544,31 +573,12 @@ class RoadChangeWidget(QWidget):
                 if issues:
                     self.configuration.locate(issues[0])
 
-    def _set_tasks(self, tasks):
-        selected = self.task.currentData()
-        selected_id = selected["id"] if selected else ""
-        self.task.blockSignals(True)
-        self.task.clear()
-        for task in tasks:
-            self.task.addItem(f"{task['id']} · {STATUS.get(task['status'], task['status'])}", task)
-        if not tasks:
-            self.task.addItem("暂无可重跑任务", None)
-        else:
-            for index, task in enumerate(tasks):
-                if task["id"] == selected_id:
-                    self.task.setCurrentIndex(index)
-        self.task.blockSignals(False)
+    def _set_current(self, current):
+        self._current = current
         self._task_changed()
-        for task in tasks:
-            task_id = task["id"]
-            if task_id not in self._records:
-                data = task["data"]
-                self._records[task_id] = {"lines": [f"任务：{task_id}", f"状态：{STATUS.get(task['status'], task['status'])}"],
-                                          "error": str(data.get("last_error") or "")}
-                self.recent.addItem(f"{task_id} · {STATUS.get(task['status'], task['status'])}", task_id)
 
     def _task_changed(self, *args):
-        task = self.task.currentData()
+        task = self._current
         data = task["data"] if task else {}
         self._period_rows = [[e.get("grid", ""), e.get("period", "")] for e in data.get("period_results", [])]
         if not self._period_rows:
@@ -589,12 +599,11 @@ class RoadChangeWidget(QWidget):
                 self.pair.addItem(f"{before} → {after}", (before, after))
 
     def _data(self):
-        task = self.task.currentData()
+        task = self._current
         pair = self.pair.currentData() or ("", "")
-        run_id = task["id"] if self.resume.isChecked() and task else self.run_id.text()
-        return dict(area_irmad_references=self.model.get("area_irmad_references",{}),areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
+        return dict(project_root=self.model.get("root", ""), area_irmad_references=self.model.get("area_irmad_references",{}),areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
                     output=self.output.text(), profile="fast", evaluate=any(Path(row[-1]).is_file() for row in self.model["truths"]),
-                    truth_type_field="", run_id=run_id, resume=self.resume.isChecked(),
+                    truth_type_field="", resume=False,
                     manifest=task["path"] if task else "", grid=self.grid.currentText(), period=self.period.currentText(),
                     before_period=pair[0], after_period=pair[1], device="auto",
                     **{key: field.text() for key, field in self.parameters.items()})
@@ -607,7 +616,11 @@ class RoadChangeWidget(QWidget):
         has_data = bool(self.model["areas"]) and same_root
         self.run_button.setEnabled(available and self.checked)
         self.scan_button.setEnabled(available)
-        self.check_button.setEnabled(available and has_data)
+        self.new_button.setEnabled(available)
+        self.open_button.setEnabled(not self.busy)
+        self.creation.body.setEnabled(available)
+        self.creation.save_button.setEnabled(available)
+        self.check_button.setEnabled(available and same_root)
         self.project.setEnabled(not self.busy)
         self.rescan_action.setEnabled(available)
         self.recheck_action.setEnabled(available and has_data)
@@ -617,27 +630,24 @@ class RoadChangeWidget(QWidget):
         self.output.setEnabled(available)
         self.cancel_button.setEnabled(self.busy)
         self.cancel_button.setVisible(self.busy)
-        has_task = bool(self.task.currentData()) and same_root and self.task.currentData()["data"].get("execution_profile") == "fast"
-        self.resume.setEnabled(available and has_task)
-        if not has_task:
-            self.resume.setChecked(False)
+        has_task = bool(self._current) and same_root and self._current["data"].get("execution_profile") == "fast" and not self._resume_task
         self.rerun_period.setEnabled(available and has_task and self.period.count() > 0)
         self.rerun_pair.setEnabled(available and has_task and self.pair.count() > 0)
         project_name = Path(self.model["root"]).name if same_root else "尚未打开项目"
         self.summary.setText(f"项目：{project_name}  {len(self.model['areas'])} 个区域  {len(self.model['periods'])} 个期次" if same_root else project_name)
         self.resume_button.setVisible(bool(self._resume_task))
         self.resume_button.setEnabled(available and self.checked and bool(self._resume_task))
-        if self._resume_task:
-            self.resume_button.setText("继续任务：" + self._resume_task["id"])
         self.check_note.setVisible(bool(self.check_note.text()))
         self._render_task_state()
 
-    def _run(self, action):
+    def _run(self, action, resume=False):
         self._action = action
         self.busy = True
         self.state_text.setText("正在启动")
         self._update_controls()
-        self.controller.run(action, self._data())
+        data = self._data()
+        data["resume"] = resume
+        self.controller.run(action, data)
 
     def _runtime(self):
         self.status.setText(self.controller.runtime_message())
@@ -646,6 +656,10 @@ class RoadChangeWidget(QWidget):
 
     def _started(self, payload):
         self.busy = True
+        self._log_lines = [f"[{e.get('level', 'INFO')}] {e.get('message', '')}" for e in self.controller.history]
+        self._last_error = ""
+        self._show_record()
+        self._refresh_results()
         self._started_at = time.monotonic()
         self._active_record = payload["task_id"]
         self._task_log_path = None
@@ -654,7 +668,8 @@ class RoadChangeWidget(QWidget):
             folder = Path(root) / "_logs/plugin_ui"
             try:
                 folder.mkdir(parents=True, exist_ok=True)
-                self._task_log_path = folder / f"{payload['task_id']}.log"
+                self._task_log_path = folder / "current.log"
+                self._task_log_path.write_text("\n".join(self._log_lines) + ("\n" if self._log_lines else ""), encoding="utf-8")
             except OSError:
                 self.status.setText("日志目录不可写，日志仅保留在本次会话")
         self.state_text.setText("运行中")
@@ -709,19 +724,11 @@ class RoadChangeWidget(QWidget):
         self._render_task_state()
 
     def _log(self, payload):
-        task_id = payload.get("task_id") or self._active_record
-        if task_id not in self._records:
-            self._records[task_id] = {"lines": [], "error": ""}
-            title = "当前会话" if task_id == "session" else "任务 · " + datetime.now().strftime("%m-%d %H:%M:%S")
-            self.recent.addItem(title, task_id)
-            self.recent.setCurrentIndex(self.recent.count() - 1)
         text = f"[{payload.get('level', 'INFO')}] {payload.get('message', '')}"
-        record = self._records[task_id]
-        record["lines"].append(text)
-        del record["lines"][:-2000]
-        if self.recent.currentData() == task_id:
-            self.logs.appendPlainText(text)
-        if self._task_log_path and task_id == self._active_record:
+        self._log_lines.append(text)
+        del self._log_lines[:-2000]
+        self.logs.appendPlainText(text)
+        if self._task_log_path:
             try:
                 with self._task_log_path.open("a", encoding="utf-8") as stream:
                     stream.write(text + "\n")
@@ -729,9 +736,8 @@ class RoadChangeWidget(QWidget):
                 self._task_log_path = None
 
     def _show_record(self, *args):
-        record = self._records.get(self.recent.currentData(), {})
-        self.logs.setPlainText("\n".join(record.get("lines", [])))
-        self.error_detail.setPlainText(record.get("error", ""))
+        self.logs.setPlainText("\n".join(self._log_lines))
+        self.error_detail.setPlainText(self._last_error)
 
     def _failed(self, payload):
         self.busy = False
@@ -741,8 +747,8 @@ class RoadChangeWidget(QWidget):
         self.status.setText("任务未完成，请查看运行记录中的错误详情")
         self.progress.setRange(0, 1000)
         self._log({**payload, "level": "ERROR"})
-        task_id = payload.get("task_id") or self._active_record
-        self._records[task_id]["error"] = payload["message"] + "\n" + payload.get("detail", "")
+        self._refresh_results()
+        self._last_error = payload["message"] + "\n" + payload.get("detail", "")
         self._show_record()
         self._update_controls()
 
@@ -780,22 +786,20 @@ class RoadChangeWidget(QWidget):
         root = self.model.get("root")
         if not root:
             return
-        tasks = discover_tasks(Path(root), self.output.text())
-        self._resume_task = next((task for task in tasks if task["status"] in {"running", "failed", "cancelled", "completed_with_errors"}
-                                  and task["data"].get("execution_profile") == "fast"), None)
-        self._set_tasks(tasks)
-        if latest and tasks:
-            self.task.setCurrentIndex(0)
-        self._reset_results()
-        task = self.task.currentData()
-        if task:
-            try:
-                for payload in read_results(Path(task["path"])):
-                    self._result({"plugin_id": "road_change", "task_id": task["id"], **payload})
-            except (OSError, ValueError, TypeError) as exc:
-                self.result_summary.setText(f"成果读取失败：{exc}")
-                return
-        self.result_summary.setText(f"{len(self._result_keys)} 项可用成果" if self._result_keys else "暂无成果，运行完成后在此查看")
+        try:
+            store = ProjectState(root, self.output.text())
+            self._resume_task = store.state() if store.resumable() else None
+            self._set_current(store.descriptor())
+            self._reset_results()
+            for payload in store.results():
+                self._result({"plugin_id": "road_change", **payload})
+            self.result_summary.setText(f"{len(self._result_keys)} 项当前成果" if self._result_keys else "暂无成果，运行完成后在此查看")
+            self._last_error = store.state().get('last_error', self._last_error)
+            self._show_record()
+        except (OSError, ValueError, TypeError) as exc:
+            self._resume_task = None
+            self.result_summary.setText(f"项目状态读取失败：{exc}")
+        self._update_controls()
 
     def _result(self, payload):
         kind = payload.get("result_type")

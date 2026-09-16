@@ -50,7 +50,11 @@ def main():
                     data["change_results"].append({"grid": area, "before_period": before, "after_period": after,
                                                    "published": {"changes": str(target)}})
             data["evaluation_summary"]["json"] = str(report)
+            manifest = project / '_work/current/pipeline_result.json'
+            manifest.parent.mkdir(parents=True)
+            data['job_root'] = str(manifest.parent)
             manifest.write_text(json.dumps(data))
+            (manifest.parent / 'job_state.json').write_text(json.dumps(data))
             plugin = original()
             plugin._controller.inspect_data = lambda data: {"periods": []}  # UI-only fixture
             create = plugin.create_widget
@@ -82,6 +86,16 @@ def main():
                     widget._started_at -= 48
                     widget._finished({"status": "completed", "task_id": "preview-only"})
                     save("ui_completed_680")
+                    from plugin.project_state import ProjectState
+                    current = ProjectState(project)
+                    current.finish('cancelled')
+                    widget._finished({'status': 'cancelled', 'task_id': 'preview-only'})
+                    save('ui_resume_680')
+                    current.finish('completed')
+                    widget._finished({'status': 'completed', 'task_id': 'preview-only'})
+                    widget._reveal(widget.local)
+                    save('ui_local_rerun_680')
+                    widget._reveal(widget.local)
                     widget.resize(360, 600)
                     save("ui_narrow_360")
                     widget.resize(680, 600)
@@ -94,7 +108,19 @@ def main():
                     QApplication.processEvents()
                     QApplication.processEvents()
                     widget.grab().save(str(ROOT / "resources/ui_configuration_360.png"))
-                    print("Captured main and data configuration pages with simulated states")
+                    widget.resize(680, 600)
+                    widget._show_creation()
+                    widget.creation.project_name.setText("道路变化项目")
+                    widget.creation.project_location.edit.setText(str(project.parent))
+                    QApplication.processEvents()
+                    QApplication.processEvents()
+                    widget.grab().save(str(ROOT / "resources/ui_create_project_680.png"))
+                    widget.resize(360, 600)
+                    QApplication.processEvents()
+                    QApplication.processEvents()
+                    assert widget.creation.scroll.horizontalScrollBar().maximum() == 0
+                    widget.grab().save(str(ROOT / "resources/ui_create_project_360.png"))
+                    print("Captured main, configuration and creation pages with simulated states")
                     QApplication.instance().quit()
 
                 QTimer.singleShot(100, capture)

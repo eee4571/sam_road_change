@@ -39,9 +39,10 @@ class PathField(QWidget):
 
 
 class Rows(QWidget):
-    def __init__(self, headers, file_filter, parent=None):
+    def __init__(self, headers, file_filter, parent=None, multiple_files=False):
         super().__init__(parent)
         self.file_filter = file_filter
+        self.multiple_files = multiple_files
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0, len(headers))
@@ -74,7 +75,11 @@ class Rows(QWidget):
     def browse(self):
         if self.table.currentRow() < 0:
             self.add()
-        path = QFileDialog.getOpenFileName(self, "选择数据", "", self.file_filter)[0]
+        if self.multiple_files:
+            paths = QFileDialog.getOpenFileNames(self, "选择一份影像清单或多幅影像", "", self.file_filter)[0]
+            path = "\n".join(paths)
+        else:
+            path = QFileDialog.getOpenFileName(self, "选择数据", "", self.file_filter)[0]
         if path:
             self.table.setItem(self.table.currentRow(), self.table.columnCount() - 1, QTableWidgetItem(path))
 
