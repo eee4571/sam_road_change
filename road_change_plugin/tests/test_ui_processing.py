@@ -55,12 +55,12 @@ class ProcessingUiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         fixture(self.root)
-        check=patch('plugin.controller.Controller.inspect_data',return_value={'periods':[]});check.start();self.addCleanup(check.stop)
+        check = patch('plugin.controller.Controller.inspect_data', return_value={'issues': []})
+        check.start()
+        self.addCleanup(check.stop)
         self.plugin = create_plugin()
         self.widget = self.plugin.create_widget()
-        self.widget.project.edit.setText(str(self.root))
-        model=scan_project(self.root);model['area_irmad_references']={'北区':'2020','南区':'2022'}
-        self.widget._scanned(model)
+        self.widget._load_project(self.root)
         self.wait_ready()
 
     def wait_ready(self):
@@ -69,6 +69,7 @@ class ProcessingUiTests(unittest.TestCase):
             APP.processEvents()
             time.sleep(.01)
         self.assertFalse(self.widget.browsing)
+        APP.processEvents()
 
     def tearDown(self):
         self.widget.close()
@@ -77,270 +78,415 @@ class ProcessingUiTests(unittest.TestCase):
         APP.processEvents()
         self.tmp.cleanup()
 
-    def test_scan_and_check(self):
-        self.assertEqual(len(self.widget.model["areas"]), 2)
-        self.assertEqual(len(self.widget.model["periods"]), 6)
-        self.assertEqual(len(pairs(self.widget.model["periods"])), 4)
-        self.assertEqual(len(self.widget.model["truths"]), 2)
+    def test_project_entry_and_current_state(self):
+        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        self.assertTrue(self.widget.project_entry.isHidden())
+        self.assertFalse(self.widget.project_details.isHidden())
+        self.assertEqual(self.widget.project_path.text(), str(self.root))
+        self.assertFalse(hasattr(self.widget, 'project'))  # no editable project-path control
+        self.assertFalse(hasattr(self.widget, 'scan_button'))
+        self.assertIn('2 个区域', self.widget.summary.text())
+        self.assertEqual(self.widget.data_state.text(), '数据已就绪')
+        self.assertEqual(self.widget.logs_button.text(), '日志')
+        self.widget._reveal(self.widget.records_fold)
+        self.widget._load_project('')
+        self.wait_ready()
+        self.assertFalse(self.widget.project_entry.isHidden())
+        for item in (self.widget.project_details, self.widget.processing_group, self.widget.result_group,
+                     self.widget.footer, self.widget.logs_button, self.widget.more_button, self.widget.records_fold):
+            self.assertTrue(item.isHidden())
+
+    def test_scan_check_and_fixed_processing(self):
+        self.assertEqual(len(self.widget.model['areas']), 2)
+        self.assertEqual(len(self.widget.model['periods']), 6)
+        self.assertEqual(len(pairs(self.widget.model['periods'])), 4)
         self.assertEqual(check_files(self.widget.model), [])
-        self.widget._checked([])
-        self.assertTrue(self.widget.run_button.isEnabled())
-        self.assertEqual(self.widget.check_note.text(), "")
-        self.assertIn("2 个区域", self.widget.summary.text())
-
-    def test_fixed_processing_and_automatic_evaluation(self):
-        self.assertFalse(hasattr(self.widget, "profile"))
-        self.assertFalse(hasattr(self.widget, "evaluate"))
+        self.assertEqual(self.widget.check_note.text(), '')
         data = self.widget._data()
-        self.assertEqual(data["profile"], "fast")
-        self.assertTrue(data["evaluate"])  # partial truth coverage is sufficient
-        command = self.widget.controller.build_command("all", data)
-        self.assertNotIn("--no-evaluation", command)
-        self.widget.model["truths"] = []
-        data = self.widget._data()
-        self.assertFalse(data["evaluate"])
-        self.assertIn("--no-evaluation", self.widget.controller.build_command("all", data))
-        task = self.widget._current
-        task["data"]["execution_profile"] = "full"
+        self.assertEqual(data['profile'], 'fast')
+        self.assertTrue(data['evaluate'])
+        self.assertNotIn('--no-evaluation', self.widget.controller.build_command('all', data))
+        self.widget.model['truths'] = []
+        self.assertIn('--no-evaluation', self.widget.controller.build_command('all', self.widget._data()))
+        for name in ('profile', 'evaluate', 'task', 'run_id', 'recent', 'resume_button'):
+            self.assertFalse(hasattr(self.widget, name))
+        self.widget._current['data']['execution_profile'] = 'full'
         self.widget._update_controls()
-        self.assertFalse(self.widget.rerun_period.isEnabled())
-        self.assertFalse(hasattr(self.widget, "task"))
-        self.assertFalse(hasattr(self.widget, "run_id"))
-        self.assertFalse(hasattr(self.widget, "recent"))
+        self.assertFalse(self.widget.update_action.isEnabled())
 
-    def test_background_scan(self):
-        self.widget.scan()
-        deadline = time.monotonic() + 5
-        while self.widget.browsing and time.monotonic() < deadline:
-            APP.processEvents()
-            time.sleep(.01)
-        self.assertFalse(self.widget.browsing)
-        self.assertEqual(self.widget.areas.table.rowCount(), 2)
-
-    def test_corrections_invalidate_and_apply(self):
-        self.widget._checked([])
-        self.widget.periods.table.item(0, 1).setText("2019")
-        self.assertFalse(self.widget.checked)
-        self.widget._apply_corrections()
-        self.assertIn("2019", [r[1] for r in self.widget.model["periods"]])
-        self.assertTrue(check_files(self.widget.model))  # stale GT pair detected
-
-    def test_dropdowns_and_unchanged_controller_contract(self):
-        self.assertEqual(self.widget.grid.count(), 2)
-        self.assertEqual(self.widget.period.count(), 3)
-        self.assertEqual(self.widget.pair.count(), 2)
-        data = self.widget._data()
-        self.assertTrue(data["manifest"].endswith("latest_pipeline.json"))
-        self.assertEqual((data["before_period"], data["after_period"]), ("2020", "2022"))
-        for action in ("all", "rerun-period", "rerun-change"):
-            command = self.widget.controller.build_command(action, data)
-            self.assertEqual(command[0], action)
-
-    def test_file_check_missing_image(self):
-        (self.root / "北区/02_影像/2020.tif").unlink()
-        self.assertTrue(any("影像路径不存在" in e for e in check_files(self.widget.model)))
-
-    def test_status_uses_events_not_log_text(self):
-        self.widget._started({"task_id": "ui-test"})
-        self.widget._progress({"stage": "道路提取", "progress": .8, "event": {"kind": "stage", "grid": "北区", "period": "2022"}})
-        self.assertEqual(self.widget.progress.maximum(), 0)
-        self.assertEqual(self.widget.area_text.text(), "北区")
-        self.widget._progress({"stage": "变化检测", "event": {"kind": "pipeline", "grid": "南区", "before_period": "2020", "after_period": "2022", "progress": .4, "completed": 4, "total": 10}})
-        self.assertEqual(self.widget.progress.value(), 400)
-        self.assertEqual(self.widget.scope_text.text(), "2020 → 2022")
-        self.widget._log({"message": "completed failed 100%"})
-        self.assertEqual(self.widget.state_text.text(), "运行中")
-        self.widget._failed({"task_id": "ui-test", "message": "示例错误", "detail": "详细原因"})
-        self.assertIn("详细原因", self.widget.error_detail.toPlainText())
-
-    def test_result_open_signal_only(self):
-        received = []
-        self.plugin.result_ready.connect(received.append)
-        self.widget._refresh_results()
-        self.assertFalse(received)
-        action = self.widget.result_menus["单期道路"].actions()[0]
-        action.trigger()
-        self.assertEqual(len(received), 1)
-        self.assertEqual(received[0]["result_type"], "road_centerline")
-        self.assertNotIn("road_centerline", action.text())
-
-    def test_narrow_dock_and_default_visibility(self):
-        self.widget.show()
-        for width in (300, 380, 450):
-            self.widget.resize(width, 760)
-            APP.processEvents()
-            self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
-            self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
-        self.assertEqual(len(self.widget.findChildren(QScrollArea)), 3)
-        self.assertFalse(self.widget.findChildren(QTabBar))
-        self.assertEqual(self.widget.pages.count(), 3)
-        self.assertFalse(self.widget.local.toggle.isChecked())
-        self.assertFalse(self.widget.advanced.toggle.isChecked())
-        self.assertFalse(self.widget.records_fold.toggle.isChecked())
-
-    def test_group_open_and_automatic_completion_results(self):
-        received = []
-        self.plugin.result_ready.connect(received.append)
-        self.widget._reset_results()
-        self.widget._finished({"status": "completed", "task_id": "demo"})
-        self.assertTrue(self.widget.group_buttons["单期道路"].isEnabled())
-        self.assertFalse(received)
-        self.widget.group_buttons["单期道路"].click()
-        self.assertFalse(received)
-        self.assertFalse(self.widget.chooser.isHidden())
-        self.widget.chooser.open_button.click()
-        self.assertEqual(len(received), 1)
-
-    def test_hidden_widget_keeps_task_updates(self):
-        with patch.object(self.widget.controller, "cancel") as cancel:
-            self.widget._started({"task_id": "hidden-test"})
-            self.widget.hide()
-            for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
-                fold.toggle.setChecked(True)
-                fold.toggle.setChecked(False)
-            self.widget._progress({"stage": "道路提取", "event": {"kind": "pipeline", "progress": .25}})
-            self.assertEqual(self.widget.progress.value(), 250)
-            self.assertTrue(self.widget.timer.isActive())
-            cancel.assert_not_called()
-
-    def test_evaluation_summary(self):
-        report = self.root / "metrics.json"
-        report.write_text(json.dumps({"metrics": [{"class": "all", "precision": .9, "recall": .8, "f1": .847}]}))
-        self.widget._result({"result_type": "road_evaluation", "path": str(report), "name": "评价报告", "metadata": {}})
-        self.assertIn("P 90%", self.widget.metrics.text())
-        self.assertIn("F1 85%", self.widget.metrics.text())
-
-    def test_visual_hierarchy_and_native_boundaries(self):
-        from PySide6.QtWidgets import QTreeWidget
-        self.assertFalse(self.widget.results.findChildren(QTreeWidget))
-        self.assertTrue(self.widget.scan_button.icon().isNull())
-        self.assertTrue(self.widget.check_button.icon().isNull())
-        self.assertTrue(self.widget.run_button.icon().isNull())
-        self.assertEqual(self.widget.run_button.property("role"), "primary")
-        self.assertIn("#roadChangeDock", self.widget.styleSheet())
-        self.assertEqual(self.widget.scan_button.styleSheet(), "")
-        for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
-            self.assertTrue(fold.toggle.autoRaise())
-
-    def test_footer_stays_visible_with_expanded_tools(self):
-        self.widget.show()
-        for width in (300, 360, 680):
-            self.widget.resize(width, 600)
-            for fold in (self.widget.advanced, self.widget.local, self.widget.records_fold):
-                self.widget._reveal(fold)
-                APP.processEvents()
-                APP.processEvents()
-                self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
-                bottom = self.widget.run_button.mapTo(self.widget, self.widget.run_button.rect().bottomRight())
-                self.assertLess(bottom.y(), self.widget.height())
-                self.widget._reveal(fold)
-        self.widget._started({"task_id": "state-test"})
-        self.assertFalse(self.widget.running_status.isHidden())
-        self.widget._finished({"status": "completed", "task_id": "state-test"})
-        self.assertTrue(self.widget.running_status.isHidden())
-        self.assertEqual(self.widget.task_line.text().count("已完成"), 1)
-        self.widget._failed({"message": "测试错误", "detail": "错误详情"})
-        self.assertIn("测试错误", self.widget.task_line.text())
-        self.assertFalse(self.widget.failure_details.isHidden())
-
-    def test_area_reference_selection_persists_independently(self):
-        self.widget._show_configuration()
-        self.widget.configuration.reference_boxes['北区'].setCurrentText('2022')
-        self.assertFalse(self.widget.checked)
-        self.assertEqual(scan_project(self.root)['area_irmad_references']['北区'], '2020')
-        self.widget._save_and_check()
+    def test_background_rescan(self):
+        self.widget.rescan_action.trigger()
         self.wait_ready()
-        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+        self.assertEqual(self.widget.configuration.area.count(), 2)
+        self.assertEqual(self.widget.configuration.periods.rowCount(), 3)
+
+    def test_removing_all_regions_is_not_undone_by_automatic_scan(self):
+        self.widget._show_configuration()
+        page = self.widget.configuration
+        page.remove_area()
+        page.remove_area()
+        page.save_button.click()
+        self.wait_ready()
+        self.assertEqual(scan_project(self.root)['areas'], [])
+        self.assertEqual(self.widget.run_button.text(), '配置数据')
+        self.assertTrue((self.root / '北区/01_验证区/北区.shp').is_file())
+        self.assertEqual(self.widget.pages.currentWidget(), page)
+
+    def test_switch_cancel_preserves_unsaved_area_changes(self):
+        from PySide6.QtWidgets import QMessageBox
+        page = self.widget.configuration
+        page.add_area('未保存区域')
+        with patch('plugin.widget.QMessageBox.question', return_value=QMessageBox.StandardButton.No), patch('plugin.widget.QFileDialog.getExistingDirectory') as choose:
+            self.widget.switch_button.click()
+            choose.assert_not_called()
+        self.assertEqual(self.widget.model['root'], str(self.root))
+        self.assertIn(['未保存区域', ''], page.inputs()['areas'])
+
+    def test_pending_image_editor_cannot_be_silently_saved(self):
+        page = self.widget.configuration
+        before = (self.root / 'project_config.json').read_bytes()
+        page.edit_period('2020')
+        self.widget._save_and_check()
+        self.assertEqual((self.root / 'project_config.json').read_bytes(), before)
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertFalse(page.set_period(None, '2022', ''))
+        page._cancel_period()
+        self.assertTrue(page.area.isEnabled())
+
+    def test_reference_selection_is_scoped_and_persists(self):
+        page = self.widget.configuration
+        self.widget._show_configuration()
+        page.area.setCurrentText('北区')
+        page.reference.setCurrentText('2022')
+        page.area.setCurrentText('南区')
+        self.assertEqual(page.reference.currentText(), '2022')
+        page.reference.setCurrentText('20250118')
+        page.area.setCurrentText('北区')
+        self.assertEqual(page.reference.currentText(), '2022')
+        self.assertFalse(self.widget.checked)
+        self.assertEqual(self.widget.run_button.text(), '修正数据')
+        page.save_button.click()
+        self.wait_ready()
         restored = scan_project(self.root)
-        self.assertEqual(restored['area_irmad_references'], {'北区': '2022', '南区': '2022'})
+        self.assertEqual(restored['area_irmad_references'], {'北区': '2022', '南区': '20250118'})
         self.assertEqual(restored['config']['custom_key'], 'preserve')
-        self.assertEqual(restored['periods'], self.widget.model['periods'])
-
-    def test_auto_open_missing_reference_and_save(self):
-        path = self.root / 'project_config.json'
-        path.write_text('{}')
-        self.widget.scan()
-        self.wait_ready()
-        self.assertFalse(self.widget.checked)
-        self.assertEqual(self.widget.check_note.text(), '北区：请选择 IR-MAD 参考期')
-        self.assertTrue(self.widget.group_buttons['单期道路'].isEnabled())
-        self.widget._show_configuration()
-        self.widget._save_and_check()
-        self.wait_ready()
-        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
-        self.widget.configuration.reference_boxes['北区'].setCurrentText('2020')
-        self.widget.configuration.reference_boxes['南区'].setCurrentText('2022')
-        self.widget._save_and_check()
-        self.wait_ready()
-        self.assertTrue(self.widget.run_button.isEnabled())
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
 
-    def test_auto_open_and_continue_task(self):
+    def test_area_add_rename_delete_preserves_other_area(self):
+        page = self.widget.configuration
+        original = page.inputs()
+        self.assertTrue(page.add_area('新区', str(self.root / 'new.shp')))
+        self.assertEqual(page.area.currentText(), '新区')
+        self.assertEqual(page.periods.rowCount(), 0)
+        page.set_period(None, '2020', str(self.root / 'new.txt'))
+        page.reference.setCurrentText('2020')
+        page.rename_area('东区')
+        inputs = page.inputs()
+        self.assertIn(['东区', '2020', str(self.root / 'new.txt')], inputs['periods'])
+        self.assertEqual(inputs['area_irmad_references']['东区'], '2020')
+        page.remove_area()
+        self.assertEqual(page.inputs(), original)
+        self.assertFalse(page.add_area('北区'))
+
+    def test_image_editor_supports_txt_and_multiple_rasters_without_internal_paths(self):
+        page = self.widget.configuration
+        self.widget._show_configuration()
+        page.area.setCurrentText('北区')
+        self.assertEqual(page.periods.item(0, 1).text(), '1 幅影像')
+        page.edit_period('2022')
+        images = [str(self.root / '北区/02_影像' / (p + '.tif')) for p in ('2020', '2022', '20250118')]
+        with patch('plugin.ui.data_configuration.QFileDialog.getOpenFileNames', return_value=(images, '')):
+            page._choose_images()
+        self.assertEqual(page.source_summary.text(), '3 幅影像')
+        self.assertFalse(self.widget.checked)
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertFalse(page.area.isEnabled())
+        page.apply_period_button.click()
+        page.save_button.click()
+        self.wait_ready()
+        rows = scan_project(self.root)['periods']
+        source = next(p for a, year, p in rows if (a, year) == ('北区', '2022'))
+        self.assertTrue(Path(source).is_file())
+        self.assertEqual(len(Path(source).read_text(encoding='utf-8').splitlines()), 3)
+        page.area.setCurrentText('北区')
+        self.assertEqual(page.periods.item(1, 1).text(), '3 幅影像')
+        for row in range(page.periods.rowCount()):
+            for col in (0, 1):
+                self.assertNotIn('_lists', page.periods.item(row, col).text())
+        page.edit_period('2020')
+        txt = str(self.root / '北区/02_影像/2022.txt')
+        with patch('plugin.ui.data_configuration.QFileDialog.getOpenFileName', return_value=(txt, '')):
+            page._choose_txt()
+        page.apply_period_button.click()
+        self.assertIn(['北区', '2020', txt], page.inputs()['periods'])
+
+    def test_pairs_are_derived_and_truth_is_scoped(self):
+        page = self.widget.configuration
+        page.area.setCurrentText('北区')
+        self.assertEqual(page.truths.rowCount(), 2)
+        self.assertEqual(page.truths.item(0, 0).text(), '2020 → 2022')
+        self.assertEqual(page.truths.item(0, 1).text(), '已提供')
+        page.set_truth('2022', '20250118', str(self.root / 'truth.shp'))
+        self.assertEqual(page.truths.item(1, 1).text(), '已提供')
+        page.remove_period('2022')
+        self.assertEqual(page.truths.rowCount(), 1)
+        self.assertEqual(page.truths.item(0, 0).text(), '2020 → 20250118')
+        self.assertEqual(page.truths.item(0, 1).text(), '未提供')
+        self.assertTrue(any(r[0] == '南区' for r in page.inputs()['truths']))
+
+    def test_missing_reference_locates_area_and_blocks_processing(self):
+        (self.root / 'project_config.json').write_text('{}')
+        self.widget.scan()
+        self.wait_ready()
+        self.assertEqual(self.widget.run_button.text(), '修正数据')
+        self.assertEqual(self.widget.check_note.text(), '北区：请选择 IR-MAD 参考期')
+        self.widget.run_button.click()
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
+        self.assertEqual(self.widget.configuration.area.currentText(), '北区')
+        self.assertTrue(self.widget.configuration.reference.property('inputProblem'))
+        for area, year in (('北区', '2020'), ('南区', '2022')):
+            self.widget.configuration.area.setCurrentText(area)
+            self.widget.configuration.reference.setCurrentText(year)
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+
+    def test_missing_image_targets_specific_period(self):
+        self.widget._show_configuration()
+        page = self.widget.configuration
+        page.area.setCurrentText('南区')
+        page.set_period('2022', '2022', 'missing.txt')
+        self.widget._save_and_check()
+        self.wait_ready()
+        message = self.widget.check_note.text()
+        self.assertIn('南区 / 2022', message)
+        self.assertIn('文件不存在', message)
+        self.assertEqual(self.widget.pages.currentWidget(), page)
+        page.locate(message)
+        self.assertEqual(page.area.currentText(), '南区')
+        self.assertEqual(page.periods.item(page.periods.currentRow(), 0).text(), '2022')
+        self.assertEqual(page.periods.item(page.periods.currentRow(), 1).toolTip(), message)
+
+    def test_missing_truth_targets_pair_instead_of_its_first_period(self):
+        self.widget._show_configuration()
+        page = self.widget.configuration
+        page.area.setCurrentText('北区')
+        page.set_truth('2020', '2022', str(self.root / 'missing-truth.shp'))
+        page.save_button.click()
+        self.wait_ready()
+        message = self.widget.check_note.text()
+        self.assertIn('北区 / 2020 / 2022', message)
+        self.assertEqual(page.truths.currentRow(), 0)
+        self.assertEqual(page.truths.item(0, 1).toolTip(), message)
+        self.assertEqual(page.periods.item(0, 1).toolTip(), '')
+
+    def test_full_restart_requires_confirmation_and_cancel_does_nothing(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        with patch('plugin.widget.QMessageBox.question', return_value=QMessageBox.StandardButton.No) as question, patch.object(self.widget.controller, 'run') as run:
+            self.widget.restart_action.trigger()
+            run.assert_not_called()
+            self.assertIn('项目数据和可复用缓存不会删除', question.call_args.args[2])
+        with patch('plugin.widget.QMessageBox.question', return_value=QMessageBox.StandardButton.Yes), patch.object(self.widget.controller, 'run') as run:
+            self.widget.restart_action.trigger()
+            self.assertEqual(run.call_args.args[0], 'all')
+            self.assertFalse(run.call_args.args[1]['resume'])
+
+    def test_ready_primary_starts_first_run(self):
+        self.widget._current = None
+        self.widget._project_operation = {}
+        self.widget._reset_results()
+        self.widget._update_controls()
+        self.assertEqual(self.widget.run_button.text(), '开始处理')
+        with patch.object(self.widget.controller, 'run') as run, patch('plugin.widget.QMessageBox.question') as confirm:
+            self.widget.run_button.click()
+            self.assertEqual(run.call_args.args[0], 'all')
+            confirm.assert_not_called()
+
+    def test_continue_full_run_uses_project_checkpoint(self):
         manifest = self.root / '_work/tasks/latest_pipeline.json'
         data = json.loads(manifest.read_text())
         data['status'] = 'cancelled'
         manifest.write_text(json.dumps(data))
         (manifest.parent / 'job_state.json').write_text(json.dumps(data))
-        self.widget.project.edit.setText('')
-        self.widget.project.edit.setText(str(self.root))
+        self.widget.scan()
         self.wait_ready()
-        self.assertTrue(self.widget.checked)
-        self.assertFalse(self.widget.resume_button.isHidden())
+        self.assertEqual(self.widget.run_button.text(), '继续处理')
         with patch.object(self.widget.controller, 'run') as run:
-            self.widget.resume_button.click()
+            self.widget.run_button.click()
             action, payload = run.call_args.args
             self.assertEqual(action, 'all')
             self.assertTrue(payload['resume'])
             self.assertNotIn('run_id', payload)
 
-    def test_configuration_scroll_positions_and_wheel(self):
-        from PySide6.QtCore import QPoint, QPointF
+    def test_continue_local_update_uses_saved_action_scope(self):
+        from plugin.project_state import ProjectState, write_json
+        store = ProjectState(self.root)
+        state = store.state()
+        state.update(status='cancelled', action='rerun-period',
+                     scope={'grid': '北区', 'periods': ['2022'], 'changes': ['2020_to_2022', '2022_to_20250118']},
+                     parameters={'grid': '北区', 'period': '2022'})
+        write_json(store.path, state)
+        self.widget._refresh_results()
+        self.assertEqual(self.widget.run_button.text(), '继续更新')
+        self.assertIn('上次更新尚未完成', self.widget.processing_hint.text())
+        self.assertIn('北区 / 2022', self.widget.processing_hint.text())
+        self.assertFalse(self.widget.update_action.isEnabled())
+        with patch.object(self.widget.controller, 'run') as run:
+            self.widget.run_button.click()
+            self.assertEqual(run.call_args.args[0], 'rerun-period')
+            self.assertTrue(run.call_args.args[1]['resume'])
+
+    def test_update_preview_uses_exact_shared_scope_and_starts_single_command(self):
+        from plugin.project_state import ProjectState
+        self.widget.update_action.trigger()
+        page = self.widget.update_page
+        self.assertEqual(self.widget.pages.currentWidget(), page)
+        self.assertFalse(page.save_button.isEnabled())
+        page.area.setCurrentText('北区')
+        button = next(b for b in page.buttons.buttons() if b.selection.get('period') == '2022')
+        before = (self.root / '_work/tasks/latest_pipeline.json').read_bytes()
+        button.click()
+        expected = ProjectState(self.root).local_scope('rerun-period', button.selection)
+        self.assertEqual(page.scope, expected)
+        self.assertEqual((self.root / '_work/tasks/latest_pipeline.json').read_bytes(), before)
+        self.assertFalse((self.root / '_work/project_state.json').exists())
+        self.assertIn('2020 → 2022', page.impact.text())
+        self.assertIn('长时序成果', page.impact.text())
+        self.assertIn('精度评价', page.impact.text())
+        with patch.object(self.widget.controller, 'run') as run:
+            page.save_button.click()
+            action, data = run.call_args.args
+            self.assertEqual((action, data['grid'], data['period']), ('rerun-period', '北区', '2022'))
+            self.assertIn('--update-related', self.widget.controller.build_command(action, data))
+            self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+
+    def test_change_update_is_mutually_exclusive_and_automatic_downstream(self):
+        self.widget._show_update()
+        page = self.widget.update_page
+        page.buttons.buttons()[0].click()
+        pair = next(b for b in page.buttons.buttons() if b.selection['action'] == 'rerun-change')
+        pair.click()
+        self.assertEqual(sum(b.isChecked() for b in page.buttons.buttons()), 1)
+        self.assertEqual(page.scope['periods'], [])
+        with patch.object(self.widget.controller, 'run') as run:
+            page.save_button.click()
+            action, data = run.call_args.args
+            self.assertEqual(action, 'rerun-change')
+            self.assertIn('--update-temporal', self.widget.controller.build_command(action, data))
+
+    def test_result_browser_explicit_open_signal_only(self):
+        received = []
+        self.plugin.result_ready.connect(received.append)
+        self.widget._refresh_results()
+        self.widget.group_buttons['单期道路'].click()
+        page = self.widget.results_page
+        self.assertEqual(self.widget.pages.currentWidget(), page)
+        self.assertFalse(received)
+        self.assertFalse(hasattr(self.widget, 'chooser'))
+        self.assertFalse(hasattr(self.widget, 'result_menus'))
+        button = next(b for b in page.open_buttons if b.payload['result_type'] == 'road_centerline')
+        button.click()
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]['path'], button.payload['path'])
+        self.assertEqual(received[0]['result_type'], 'road_centerline')
+        self.assertTrue(page.tree.topLevelItem(0).isExpanded())
+        self.assertEqual(page.tree.topLevelItem(0).text(0), '单期道路')
+        Path(button.payload['path']).unlink()
+        button.click()
+        self.assertEqual(len(received), 1)
+        self.assertIn('已不存在', page.message.text())
+
+    def test_evaluation_summary(self):
+        report = self.root / 'metrics.json'
+        report.write_text(json.dumps({'metrics': [{'class': 'all', 'precision': .9, 'recall': .8, 'f1': .847}]}))
+        self.widget._result({'result_type': 'road_evaluation', 'path': str(report), 'name': '评价报告', 'metadata': {}})
+        self.assertIn('P 90%', self.widget.metrics.text())
+        self.assertIn('F1 85%', self.widget.metrics.text())
+
+    def test_status_is_structured_and_hidden_widget_keeps_processing(self):
+        with patch.object(self.widget.controller, 'cancel') as cancel:
+            self.widget._started({'task_id': 'ui-test'})
+            self.assertTrue(self.widget.run_button.isHidden())
+            self.assertFalse(self.widget.cancel_button.isHidden())
+            self.widget._progress({'stage': '道路提取', 'progress': .8, 'event': {'kind': 'stage', 'grid': '北区', 'period': '2022'}})
+            self.assertEqual(self.widget.progress.maximum(), 0)
+            self.widget._show_results()
+            self.widget.hide()
+            self.widget._progress({'stage': '变化检测', 'event': {'kind': 'pipeline', 'grid': '南区', 'before_period': '2020', 'after_period': '2022', 'progress': .4}})
+            self.assertEqual(self.widget.progress.value(), 400)
+            self.assertEqual(self.widget.scope_text.text(), '2020 → 2022')
+            self.widget._log({'message': 'completed failed 100%'})
+            self.assertEqual(self.widget.state_text.text(), '运行中')
+            self.assertTrue(self.widget.timer.isActive())
+            cancel.assert_not_called()
+        self.widget._failed({'message': '示例错误', 'detail': '错误详情'})
+        self.assertIn('错误详情', self.widget.error_detail.toPlainText())
+        self.assertFalse(self.widget.failure_details.isHidden())
+
+    def test_narrow_pages_and_fixed_actions(self):
+        self.widget.show()
+        self.widget._show_results()
+        self.widget._show_update()
+        for width in (300, 360, 450, 680):
+            self.widget.resize(width, 600)
+            for page in (self.widget.main_page, self.widget.configuration, self.widget.creation, self.widget.results_page, self.widget.update_page):
+                self.widget.pages.setCurrentWidget(page)
+                APP.processEvents()
+                APP.processEvents()
+                self.assertLessEqual(self.widget.minimumSizeHint().width(), 300)
+                scroll = getattr(page, 'scroll', self.widget.scroll if page is self.widget.main_page else None)
+                if isinstance(scroll, QScrollArea):
+                    self.assertEqual(scroll.horizontalScrollBar().maximum(), 0, (width, type(page)))
+                if page is self.widget.results_page:
+                    self.assertGreater(page.area.width(), 150)
+                button = self.widget.run_button if page is self.widget.main_page else getattr(page, 'save_button', None)
+                if button:
+                    self.assertLess(button.mapTo(self.widget, button.rect().bottomRight()).y(), self.widget.height())
+        self.assertFalse(self.widget.findChildren(QTabBar))
+        self.assertEqual(self.widget.pages.count(), 5)
+
+    def test_configuration_scroll_wheel_and_page_position(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
         from PySide6.QtGui import QWheelEvent
         self.widget.show()
-        for width in (300, 360, 680):
-            self.widget.resize(width, 600)
-            self.widget._show_configuration()
-            APP.processEvents()
-            APP.processEvents()
-            panel = self.widget.configuration
-            self.assertEqual(panel.scroll.horizontalScrollBar().maximum(), 0)
-            bar = panel.scroll.verticalScrollBar()
-            bar.setValue(min(120, bar.maximum()))
-            value = bar.value()
-            self.widget._back_to_main()
-            self.widget._show_configuration()
-            APP.processEvents()
-            self.assertEqual(bar.value(), value)
-            bottom = panel.save_button.mapTo(self.widget, panel.save_button.rect().bottomRight())
-            self.assertLess(bottom.y(), self.widget.height())
-            viewport = panel.periods.table.viewport()
-            before = panel.periods.table.verticalScrollBar().value()
-            event = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, -120),
-                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.MouseButton.NoButton,
-                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.KeyboardModifier.NoModifier,
-                                __import__('PySide6.QtCore', fromlist=['Qt']).Qt.ScrollPhase.NoScrollPhase, False)
-            APP.sendEvent(viewport, event)
-            self.assertGreaterEqual(bar.value(), value)
-            self.assertEqual(panel.periods.table.verticalScrollBar().value(), before)
+        self.widget.resize(300, 550)
+        self.widget._show_configuration()
+        APP.processEvents()
+        panel = self.widget.configuration
+        bar = panel.scroll.verticalScrollBar()
+        bar.setValue(min(100, bar.maximum()))
+        value = bar.value()
+        self.widget._back_to_main()
+        self.widget._show_configuration()
+        APP.processEvents()
+        self.assertEqual(bar.value(), value)
+        old = panel.periods.verticalScrollBar().value()
+        event = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, -120), Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        APP.sendEvent(panel.periods.viewport(), event)
+        self.assertGreaterEqual(bar.value(), value)
+        self.assertEqual(panel.periods.verticalScrollBar().value(), old)
 
-    def test_stale_check_cannot_overwrite_changed_project(self):
+    def test_stale_check_cannot_replace_current_project(self):
         from threading import Event
         entered, release = Event(), Event()
         def delayed(data):
             entered.set()
             release.wait(3)
-            return {'periods': []}
+            return {'issues': []}
         with patch.object(self.widget.controller, 'inspect_data', side_effect=delayed):
             self.widget.check_data()
             self.assertTrue(entered.wait(1))
-            self.widget.project.edit.setText(str(self.root / 'missing-project'))
+            self.widget._load_project(self.root / 'missing-project')
             release.set()
             self.wait_ready()
         self.assertFalse(self.widget.checked)
         self.assertFalse(self.widget.group_buttons['单期道路'].isEnabled())
         self.assertIn('存在的项目', self.widget.check_note.text())
 
-    def test_save_error_stays_in_configuration_and_preserves_file(self):
+    def test_save_error_keeps_configuration_and_existing_config(self):
         self.widget._show_configuration()
         target = self.root / 'project_config.json'
         before = target.read_bytes()
@@ -350,123 +496,69 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
         self.assertIn('文件被占用', self.widget.check_note.text())
 
-    def test_missing_image_targets_its_table_row(self):
-        self.widget._show_configuration()
-        self.widget.periods.table.item(0, 2).setText('missing-images.txt')
-        self.widget._save_and_check()
-        self.wait_ready()
-        message = self.widget.check_note.text()
-        self.assertIn('北区 / 2020', message)
-        self.assertIn('文件不存在', message)
-        self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
-        self.widget.configuration.locate(message)
-        self.assertEqual(self.widget.periods.table.currentRow(), 0)
-        self.assertEqual(self.widget.periods.table.item(0, 2).toolTip(), message)
-
-    def create_from_inputs(self, name, inputs):
+    def test_create_empty_then_configure_and_reopen(self):
+        source = self.widget.configuration.inputs()
         self.widget._show_creation()
         page = self.widget.creation
-        page.project_name.setText(name)
+        self.assertFalse(hasattr(page, 'areas'))
+        self.assertFalse(hasattr(page, 'periods'))
+        from PySide6.QtWidgets import QLineEdit
+        self.assertEqual(len(page.findChildren(QLineEdit)), 2)
+        page.project_name.setText('新项目')
         page.project_location.edit.setText(str(self.root))
-        page.load(inputs)
         page.save_button.click()
         self.wait_ready()
-        return self.root / name
-
-    def test_create_empty_project_then_configure(self):
-        source = self.widget.configuration.inputs()
-        root = self.create_from_inputs('空项目', dict(areas=[], periods=[], truths=[], area_irmad_references={}))
+        target = self.root / '新项目'
         for folder in ('01_验证区', '02_影像', '03_变化真值', '成果输出', '_work'):
-            self.assertTrue((root / folder).is_dir())
-        self.assertTrue((root / 'project_config.json').is_file())
+            self.assertTrue((target / folder).is_dir())
+        self.assertEqual(scan_project(target)['areas'], [])
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
-        self.assertFalse(self.widget.checked)
-        self.assertTrue(self.widget.configuration.save_button.isEnabled())
+        self.assertEqual(self.widget.run_button.text(), '配置数据')
+        source['periods'][0][-1] = str(self.root / '北区/02_影像/2020.tif')
         self.widget.configuration.load(source)
         self.widget.configuration.save_button.click()
         self.wait_ready()
-        self.assertTrue(self.widget.checked)
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
-        self.widget.project.edit.setText(str(self.root))
+        self.assertEqual(self.widget.run_button.text(), '开始处理')
+        model = scan_project(target)
+        self.assertEqual(model['area_irmad_references'], source['area_irmad_references'])
+        self.assertFalse(list((target / '02_影像').rglob('*.tif')))
+        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(self.root)):
+            self.widget.switch_button.click()
         self.wait_ready()
-        self.widget.project.edit.setText(str(root))
+        self.assertEqual(self.widget.run_button.text(), '查看成果')
+        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(target)):
+            self.widget.switch_button.click()
         self.wait_ready()
-        self.assertTrue(self.widget.checked)
+        self.assertEqual(self.widget.run_button.text(), '开始处理')
         self.assertEqual(len(self.widget.model['periods']), 6)
 
-    def test_create_complete_project_with_external_images(self):
-        source = self.widget.configuration.inputs()
-        source['periods'][0][-1] = str(self.root / '北区/02_影像/2020.tif')
-        source['periods'][1][-1] = '\n'.join([str(self.root / '北区/02_影像/2022.tif'), str(self.root / '北区/02_影像/20250118.tif')])
-        root = self.create_from_inputs('完整项目', source)
-        self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
-        self.assertTrue(self.widget.run_button.isEnabled())
-        model = scan_project(root)
-        self.assertEqual(model['areas'], source['areas'])
-        self.assertEqual(model['area_irmad_references'], source['area_irmad_references'])
-        self.assertEqual(model['output'], str(root / '成果输出'))
-        self.assertFalse(list((root / '02_影像').rglob('*.tif')))
-        first = Path(model['periods'][0][-1])
-        self.assertTrue(first.is_relative_to(root))
-        self.assertEqual(first.read_text(encoding='utf-8').strip(), source['periods'][0][-1])
-        self.assertEqual(len(Path(model['periods'][1][-1]).read_text(encoding='utf-8').splitlines()), 2)
-        self.assertEqual(check_files(model), [])
-        self.widget._show_configuration()
-        self.widget.configuration.reference_boxes['北区'].setCurrentText('2022')
-        self.widget.configuration.save_button.click()
-        self.wait_ready()
-        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(self.root)):
-            self.widget.open_button.click()
-        self.wait_ready()
-        self.assertTrue(self.widget.group_buttons['单期道路'].isEnabled())
-        with patch('plugin.widget.QFileDialog.getExistingDirectory', return_value=str(root)):
-            self.widget.open_button.click()
-        self.wait_ready()
-        self.assertEqual(self.widget.model['area_irmad_references']['北区'], '2022')
-
-    def test_creation_collision_and_failed_write_preserve_existing_project(self):
+    def test_creation_collision_and_failed_write_preserve_project(self):
         from plugin.ui.project_browser import create_project
-        source = self.widget.configuration.inputs()
-        config = (self.root / 'project_config.json').read_bytes()
+        empty = dict(areas=[], periods=[], truths=[], area_irmad_references={})
+        before = (self.root / 'project_config.json').read_bytes()
         with self.assertRaises(ValueError):
-            create_project(self.root.parent, self.root.name, source)
-        self.assertEqual((self.root / 'project_config.json').read_bytes(), config)
+            create_project(self.root.parent, self.root.name, empty)
+        self.assertEqual((self.root / 'project_config.json').read_bytes(), before)
         for name in ('../outside', 'bad/name', 'CON', ''):
             with self.assertRaises(ValueError):
-                create_project(self.root, name, source)
+                create_project(self.root, name, empty)
         with patch('plugin.ui.project_browser.os.replace', side_effect=OSError('写入失败')):
             with self.assertRaises(OSError):
-                create_project(self.root, '失败项目', source)
+                create_project(self.root, '失败项目', empty)
         self.assertFalse((self.root / '失败项目').exists())
-        self.assertFalse(list(self.root.glob('.road-change-new-*')))
 
-    def test_creation_draft_and_narrow_page(self):
-        self.widget.show()
-        self.widget._show_creation()
-        page = self.widget.creation
-        page.project_name.setText('草稿')
-        for width in (300, 360, 450, 680):
-            self.widget.resize(width, 600)
-            APP.processEvents()
-            APP.processEvents()
-            self.assertEqual(page.scroll.horizontalScrollBar().maximum(), 0)
-            page.scroll.verticalScrollBar().setValue(100)
-            value = page.scroll.verticalScrollBar().value()
-            self.widget._back_to_main()
-            self.widget._show_creation()
-            APP.processEvents()
-            self.assertEqual(page.project_name.text(), '草稿')
-            self.assertEqual(page.scroll.verticalScrollBar().value(), value)
-            self.assertLess(page.save_button.mapTo(self.widget, page.save_button.rect().bottomRight()).y(), self.widget.height())
-
-    def test_host_can_override_local_appearance(self):
-        application_style = APP.styleSheet()
-        self.widget.setProperty("hostStyled", True)
-        self.assertEqual(self.widget.styleSheet(), "")
-        self.widget.setProperty("hostStyled", False)
+    def test_host_style_and_auxiliary_visibility(self):
+        app_style = APP.styleSheet()
+        self.assertFalse(self.widget.advanced.toggle.isChecked())
+        self.assertFalse(self.widget.records_fold.toggle.isChecked())
+        self.widget.setProperty('hostStyled', True)
+        self.assertEqual(self.widget.styleSheet(), '')
+        self.widget.setProperty('hostStyled', False)
         self.assertTrue(self.widget.styleSheet())
-        self.assertEqual(APP.styleSheet(), application_style)
+        self.assertEqual(APP.styleSheet(), app_style)
+        self.assertTrue(self.widget.run_button.icon().isNull())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

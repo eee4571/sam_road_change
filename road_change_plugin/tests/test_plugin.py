@@ -66,7 +66,7 @@ class PluginTests(unittest.TestCase):
             widget.resize(width, 700)
             APP.processEvents()
             self.assertLessEqual(widget.minimumSizeHint().width(), 300)
-        self.assertFalse(widget.local.toggle.isChecked())
+        self.assertIsNot(widget.pages.currentWidget(), widget.update_page)
         self.assertFalse(widget.advanced.toggle.isChecked())
         self.assertEqual(set(widget.group_buttons), {"单期道路", "变化检测", "长时序", "精度评价"})
         widget.close()

@@ -211,15 +211,9 @@ class ProjectState:
             return f"{meta.get('before_period')}_to_{meta.get('after_period')}" in scope['changes']
         return kind == 'road_temporal'
 
-    def local(self, action, data):
-        descriptor = self.descriptor()
-        if not descriptor:
-            raise ValueError('当前项目没有可重跑的成果')
-        manifest = descriptor['data']
-        grid = data['grid']
-        period = data.get('period', '')
-        # Use the frozen period order, including failed/missing periods. Fast
-        # change evidence uses each pair and its immediate planned neighbours.
+    @staticmethod
+    def period_order(manifest, grid):
+        """Frozen processing order, including failed/missing periods."""
         names = manifest.get('period_orders', {}).get(grid, {}).get('period_order', [])
         if not names:
             names = list(manifest.get('input_spec', {}).get('grids', {}).get(grid, {}))
@@ -227,6 +221,17 @@ class ProjectState:
                 names = [str(e['period']) for e in manifest.get('period_results', []) if str(e.get('grid')) == grid]
             names = sorted(set(names), key=lambda v: [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', v)])
         names = list(map(str, names))
+        return names
+
+    def local_scope(self, action, data):
+        """Read-only impact preview, shared by UI and destructive preparation."""
+        descriptor = self.descriptor()
+        if not descriptor:
+            raise ValueError('当前项目没有可更新的成果')
+        if action not in {'rerun-period', 'rerun-change'}:
+            raise ValueError('请选择更新期次或变化对')
+        grid, period = data['grid'], data.get('period', '')
+        names = self.period_order(descriptor['data'], grid)
         adjacent = list(zip(names, names[1:]))
         if action == 'rerun-period':
             if period not in names:
@@ -237,7 +242,13 @@ class ProjectState:
             if (data['before_period'], data['after_period']) not in adjacent:
                 raise ValueError(f'{grid}：当前成果中不存在所选变化对')
             changes = [f"{data['before_period']}_to_{data['after_period']}"]
-        scope = dict(grid=grid, periods=[period] if action == 'rerun-period' else [], changes=changes)
+        return dict(grid=grid, periods=[period] if action == 'rerun-period' else [], changes=changes)
+
+    def local(self, action, data):
+        scope = self.local_scope(action, data)
+        descriptor = self.descriptor()
+        manifest = descriptor['data']
+        grid, period, changes = scope['grid'], data.get('period', ''), scope['changes']
         products = self.results()
         removed = [p for p in products if self.in_scope(p, scope)]
         targets = [path for p in removed for path in self.dataset_files(p['path'])]

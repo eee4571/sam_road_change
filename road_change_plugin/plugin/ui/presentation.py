@@ -1,7 +1,7 @@
 """Small layout primitives; colors and typography come from the Qt host."""
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette, QPainter, QPen
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QMenu, QToolButton, QSizePolicy
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QToolButton, QSizePolicy
 
 
 class SectionHeader(QWidget):
@@ -66,14 +66,3 @@ class AccordionButton(QToolButton):
         if self.hasFocus():
             painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 1, Qt.PenStyle.DotLine))
             painter.drawRect(self.rect().adjusted(1, 1, -2, -2))
-
-
-def result_menu(button, title, payloads, open_result):
-    """Keep individual-file access available without a permanent results tree."""
-    menu = QMenu(button)
-    for caption, payload in payloads:
-        action = menu.addAction(caption)
-        action.setToolTip(payload["path"])
-        action.triggered.connect(lambda _checked=False, value=payload: open_result(value))
-    button.setToolTip(f"查看{title}成果并选择单个文件")
-    return menu

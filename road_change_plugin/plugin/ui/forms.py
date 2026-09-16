@@ -1,8 +1,7 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QLineEdit,
-    QToolButton, QFormLayout, QFrame)
+    QFileDialog, QLineEdit,
+    QToolButton, QFormLayout)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
 from .presentation import AccordionButton
 
 
@@ -15,8 +14,9 @@ def form_layout(widget):
 
 
 class PathField(QWidget):
-    def __init__(self, directory=False, parent=None):
+    def __init__(self, directory=False, parent=None, file_filter='所有文件 (*)'):
         super().__init__(parent)
+        self.file_filter = file_filter
         self.edit = QLineEdit()
         self.edit.setMinimumWidth(0)
         button = QToolButton()
@@ -30,70 +30,12 @@ class PathField(QWidget):
         button.clicked.connect(lambda: self.browse(directory))
 
     def browse(self, directory):
-        value = QFileDialog.getExistingDirectory(self, "选择目录") if directory else QFileDialog.getOpenFileName(self, "选择文件")[0]
+        value = QFileDialog.getExistingDirectory(self, "选择目录") if directory else QFileDialog.getOpenFileName(self, "选择文件", '', self.file_filter)[0]
         if value:
             self.edit.setText(value)
 
     def text(self):
         return self.edit.text().strip()
-
-
-class Rows(QWidget):
-    def __init__(self, headers, file_filter, parent=None, multiple_files=False):
-        super().__init__(parent)
-        self.file_filter = file_filter
-        self.multiple_files = multiple_files
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.table = QTableWidget(0, len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setMinimumWidth(0)
-        self.table.setMaximumHeight(160)
-        layout.addWidget(self.table)
-        bar = QHBoxLayout()
-        for title, callback in (("添加", self.add), ("删除", self.remove), ("选择文件", self.browse)):
-            button = QPushButton(title)
-            button.clicked.connect(callback)
-            bar.addWidget(button)
-        bar.addStretch(1)
-        layout.addLayout(bar)
-
-    def add(self):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        for column in range(self.table.columnCount()):
-            self.table.setItem(row, column, QTableWidgetItem(""))
-        self.table.setCurrentCell(row, 0)
-
-    def remove(self):
-        row = self.table.currentRow()
-        if row >= 0:
-            self.table.removeRow(row)
-
-    def browse(self):
-        if self.table.currentRow() < 0:
-            self.add()
-        if self.multiple_files:
-            paths = QFileDialog.getOpenFileNames(self, "选择一份影像清单或多幅影像", "", self.file_filter)[0]
-            path = "\n".join(paths)
-        else:
-            path = QFileDialog.getOpenFileName(self, "选择数据", "", self.file_filter)[0]
-        if path:
-            self.table.setItem(self.table.currentRow(), self.table.columnCount() - 1, QTableWidgetItem(path))
-
-    def values(self):
-        return [[self.table.item(r, c).text().strip() if self.table.item(r, c) else ""
-                 for c in range(self.table.columnCount())] for r in range(self.table.rowCount())]
-
-    def set_values(self, values):
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(values))
-        for r, row in enumerate(values):
-            for c, value in enumerate(row):
-                self.table.setItem(r, c, QTableWidgetItem(str(value)))
-        self.table.blockSignals(False)
 
 
 class Fold(QWidget):

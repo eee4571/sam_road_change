@@ -8,28 +8,18 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
     QComboBox, QScrollArea, QLabel, QPushButton, QLineEdit,
     QProgressBar, QPlainTextEdit,
-    QGridLayout, QToolButton, QMenu, QGroupBox, QStackedWidget, QFileDialog)
+    QGridLayout, QToolButton, QMenu, QGroupBox, QStackedWidget, QFileDialog, QMessageBox)
 from .ui.forms import PathField, Fold, form_layout
-from .ui.presentation import inline, primary_button, result_menu
+from .ui.presentation import inline, primary_button
 from .ui.appearance import dock_style
 from .ui.data_configuration import DataConfiguration
-from .ui.desktop import ResponsiveRow, ResultChooser
-from .ui.project_browser import ROOT, scan_project, check_files, pairs, natural, resolve, save_configuration, create_project
+from .ui.desktop import ResponsiveRow
+from .ui.project_pages import ProjectCreation, UpdatePage
+from .ui.results_page import ResultsPage, GROUPS
+from .ui.project_browser import ROOT, scan_project, check_files, resolve, save_configuration, create_project
 from .ui.background import BrowseJob
 from .ui.evaluation_summary import metrics_text
 from .project_state import ProjectState
-
-RESULT_LABELS = {"road_centerline": "道路中心线", "road_surface": "道路面",
-                 "road_width": "道路宽度", "road_change": "变化检测",
-                 "road_temporal": "长时序", "road_evaluation": "精度评价"}
-GROUPS = {"road_centerline": "单期道路", "road_surface": "单期道路", "road_width": "单期道路",
-          "road_change": "变化检测", "road_temporal": "长时序", "road_evaluation": "精度评价"}
-DETAIL_LABELS = {"changes": "全部变化", "added": "新增道路", "removed": "消失道路",
-                 "widened": "道路拓宽", "narrowed": "道路收窄", "gpkg": "变化数据集",
-                 "life_shp": "道路生命周期", "observations_shp": "逐期观测",
-                 "events_shp": "变化事件", "event_parts_shp": "事件分段",
-                 "lineage_shp": "道路沿革", "csv": "评价表格", "json": "评价报告"}
-
 
 def label(text, role=None):
     value = QLabel(text)
@@ -44,31 +34,24 @@ class RoadChangeWidget(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self.model = {"areas": [], "periods": [], "truths": [], "issues": []}
-        self.checked = False
-        self.busy = False
-        self.browsing = False
+        self.model = dict(areas=[], periods=[], truths=[], issues=[])
+        self._project_directory = ''
+        self.checked = self.busy = self.browsing = False
         self._started_at = None
-        self._action = "all"
-        self._job = None
-        self._task_log_path = None
-        self._log_lines = []
-        self._last_error = ""
-        self._current = None
-        self._active_record = "session"
-        self._result_keys = set()
+        self._action = 'all'
+        self._job = self._task_log_path = self._current = None
+        self._log_lines, self._last_error = [], ''
+        self._active_record = 'session'
+        self._result_keys, self._jobs = set(), {}
         self._project_revision = 0
-        self._jobs = {}
-        self._return_after_check = False
-        self._restoring = False
-        self._draft_dirty = False
-        self._resume_task = None
-        self._created_root = None
+        self._return_after_check = self._restoring = self._draft_dirty = False
+        self._resume_task = self._created_root = None
+        self._project_operation = {}
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
-        self.open_timer.setInterval(350)
+        self.open_timer.setInterval(200)
         self.open_timer.timeout.connect(self.scan)
-        self.setObjectName("roadChangeDock")
+        self.setObjectName('roadChangeDock')
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.pages = QStackedWidget()
@@ -78,64 +61,66 @@ class RoadChangeWidget(QWidget):
         layout = QVBoxLayout(self.main_page)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-        logs_button = self._tool_button("记录", lambda: self._reveal(self.records_fold))
-        more = self._tool_button("…", lambda: None)
-        logs_button.setToolTip("运行记录")
-        more.setToolTip("更多操作")
-        logs_button.setProperty("role", "toolbarAction")
-        more.setProperty("role", "toolbarAction")
-        menu = QMenu(more)
-        menu.addAction("局部重跑", lambda: self._reveal(self.local))
-        menu.addAction("检查运行资源", self._runtime)
-        self.rescan_action = menu.addAction("重新扫描", self.scan)
-        self.recheck_action = menu.addAction("重新检查", self.check_data)
-        more.setMenu(menu)
-        layout.addWidget(inline(label("道路变化检测", "title"), logs_button, more))
+        self.logs_button = self._tool_button('日志', lambda: self._reveal(self.records_fold))
+        self.more_button = self._tool_button('…', lambda: None)
+        self.more_button.setToolTip('更多操作')
+        for button in (self.logs_button, self.more_button):
+            button.setProperty('role', 'toolbarAction')
+        menu = QMenu(self.more_button)
+        self.update_action = menu.addAction('更新部分成果', self._show_update)
+        self.restart_action = menu.addAction('重新运行完整流程', self._restart)
+        menu.addSeparator()
+        self.new_project_action = menu.addAction('新建项目', self._show_creation)
+        self.rescan_action = menu.addAction('重新扫描', self.scan)
+        self.recheck_action = menu.addAction('重新检查', self.check_data)
+        self.runtime_action = menu.addAction('运行环境检查', self._runtime)
+        self.more_button.setMenu(menu)
+        layout.addWidget(inline(label('道路变化检测', 'title'), self.logs_button, self.more_button))
         self.scroll = QScrollArea()
         self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self.scroll.setWidgetResizable(True)
         body = QWidget()
-        body.setObjectName("roadChangeBody")
+        body.setObjectName('roadChangeBody')
         form = form_layout(body)
         form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(8)
         self.scroll.setWidget(body)
         layout.addWidget(self.scroll, 1)
-        self._data_section(self._section(form, "项目与数据"))
-        self._processing_section(self._section(form, "处理参数"))
-        self._results_section(self._section(form, "成果与评价", expand=True))
+        project_form = self._section(form, '项目')
+        self.project_group = project_form.parentWidget()
+        self._data_section(project_form)
+        process_form = self._section(form, '处理')
+        self.processing_group = process_form.parentWidget()
+        self._processing_section(process_form)
+        result_form = self._section(form, '成果')
+        self.result_group = result_form.parentWidget()
+        self._results_section(result_form)
         self._history_section()
-        for fold in (self.local, self.records_fold):
-            form.addRow(fold)
-        for fold in (self.advanced, self.local, self.records_fold):
+        form.addRow(self.records_fold)
+        for fold in (self.advanced, self.records_fold):
             fold.toggle.hide()
-            fold.setVisible(False)
-        self.status = label("选择项目目录，开始扫描数据", "secondary")
+            fold.hide()
+        self.status = label('', 'secondary')
         form.addRow(self.status)
         self.status.hide()
-        self.status.setWordWrap(True)
-
         self._footer(layout)
-        self.pages.addWidget(self.configuration)
-        self.pages.addWidget(self.creation)
-        self.pages.setCurrentWidget(self.main_page)
+        self.results_page = ResultsPage(self._back_to_main, self._open_result)
+        self.update_page = UpdatePage(self._back_to_main, self._start_update)
+        for page in (self.configuration, self.creation, self.results_page, self.update_page):
+            self.pages.addWidget(page)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._tick)
-        controller.task_started.connect(self._started)
-        controller.task_progress.connect(self._progress)
-        controller.task_log.connect(self._log)
-        controller.task_failed.connect(self._failed)
-        controller.task_finished.connect(self._finished)
-        controller.result_ready.connect(self._result)
+        for signal, slot in (('task_started', self._started), ('task_progress', self._progress),
+                             ('task_log', self._log), ('task_failed', self._failed),
+                             ('task_finished', self._finished), ('result_ready', self._result)):
+            getattr(controller, signal).connect(slot)
         for entry in controller.history:
             self._log(entry)
+        self._ui_ready = True
         self._update_controls()
-        # Minimums follow the inherited font; the host may make controls larger.
         for control in self.findChildren(QWidget):
-            if not isinstance(control, (QPushButton, QLineEdit, QComboBox, QToolButton)):
-                continue
-            control.setMinimumHeight(max(control.minimumHeight(), 28))
+            if isinstance(control, (QPushButton, QLineEdit, QComboBox, QToolButton)):
+                control.setMinimumHeight(max(control.minimumHeight(), 28))
         self._refresh_appearance()
 
     def _section(self, parent_form, title, expand=False):
@@ -157,7 +142,7 @@ class RoadChangeWidget(QWidget):
             QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(fold) if fold.isVisible() else None)
 
     def _footer(self, layout):
-        self.footer = QGroupBox("任务状态")
+        self.footer = QWidget()
         box = QVBoxLayout(self.footer)
         box.setContentsMargins(8, 14, 8, 8)
         box.setSpacing(8)
@@ -184,20 +169,20 @@ class RoadChangeWidget(QWidget):
             value.hide()
 
     def _render_task_state(self):
-        if not hasattr(self, "footer"):
+        if not hasattr(self, 'footer'):
             return
         self.running_status.setVisible(self.busy)
         self.task_fields.setVisible(self.busy)
-        state = self.state_text.text()
-        self.failure_details.setVisible(state == "失败")
+        self.failure_details.setVisible(bool(self._last_error) and not self.busy)
         if self.busy:
-            self.task_line.setText("运行中")
-        elif state in ("已完成", "已取消"):
-            self.task_line.setText(f"{state} · {self.area_text.text()} · {self.elapsed_text.text()}")
-        elif state == "失败":
-            self.task_line.setText("失败 · " + getattr(self, "_failure_reason", "请查看详情")[:120])
+            text = '正在处理'
+        elif self._last_error:
+            text = '上次处理未完成，请查看日志'
+        elif self.state_text.text() == '已完成' and self._started_at is not None:
+            text = '用时 ' + self.elapsed_text.text()
         else:
-            self.task_line.setText("正在准备项目…" if self.browsing else "" if self.checked or self.model["areas"] else "选择项目目录开始")
+            text = ''
+        self.task_line.setText(text)
 
     def _refresh_appearance(self):
         if getattr(self, "_styling", False):
@@ -236,31 +221,29 @@ class RoadChangeWidget(QWidget):
         return button
 
     def _data_section(self, form):
-        self.project = PathField(directory=True)
-        self.project.edit.setPlaceholderText("选择项目目录，自动读取和检查数据")
-        self.project.edit.textChanged.connect(self._directory_changed)
-        self.summary = label("尚未打开项目")
-        self.check_note = label("")
-        self.configure_button = self._button("配置数据", self._show_configuration)
-        self.scan_button = self._button("重新扫描", self.scan)
-        self.new_button = self._button("新建项目", self._show_creation)
-        self.open_button = self._button("打开项目", self._open_project)
-        entry = inline(self.new_button, self.open_button, stretch_first=False)
-        entry.layout().addStretch(1)
-        form.addRow(entry)
-        form.addRow(self.project)
-        form.addRow(self.summary)
-        actions = inline(self.configure_button, self.scan_button, stretch_first=False)
-        actions.layout().addStretch(1)
-        form.addRow(actions)
+        self.new_button = self._button('新建项目', self._show_creation)
+        self.open_button = self._button('打开项目', self._open_project)
+        self.project_entry = inline(self.new_button, self.open_button, stretch_first=False)
+        self.project_entry.layout().addStretch(1)
+        form.addRow(self.project_entry)
+        self.project_details = QWidget()
+        fields = form_layout(self.project_details)
+        fields.setContentsMargins(0, 0, 0, 0)
+        self.summary = label('')
+        self.project_path = label('', 'secondary')
+        self.project_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.switch_button = self._button('切换项目', self._open_project)
+        fields.addRow(inline(self.summary, self.switch_button))
+        fields.addRow(self.project_path)
+        self.data_state = label('', 'secondary')
+        self.configure_button = self._button('配置数据', self._show_configuration)
+        fields.addRow(inline(self.data_state, self.configure_button))
+        form.addRow(self.project_details)
+        self.check_note = label('')
         form.addRow(self.check_note)
         self.configuration = DataConfiguration(self._edited, self._back_to_main, self._save_and_check)
-        self.creation = DataConfiguration(lambda: None, self._back_to_main, self._create_project, creating=True)
-        self.creation.show_issues([])
-        self.areas, self.periods, self.truths = self.configuration.areas, self.configuration.periods, self.configuration.truths
+        self.creation = ProjectCreation(self._back_to_main, self._create_project)
         self.check_button = self.configuration.save_button
-        self.resume_button = self._button("继续未完成处理", self._continue_task)
-        form.addRow(self.resume_button)
 
     def _show_creation(self):
         if self.busy or self.browsing:
@@ -271,23 +254,40 @@ class RoadChangeWidget(QWidget):
         self.pages.setCurrentWidget(self.creation)
 
     def _open_project(self):
-        directory = QFileDialog.getExistingDirectory(self, "打开项目", self.project.text())
+        if self.busy or self.browsing:
+            return
+        if not self._allow_project_switch():
+            return
+        directory = QFileDialog.getExistingDirectory(self, '打开项目', self._project_directory)
         if directory:
-            if directory == self.project.text():
-                self.scan()
-            else:
-                self.project.edit.setText(directory)
+            self._load_project(directory)
+
+    def _allow_project_switch(self):
+        if not self._draft_dirty:
+            return True
+        return QMessageBox.question(self, '切换项目', '当前数据配置尚未保存，切换项目会放弃这些修改。是否继续？',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+
+    def _load_project(self, directory):
+        if self.busy:
+            return
+        self._project_directory = str(directory)
+        self._directory_changed()
+        self._back_to_main()
 
     def _create_project(self):
         if self.busy or self.browsing:
             return
+        if not self._allow_project_switch():
+            return
         try:
-            root = create_project(self.creation.project_location.text(), self.creation.project_name.text(), self.creation.inputs())
+            root = create_project(self.creation.project_location.text(), self.creation.project_name.text(), dict(areas=[], periods=[], truths=[], area_irmad_references={}))
         except (OSError, ValueError, TypeError) as exc:
             self.creation.show_issues([str(exc)])
             return
         self.creation.show_issues([])
-        self.project.edit.setText(str(root))
+        self._load_project(root)
         self._created_root = str(root)
         self.scan()
 
@@ -299,52 +299,74 @@ class RoadChangeWidget(QWidget):
 
     def _continue_task(self):
         if self._resume_task and self.checked and not self.busy and not self.browsing:
-            self._run("all", resume=True)
+            self._run(self._resume_task.get('action', 'all'), resume=True)
+
+    def _primary(self):
+        if self.ui_state in {'unconfigured', 'problem'}:
+            self._show_configuration()
+            if self.check_note.text():
+                self.configuration.locate(self.check_note.text())
+        elif self.ui_state == 'resume':
+            self._continue_task()
+        elif self.ui_state == 'completed':
+            self._show_results()
+        elif self.ui_state == 'ready':
+            if self._current or self._result_keys:
+                self._restart()
+            else:
+                self._run('all')
+
+    def _restart(self):
+        if self.busy or self.browsing or not self.checked:
+            return
+        answer = QMessageBox.question(self, '重新运行完整流程',
+            '当前正式成果将重新计算并替换，项目数据和可复用缓存不会删除。',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run('all')
+
+    def _show_update(self):
+        if self.update_action.isEnabled():
+            self.update_page.load(ProjectState(self.model['root'], self.output.text()))
+            self.pages.setCurrentWidget(self.update_page)
+
+    def _start_update(self):
+        if self.update_page.selection and not self.busy and self.checked and not self.browsing:
+            selection = dict(self.update_page.selection)
+            self._run(selection.pop('action'), selection=selection)
 
     def _processing_section(self, form):
-        self.run_button = self._button("运行完整流程", lambda: self._run("all"))
+        self.run_button = self._button('配置数据', self._primary)
         primary_button(self.run_button)
-        self.state_text = label("待就绪")
-        self.area_text = label("—")
-        self.scope_text = label("—")
-        self.stage_text = label("—")
-        self.elapsed_text = label("00:00:00")
+        self.state_text, self.area_text, self.scope_text = label(''), label('—'), label('—')
+        self.stage_text, self.elapsed_text = label('—'), label('00:00:00')
+        self.processing_hint = label('')
+        form.addRow(self.processing_hint)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
-        self.progress.setAccessibleName("总体进度")
+        self.progress.setAccessibleName('总体进度')
         self.progress.setTextVisible(False)
-        self.progress_text = label("0%", "secondary")
+        self.progress_text = label('0%', 'secondary')
         self.progress.valueChanged.connect(self._display_progress)
-        self.progress_note = label("等待任务开始", "secondary")
-        self.cancel_button = self._button("取消", self.controller.cancel)
-        self.local = Fold("局部重跑")
-        self.grid, self.period, self.pair = QComboBox(), QComboBox(), QComboBox()
-        self.grid.currentIndexChanged.connect(self._grid_changed)
-        self.local.form.addRow("区域", self.grid)
-        self.local.form.addRow("期次", self.period)
-        self.rerun_period = self._button("重跑该期并更新相关成果", lambda: self._run("rerun-period"))
-        self.local.form.addRow(self.rerun_period)
-        self.local.form.addRow("变化对", self.pair)
-        self.rerun_pair = self._button("重跑该变化对", lambda: self._run("rerun-change"))
-        self.local.form.addRow(self.rerun_pair)
-        self.advanced = Fold("高级设置")
+        self.progress_note = label('', 'secondary')
+        self.cancel_button = self._button('取消', self.controller.cancel)
+        self.advanced = Fold('高级设置')
         self.output = PathField(directory=True)
         self.output.edit.textChanged.connect(self._invalidate_check)
         self.output.edit.editingFinished.connect(self.check_data)
-        form.addRow(ResponsiveRow("成果目录", self.output))
-        advanced_button = self._button("高级设置", lambda: self._reveal(self.advanced))
-        form.addRow(inline(label("道路变化检测"), advanced_button))
+        form.addRow(ResponsiveRow('成果目录', self.output))
+        self.advanced_button = self._button('高级设置', lambda: self._reveal(self.advanced))
+        form.addRow(inline(label(''), self.advanced_button))
         form.addRow(self.advanced)
         self.parameters = {}
-        for key, title, value in (("pixel-size", "像元大小（0 自动）", "0.0"), ("absolute", "宽度变化阈值", "2.0"),
-                                  ("ratio", "宽度变化比例", "0.2"), ("tolerance", "匹配容差", "3.0")):
+        for key, title, value in (('pixel-size', '像元大小（0 自动）', '0.0'), ('absolute', '宽度变化阈值', '2.0'),
+                                  ('ratio', '宽度变化比例', '0.2'), ('tolerance', '匹配容差', '3.0')):
             field = QLineEdit(value)
             self.parameters[key] = field
             field.textChanged.connect(self._invalidate_check)
             field.editingFinished.connect(self.check_data)
             self.advanced.form.addRow(title, field)
-        self.advanced.form.addRow(self._button("检查运行资源", self._runtime))
 
     def _results_section(self, form):
         self.result_summary = label("扫描项目后自动发现已有成果", "secondary")
@@ -355,16 +377,11 @@ class RoadChangeWidget(QWidget):
         grid.setSpacing(0)
         self.group_buttons = {}
         self.result_labels = {}
-        self.result_menus = {}
         for row, name in enumerate(("单期道路", "变化检测", "长时序", "精度评价")):
             heading = label(name)
             summary = label("暂无成果", "secondary")
             button = self._button("查看", lambda _checked=False, group=name: self._open_group(group))
             button.setProperty("role", "resultAction")
-            button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            button.customContextMenuRequested.connect(
-                lambda point, group=name, target=button: self.result_menus[group].exec(target.mapToGlobal(point))
-                if group in self.result_menus else None)
             line = QWidget()
             line.setProperty("role", "resultRow")
             line.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -382,13 +399,9 @@ class RoadChangeWidget(QWidget):
         self.metrics = self.result_labels["精度评价"]
         self._reset_results()
         form.addRow(self.results)
-        self.chooser = ResultChooser(self._open_result)
-        form.addRow(self.chooser)
-        self.chooser.hide()
-        self._ui_ready = True
 
     def _history_section(self):
-        self.records_fold = Fold("运行记录")
+        self.records_fold = Fold("日志")
         form = self.records_fold.form
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
@@ -410,12 +423,17 @@ class RoadChangeWidget(QWidget):
         if not self.busy and hasattr(self, "run_button"):
             self.model = {"areas": [], "periods": [], "truths": [], "issues": []}
             self._resume_task = None
+            self._project_operation = {}
             self.state_text.setText("待就绪")
             self._reset_results()
             self._set_current(None)
             self._log_lines.clear()
             self._last_error = ""
             self._task_log_path = None
+            for fold in (self.advanced, self.records_fold):
+                fold.hide()
+                fold.toggle.setChecked(False)
+            self.status.hide()
             self._show_record()
             self.configuration.load(self.model)
             self._show_problems([])
@@ -465,13 +483,13 @@ class RoadChangeWidget(QWidget):
         self.open_timer.stop()
         if self.busy:
             return
-        if not self.project.text():
+        if not self._project_directory:
             self._show_problems([])
             return
         self._project_revision += 1
         self.checked = False
         self._return_after_check = False
-        self._background(scan_project, (self.project.text(),), self._scanned)
+        self._background(scan_project, (self._project_directory,), self._scanned)
 
     def _scanned(self, model):
         self.open_timer.stop()
@@ -493,22 +511,21 @@ class RoadChangeWidget(QWidget):
         self._refresh_results()
         self._restoring = False
         if self._created_root == model["root"]:
-            self._return_after_check = True
+            self._show_configuration()
             self._created_root = None
         self.check_data()
 
     def _apply_corrections(self):
-        self.model.update(areas=self.areas.values(), periods=self.periods.values(), truths=self.truths.values(),
-                          area_irmad_references=self.configuration.reference_values(), issues=[], output=self.output.text())
-        for key in ("areas", "periods", "truths"):
+        self.model.update(self.configuration.inputs(), issues=[], output=self.output.text())
+        for key in ('areas', 'periods', 'truths'):
             for row in self.model[key]:
                 if row[-1]:
-                    row[-1] = str(resolve(row[-1], Path(self.model.get("root", ROOT))))
+                    row[-1] = '\n'.join(str(resolve(value, Path(self.model.get('root', ROOT))))
+                                          for value in row[-1].splitlines() if value.strip())
         self.checked = False
-        self._task_changed()
 
     def _save_and_check(self):
-        if self.busy or self.browsing or not self.model.get("root"):
+        if self.busy or self.browsing or not self.model.get("root") or not self.configuration.period_editor.isHidden():
             return
         self._project_revision += 1
         self._apply_corrections()
@@ -516,7 +533,6 @@ class RoadChangeWidget(QWidget):
             save_configuration(self.model, {key: field.text() for key, field in self.parameters.items()})
             self.model = scan_project(self.model["root"])
             self.configuration.load(self.model)
-            self._task_changed()
         except (OSError, ValueError, TypeError) as exc:
             self._show_problems([f"项目配置保存失败：{exc}"])
             return
@@ -528,6 +544,7 @@ class RoadChangeWidget(QWidget):
         self.check_note.setText(issues[0] if issues else "")
         self.check_note.setVisible(bool(issues))
         self.configuration.show_issues(issues)
+        self._update_controls()
 
     def check_data(self):
         if self.busy or not self.model.get("root"):
@@ -575,78 +592,94 @@ class RoadChangeWidget(QWidget):
 
     def _set_current(self, current):
         self._current = current
-        self._task_changed()
-
-    def _task_changed(self, *args):
-        task = self._current
-        data = task["data"] if task else {}
-        self._period_rows = [[e.get("grid", ""), e.get("period", "")] for e in data.get("period_results", [])]
-        if not self._period_rows:
-            self._period_rows = [r[:2] for r in self.model["periods"]]
-        self.grid.clear()
-        self.grid.addItems(sorted({r[0] for r in self._period_rows}, key=natural))
-        self._grid_changed()
-        if getattr(self, "_ui_ready", False):
-            self._update_controls()
-
-    def _grid_changed(self, *args):
-        area = self.grid.currentText()
-        self.period.clear()
-        self.period.addItems(sorted({r[1] for r in getattr(self, "_period_rows", []) if r[0] == area}, key=natural))
-        self.pair.clear()
-        for a, before, after in pairs(getattr(self, "_period_rows", [])):
-            if a == area:
-                self.pair.addItem(f"{before} → {after}", (before, after))
 
     def _data(self):
-        task = self._current
-        pair = self.pair.currentData() or ("", "")
-        return dict(project_root=self.model.get("root", ""), area_irmad_references=self.model.get("area_irmad_references",{}),areas=self.model["areas"], periods=self.model["periods"], truths=self.model["truths"],
-                    output=self.output.text(), profile="fast", evaluate=any(Path(row[-1]).is_file() for row in self.model["truths"]),
-                    truth_type_field="", resume=False,
-                    manifest=task["path"] if task else "", grid=self.grid.currentText(), period=self.period.currentText(),
-                    before_period=pair[0], after_period=pair[1], device="auto",
+        return dict(project_root=self.model.get('root', ''),
+                    area_irmad_references=self.model.get('area_irmad_references', {}),
+                    areas=self.model['areas'], periods=self.model['periods'], truths=self.model['truths'],
+                    output=self.output.text(), profile='fast',
+                    evaluate=any(Path(row[-1]).is_file() for row in self.model['truths']),
+                    truth_type_field='', resume=False, manifest=self._current['path'] if self._current else '',
+                    grid='', period='', before_period='', after_period='', device='auto',
                     **{key: field.text() for key, field in self.parameters.items()})
 
     def _update_controls(self, *args):
-        if not getattr(self, "_ui_ready", False):
+        if not getattr(self, '_ui_ready', False):
             return
         available = not self.busy and not self.browsing
-        same_root = bool(self.model.get("root")) and self.controller.path(self.project.text()) == Path(self.model["root"])
-        has_data = bool(self.model["areas"]) and same_root
-        self.run_button.setEnabled(available and self.checked)
-        self.scan_button.setEnabled(available)
+        opened = bool(self.model.get('root'))
+        self.project_entry.setVisible(not opened)
+        self.project_details.setVisible(opened)
+        self.project_group.setTitle('项目' if opened else '')
+        for section in (self.processing_group, self.result_group, self.footer, self.logs_button, self.more_button):
+            section.setVisible(opened)
         self.new_button.setEnabled(available)
-        self.open_button.setEnabled(not self.busy)
+        self.new_project_action.setEnabled(available)
+        self.open_button.setEnabled(available)
+        self.switch_button.setEnabled(available)
         self.creation.body.setEnabled(available)
         self.creation.save_button.setEnabled(available)
-        self.check_button.setEnabled(available and same_root)
-        self.project.setEnabled(not self.busy)
-        self.rescan_action.setEnabled(available)
-        self.recheck_action.setEnabled(available and has_data)
         self.configuration.body.setEnabled(available)
-        self.configure_button.setEnabled(bool(self.model.get("root")))
+        self.check_button.setEnabled(available and opened and self.configuration.period_editor.isHidden())
+        self.configure_button.setEnabled(available and opened)
         self.advanced.setEnabled(available)
         self.output.setEnabled(available)
-        self.cancel_button.setEnabled(self.busy)
+        self.rescan_action.setEnabled(available and opened)
+        self.recheck_action.setEnabled(available and opened)
+        self.restart_action.setEnabled(available and opened and self.checked)
+        compatible = bool(self._current) and self._current['data'].get('execution_profile') == 'fast'
+        self.update_action.setEnabled(available and self.checked and compatible and bool(self._result_keys) and not self._resume_task)
+        self.update_page.body.setEnabled(available)
+        self.update_page.save_button.setEnabled(self.update_action.isEnabled() and bool(self.update_page.scope))
         self.cancel_button.setVisible(self.busy)
-        has_task = bool(self._current) and same_root and self._current["data"].get("execution_profile") == "fast" and not self._resume_task
-        self.rerun_period.setEnabled(available and has_task and self.period.count() > 0)
-        self.rerun_pair.setEnabled(available and has_task and self.pair.count() > 0)
-        project_name = Path(self.model["root"]).name if same_root else "尚未打开项目"
-        self.summary.setText(f"项目：{project_name}  {len(self.model['areas'])} 个区域  {len(self.model['periods'])} 个期次" if same_root else project_name)
-        self.resume_button.setVisible(bool(self._resume_task))
-        self.resume_button.setEnabled(available and self.checked and bool(self._resume_task))
+        self.cancel_button.setEnabled(self.busy)
+        if opened:
+            project_name = self.model.get('config', {}).get('project_name') or Path(self.model['root']).name
+            self.summary.setText(f"{project_name} · {len(self.model['areas'])} 个区域 · {len(self.model['periods'])} 个期次")
+            self.project_path.setText(self.model['root'])
+        if not opened:
+            state, title, description = 'closed', '', ''
+        elif self.busy:
+            state, title, description = 'running', '', '道路变化检测正在处理'
+        elif self.browsing:
+            state, title, description = 'checking', '正在检查', '正在读取项目并检查数据'
+        elif not self.model['areas']:
+            state, title, description = 'unconfigured', '配置数据', '项目尚未配置数据'
+        elif not self.checked:
+            state, title, description = 'problem', '修正数据', '请修正数据配置后再处理'
+        elif self._resume_task:
+            local = self._resume_task.get('action', 'all') != 'all'
+            state, title = 'resume', '继续更新' if local else '继续处理'
+            description = '上次更新尚未完成' if local else '上次处理尚未完成'
+            if local:
+                scope = self._resume_task.get('scope') or {}
+                target = (scope.get('periods') or scope.get('changes') or [])
+                description += '\n' + scope.get('grid', '') + ' / ' + '、'.join(target).replace('_to_', ' → ')
+        elif self._result_keys and self._project_operation.get('status') == 'completed':
+            state, title, description = 'completed', '查看成果', '处理已完成，当前成果可用'
+        else:
+            state, title, description = 'ready', '开始处理', '项目数据已就绪'
+        self.ui_state = state
+        self.run_button.setText(title)
+        self.run_button.setVisible(opened and not self.busy)
+        self.run_button.setEnabled(available and opened)
+        self.processing_hint.setText(description)
+        self.data_state.setText('尚未配置' if not self.model['areas'] else '检查中' if self.browsing else '数据已就绪' if self.checked else '数据有问题')
         self.check_note.setVisible(bool(self.check_note.text()))
         self._render_task_state()
 
-    def _run(self, action, resume=False):
+    def _run(self, action, resume=False, selection=None):
+        if self.busy or self.browsing or not self.checked:
+            return
         self._action = action
         self.busy = True
-        self.state_text.setText("正在启动")
+        self.state_text.setText('正在启动')
+        self._last_error = ''
+        self._back_to_main()
         self._update_controls()
         data = self._data()
-        data["resume"] = resume
+        data.update(selection or {})
+        data['resume'] = resume
         self.controller.run(action, data)
 
     def _runtime(self):
@@ -744,7 +777,7 @@ class RoadChangeWidget(QWidget):
         self.timer.stop()
         self.state_text.setText("失败")
         self._failure_reason = payload.get("message", "任务失败").splitlines()[0]
-        self.status.setText("任务未完成，请查看运行记录中的错误详情")
+        self.status.setText("任务未完成，请查看日志中的错误详情")
         self.progress.setRange(0, 1000)
         self._log({**payload, "level": "ERROR"})
         self._refresh_results()
@@ -769,18 +802,12 @@ class RoadChangeWidget(QWidget):
 
     def _reset_results(self):
         self._result_keys.clear()
-        if hasattr(self, "chooser"):
-            self.chooser.hide()
         self.results.hide()
         self.result_summary.show()
         self._group_payloads = {name: [] for name in self.group_buttons}
-        self._result_captions = {name: [] for name in self.group_buttons}
         for name, button in self.group_buttons.items():
             button.setEnabled(False)
             self.result_labels[name].setText("暂无成果")
-        for menu in self.result_menus.values():
-            menu.deleteLater()
-        self.result_menus.clear()
 
     def _refresh_results(self, latest=False):
         root = self.model.get("root")
@@ -788,7 +815,8 @@ class RoadChangeWidget(QWidget):
             return
         try:
             store = ProjectState(root, self.output.text())
-            self._resume_task = store.state() if store.resumable() else None
+            self._project_operation = store.state()
+            self._resume_task = self._project_operation if store.resumable() else None
             self._set_current(store.descriptor())
             self._reset_results()
             for payload in store.results():
@@ -796,6 +824,8 @@ class RoadChangeWidget(QWidget):
             self.result_summary.setText(f"{len(self._result_keys)} 项当前成果" if self._result_keys else "暂无成果，运行完成后在此查看")
             self._last_error = store.state().get('last_error', self._last_error)
             self._show_record()
+            if self.pages.currentWidget() is self.results_page:
+                self.results_page.populate(self._all_results())
         except (OSError, ValueError, TypeError) as exc:
             self._resume_task = None
             self.result_summary.setText(f"项目状态读取失败：{exc}")
@@ -814,20 +844,6 @@ class RoadChangeWidget(QWidget):
         group = GROUPS[kind]
         self._group_payloads[group].append(dict(payload))
         self.group_buttons[group].setEnabled(True)
-        meta = payload.get("metadata", {})
-        scope = str(meta.get("period") or "")
-        if meta.get("before_period") and meta.get("after_period"):
-            scope = f"{meta['before_period']} → {meta['after_period']}"
-        leaf = str(payload.get("name", "")).split(" / ")[-1]
-        title = DETAIL_LABELS.get(leaf, RESULT_LABELS[kind])
-        context = " / ".join(str(v) for v in (meta.get("grid"), scope) if v)
-        caption = title + (f" · {context}" if context else "")
-        self._result_captions[group].append((caption, dict(payload)))
-        previous = self.result_menus.get(group)
-        if previous:
-            previous.deleteLater()
-        self.result_menus[group] = result_menu(self.group_buttons[group], group,
-                                               self._result_captions[group], self._open_result)
         members = self._group_payloads[group]
         if group == "单期道路":
             scopes = {(p.get("metadata", {}).get("grid"), p.get("metadata", {}).get("period"))
@@ -846,20 +862,25 @@ class RoadChangeWidget(QWidget):
             self.metrics.setText("报告已生成")
         self.result_summary.setText(f"{len(self._result_keys)} 个成果文件可用")
 
+    def _all_results(self):
+        return [p for values in self._group_payloads.values() for p in values]
+
+    def _show_results(self, group=None):
+        self.results_page.populate(self._all_results(), group)
+        self.pages.setCurrentWidget(self.results_page)
+        self.results_page.back_button.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def _open_group(self, group):
-        self.chooser.populate(group, self._result_captions[group])
-        self.chooser.show()
-        self.scroll.ensureWidgetVisible(self.chooser)
+        self._show_results(group)
 
     def _open_result(self, payload):
-        if not Path(payload["path"]).is_file():
-            self.status.setText("成果文件已不存在，请重新扫描项目")
-            self.status.show()
-            self.scroll.ensureWidgetVisible(self.status)
-            return
-        self.controller.result_ready.emit(dict(payload))
-        self.status.setText("已将成果路径报告给宿主")
-        self.status.show()
+        if not Path(payload['path']).is_file():
+            message = '成果文件已不存在，请重新扫描项目'
+        else:
+            self.controller.result_ready.emit(dict(payload))
+            message = '已将成果路径报告给宿主'
+        self.results_page.message.setText(message)
+        self.results_page.message.show()
 
     def _open_logs(self):
         root = self.model.get("root")

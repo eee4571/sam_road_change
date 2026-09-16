@@ -68,7 +68,7 @@ def scan_project(directory):
         model["truths"] = [[str(a), str(b), str(c), configured(p)] for a, b, c, p in config.get("area_truths", [])]
         if config.get("output_root"):
             model["output"] = configured(config["output_root"])
-    if not model["areas"]:
+    if not model["areas"] and 'validation_areas' not in model['config']:
         def named(parent, prefix, aliases):
             found = sorted((p for p in parent.iterdir() if p.is_dir() and
                             (p.name.startswith(prefix) or p.name.casefold() in aliases)), key=lambda p: natural(p.name))
@@ -103,9 +103,9 @@ def scan_project(directory):
 
         if not collect(root, False):
             for child in sorted(root.iterdir(), key=lambda p: natural(p.name)):
-                if child.is_dir() and child.name not in EXCLUDED and not child.name.startswith(".") and not child.is_symlink():
+                if child.is_dir() and child.name not in EXCLUDED and not child.name.startswith(".") and not child.is_symlink() and not (child / 'project_config.json').is_file():
                     collect(child, True)
-    if not model["areas"]:
+    if not model["areas"] and 'validation_areas' not in model['config']:
         model["issues"].append("未识别到验证区。支持项目配置，或 01_验证区 / 02_影像 / 03_变化真值 目录。")
     model["current"] = current_project(root, model["output"])
     return model
@@ -116,7 +116,9 @@ def check_files(model):
     issues = []
     expected = set(pairs(model["periods"]))
     names = [r[0] for r in model["areas"]]
-    if not names or len(set(names)) != len(names) or any(not n for n in names):
+    if not names:
+        issues.append('请添加验证区，并为每个区域配置至少两个影像期次')
+    elif len(set(names)) != len(names) or any(not n for n in names):
         issues.append("区域名称为空或重复，请修正")
     for name in names:
         rows = [r for r in model["periods"] if r[0] == name]

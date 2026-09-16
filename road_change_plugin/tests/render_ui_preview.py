@@ -44,7 +44,7 @@ def main():
                     entry["published"][kind] = str(target)
             data["change_results"] = []
             for area in ("北区", "南区"):
-                for before, after in (("2020", "2022"), ("2022", "2024")):
+                for before, after in (("2020", "2022"), ("2022", "20250118")):
                     target = project / "成果输出" / area / (before + "_to_" + after + ".shp")
                     target.touch()
                     data["change_results"].append({"grid": area, "before_period": before, "after_period": after,
@@ -61,7 +61,7 @@ def main():
 
             def widget_factory(parent=None):
                 widget = create(parent)
-                widget.project.edit.setText(str(project))
+                widget._project_directory = str(project)
                 widget._scanned(scan_project(project))
                 def capture():
                     if widget.browsing:
@@ -72,11 +72,14 @@ def main():
                         QApplication.processEvents()
                         QApplication.processEvents()
                         assert widget.scroll.horizontalScrollBar().maximum() == 0
-                        assert widget.run_button.isVisible()
-                        assert widget.run_button.mapTo(widget, widget.run_button.rect().bottomRight()).y() < widget.height()
+                        if widget.pages.currentWidget() is widget.main_page and widget.model.get('root'):
+                            action = widget.cancel_button if widget.busy else widget.run_button
+                            assert action.isVisible()
+                            assert action.mapTo(widget, action.rect().bottomRight()).y() < widget.height()
                         widget.grab().save(str(ROOT / ("resources/" + name + ".png")))
                     widget._reset_results()
                     widget.result_summary.setText("暂无成果，运行完成后在此查看")
+                    widget._update_controls()
                     save("ui_idle_680")
                     widget._started({"task_id": "preview-only"})
                     widget._started_at -= 98
@@ -91,18 +94,35 @@ def main():
                     current.finish('cancelled')
                     widget._finished({'status': 'cancelled', 'task_id': 'preview-only'})
                     save('ui_resume_680')
+                    from plugin.project_state import write_json
+                    state = current.state()
+                    state.update(action='rerun-period', scope={'grid': '北区', 'periods': ['2022'], 'changes': ['2020_to_2022', '2022_to_20250118']})
+                    write_json(current.path, state)
+                    widget._refresh_results()
+                    save('ui_resume_update_680')
+                    state.update(action='all', scope=None)
+                    write_json(current.path, state)
                     current.finish('completed')
                     widget._finished({'status': 'completed', 'task_id': 'preview-only'})
-                    widget._reveal(widget.local)
+                    widget._show_update()
+                    next(b for b in widget.update_page.buttons.buttons() if b.selection.get('period') == '2022').click()
                     save('ui_local_rerun_680')
-                    widget._reveal(widget.local)
+                    widget.resize(300, 600)
+                    save('ui_update_300')
+                    widget.resize(680, 600)
+                    widget._show_results()
+                    save('ui_results_680')
+                    widget.resize(300, 600)
+                    save('ui_results_300')
+                    widget._back_to_main()
                     widget.resize(360, 600)
                     save("ui_narrow_360")
                     widget.resize(680, 600)
                     widget._show_configuration()
                     QApplication.processEvents()
                     widget.grab().save(str(ROOT / "resources/ui_configuration_680.png"))
-                    widget.configuration.reference_boxes["北区"].setCurrentIndex(0)
+                    widget.configuration.area.setCurrentText("北区")
+                    widget.configuration.reference.setCurrentIndex(0)
                     widget.configuration.show_issues(["北区：请选择 IR-MAD 参考期"])
                     widget.resize(360, 600)
                     QApplication.processEvents()
@@ -120,6 +140,10 @@ def main():
                     QApplication.processEvents()
                     assert widget.creation.scroll.horizontalScrollBar().maximum() == 0
                     widget.grab().save(str(ROOT / "resources/ui_create_project_360.png"))
+                    widget._load_project('')
+                    widget.open_timer.stop()
+                    widget.resize(680, 600)
+                    save('ui_welcome_680')
                     print("Captured main, configuration and creation pages with simulated states")
                     QApplication.instance().quit()
 

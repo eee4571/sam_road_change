@@ -186,9 +186,11 @@ class ProjectLifecycleTests(unittest.TestCase):
     def test_period_rerun_cleans_four_period_evidence_dependencies_only(self):
         self.existing()
         original = self.store.results()
+        preview = self.store.local_scope('rerun-period', self.data)
         self.controller.run('rerun-period', self.data)
         self.assertEqual(self.errors, [])
         scope = self.store.state()['scope']
+        self.assertEqual(scope, preview)
         self.assertEqual(scope['changes'], ['2020_to_2021', '2021_to_2022'])
         for p in original:
             self.assertEqual(Path(p['path']).exists(), not self.store.in_scope(p, scope), p['path'])
