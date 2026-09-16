@@ -15,6 +15,7 @@ import numpy as np
 import rasterio
 from threadpoolctl import threadpool_limits
 from . import irmad_core as core
+from .cache_commit import find_prepared, seal_prepared, commit_prepared
 
 REFERENCE = '20250118'
 VERSION = 'fast_irmad_pif_tls_v2'
@@ -208,19 +209,21 @@ def prepare_period(period,sources,cache_root,*,enabled=False,origin=None,referen
     # Independent attempt directories prevent partial writes being mistaken for a hit.
     attempt=Path(cache_root)/f'{key}.pending-{uuid.uuid4().hex}'
     try:
-        print(f'[IR-MAD] {period} → {reference_period}: 独立 PIF / TLS 拟合',flush=True)
-        normalize_pair(pairs,attempt,reference_period=reference_period)
-        tiles=attempt/'normalized_tiles'
-        for p in source.glob('valid_observation.*'):shutil.copy2(p,tiles/p.name)
-        save(tiles/'normalized_cache.json',dict(irmad_identity=key,source=str(source)))
-        if root.exists():raise FileExistsError(f'IR-MAD incomplete or concurrent cache: {root}')
-        attempt.rename(root)
-        audit=json.loads((root/'normalization.json').read_text(encoding='utf8'))
-        for row in audit['outputs']:row['output']=str(root/'normalized_tiles'/Path(row['output']).name)
-        save(root/'normalization.json',audit)
-        files=[fingerprint(p) for p in sorted(root.rglob('*')) if p.is_file() and p.name!='paired_valid_rgb.bin']
-        save(marker,dict(identity=identity,files=files))
+        prepared=find_prepared(root,identity)
+        if prepared:
+            attempt=prepared
+            print(f'[IR-MAD] {period} → {reference_period}: 重试提交已完成缓存',flush=True)
+        else:
+            print(f'[IR-MAD] {period} → {reference_period}: 独立 PIF / TLS 拟合',flush=True)
+            normalize_pair(pairs,attempt,reference_period=reference_period)
+            tiles=attempt/'normalized_tiles'
+            for p in source.glob('valid_observation.*'):shutil.copy2(p,tiles/p.name)
+            save(tiles/'normalized_cache.json',dict(irmad_identity=key,source=str(source)))
+            seal_prepared(attempt,root,identity)
+        commit_prepared(attempt,root,identity)
     except Exception as exc:
-        if attempt.is_dir():save(attempt/'failure.json',dict(error=str(exc),identity=identity))
+        if attempt.is_dir():
+            try:save(attempt/'failure.json',dict(error=str(exc),identity=identity))
+            except OSError:pass
         raise RuntimeError(f'IR-MAD {period} → {reference_period} 失败：{exc}') from exc
     return PreparedInput(root/'normalized_tiles',dict(base,status='normalized',cache_identity=key,audit=str(root/'normalization.json')))

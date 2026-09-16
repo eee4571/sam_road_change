@@ -35,6 +35,8 @@ def _contact_geometry(first, second):
 
 def _node_network(roads):
     """Insert planar contacts and emit edges between junctions, retaining bodies."""
+    # Trimming may leave a point or a repeated-point line. It has no network edge.
+    roads = [road for road in roads if _polyline_length(road.points) > 1e-8]
     lines = [LineString(road.points) for road in roads]
     tree = STRtree(lines)
     cuts = [[] for _ in roads]
@@ -78,7 +80,9 @@ def _node_network(roads):
             if second-first > 1e-8:
                 points = road.points.copy() if len(positions)==2 else np.asarray(substring(line, first, second).coords)
                 points[0],points[-1] = first_xy,second_xy
-                result.append(_RegionalRoadSeed(points, road.width_m, road.source_ids, road.geometry_kind))
+                # Contact snapping can collapse an originally positive-length span.
+                if _polyline_length(points) > 1e-8:
+                    result.append(_RegionalRoadSeed(points, road.width_m, road.source_ids, road.geometry_kind))
     return result
 
 
@@ -95,6 +99,9 @@ def _graph(roads):
 
 
 def _join_chains(roads):
+    # Use the same geometric tolerance as point deduplication, before indexing
+    # endpoints or using segment lengths as width weights.
+    roads = [road for road in roads if _polyline_length(road.points) > 1e-8]
     ends = {}
     for index, road in enumerate(roads):
         for start in (True, False):
@@ -124,7 +131,9 @@ def _join_chains(roads):
             if (index,not start) not in links:
                 break
             index, start = links[index,not start]
-        result.append(_RegionalRoadSeed(_deduplicate_points(np.vstack(chunks)),float(np.average(widths,weights=lengths)),tuple(sorted(sources)),'network_track'))
+        points = _deduplicate_points(np.vstack(chunks))
+        if _polyline_length(points) > 1e-8:
+            result.append(_RegionalRoadSeed(points,float(np.average(widths,weights=lengths)),tuple(sorted(sources)),'network_track'))
     return result
 
 

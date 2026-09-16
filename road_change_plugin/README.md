@@ -104,12 +104,17 @@ plugin.shutdown()
 
 ## 测宽缓存与验证
 
+IR-MAD 缓存提交遇到 Windows 文件占用或拒绝访问时会有限重试。计算完成的临时缓存先保存可校验的待提交记录；若提交仍失败，后续继续处理会校验并重试提交，避免重复计算。没有完整记录或文件已改变的临时缓存不会复用，也不会删除其他缓存。此机制不绕过目录权限；持续失败时错误详情会保留后端异常和相关路径。
+
+缓存提交回归：`python -m unittest discover -s tests -p test_cache_commit.py`。开发仓库中可用插件后端解释器执行 `tests/check_irmad_cache_recovery.py`，仅使用微型合成影像检查缓存恢复和现有数值回归，不加载模型。
+
 RGB/Lab/灰度按块缓存；Gaussian/Sobel/Canny/texture 按完整窗口精确缓存，保留 Canny 的窗口连接语义。共用 128 MiB LRU 上限，最多 4 个 road-chain 求解线程，不写整区 RGB 拼接图。
 
 ## 验证
 
 轻量插件测试：`python -m unittest discover -s tests -p "test_*.py"`（PySide6 环境，无模型推理）。
 复制后端合成回归：用插件算法解释器执行 `tests/run_backend_smoke.py <主工作台/code/tests>`；测试源码仅为开发输入，所有被测后端必须来自插件副本，生产不依赖测试源码。
+路网退化几何回归：开发仓库中用插件后端解释器执行 `tests/check_road_network_degeneracy.py`；覆盖端点吸附后线段坍缩、零长度线、有效短线、闭环及原有路网连接用例，不运行模型。
 `tests/run_real_pipeline.py` 是显式手动真实任务驱动，不在 unittest discovery 中；未经要求不运行。
 
 本轮真实任务尝试因长路径图片写入失败而退出，未完整完成。后续按用户要求停止真实模型验证；已同步长路径图片 I/O 修复并通过微型图像读写测试，未重新跑真实任务。

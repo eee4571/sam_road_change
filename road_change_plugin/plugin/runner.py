@@ -1,5 +1,6 @@
 """Qt-only process boundary. Never import the backend into the host."""
 import codecs
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ class Runner(TaskSignals):
         self._cancelled = False
         self._completion = {}
         self._failure = ""
+        self._output_tail = deque(maxlen=100)
         self._buffer = ""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._kill_timer = QTimer(self)
@@ -90,6 +92,7 @@ class Runner(TaskSignals):
         self._cancelled = False
         self._completion = {}
         self._failure = ""
+        self._output_tail.clear()
         self._buffer = ""
         self._decoder.reset()
         self.state = "queued"
@@ -127,6 +130,8 @@ class Runner(TaskSignals):
             self.consume_line(line.rstrip("\r"))
 
     def consume_line(self, line):
+        # Diagnostics only: task state still comes from events and process exit.
+        self._output_tail.append(line[-4096:])
         try:
             event = parse_line(line)
         except (ValueError, TypeError) as exc:
@@ -159,7 +164,10 @@ class Runner(TaskSignals):
             return
         self._terminal = True
         self.state = "failed"
-        self.task_failed.emit(self._payload(message=message, detail=self.process.errorString(), status="failed"))
+        detail = '\n'.join(self._output_tail)[-24000:]
+        if self.process.error() != QProcess.ProcessError.UnknownError:
+            detail = '\n'.join(filter(None, (detail, self.process.errorString())))
+        self.task_failed.emit(self._payload(message=message, detail=detail or message, status="failed"))
 
     def _error(self, error):
         if error == QProcess.ProcessError.FailedToStart:

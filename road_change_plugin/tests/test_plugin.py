@@ -177,6 +177,34 @@ class PluginTests(unittest.TestCase):
             self.assertEqual(runner.state, "failed")
             self.assertEqual(len(failures), 1)
 
+    def test_python_traceback_is_preserved_in_failure_detail(self):
+        runner = FakeRunner()
+        runner.script = "raise RuntimeError('IR-MAD cache rename: WinError 5 access denied')"
+        failed = []
+        runner.task_failed.connect(failed.append)
+        runner.start([])
+        wait_done(runner)
+        self.assertEqual(len(failed), 1)
+        self.assertIn('Traceback', failed[0]['detail'])
+        self.assertIn('WinError 5 access denied', failed[0]['detail'])
+        self.assertNotEqual(failed[0]['detail'], 'Unknown error')
+
+    def test_log_text_does_not_change_success_and_previous_tail_is_cleared(self):
+        runner = FakeRunner()
+        runner.script = "raise RuntimeError('previous-only-error')"
+        failed, finished = [], []
+        runner.task_failed.connect(failed.append)
+        runner.task_finished.connect(finished.append)
+        runner.start([])
+        wait_done(runner)
+        runner.script = "print('RuntimeError: example documentation; failed 100%'); print('__SAMROAD_USER__{\"kind\":\"complete\"}')"
+        runner.start([])
+        wait_done(runner)
+        self.assertEqual(runner.state, 'completed')
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(len(finished), 1)
+        self.assertNotIn('previous-only-error', '\n'.join(runner._output_tail))
+
     def test_batch_failure_count_prevents_success_with_zero_exit(self):
         runner = FakeRunner()
         runner.script = "print('__SAMROAD_USER__{\"kind\":\"complete\",\"stage\":\"rerun-all-changes\",\"failure_count\":2}')"

@@ -387,9 +387,13 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
     # paths. Fast prepare intentionally references this cache without copying
     # GeoTIFFs into period/images.
     cache_root = None
-    if (root.parent.name == 'runs' and root.parent.parent.name == 'tasks'
+    work_root = None
+    if root.name == 'current' and root.parent.name == '_work':
+        work_root = root.parent
+    elif (root.parent.name == 'runs' and root.parent.parent.name == 'tasks'
             and root.parent.parent.parent.name == '_work'):
         work_root = root.parent.parent.parent
+    if work_root is not None:
         candidate = (work_root / 'cache' / 'normalized').resolve()
         if _relative_to(candidate, work_root) is not None:
             cache_root = candidate
@@ -450,7 +454,7 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
     if missing:
         details = "\n".join(f"- {path}" for path in sorted(set(missing), key=str))
         raise FileNotFoundError(
-            "复制后的当前项目缺少影像清单所需文件；不会回退读取其他项目，也不会重新切片：\n"
+            "当前项目缺少影像清单所需文件；不会回退读取其他项目，也不会重新切片：\n"
             + details
         )
     modified_lists = 0
