@@ -33,18 +33,31 @@ def _contact_geometry(first, second):
     return first.intersection(second)
 
 
-def _node_network(roads):
+def _node_network(roads, changed=None):
     """Insert planar contacts and emit edges between junctions, retaining bodies."""
     # Trimming may leave a point or a repeated-point line. It has no network edge.
-    roads = [road for road in roads if _polyline_length(road.points) > 1e-8]
+    retained = [i for i,road in enumerate(roads) if _polyline_length(road.points) > 1e-8]
+    if changed is not None:
+        changed = {j for j,i in enumerate(retained) if i in changed}
+    roads = [roads[i] for i in retained]
     lines = [LineString(road.points) for road in roads]
     tree = STRtree(lines)
     cuts = [[] for _ in roads]
     endpoint_contacts = {}
-    for i, line in enumerate(lines):
+    affected = None
+    if changed is not None:
+        # Unchanged edges are already noded. Only changed edges and their
+        # spatial neighbours can gain intersections or numerical contacts.
+        affected = set(changed)
+        for i in changed:
+            affected.update(map(int, tree.query(lines[i], predicate='dwithin', distance=1e-5)))
+    for i in (range(len(lines)) if affected is None else sorted(affected)):
+        line = lines[i]
         for raw_j in tree.query(line):
             j = int(raw_j)
             if j <= i:
+                continue
+            if changed is not None and i not in changed and j not in changed:
                 continue
             intersection = _contact_geometry(line, lines[j])
             points = _parts(intersection, 'Point')
@@ -57,7 +70,8 @@ def _node_network(roads):
                         cuts[index].append((distance,np.asarray(point.coords[0])))
     # Projected-coordinate roundoff can leave a mathematically touching T-node
     # a few nanometres off the segment. Resolve only numerical contacts here.
-    for i,line in enumerate(lines):
+    for i in (range(len(lines)) if affected is None else sorted(affected)):
+        line = lines[i]
         for at_start in (True,False):
             point = Point(line.coords[0 if at_start else -1])
             for raw_j in tree.query(point.buffer(1e-5)):
@@ -71,6 +85,9 @@ def _node_network(roads):
                     cuts[j].append((distance,xy))
     result = []
     for road_id,(road, line, distances) in enumerate(zip(roads, lines, cuts)):
+        if affected is not None and road_id not in affected:
+            result.append(road)
+            continue
         positions = [(0.0,endpoint_contacts.get((road_id,True),np.asarray(line.coords[0])))]
         for value,xy in sorted(distances,key=lambda item:item[0]):
             if value-positions[-1][0] > 1e-6:
@@ -257,18 +274,16 @@ def _continuations(ports,roads,maximum,surface):
             chord = delta/distance
             facing = min(a.heading@chord,b.heading@-chord)
             turn = a.heading@-b.heading
-            chord_support = _support([a.point,b.point],surface)
-            supported_curve = chord_support>=0.65 and distance<=100 and min(a.separation,b.separation)>30
-            facing_degrees = 62 if supported_curve else (55 if distance<25 else 38)
-            if facing<np.cos(np.deg2rad(facing_degrees)) or turn<np.cos(np.deg2rad(60)):
+            can_be_supported = distance<=100 and min(a.separation,b.separation)>30
+            widest_facing = 62 if can_be_supported else (55 if distance<25 else 38)
+            if facing<np.cos(np.deg2rad(widest_facing)) or turn<np.cos(np.deg2rad(60)):
                 continue
             axis = a.heading-b.heading
             axis /= max(np.linalg.norm(axis),1e-9)
             lateral = abs(delta@np.asarray([-axis[1],axis[0]]))
             limit = min(20.0,max(8.0,distance*0.16),0.45*min(a.separation,b.separation))
-            if supported_curve:
-                limit = max(limit,min(22.0,distance*0.6))
-            if lateral>limit or (distance>40 and min(a.length,b.length)<4):
+            widest_limit = max(limit,min(22.0,distance*0.6)) if can_be_supported else limit
+            if lateral>widest_limit or (distance>40 and min(a.length,b.length)<4):
                 continue
             # Averaging two headings can hide a lane swap: opposite lateral
             # errors cancel. Check the corridor of each approach separately.
@@ -276,6 +291,11 @@ def _continuations(ports,roads,maximum,surface):
                    for p in (a,b)):
                 continue
             if distance>80 and a.length+b.length<distance*0.5:
+                continue
+            supported_curve = can_be_supported and _support([a.point,b.point],surface)>=0.65
+            facing_degrees = 62 if supported_curve else (55 if distance<25 else 38)
+            if supported_curve:limit = max(limit,min(22.0,distance*0.6))
+            if facing<np.cos(np.deg2rad(facing_degrees)) or lateral>limit:
                 continue
             curve = _tangent_continuous_connector(a.anchor,a.tangent,b.anchor,b.tangent,1.0)
             if curve is None:
@@ -505,7 +525,8 @@ def _apply(roads,candidates):
         members = [roads[c.first.road],roads[c.target]]
         sources = tuple(sorted(set(members[0].source_ids+members[1].source_ids)))
         result.append(_RegionalRoadSeed(c.points,float(np.mean([r.width_m for r in members])),sources,'connection'))
-    return _join_chains(_node_network(result))
+    changed = {index for index,start in trims} | set(range(len(roads),len(result)))
+    return _join_chains(_node_network(result, changed=changed if candidates else None))
 
 
 def _metrics(roads):
@@ -541,6 +562,8 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
     """
     if not np.isfinite(unit_size_m) or unit_size_m<=0 or not np.isfinite(max_gap_m) or max_gap_m<=0:
         raise ValueError('Distances must be finite and positive')
+    if evidence is not None:
+        max_gap_m = min(max_gap_m,evidence.maximum_gap_m)
     import time
     from collections import Counter
     timing=Counter()
@@ -555,7 +578,13 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
         from shapely.affinity import scale
         surface_geometry = scale(surface_geometry,xfact=unit_size_m,yfact=unit_size_m,origin=(0,0))
     surface = prep(surface_geometry) if surface_geometry is not None and not surface_geometry.is_empty else None
-    noded = _node_network(active)
+    from .road_axis_cleanup import remove_exact_duplicates, correct_oscillating_chains
+    distinct = remove_exact_duplicates(active)
+    noded = _node_network(distinct)
+    compact = _join_chains(noded)
+    active, axis_corrected = correct_oscillating_chains(compact,evidence)
+    active = _join_chains(active)
+    noded = active
     timing['network_initial_noding'] += time.perf_counter()-started
     started=time.perf_counter()
     baseline = _metrics(noded)
@@ -647,6 +676,9 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
     diagnostics = dict(connection_input_count=len(roads),connection_output_count=len(active),connection_added_count=len(additions),connection_added_length_m=float(sum(lengths)),connection_max_length_m=float(max(lengths,default=0)),connection_round_count=rounds,connection_continuation_count=sum(c.second is not None for c in additions),connection_attachment_count=sum(c.second is None for c in additions),connection_smoothed_tail_length_m=float(trim_length),connection_dangling_before=baseline['dangling'],connection_dangling_after=final['dangling'],connection_components_before=baseline['components'],connection_components_after=final['components'],connection_main_length_ratio_before=baseline['main_length_ratio'],connection_main_length_ratio_after=final['main_length_ratio'],connection_junctions_before=baseline['junctions'],connection_junctions_after=final['junctions'])
     diagnostics.update(connection_corridor_count=len(corridors),connection_corridor_replaced_length_m=replaced.length,connection_corridor_bridge_count=len(corridor_bridges),connection_corridor_bridge_length_m=sum(g.length for g,_ in corridor_bridges))
     diagnostics.update(cleanup)
+    diagnostics.update(connection_exact_duplicates_removed=len(roads)-len(distinct),
+                       connection_premerged_count=len(compact),
+                       connection_axis_corrected_count=axis_corrected)
     diagnostics.update(connection_keep_main_component=keep_main_component,
                        connection_components_before_filter=components_before_filter,
                        connection_isolated_removed_count=len(removed),

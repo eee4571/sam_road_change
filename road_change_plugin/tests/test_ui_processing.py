@@ -440,14 +440,24 @@ class ProcessingUiTests(unittest.TestCase):
 
     def test_evaluation_summary(self):
         report = self.root / 'metrics.json'
-        report.write_text(json.dumps({'metrics': [{'class': 'all', 'precision': .9, 'recall': .8, 'f1': .847}]}))
+        report.write_text(json.dumps({'metrics': [{'class': 'all', 'change_precision': .9, 'change_recall': .8,
+            'road_centerline_completeness': .86, 'centerline_mean_offset_px': 1.25, 'change_type_accuracy': .92}]}))
         manifest = self.root / '_work/tasks/latest_pipeline.json'
         data = json.loads(manifest.read_text())
         data['evaluation_summary']['json'] = str(report)
         manifest.write_text(json.dumps(data))
         self.widget._refresh_results()
-        self.assertIn('P 90%', self.widget.metrics.text())
-        self.assertIn('F1 85%', self.widget.metrics.text())
+        self.assertIn('变化图斑准确率  90.0%', self.widget.metrics.text())
+        self.assertIn('变化道路提取完整度  86.0%', self.widget.metrics.text())
+        self.assertIn('中心线平均偏移距离  1.25 px', self.widget.metrics.text())
+        self.assertIn('变化类型正确率  92.0%', self.widget.metrics.text())
+        self.assertNotIn('F1', self.widget.metrics.text())
+        self.widget.project_path.setText('C:\\projects\\' + 'long_project_name_' * 8)
+        self.widget.show()
+        self.widget.resize(300, 600)
+        APP.processEvents()
+        APP.processEvents()
+        self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
 
     def test_status_is_structured_and_hidden_widget_keeps_processing(self):
         with patch.object(self.widget.controller, 'cancel') as cancel:

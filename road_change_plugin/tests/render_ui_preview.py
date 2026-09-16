@@ -31,7 +31,8 @@ def main():
             project.mkdir()
             fixture(project)
             report = project / "成果输出/evaluation.json"
-            report.write_text(json.dumps({"metrics": [{"class": "all", "precision": .912, "recall": .876, "f1": .894}]}))
+            report.write_text(json.dumps({"metrics": [{"class": "all", "change_precision": .912, "change_recall": .876,
+                "road_centerline_completeness": .894, "centerline_mean_offset_px": 1.25, "change_type_accuracy": .93}]}))
             manifest = project / "_work/tasks/latest_pipeline.json"
             data = json.loads(manifest.read_text())
             # Distinct placeholder files make the displayed scope counts real.

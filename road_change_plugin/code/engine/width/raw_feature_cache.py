@@ -1,5 +1,6 @@
 """Bounded, thread-safe RGB tile reader. No mosaics are written or resampled."""
 from collections import OrderedDict
+from concurrent.futures import Future
 from threading import RLock
 import cv2
 import numpy as np
@@ -56,41 +57,58 @@ class FeatureCache:
     def __init__(self,ds,max_bytes=128*1024*1024,block_size=512):
         self.ds=ds;self.max_bytes=max_bytes;self.block_size=block_size
         self.items=OrderedDict();self.bytes=0;self.lock=RLock()
+        self.read_lock=RLock();self.pending={}
         self.hits=0;self.misses=0;self.evictions=0
 
     def _get(self,key,build):
-        if key in self.items:
-            self.hits+=1;self.items.move_to_end(key);return self.items[key]
-        self.misses+=1;value=build();size=sum(a.nbytes for a in value)
-        while self.items and self.bytes+size>self.max_bytes:
-            _,old=self.items.popitem(last=False);self.bytes-=sum(a.nbytes for a in old);self.evictions+=1
-        if size<=self.max_bytes:self.items[key]=value;self.bytes+=size
-        return value
+        with self.lock:
+            if key in self.items:
+                self.hits+=1;self.items.move_to_end(key);return self.items[key]
+            future=self.pending.get(key)
+            owner=future is None
+            if owner:
+                self.misses+=1;future=Future();self.pending[key]=future
+            else:self.hits+=1
+        if not owner:return future.result()
+        try:
+            value=build();size=sum(a.nbytes for a in value)
+            with self.lock:
+                while self.items and self.bytes+size>self.max_bytes:
+                    _,old=self.items.popitem(last=False);self.bytes-=sum(a.nbytes for a in old);self.evictions+=1
+                if size<=self.max_bytes:self.items[key]=value;self.bytes+=size
+                # Wake same-key readers only after publication; no computations
+                # or dataset I/O run while holding the cache-state lock.
+                future.set_result(value);self.pending.pop(key)
+            return value
+        except BaseException as exc:
+            with self.lock:
+                future.set_exception(exc);self.pending.pop(key,None)
+            raise
 
     def features(self,lo,hi):
         x,y=map(int,lo);w,h=map(int,hi-lo)
-        with self.lock:
-            def build():
-                rgbf=np.empty((h,w,3),np.float32);lab=np.empty_like(rgbf)
-                gray=np.empty((h,w),np.float32);mask=np.empty((h,w),np.uint8)
-                b=self.block_size
-                for by in range(y//b,(y+h-1)//b+1):
-                    for bx in range(x//b,(x+w-1)//b+1):
-                        def block():
+        def build():
+            rgbf=np.empty((h,w,3),np.float32);lab=np.empty_like(rgbf)
+            gray=np.empty((h,w),np.float32);mask=np.empty((h,w),np.uint8)
+            b=self.block_size
+            for by in range(y//b,(y+h-1)//b+1):
+                for bx in range(x//b,(x+w-1)//b+1):
+                    def block():
+                        with self.read_lock:
                             rgb,valid=self.ds.read_window(Window(bx*b,by*b,min(b,self.ds.width-bx*b),min(b,self.ds.height-by*b)))
-                            f=rgb.astype(np.float32)/255
-                            return f,cv2.cvtColor(f,cv2.COLOR_RGB2LAB),cv2.cvtColor(f,cv2.COLOR_RGB2GRAY),valid.astype(np.uint8)
-                        parts=self._get(('block',bx,by),block)
-                        x0,y0=max(x,bx*b),max(y,by*b);x1,y1=min(x+w,(bx+1)*b),min(y+h,(by+1)*b)
-                        src=np.s_[y0-by*b:y1-by*b,x0-bx*b:x1-bx*b];dst=np.s_[y0-y:y1-y,x0-x:x1-x]
-                        for out,part in zip((rgbf,lab,gray,mask),parts):out[dst]=part[src]
-                blurred=cv2.GaussianBlur(gray,(0,0),.8)
-                gx=cv2.Sobel(blurred,cv2.CV_32F,1,0,ksize=3)/8
-                gy=cv2.Sobel(blurred,cv2.CV_32F,0,1,ksize=3)/8
-                edge=np.hypot(gx,gy)
-                canny=cv2.dilate(cv2.Canny((blurred*255).astype('uint8'),40,100),np.ones((3,3),'uint8'))/255
-                variance=cv2.boxFilter(gray*gray,-1,(7,7))-cv2.boxFilter(gray,-1,(7,7))**2
-                texture=np.sqrt(np.maximum(variance,0))
-                valid=cv2.erode(mask,np.ones((3,3),'uint8')).astype(float)
-                return rgbf,lab,edge,canny,texture,valid
-            return self._get(('window',x,y,w,h),build)
+                        f=rgb.astype(np.float32)/255
+                        return f,cv2.cvtColor(f,cv2.COLOR_RGB2LAB),cv2.cvtColor(f,cv2.COLOR_RGB2GRAY),valid.astype(np.uint8)
+                    parts=self._get(('block',bx,by),block)
+                    x0,y0=max(x,bx*b),max(y,by*b);x1,y1=min(x+w,(bx+1)*b),min(y+h,(by+1)*b)
+                    src=np.s_[y0-by*b:y1-by*b,x0-bx*b:x1-bx*b];dst=np.s_[y0-y:y1-y,x0-x:x1-x]
+                    for out,part in zip((rgbf,lab,gray,mask),parts):out[dst]=part[src]
+            blurred=cv2.GaussianBlur(gray,(0,0),.8)
+            gx=cv2.Sobel(blurred,cv2.CV_32F,1,0,ksize=3)/8
+            gy=cv2.Sobel(blurred,cv2.CV_32F,0,1,ksize=3)/8
+            edge=np.hypot(gx,gy)
+            canny=cv2.dilate(cv2.Canny((blurred*255).astype('uint8'),40,100),np.ones((3,3),'uint8'))/255
+            variance=cv2.boxFilter(gray*gray,-1,(7,7))-cv2.boxFilter(gray,-1,(7,7))**2
+            texture=np.sqrt(np.maximum(variance,0))
+            valid=cv2.erode(mask,np.ones((3,3),'uint8')).astype(float)
+            return rgbf,lab,edge,canny,texture,valid
+        return self._get(('window',x,y,w,h),build)

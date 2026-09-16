@@ -119,7 +119,7 @@ class ImageReader:
         if np.any(hi <= lo):
             raise ValueError('Centerline does not overlap image')
         window = Window(*lo, *(hi-lo))
-        with self.feature_cache.lock:
+        with self.feature_cache.read_lock:
             rgb,valid=self.ds.read_window(window)
         return rgb, valid, pix-lo, lo
 

@@ -233,6 +233,7 @@ class RoadChangeWidget(QWidget):
         fields.setContentsMargins(0, 0, 0, 0)
         self.summary = label('')
         self.project_path = label('', 'secondary')
+        self.project_path.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.project_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.switch_button = self._button('切换项目', self._open_project)
         fields.addRow(inline(self.summary, self.switch_button))

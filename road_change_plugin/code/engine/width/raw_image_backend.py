@@ -105,6 +105,8 @@ def measure_region(centerlines,image_dir,output_dir):
     (output/'summary.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf8')
     write_completed(marker,identities,manifest,[path,output/'summary.json'])
     print(f'[RGB width] chains={len(roads)} samples={len(samples)} seconds={manifest["seconds"]:.3f}',flush=True)
+    cache=manifest['feature_cache']
+    print(f'[RGB feature cache] hit={cache["hits"]} miss={cache["misses"]} eviction={cache["evictions"]} bytes={cache["bytes"]}/{cache["max_bytes"]}',flush=True)
     return observations
 
 def rebuild_observations(measured):

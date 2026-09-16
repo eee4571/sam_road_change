@@ -110,11 +110,19 @@ IR-MAD 缓存提交遇到 Windows 文件占用或拒绝访问时会有限重试�
 
 RGB/Lab/灰度按块缓存；Gaussian/Sobel/Canny/texture 按完整窗口精确缓存，保留 Canny 的窗口连接语义。共用 128 MiB LRU 上限，最多 4 个 road-chain 求解线程，不写整区 RGB 拼接图。
 
+缓存状态锁与影像读取锁独立，特征计算在锁外并行执行；同一缓存键的并发请求共用一次计算，失败后可重试。日志输出 `[RGB feature cache] hit=… miss=… eviction=…`。测宽间距、横断面采样、候选数、Viterbi、连续重建和代表性宽度参数保持不变。
+
+有影像证据时，区域连接搜索使用证据对象的 150m 上限；先做廉价几何筛选，再计算支持度。每轮连接只对改动道路及空间邻域执行 noding。恢复前清除完全重复的线并合并 degree-2 连续链；高频轴线修正只作用于符合短周期左右摆动特征的链内部，固定端点和真实路口，保留持续弯道，仍受 2m 位移上限、既有影像支持和拓扑约束。下一期 SAMRoad 预取保持不变。
+
+成果区读取汇总 JSON 的 `change_recall`、`change_precision`、`road_centerline_completeness`、中心线偏移和 `change_type_accuracy`，显示五项业务指标。偏移遵循报告 `centerline_offset_unit`，明确显示 m 或 px；缺失项显示“—”，不使用通用 P/R/F1/IoU 补值或重新计算评价。
+
 ## 验证
 
 轻量插件测试：`python -m unittest discover -s tests -p "test_*.py"`（PySide6 环境，无模型推理）。
 复制后端合成回归：用插件算法解释器执行 `tests/run_backend_smoke.py <主工作台/code/tests>`；测试源码仅为开发输入，所有被测后端必须来自插件副本，生产不依赖测试源码。
 路网退化几何回归：开发仓库中用插件后端解释器执行 `tests/check_road_network_degeneracy.py`；覆盖端点吸附后线段坍缩、零长度线、有效短线、闭环及原有路网连接用例，不运行模型。
+性能与轴线烟雾测试：`tests/check_processing_optimizations.py`，包含候选等价性、局部 noding、真实曲率保留、四线程特征计算及原有 RGB 成果结构检查。
+经用户明确授权后，可用 `tests/check_existing_period.py <项目目录> --period <期次>` 在已有数据的 600m 局部范围恢复路网并测量最多四条链；`tests/check_existing_axes.py <项目目录>` 检查已有 20221020 期次中至多 200 条链并导出一处修正对照。两者都不调用模型或完整流水线，输出位于项目 `_work/_processing_check/`，不覆盖正式成果。
 `tests/run_real_pipeline.py` 是显式手动真实任务驱动，不在 unittest discovery 中；未经要求不运行。
 
-本轮真实任务尝试因长路径图片写入失败而退出，未完整完成。后续按用户要求停止真实模型验证；已同步长路径图片 I/O 修复并通过微型图像读写测试，未重新跑真实任务。
+默认不运行真实模型或完整项目。已有数据的局部检查不代表全项目性能或精度评估。

@@ -7,7 +7,7 @@ from pathlib import Path
 import json
 from .fast_timing import timed_stage
 
-NETWORK_CONNECTION_VERSION = 5
+NETWORK_CONNECTION_VERSION = 6
 NETWORK_REPORT = 'road_network_report.json'
 
 
