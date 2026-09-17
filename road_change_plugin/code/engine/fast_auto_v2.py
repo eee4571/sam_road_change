@@ -20,6 +20,8 @@ from . import fast_auto_change as legacy
 from .auto_presence_candidates import LongitudinalCoverage, line_parts
 from .fast2_compensation import Fast2Compensation
 
+WIDTH_QUALITY_FIELDS = ('quality_grade','width_quality','quality_gr','width_qual')
+
 
 @dataclass(frozen=True)
 class V2Config:
@@ -223,7 +225,7 @@ def _paired_profiles(axis,intervals,before,after,minimum_length):
 def _reliable_width_at(scene,points):
     """C display/propagation widths are never temporal width evidence."""
     from shapely import distance
-    field=next((f for f in ('quality_grade','width_quality','quality_gr','width_qual') if f in scene.widths),None)
+    field=next((f for f in WIDTH_QUALITY_FIELDS if f in scene.widths),None)
     if field is None:return np.ones(len(points),dtype=bool)
     result=np.zeros(len(points),dtype=bool)
     pairs=scene.width_tree.query(points,predicate='dwithin',distance=3.)
@@ -256,6 +258,7 @@ def _calibration_roads(profiles,before,after,tolerance):
 
 def _width_changes(axis_id,axis,profiles,before,after,evidence,absolute,relative,minimum_length,minimum_area,counts,config,calibration):
     records=[];audit=[]
+    quality_verified=all(any(f in scene.widths for f in WIDTH_QUALITY_FIELDS) for scene in (before,after))
     bias=calibration['bias'];background=2.5*calibration['scatter']
     for start,end,target_id,a,b,bw,aw in profiles:
         other=after.lines[target_id]
@@ -326,6 +329,8 @@ def _width_changes(axis_id,axis,profiles,before,after,evidence,absolute,relative
                 v2_width_bias_m=bias,v2_width_residual_m=corrected_difference,v2_width_background_scatter_m=calibration['scatter'],
                 v2_publish=publish,v2_precision_reason='temporal_width_bias_or_population_fluctuation' if raw_publish and not publish else 'profile_evidence_conflict' if conflict else 'within_period_width_fluctuation' if not stable_profile else 'sustained_width_margin' if publish else 'small_or_short_width_fluctuation'))
             audit.append(dict(axis_id=axis_id,target_axis=target_id,start_m=low,end_m=high,sign=direction,accepted=True,
+                              quality_verified=quality_verified,
+                              centerline_offset_m=float(np.max(np.linalg.norm(xy-partners,axis=1))),
                               profile_interval_count=len(indexes),event_validation=False,profile_variability_m=variability,geometry=canonical))
     return records,audit
 
@@ -391,6 +396,10 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
     counts.update(reconcile_temporal(records,temporal_context or {},max(minimum_length,config.presence_minimum_length)))
     if patch_verifier is not None:
         counts.update(patch_verifier.verify(records,controls,profiles=profiles,width_audit=width_audit,absolute=absolute,relative=relative))
+    else:
+        from .fast_candidate_publication import CandidateEvidence,screen_candidates
+        structural,_=screen_candidates(records,CandidateEvidence((before,after),profiles,width_audit,absolute,relative))
+        counts.update(structural)
     counts['v2_local_sample_count']=counts['v2_probability_event_locations']+counts['v2_exact_width_event_sections']//2
     counts['timing_v2_total_seconds']=time.perf_counter()-started
     print('[Fast v2] '+str(dict(counts)),flush=True)

@@ -1,6 +1,6 @@
 """Small project creation and update pages. No processing code."""
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QToolButton, QLabel, QScrollArea,
-    QPushButton, QLineEdit, QComboBox, QButtonGroup, QRadioButton)
+    QPushButton, QLineEdit, QComboBox, QButtonGroup, QCheckBox)
 from .forms import PathField, form_layout
 from .presentation import inline, primary_button
 from .project_browser import natural
@@ -56,7 +56,7 @@ class ProjectCreation(ProjectPage):
 
 class UpdatePage(ProjectPage):
     def __init__(self, back, start):
-        super().__init__('更新部分成果', back, '开始更新', start)
+        super().__init__('局部重跑', back, '开始重跑', start)
         self.store = None
         self.selection = None
         self.scope = None
@@ -64,23 +64,26 @@ class UpdatePage(ProjectPage):
         self.area.setMinimumWidth(0)
         self.area.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.form.addRow('区域', self.area)
-        self.configuration_note = note('更新针对上次已处理的数据；开始后受影响的旧成果将失效。')
+        self.form.addRow(note('选择需要重新计算的期次或变化对。重跑道路期次时，与该期次相关的变化成果将自动重新计算。'))
+        self.configuration_note = note()
         self.form.addRow(self.configuration_note)
         self.options = QWidget()
         self.option_layout = QVBoxLayout(self.options)
         self.option_layout.setContentsMargins(0, 0, 0, 0)
         self.form.addRow(self.options)
-        self.impact = note('请选择需要更新的期次或变化对')
+        self.impact = note('请选择需要重跑的期次或变化对')
         self.form.addRow(self.impact)
         self.buttons = QButtonGroup(self)
-        self.buttons.buttonClicked.connect(self._selected)
+        self.buttons.setExclusive(False)
+        self.buttons.buttonToggled.connect(self._selected)
         self.area.currentIndexChanged.connect(self._area_changed)
         self.save_button.setEnabled(False)
 
     def load(self, store):
         self.store = store
-        self.configuration_note.setText('数据配置已修改。本次局部更新仍使用上次已处理的数据；要应用新配置，请完整重算。'
-            if store.configuration_status() == 'changed' else '更新针对上次已处理的数据；开始后受影响的旧成果将失效。')
+        self.configuration_note.setText('数据配置已修改。本次局部重跑仍使用上次已处理的数据；要应用新配置，请完整重算。'
+            if store.configuration_status() == 'changed' else '')
+        self.configuration_note.setVisible(bool(self.configuration_note.text()))
         descriptor = store.descriptor()
         self.manifest = descriptor['data'] if descriptor else {}
         areas = set(self.manifest.get('period_orders', {}))
@@ -102,32 +105,52 @@ class UpdatePage(ProjectPage):
             self.option_layout.takeAt(0).widget().deleteLater()
         self.selection, self.scope = None, None
         self.save_button.setEnabled(False)
-        self.impact.setText('请选择需要更新的期次或变化对')
+        self.impact.setText('请选择需要重跑的期次或变化对')
+        self.selection_groups = {}
         grid = self.area.currentText()
         names = ProjectState.period_order(getattr(self, 'manifest', {}), grid)
         for heading, values in (
-            ('更新期次', [(p, dict(action='rerun-period', grid=grid, period=p)) for p in names]),
-            ('更新变化对', [(f'{a} → {b}', dict(action='rerun-change', grid=grid, before_period=a, after_period=b))
+            ('重跑道路期次', [(p, dict(action='rerun-period', grid=grid, period=p)) for p in names]),
+            ('重跑变化对', [(f'{a} → {b}', dict(action='rerun-change', grid=grid, before_period=a, after_period=b))
                            for a, b in zip(names, names[1:])])):
-            self.option_layout.addWidget(note(heading))
+            group = self.selection_groups[heading] = []
+            select, clear = QPushButton('全选'), QPushButton('清空')
+            select.clicked.connect(lambda checked=False, g=group: self._set_group(g, True))
+            clear.clicked.connect(lambda checked=False, g=group: self._set_group(g, False))
+            self.option_layout.addWidget(inline(note(heading), select, clear))
             for text, selection in values:
-                button = QRadioButton(text)
+                button = QCheckBox(text)
                 button.selection = selection
                 self.buttons.addButton(button)
+                group.append(button)
                 self.option_layout.addWidget(button)
 
-    def _selected(self, button):
-        self.selection = dict(button.selection)
+    def _set_group(self, group, checked):
+        self.buttons.blockSignals(True)
+        for button in group:button.setChecked(checked)
+        self.buttons.blockSignals(False)
+        self._selected()
+
+    def _selected(self, *_):
+        chosen = [b.selection for b in self.buttons.buttons() if b.isChecked()]
+        self.selection = None
+        self.scope = None
+        self.save_button.setEnabled(False)
+        if not chosen:
+            self.impact.setText('请选择需要重跑的期次或变化对')
+            return
+        self.selection = dict(action='rerun-selection', grid=self.area.currentText(),
+            selected_periods=[r['period'] for r in chosen if r['action']=='rerun-period'],
+            selected_pairs=[[r['before_period'], r['after_period']] for r in chosen if r['action']=='rerun-change'])
         try:
             self.scope = self.store.local_scope(self.selection['action'], self.selection)
-            selected = self.selection.get('period') or f"{self.selection['before_period']} → {self.selection['after_period']}"
+            selected = self.selection['selected_periods'] + [f'{a} → {b}' for a,b in self.selection['selected_pairs']]
             changes = [pair.replace('_to_', ' → ') for pair in self.scope['changes']]
-            if self.selection['action'] == 'rerun-change':
-                changes = []  # already listed under the directly selected target
             downstream = changes + ['长时序成果']
             if self.manifest.get('input_spec', {}).get('truths') or any(p['result_type'] == 'road_evaluation' for p in self.store.results()):
                 downstream.append('精度评价')
-            self.impact.setText(f"重新处理：\n{self.scope['grid']} / {selected}\n\n系统将自动更新：\n" + '\n'.join(downstream))
+            self.impact.setText(f"重新处理：\n{self.scope['grid']} / " + '、'.join(selected) +
+                               '\n\n合并后的变化成果与下游范围：\n' + '\n'.join(downstream))
             self.save_button.setEnabled(True)
         except (OSError, ValueError, KeyError) as exc:
             self.scope = None

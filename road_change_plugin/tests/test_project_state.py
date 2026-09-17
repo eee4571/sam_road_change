@@ -199,6 +199,48 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertTrue((self.store.current / 'grids/南区/changes/2022_to_2023/intermediate.dat').exists())
         self.assert_cache()
 
+    def test_multi_selection_cleanup_union_and_resume_original_scope(self):
+        self.existing()
+        original = self.store.results()
+        data = {**self.data, 'selected_periods': ['2020', '2021', '2020'],
+                'selected_pairs': [['2020', '2021'], ['2023', '2024']]}
+        scope = self.store.local_scope('rerun-selection', data)
+        self.controller.run('rerun-selection', data)
+        self.assertFalse(self.errors)
+        self.assertEqual(scope, self.store.state()['scope'])
+        self.assertEqual(scope['periods'], ['2020', '2021'])
+        self.assertEqual(scope['changes'], ['2020_to_2021','2021_to_2022','2022_to_2023','2023_to_2024'])
+        for product in original:
+            self.assertEqual(Path(product['path']).exists(), not self.store.in_scope(product, scope))
+        command = self.controller.runner.commands[-1]
+        marker = Path(file(self.store.current / 'local_rerun.json', 'saved-step'))
+        self.controller.cancel()
+        self.controller.run('all', {**self.data, 'resume': True, 'selected_periods': ['2024']})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.controller.runner.commands[-1], command)
+        self.assertEqual(marker.read_text(), 'saved-step')
+        self.assertEqual(self.store.state()['scope'], scope)
+        self.assert_cache()
+
+    def test_multi_pair_only_preserves_all_roads_and_unrelated_changes(self):
+        self.existing()
+        data = {**self.data, 'selected_periods': [], 'selected_pairs': [['2020','2021'],['2023','2024']]}
+        self.controller.run('rerun-selection', data)
+        self.assertFalse(self.errors)
+        self.assertEqual(self.store.state()['scope']['periods'], [])
+        for year in range(2020,2025):
+            self.assertTrue((self.store.current / f'grids/南区/periods/{year}/intermediate.dat').is_file())
+        self.assertTrue((self.store.current / 'grids/南区/changes/2021_to_2022/intermediate.dat').is_file())
+        self.assert_cache()
+
+    def test_empty_selection_is_rejected_before_cleanup(self):
+        self.existing()
+        products = self.store.results()
+        self.controller.run('rerun-selection', {**self.data, 'selected_periods': [], 'selected_pairs': []})
+        self.assertTrue(self.errors)
+        self.assertTrue(all(Path(p['path']).is_file() for p in products))
+        self.assert_cache()
+
     def test_change_rerun_and_cancel_continue_preserve_roads_and_other_changes(self):
         self.existing()
         original = self.store.results()

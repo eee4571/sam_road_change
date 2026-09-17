@@ -361,7 +361,7 @@ class RoadChangeWidget(QWidget):
         self.output.edit.editingFinished.connect(self.check_data)
         form.addRow(ResponsiveRow('成果目录', self.output))
         self.advanced_button = self._button('高级设置', lambda: self._reveal(self.advanced))
-        self.update_button = self._button('更新部分成果', self._show_update)
+        self.update_button = self._button('局部重跑', self._show_update)
         actions = inline(self.update_button, self.advanced_button, stretch_first=False)
         actions.layout().insertStretch(1, 1)
         form.addRow(actions)
@@ -650,8 +650,8 @@ class RoadChangeWidget(QWidget):
             state, title, description = 'checking', '正在检查', '正在读取项目并检查数据'
         elif self._resume_task:
             local = self._resume_task.get('action', 'all') != 'all'
-            state, title = 'resume', '继续更新' if local else '继续处理'
-            description = '上次更新尚未完成' if local else '上次处理尚未完成'
+            state, title = 'resume', '继续重跑' if local else '继续处理'
+            description = '上次重跑尚未完成' if local else '上次处理尚未完成'
             if local:
                 scope = self._resume_task.get('scope') or {}
                 target = (scope.get('periods') or scope.get('changes') or [])
@@ -857,7 +857,7 @@ class RoadChangeWidget(QWidget):
             freshness = store.configuration_status()
             self._configuration_status = freshness
             self.configuration_note.setText(
-                '数据配置已修改，当前成果尚未更新。局部更新仍针对上次已处理的数据。' if freshness == 'changed'
+                '数据配置已修改，当前成果尚未更新。局部重跑仍针对上次已处理的数据。' if freshness == 'changed'
                 else '旧成果缺少配置版本记录，尚不能确认与当前配置一致。' if freshness == 'unknown' and self._result_keys else '')
             self._last_error = store.state().get('last_error', self._last_error)
             self._show_record()

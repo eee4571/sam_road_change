@@ -16,7 +16,7 @@ def task_arguments(args, root=ROOT):
     action=args[0]
     if action.startswith('evaluate-'):
         return list(args)
-    if action not in {'all','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'}:
+    if action not in {'all','rerun-period','rerun-change','rerun-selection','rerun-all-periods','rerun-all-changes'}:
         raise ValueError('插件只支持当前正式流程任务')
     remove={'--execution-profile','--width-method','--fast2-compensation'}
     result=[action];i=1
@@ -30,7 +30,7 @@ def task_arguments(args, root=ROOT):
             result.append(str(args[i]));i+=1
     if action=='all':
         result += ['--execution-profile','fast','--irmad']
-    if action in {'all','rerun-period','rerun-all-periods'}:
+    if action in {'all','rerun-period','rerun-selection','rerun-all-periods'}:
         result += ['--width-method','raw_image']
     result += ['--fast2-compensation',json.dumps(settings['fast2_compensation'],sort_keys=True)]
     return result

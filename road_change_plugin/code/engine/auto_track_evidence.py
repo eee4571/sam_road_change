@@ -10,9 +10,9 @@ def tangent(line, station):
     return delta/max(np.linalg.norm(delta), 1e-9)
 
 
-def displacement_rescue(axis, source, target, radius=12.):
+def displacement_rescue(axis, source, target, radius=12., *, positions=None):
     """Look beyond the strict match tolerance; never assign or move a track."""
-    positions = np.linspace(0., axis.length, max(5, int(np.ceil(axis.length/4.))+1))
+    if positions is None:positions = np.linspace(0., axis.length, max(5, int(np.ceil(axis.length/4.))+1))
     points = [axis.interpolate(s) for s in positions]
     directions = np.array([tangent(axis,s) for s in positions])
     choices = []
@@ -66,13 +66,13 @@ def longest_run(mask, weights):
     return best
 
 
-def nearby_opposite_support(axis, target, width):
+def nearby_opposite_support(axis, target, width, *, positions=None, use_probability=True):
     """Check a parallel corridor even when the other period lost its axis.
 
     This is a reason to review, never a synthesized match or changed geometry.
     Require longitudinal support so a crossing strip is not mistaken for a road.
     """
-    positions=np.linspace(0.,axis.length,max(5,int(np.ceil(axis.length/4.))+1))
+    if positions is None:positions=np.linspace(0.,axis.length,max(5,int(np.ceil(axis.length/4.))+1))
     points=np.array([axis.interpolate(s).coords[0] for s in positions])
     direction=np.array([tangent(axis,s) for s in positions])
     normal=np.column_stack((-direction[:,1],direction[:,0]))
@@ -84,7 +84,7 @@ def nearby_opposite_support(axis, target, width):
         if coverage>=.8:
             return dict(nearby_opposite_reason='nearby_opposite_surface_support',nearby_opposite_offset_m=offset,
                         nearby_opposite_surface_ratio=coverage)
-        if probability is not None:
+        if probability is not None and use_probability:
             evidence=probability.sample_axis(shifted,target.crs,road_width=width,position_tolerance=3.)
             rank=evidence['scene_percentile_rank']; background=evidence['background_percentile_rank']
             lower_rank=probability.percentile_rank(evidence['center_probability_q25'])

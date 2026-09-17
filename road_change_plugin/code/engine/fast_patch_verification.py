@@ -220,10 +220,14 @@ class PatchVerifier:
         return ['raw_width_evidence_inconclusive'],'uncertain'
 
     def verify(self,records,controls,*,profiles=None,width_audit=None,absolute=2.,relative=.2):
-        from .fast_candidate_publication import CandidateEvidence
+        from .fast_candidate_publication import CandidateEvidence,screen_candidates
         self.fast2_evidence=CandidateEvidence(self.scenes,profiles,width_audit,absolute,relative)
         self.absolute=absolute;self.relative=relative
-        start=time.perf_counter();self.calibrate(controls)
+        start=time.perf_counter()
+        structural,rejected=screen_candidates(records,self.fast2_evidence)
+        self.structural_counts=structural
+        self.audit.extend(rejected)
+        if any(row.get('v2_publish',False) for row in records):self.calibrate(controls)
         for i,row in enumerate(records):
             if not row.get('v2_publish',False):continue
             kind=row['change_typ'];self.counts[f'before_{kind}']+=1
@@ -231,7 +235,7 @@ class PatchVerifier:
             self.record_decision(row,p,i)
         self.counts['verification_seconds']=time.perf_counter()-start
         self.counts['raster_window_reads']=sum(t.reads for t in self.tiles)
-        return {'timing_patch_verification_seconds':self.counts['verification_seconds'],
+        return {**structural,'timing_patch_verification_seconds':self.counts['verification_seconds'],
                 **{'v2_patch_'+k:v for k,v in self.counts.items()}}
 
     def record_decision(self,row,p,i):
@@ -287,4 +291,5 @@ class PatchVerifier:
     def write_audit(self,directory):
         directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
         (directory/'patch_verification.json').write_text(json.dumps(dict(compensation=self.compensation.metadata(),calibration=self.calibration,
-            counts=dict(self.counts),candidates=self.audit),ensure_ascii=False,indent=2),encoding='utf-8')
+            counts=dict(self.counts),structural_counts=getattr(self,'structural_counts',{}),
+            candidates=self.audit),ensure_ascii=False,indent=2),encoding='utf-8')

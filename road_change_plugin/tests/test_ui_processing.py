@@ -358,8 +358,8 @@ class ProcessingUiTests(unittest.TestCase):
                      parameters={'grid': '北区', 'period': '2022'})
         write_json(store.path, state)
         self.widget._refresh_results()
-        self.assertEqual(self.widget.run_button.text(), '继续更新')
-        self.assertIn('上次更新尚未完成', self.widget.processing_hint.text())
+        self.assertEqual(self.widget.run_button.text(), '继续重跑')
+        self.assertIn('上次重跑尚未完成', self.widget.processing_hint.text())
         self.assertIn('北区 / 2022', self.widget.processing_hint.text())
         self.assertFalse(self.widget.update_button.isEnabled())
         with patch.object(self.widget.controller, 'run') as run:
@@ -387,23 +387,38 @@ class ProcessingUiTests(unittest.TestCase):
         with patch.object(self.widget.controller, 'run') as run:
             page.save_button.click()
             action, data = run.call_args.args
-            self.assertEqual((action, data['grid'], data['period']), ('rerun-period', '北区', '2022'))
-            self.assertIn('--update-related', self.widget.controller.build_command(action, data))
+            self.assertEqual((action, data['grid'], data['selected_periods']), ('rerun-selection', '北区', ['2022']))
+            self.assertIn('--selection', self.widget.controller.build_command(action, data))
             self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
 
-    def test_change_update_is_mutually_exclusive_and_automatic_downstream(self):
+    def test_change_rerun_multiselection_and_automatic_downstream(self):
         self.widget._show_update()
         page = self.widget.update_page
         page.buttons.buttons()[0].click()
         pair = next(b for b in page.buttons.buttons() if b.selection['action'] == 'rerun-change')
         pair.click()
-        self.assertEqual(sum(b.isChecked() for b in page.buttons.buttons()), 1)
-        self.assertEqual(page.scope['periods'], [])
+        self.assertEqual(sum(b.isChecked() for b in page.buttons.buttons()), 2)
+        self.assertEqual(len(page.scope['periods']), 1)
         with patch.object(self.widget.controller, 'run') as run:
             page.save_button.click()
             action, data = run.call_args.args
-            self.assertEqual(action, 'rerun-change')
-            self.assertIn('--update-temporal', self.widget.controller.build_command(action, data))
+            self.assertEqual(action, 'rerun-selection')
+            self.assertIn('--selection', self.widget.controller.build_command(action, data))
+
+    def test_rerun_group_select_clear_and_empty_disabled(self):
+        self.widget._show_update()
+        page = self.widget.update_page
+        periods, pairs = page.selection_groups.values()
+        page._set_group(periods, True)
+        page._set_group(pairs, True)
+        self.assertTrue(page.save_button.isEnabled())
+        self.assertEqual(len(page.scope['changes']), len(pairs))
+        page._set_group(periods, False)
+        self.assertEqual(page.scope['periods'], [])
+        self.assertEqual(len(page.selection['selected_pairs']), len(pairs))
+        page._set_group(pairs, False)
+        self.assertFalse(page.save_button.isEnabled())
+        self.assertIsNone(page.selection)
 
     def test_summary_opens_local_output_without_reemitting_results(self):
         received = []

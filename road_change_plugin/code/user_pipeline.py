@@ -4810,6 +4810,12 @@ def _apply_fast2_task_settings(manifest, args):
         print('[Fast2 settings] ' + json.dumps(config.to_dict(), sort_keys=True), flush=True)
 
 
+@batch_models
+def rerun_pipeline_selection(args: argparse.Namespace) -> dict:
+    from app.local_rerun import run_selection
+    return run_selection(args, sys.modules[__name__])
+
+
 def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest_path = Path(args.pipeline_manifest).expanduser().resolve()
     manifest = read_json(manifest_path)
@@ -5937,6 +5943,9 @@ def parser() -> argparse.ArgumentParser:
     a = sub.add_parser("rerun-period", help="主动重跑任务索引中的一个道路提取期次")
     a.add_argument("--pipeline-manifest", required=True); a.add_argument("--grid", required=True); a.add_argument("--period", required=True)
     a.add_argument("--update-related", action="store_true")
+    a = sub.add_parser('rerun-selection', help='按合并的依赖计划重跑选定期次和变化对')
+    a.add_argument('--pipeline-manifest', required=True); a.add_argument('--grid', required=True)
+    a.add_argument('--selection', required=True, help='JSON selected_periods / selected_pairs')
     a = sub.add_parser("rerun-change", help="主动重跑任务索引中的一个相邻变化对")
     a.add_argument("--pipeline-manifest", required=True); a.add_argument("--grid", required=True)
     a.add_argument("--before-period", required=True); a.add_argument("--after-period", required=True)
@@ -6005,9 +6014,9 @@ def parser() -> argparse.ArgumentParser:
         sub.choices[command].add_argument('--irmad',action=argparse.BooleanOptionalAction,default=None,
                                          help='IR-MAD preprocessing before extraction')
         sub.choices[command].add_argument('--irmad-reference',default=None,help='IR-MAD reference period or JSON area-to-period map')
-    for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-all-periods'):
+    for command in ('all','extract','extract-project-period','extract-project-all','rerun-period','rerun-selection','rerun-all-periods'):
         sub.choices[command].add_argument('--width-method',choices=['sam_molra','raw_image'],default=None)
-    for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-all-periods','rerun-all-changes'):
+    for command in ('all','change','change-project-periods','rerun-period','rerun-change','rerun-selection','rerun-all-periods','rerun-all-changes'):
         sub.choices[command].add_argument('--fast2-compensation', default=None,
             help='raw_input / normalized_input / JSON object with preset=custom and boolean switches')
     return p
@@ -6026,6 +6035,7 @@ def main() -> int:
     elif args.command == "change": change(args)
     elif args.command == "apply-edits": apply_centerline_edits(args)
     elif args.command == "rerun-period": rerun_pipeline_period(args)
+    elif args.command == 'rerun-selection': rerun_pipeline_selection(args)
     elif args.command == "rerun-change": rerun_pipeline_change(args)
     elif args.command == "rerun-all-periods": rerun_all_pipeline_periods(args)
     elif args.command == "rerun-all-changes": rerun_all_pipeline_changes(args)

@@ -251,8 +251,19 @@ class ProjectState:
         descriptor = self.descriptor()
         if not descriptor:
             raise ValueError('当前项目没有可更新的成果')
+        if action == 'rerun-selection':
+            scopes = [self.local_scope('rerun-period', dict(grid=data['grid'], period=p))
+                      for p in data.get('selected_periods', [])]
+            scopes += [self.local_scope('rerun-change', dict(grid=data['grid'], before_period=a, after_period=b))
+                       for a, b in data.get('selected_pairs', [])]
+            if not scopes:raise ValueError('请选择需要重跑的期次或变化对')
+            names = self.period_order(descriptor['data'], data['grid'])
+            periods = {p for s in scopes for p in s['periods']}
+            changes = {p for s in scopes for p in s['changes']}
+            return dict(grid=data['grid'], periods=[p for p in names if p in periods],
+                        changes=[f'{a}_to_{b}' for a,b in zip(names,names[1:]) if f'{a}_to_{b}' in changes])
         if action not in {'rerun-period', 'rerun-change'}:
-            raise ValueError('请选择更新期次或变化对')
+            raise ValueError('请选择重跑道路期次或变化对')
         grid, period = data['grid'], data.get('period', '')
         names = self.period_order(descriptor['data'], grid)
         adjacent = list(zip(names, names[1:]))
@@ -276,8 +287,8 @@ class ProjectState:
         removed = [p for p in products if self.in_scope(p, scope)]
         targets = [path for p in removed for path in self.dataset_files(p['path'])]
         job = Path(manifest.get('job_root') or Path(descriptor['path']).parent).resolve()
-        if action == 'rerun-period':
-            targets.append(job / 'grids' / safe_name(grid) / 'periods' / safe_name(period))
+        targets += [job / 'grids' / safe_name(grid) / 'periods' / safe_name(p) for p in scope['periods']]
+        targets.append(Path(descriptor['path']).parent / 'local_rerun.json')
         targets += [job / 'grids' / safe_name(grid) / 'changes' / safe_name(pair) for pair in changes]
         # Exact published category directories include auxiliary files and previews.
         targets += [self.output / safe_name(grid) / '01_单期道路' / safe_name(p) for p in scope['periods']]

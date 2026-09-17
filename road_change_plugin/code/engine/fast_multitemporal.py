@@ -6,7 +6,7 @@ from shapely import from_wkt, union_all, prepare
 from shapely.ops import substring
 from .auto_presence_candidates import LongitudinalCoverage
 
-AUTO_REVISION = 'fast2_evidence_publication_v5_width_quality'
+AUTO_REVISION = 'fast2_evidence_publication_v6_structural_screen'
 
 
 def dependency_periods(names,before,after):

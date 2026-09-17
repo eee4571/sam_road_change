@@ -43,6 +43,13 @@ class Controller(TaskSignals):
     def build_command(self, action, data):
         if action != "all":
             manifest = self.input_file(data.get("manifest", ""), ".json")
+            if action == 'rerun-selection':
+                store = ProjectState(data['project_root'], data['output'])
+                scope = store.local_scope(action, data)
+                check_existing_task(manifest)
+                selection = {k: data.get(k, []) for k in ('selected_periods', 'selected_pairs')}
+                return task_arguments([action, '--pipeline-manifest', manifest, '--grid', scope['grid'],
+                                       '--selection', json.dumps(selection, ensure_ascii=False)])
             if action == "evaluate-all-existing":
                 args = [action, "--pipeline-manifest", manifest]
                 for row in data.get("truths", []):
