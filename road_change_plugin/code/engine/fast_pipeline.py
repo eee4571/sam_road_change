@@ -2977,7 +2977,7 @@ def prepare_regional_products(
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
                         Path(__file__).with_name('road_network_connection.py'),
-                        Path(__file__).with_name('road_axis_cleanup.py'), WIDTH_ROOT/'raw_feature_cache.py',
+                        Path(__file__).with_name('road_axis_cleanup.py'), Path(__file__).with_name('road_axis_quality.py'), WIDTH_ROOT/'raw_feature_cache.py',
                         Path(__file__).with_name('road_connection_evidence.py'),
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),

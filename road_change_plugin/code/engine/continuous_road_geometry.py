@@ -6,21 +6,27 @@ open ends of a continuous chain, never to every width station/source feature.
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from shapely import union_all
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, MultiPoint
 from shapely.strtree import STRtree
 
 
-def network_surface(profiles, node_tolerance=.5):
+def network_surface(profiles, node_tolerance=.5, _junctions=None):
     """Join compatible incident axes before offsetting, then dissolve boundaries.
 
     Profiles are (LineString, longitudinal stations, widths). Nearby parallel
     tracks are not snapped: only coincident endpoint nodes participate. A node
-    can pair its most continuous incident directions even at a junction.
+    joins degree-2 chains. True junctions retain their branches and share a
+    local boundary footprint; a loop is never concatenated onto a trunk axis.
     """
     from .auto_change_geometry import corridor, _clean_overlay
     from .auto_change_assembly import polygonal
-    profiles=[(a,np.asarray(s,float),np.asarray(w,float)) for a,s,w in profiles if a.length>1e-6]
+    # Tiny negative roundoff in a remapped station means "from the end" to
+    # Shapely.interpolate; clamp before sampling to avoid doubling the axis.
+    profiles=[(a,np.clip(np.asarray(s,float),0.,a.length),np.asarray(w,float))
+              for a,s,w in profiles if a.length>1e-6]
     if not profiles:return Polygon()
+    from .road_axis_quality import require_safe_axis, axis_quality
+    for axis,_,widths in profiles:require_safe_axis(axis,float(np.median(widths)))
     points=[Point(a.coords[e]) for a,_,_ in profiles for e in (0,-1)]
     tree=STRtree(points);parent=list(range(len(points)))
     def root(i):
@@ -32,6 +38,10 @@ def network_surface(profiles, node_tolerance=.5):
             if i//2!=j//2:parent[root(j)]=root(i)
     nodes={}
     for i in range(len(points)):nodes.setdefault(root(i),[]).append(i)
+    if _junctions is None:
+        _junctions=[Point(np.mean([points[i].coords[0] for i in ends],axis=0))
+                    for ends in nodes.values() if len(ends)>2]
+    junction_tree=STRtree(_junctions)
     # A terminal arm shorter than its own junction footprint cannot define an
     # independent road rectangle. Keep internal connectors and isolated roads;
     # only absorb short leaves attached to an established longer road chain.
@@ -66,13 +76,13 @@ def network_surface(profiles, node_tolerance=.5):
             if choices:
                 _,e,f=max(choices);absorbed.discard(e//2);absorbed.discard(f//2)
     if absorbed:
-        rebuilt=list(profiles)
+        junction_caps=[]
         for ends in nodes.values():
             leaves=[e for e in ends if e//2 in absorbed]
             retained=[e for e in ends if e//2 not in absorbed]
             if not leaves or not retained:continue
             end=max(retained,key=lambda e:profiles[e//2][0].length)
-            axis,ss,ww=rebuilt[end//2]
+            axis,ss,ww=profiles[end//2]
             xy=np.asarray(axis.coords)
             tip=xy[0] if end%2==0 else xy[-1]
             inside=np.asarray(axis.interpolate(min(6.,axis.length)).coords[0] if end%2==0
@@ -86,18 +96,31 @@ def network_surface(profiles, node_tolerance=.5):
                 reach.append(float(delta@tangent)+radius*np.sqrt(max(0.,1.-float(direction@tangent)**2)))
             extension=max([0.]+reach)
             if extension<=0:continue
-            # Preserve the supported longitudinal reach with one continuation
-            # cap; removing transverse patch arms must not shorten a junction.
+            # Extend the surface footprint, never move a shared axis endpoint.
+            # Moving it breaks degree-2 pairing and can introduce a new fold
+            # when a retained axis already curves near the junction.
             endpoint=tip+tangent*extension
-            if end%2==0:
-                rebuilt[end//2]=(LineString(np.vstack([endpoint,xy])),np.r_[0.,ss+extension],np.r_[ww[0],ww])
-            else:
-                rebuilt[end//2]=(LineString(np.vstack([xy,endpoint])),np.r_[ss,axis.length+extension],np.r_[ww,ww[-1]])
-        return network_surface([p for k,p in enumerate(rebuilt) if k not in absorbed],node_tolerance)
-    pair={};centers={}
+            width=float(ww[0 if end%2==0 else -1])
+            junction_caps.append(corridor(LineString([tip,endpoint]),[0.,extension],[width,width]))
+        surface=network_surface([p for k,p in enumerate(profiles) if k not in absorbed],node_tolerance,_junctions)
+        return _clean_overlay(polygonal(union_all([surface,*junction_caps])))
+    pair={};centers={};junction_polygons=[];footprints={}
     for ends in nodes.values():
         center=np.mean([points[i].coords[0] for i in ends],axis=0)
         for i in ends:centers[i]=center
+        protected=len(junction_tree.query(Point(center),predicate='dwithin',distance=node_tolerance))>0
+        if len(ends)>=2:
+            caps=[]
+            for i in ends:
+                a,_,w=profiles[i//2];e=i%2
+                q=np.asarray(a.interpolate(min(2.,a.length) if e==0 else max(0.,a.length-2.)).coords[0])
+                d=q-center;d/=max(np.linalg.norm(d),1e-9)
+                n=np.array([-d[1],d[0]])*w[0 if e==0 else -1]/2
+                caps.extend([center+n,center-n])
+            footprint=MultiPoint(caps).convex_hull
+            footprints[root(ends[0])]=footprint
+            if footprint.area>0 and (len(ends)>2 or protected):junction_polygons.append(footprint)
+        if len(ends)!=2 or protected:continue
         choices=[]
         for n,i in enumerate(ends):
             a,_,w=profiles[i//2];e=i%2
@@ -105,6 +128,9 @@ def network_surface(profiles, node_tolerance=.5):
             d=point-center;d/=max(np.linalg.norm(d),1e-9)
             for j in ends[n+1:]:
                 if i//2==j//2:continue
+                # Proximity is enough to share a surface footprint, but not to
+                # move authoritative axis vertices or create a tiny zigzag.
+                if points[i].distance(points[j])>1e-6:continue
                 b,_,v=profiles[j//2];f=j%2
                 q=np.asarray(b.interpolate(min(b.length,max(1.,min(6.,b.length/3))) if f==0 else max(0.,b.length-max(1.,min(6.,b.length/3)))).coords[0])
                 t=q-center;t/=max(np.linalg.norm(t),1e-9)
@@ -114,7 +140,19 @@ def network_surface(profiles, node_tolerance=.5):
         for _,__,ni,nj in sorted(choices,reverse=True):
             i,j=-ni,-nj
             if i not in pair and j not in pair:pair[i]=j;pair[j]=i
-    visited=set();polygons=[]
+    visited=set();polygons=list(junction_polygons)
+    def emit(coords,values):
+        keep=np.r_[True,np.linalg.norm(np.diff(np.asarray(coords),axis=0),axis=1)>1e-6]
+        coords=np.asarray(coords)[keep];values=np.asarray(values)[keep]
+        if len(coords)<2:return
+        axis=LineString(coords)
+        ss=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(coords,axis=0),axis=1))]
+        if axis.length<=1e-6:return
+        sampling=np.linspace(0,axis.length,max(2,int(np.ceil(axis.length/2))+1))
+        ww=np.interp(sampling,ss,values)
+        if len(ww)>3:ww=gaussian_filter1d(ww,1.,mode='nearest')
+        require_safe_axis(axis,float(np.median(ww)))
+        polygons.append(corridor(axis,sampling,ww))
     starts=[i for i in range(len(points)) if i not in pair]+list(range(len(points)))
     for start in starts:
         if start//2 in visited:continue
@@ -126,7 +164,15 @@ def network_surface(profiles, node_tolerance=.5):
             samples=np.unique(np.r_[stations,ss])
             xy=np.array([axis.interpolate(s).coords[0] for s in samples]);ww=np.interp(samples,stations,widths)
             if current%2:xy=xy[::-1];ww=ww[::-1]
-            xy[0]=centers[current];xy[-1]=centers[current^1]
+            if coords:
+                joined=LineString(coords+list(xy[1:]))
+                if not joined.is_simple or axis_quality(joined,float(np.median(values+list(ww))))['abnormal']:
+                    # Two individually sound network paths can cross/overlap.
+                    # Keep those paths separate for offsets, then union their
+                    # surfaces; never turn their topology into a folded axis.
+                    emit(coords,values);coords=[];values=[]
+                    footprint=footprints.get(root(current))
+                    if footprint is not None and footprint.area>0:polygons.append(footprint)
             if coords:
                 values[-1]=(values[-1]+ww[0])/2
                 coords.extend(xy[1:]);values.extend(ww[1:])
@@ -134,17 +180,7 @@ def network_surface(profiles, node_tolerance=.5):
             following=pair.get(current^1)
             if following is None:break
             current=following
-        keep=np.r_[True,np.linalg.norm(np.diff(np.asarray(coords),axis=0),axis=1)>1e-6]
-        coords=np.asarray(coords)[keep];values=np.asarray(values)[keep]
-        if len(coords)<2:continue
-        axis=LineString(coords)
-        ss=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(np.array(coords),axis=0),axis=1))]
-        if axis.length<=1e-6:continue
-        # Smooth across former feature boundaries with a metric-length window.
-        sampling=np.linspace(0,axis.length,max(2,int(np.ceil(axis.length/2))+1))
-        ww=np.interp(sampling,ss,values)
-        if len(ww)>3:ww=gaussian_filter1d(ww,1.,mode='nearest')
-        polygons.append(corridor(axis,sampling,ww))
+        emit(coords,values)
     result=_clean_overlay(polygonal(union_all(polygons)))
     parts=[result] if result.geom_type=='Polygon' else list(result.geoms)
     axes_tree=STRtree([p[0] for p in profiles])

@@ -470,7 +470,9 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
             if present and abs(width-float(row.width_m))>.05:raise ValueError(f'Road state width contradicts final width: {track_id}/{period}')
             observations.append(dict(road_id=track_id,period=period,status=row.status,width_m=width,
                 length_m=float(row.geometry.length) if present else 0.,coverage=1. if present else 0.,match_sc=1.,extract_cf=.95,
-                geom_dev_m=0.,source_fid=','.join(actual.source_fid),qa_state='gt_assisted',qa_reason='verified_reconciled_period_state',
+                geom_dev_m=0.,source_fid=','.join(actual.source_fid),qa_state='event_constrained',
+                qa_reason=';'.join(str(v) for v in (row.get('state_source','reconciled'),
+                    row.get('observation_conflict','')) if v and str(v)!='nan'),
                 dir_sim=1.,geometry=row.geometry))
     return references,observations
 

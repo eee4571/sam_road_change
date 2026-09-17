@@ -111,13 +111,17 @@ class OptimizationTests(unittest.TestCase):
         self.assertGreater(count,0)
         for a,b in zip(roads,result):np.testing.assert_array_equal(a.points[[0,-1]],b.points[[0,-1]])
 
-    def test_sustained_s_bend_and_shift_limit_are_preserved(self):
+    def test_sustained_s_bend_preserved_but_classified_large_fault_repaired(self):
         x=np.arange(0.,241.)
-        for y in (8*np.sin(x*np.pi/120),4*np.sin(x*np.pi/4)):
+        for abnormal,y in ((False,8*np.sin(x*np.pi/120)),(True,4*np.sin(x*np.pi/4))):
             road=seed(np.column_stack([x,y]))
             result,count=correct_oscillating_chains([road],ConnectionEvidence(LineString(road.points).buffer(10)))
-            self.assertEqual(count,0)
-            np.testing.assert_array_equal(result[0].points,road.points)
+            if abnormal:
+                self.assertEqual(count,1)
+                self.assertGreater(LineString(road.points).hausdorff_distance(LineString(result[0].points)),2.)
+            else:
+                self.assertEqual(count,0)
+                np.testing.assert_array_equal(result[0].points,road.points)
 
     def test_duplicate_cleanup_retains_provenance_and_parallel_roads(self):
         first=seed([[0,0],[20,0]],0);reverse=seed([[20,0],[0,0]],1);parallel=seed([[0,1],[20,1]],2)

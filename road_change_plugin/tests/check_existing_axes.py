@@ -1,64 +1,85 @@
-"""Read-only axis diagnosis on <=200 existing chains; no pipeline or model run."""
+"""Read-only existing-product QA; writes comparisons only to an explicit directory."""
+import argparse
 import json
 from pathlib import Path
 import sys
+import time
+from collections import Counter
+from unittest.mock import patch
+import numpy as np
 
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/'code'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'code'))
+import geopandas as gpd
+from shapely import union_all
+from engine.road_axis_quality import axis_quality,repair_network_axes
+from engine.road_connection_evidence import ConnectionEvidence,RoadProbability
+from engine.auto_change_geometry import FinalWidths,corridor
 
 
 def main():
-    project=Path(sys.argv[1]).resolve()
-    workspace=next((project/'_work/current/grids/1/periods/20221020/radiometric').glob('*/latest_result.json')).parent
-    manifest=json.loads((workspace/'latest_result.json').read_text(encoding='utf8'))
-    inputs=json.loads((workspace/'input_manifest.json').read_text(encoding='utf8'))
-    run=Path(manifest['run_root']);working=run/'width_review/fast_products.gpkg'
-    import geopandas as gpd
-    import numpy as np
-    from shapely.geometry import LineString
-    from engine.road_network_connection import _node_network,_join_chains
-    from engine.road_geometry import _RegionalRoadSeed
-    from engine.road_axis_cleanup import _axis_candidate,correct_oscillating_chains,remove_exact_duplicates
-    from engine.road_connection_evidence import ConnectionEvidence,RoadProbability,probability_sources
-    frame=gpd.read_file(working,layer='centerlines')
-    projected=frame.estimate_utm_crs() if frame.crs.is_geographic else frame.crs
-    frame=frame.to_crs(projected)
-    surface=gpd.read_file(working,layer='surfaces').to_crs(projected).geometry.union_all()
-    roads=[_RegionalRoadSeed(np.asarray(line.coords),8.,(i,)) for i,line in enumerate(frame.geometry)]
-    chains=_join_chains(_node_network(remove_exact_duplicates(roads)))
-    evidence=ConnectionEvidence(surface,RoadProbability(probability_sources(Path(inputs['images']),run/'width_review'),projected))
-    inspected=0;candidates=0;rejected=0
-    for road in sorted(chains,key=lambda r:LineString(r.points).length,reverse=True)[:200]:
-        inspected+=1
-        candidate=_axis_candidate(road)
-        if candidate is None:continue
-        candidates+=1
-        neighbours=[r for r in chains if r is not road and LineString(r.points).distance(candidate)<1e-5]
-        after,count=correct_oscillating_chains([road,*neighbours],evidence)
-        if np.array_equal(road.points,after[0].points):
-            rejected+=1
-            continue
-        output=project/'_work/_processing_check/axis_detail'
-        output.mkdir(parents=True,exist_ok=True)
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        before=LineString(road.points);corrected=LineString(after[0].points)
-        frame=gpd.GeoDataFrame({'state':['before','after']},geometry=[before,corrected],crs=projected)
-        frame.to_file(output/'axis_detail.gpkg',layer='axes',driver='GPKG')
-        fig,ax=plt.subplots(figsize=(10,5))
-        ax.plot(*before.xy,color='#ac7150',lw=1.5,label='Before')
-        ax.plot(*corrected.xy,color='#205990',lw=1.2,label='After')
-        ax.scatter(*np.asarray(before.coords)[[0,-1]].T,c='black',s=15,zorder=5,label='Fixed endpoints')
-        ax.set_aspect('equal');ax.legend();ax.ticklabel_format(useOffset=False,style='plain')
-        ax.set_title('Existing 20221020 chain: high-frequency axis correction')
-        fig.tight_layout();fig.savefig(output/'axis_detail.png',dpi=160);plt.close(fig)
-        result=dict(inspected=inspected,candidates=candidates,evidence_or_topology_rejected=rejected,
-                    corrected=1,max_geometric_offset_m=before.hausdorff_distance(corrected),output=str(output))
-        (output/'report.json').write_text(json.dumps(result,indent=2),encoding='utf8')
-        print(json.dumps(result),flush=True)
-        return
-    print(json.dumps(dict(inspected=inspected,candidates=candidates,rejected=rejected,corrected=0)),flush=True)
+    parser=argparse.ArgumentParser()
+    parser.add_argument('products',type=Path);parser.add_argument('output',type=Path)
+    parser.add_argument('--continuous',action='store_true',help='Build the formal whole-network surface using saved widths')
+    args=parser.parse_args();root=args.products;out=args.output
+    if out.resolve()==root.resolve() or root.resolve() in out.resolve().parents:
+        raise ValueError('Comparison output must be separate from original products')
+    roads=gpd.read_file(root/'road_centerlines.shp')
+    roads=roads.to_crs(roads.estimate_utm_crs() if roads.crs.is_geographic else roads.crs)
+    faults=[i for i,r in roads.iterrows() if axis_quality(r.geometry,r.width_m)['abnormal']]
+    print('roads',len(roads),'individual_faults',len(faults),flush=True)
+    surfaces=gpd.read_file(root/'road_surfaces.shp').to_crs(roads.crs)
+    evidence=ConnectionEvidence(union_all(surfaces.geometry),RoadProbability([(root/'road_probability.tif',None)],roads.crs))
+    started=time.perf_counter()
+    out.mkdir(parents=True,exist_ok=True)
+    try:fixed,audit=repair_network_axes(list(roads.geometry),list(roads.width_m),evidence)
+    except Exception as exc:
+        (out/'failure.json').write_text(json.dumps(getattr(exc,'diagnostic',{}),indent=2),encoding='utf8')
+        raise
+    roads.to_file(out/'before.gpkg')
+    roads.geometry=fixed;roads.to_file(out/'after.gpkg')
+    (out/'audit.json').write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf8')
+    print('corrected_features',len(audit),'seconds',round(time.perf_counter()-started,2),flush=True)
+    before=gpd.read_file(out/'before.gpkg')
+    widths=FinalWidths(gpd.read_file(root/'road_width_segments.gpkg').to_crs(roads.crs))
+    summaries=[];before_surfaces=[];after_surfaces=[]
+    for row in audit:
+        i=row['feature'];old=before.geometry.iloc[i];new=roads.geometry.iloc[i]
+        ss,ww,_=widths.profile(old,float(roads.width_m.iloc[i]))
+        # Only this comparison bypasses the new precondition for old geometry.
+        with patch('engine.road_axis_quality.require_safe_axis'):
+            original=corridor(old,ss,ww)
+        mapping=row['station_map']
+        mapped=np.interp(ss,mapping['before'],mapping['after'])
+        fixed_surface=corridor(new,mapped,ww)
+        def holes(g):
+            return sum(len(p.interiors) for p in ([g] if g.geom_type=='Polygon' else g.geoms))
+        before_surfaces.append(dict(feature=i,geometry=original));after_surfaces.append(dict(feature=i,geometry=fixed_surface))
+        def large_holes(g):
+            from shapely.geometry import Polygon
+            return sum(Polygon(h).area>=1. for p in ([g] if g.geom_type=='Polygon' else g.geoms) for h in p.interiors)
+        summaries.append(dict(feature=i,holes_before=holes(original),holes_after=holes(fixed_surface),
+            large_holes_before=large_holes(original),large_holes_after=large_holes(fixed_surface),valid=fixed_surface.is_valid))
+    gpd.GeoDataFrame(before_surfaces,crs=roads.crs).to_file(out/'surface_before.gpkg')
+    gpd.GeoDataFrame(after_surfaces,crs=roads.crs).to_file(out/'surface_after.gpkg')
+    summary=dict(roads=len(roads),corrected=len(audit),
+        methods=dict(Counter(r['method'] for a in audit for p in a['parts'] for r in p.get('repairs',[]))),
+        features=summaries)
+    (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf8')
+    print('holes',sum(r['holes_before'] for r in summaries),'->',sum(r['holes_after'] for r in summaries),
+          'invalid',sum(not r['valid'] for r in summaries),flush=True)
+    if args.continuous:
+        from engine.continuous_road_geometry import network_surface
+        by_feature={r['feature']:r for r in audit};profiles=[]
+        for i,row in roads.iterrows():
+            ss,ww,_=widths.profile(before.geometry.iloc[i],float(row.width_m))
+            if i in by_feature:
+                mapping=by_feature[i]['station_map']
+                ss=np.interp(ss,mapping['before'],mapping['after'])
+            profiles.append((row.geometry,ss,ww))
+        joined=network_surface(profiles)
+        pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
+        gpd.GeoDataFrame(geometry=pieces,crs=roads.crs).to_file(out/'full_continuous_surface.gpkg',layer='surfaces')
+        print('continuous_parts',len(pieces),'valid',joined.is_valid,flush=True)
 
 
 if __name__=='__main__':main()

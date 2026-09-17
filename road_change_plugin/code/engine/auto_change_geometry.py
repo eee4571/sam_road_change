@@ -86,6 +86,8 @@ def corridor(axis, stations, widths):
     """
     if axis.geom_type != 'LineString' or axis.length <= 0:
         raise ValueError('Published change has no usable longitudinal axis')
+    from .road_axis_quality import require_safe_axis
+    require_safe_axis(axis,float(np.max(widths)))
     if np.ptp(widths) < 1e-8:
         return polygonal(axis.buffer(float(widths[0])/2, cap_style='flat', join_style='round'))
     original = np.asarray(axis.coords)[:, :2]

@@ -77,6 +77,13 @@ def correct_oscillating_chains(roads, evidence):
     """Only supported internal wobble moves; endpoints, junctions, CRS stay fixed."""
     if evidence is None or not roads:
         return roads, 0
+    from .road_axis_quality import repair_network_axes
+    repaired,quality_audit=repair_network_axes([LineString(r.points) for r in roads],
+                                              [r.width_m for r in roads],evidence)
+    strong={r['feature'] for r in quality_audit}
+    roads=[_RegionalRoadSeed(np.asarray(repaired[i].coords),r.width_m,r.source_ids,'axis_quality_repaired')
+           if i in strong else r for i,r in enumerate(roads)]
+    evidence.axis_quality_audit=quality_audit
     lines = [LineString(r.points) for r in roads]
     tree = STRtree(lines)
     changed = {}
@@ -108,4 +115,4 @@ def correct_oscillating_chains(roads, evidence):
         changed[i] = candidate
         result[i] = _RegionalRoadSeed(np.asarray(candidate.coords), road.width_m,
                                       road.source_ids, 'low_frequency_axis')
-    return result, len(changed)
+    return result, len(set(changed)|strong)

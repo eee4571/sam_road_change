@@ -679,6 +679,7 @@ def connect_clean_road_seeds(roads: list[_RegionalRoadSeed],surface_geometry=Non
     diagnostics.update(connection_exact_duplicates_removed=len(roads)-len(distinct),
                        connection_premerged_count=len(compact),
                        connection_axis_corrected_count=axis_corrected)
+    diagnostics['axis_quality_audit']=getattr(evidence,'axis_quality_audit',[])
     diagnostics.update(connection_keep_main_component=keep_main_component,
                        connection_components_before_filter=components_before_filter,
                        connection_isolated_removed_count=len(removed),
