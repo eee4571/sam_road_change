@@ -518,10 +518,15 @@ def reconcile_periods(periods, changes, output_dir):
         directory=output/period;directory.mkdir(exist_ok=True)
         original=next(p for p in periods if str(p['period'])==period)
         observations=[list(f.geometry) for key,f in frames.items() if key!=period]
-        layers=_write_final_period(original,base,cuts,rows,inserts,directory,metric,first.crs,observations)
+        from .formal_road_products import is_formal_result
+        if not cuts and not inserts and is_formal_result(original):
+            layers={k:v for k,v in original.items() if k not in ('period','road_state','product_variant','execution_profile','status','auto_source','result')}
+        else:
+            layers=_write_final_period(original,base,cuts,rows,inserts,directory,metric,first.crs,observations)
+        physical_rows=gpd.read_file(layers['centerlines']).to_crs(metric).to_dict('records')
         local_states=[r for r in state_rows if r['period']==period]
         for state in local_states:
-            physical=[r['geometry'] for r in rows if r.get('track_id')==state['track_id']]
+            physical=[r['geometry'] for r in physical_rows if r.get('track_id')==state['track_id']]
             if physical:state['geometry']=line_merge(union_all(physical))
         states=_frame(local_states,metric)
         if states.empty:
@@ -540,15 +545,12 @@ def reconcile_periods(periods, changes, output_dir):
 
 @timed_stage("final_road")
 def _write_final_period(original,base,cuts,centers,inserts,directory,metric,output_crs,observations=()):
-    """Preserve road decisions and axes; render all final surfaces from widths.
-
-    Corrected axes have passed the shared canonical Final Road fitter. Widths
-    are continuous per road, and surface boundaries are dissolved at junctions;
-    there are no station rectangles or separate junction patch features.
-    """
+    """Rebuild an event-edited period through the single-period geometry core."""
     from .product_cache import signature, read_completed, write_completed
+    from .formal_road_products import implementation_signature
     marker = directory/'regular_road_cache.json'
     inputs = signature([original['centerlines'], original['width_segments'], __file__,
+                        Path(__file__).with_name('formal_road_products.py'),
                         Path(__file__).with_name('canonical_road_surface.py'),
                         Path(__file__).with_name('road_surface_quality.py'),
                         Path(__file__).with_name('road_axis_quality.py'),
@@ -561,20 +563,13 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     inputs.append(hashlib.sha256(json.dumps([row_values,cuts,edits], sort_keys=True, default=str).encode()).hexdigest())
     inputs.append([len(period) for period in observations])
     inputs.append(hashlib.sha256(b''.join(a.wkb for period in observations for a in period)).hexdigest())
+    inputs.append(implementation_signature())
     cached = read_completed(marker, inputs)
     if cached is not None:
         print('[Fast timing] final_road_reused=1', flush=True)
         return cached
-    cut_axes=[substring(base.geometry.iloc[i],a,b) for i,intervals in cuts.items() for a,b in intervals]
-    originals={key:gpd.read_file(original[key]) for key in ('centerlines','width_segments')}
-    widths=originals['width_segments'].to_crs(metric)
-    retained_widths=[]
-    for i,row in enumerate(widths.to_dict('records')):
-        hits=track_intervals(row['geometry'],cut_axes,tolerance=.1) if cut_axes else []
-        if not hits:retained_widths.append({**row,'_original_row':i});continue
-        for a,b in _remaining(row['geometry'].length,[(h['source_start'],h['source_end']) for h in hits]):
-            retained_widths.append({**row,'geometry':substring(row['geometry'],a,b)})
-    from .road_axis_quality import repair_network_axes
+    widths=gpd.read_file(original['width_segments']).to_crs(metric)
+    from .formal_road_products import reconstruct_frames, formal_metadata
     from .road_connection_evidence import ConnectionEvidence, RoadProbability
     from functools import lru_cache
     @lru_cache(maxsize=1)
@@ -583,113 +578,24 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         probability=original.get('road_probability')
         return ConnectionEvidence(union_all(surface.geometry) if surface is not None else None,
             RoadProbability([(probability,None)],metric) if probability and Path(probability).is_file() else None)
-    uncorrected=[r['geometry'] for r in centers]
-    repaired,axis_audit=repair_network_axes(uncorrected,
-                                          [_number(r,('width_m','width_map'),6.) for r in centers],evidence)
-    corrected={r['feature'] for r in axis_audit}
-    repair_reports={r['feature']:r for r in axis_audit}
-    for i in corrected:
-        methods=sorted({r['method'] for p in repair_reports[i]['parts'] for r in p.get('repairs',[])})
-        centers[i]=dict(centers[i],geometry=repaired[i],_original_row=-1,axis_fix=','.join(methods))
-    corrected_profiles={}
-    profile_source=FinalWidths(widths)
-    for i in corrected:
-        row=centers[i];axis=row['geometry'];old=uncorrected[i]
-        width=_number(row,('width_m','width_map'),6.)
-        ss,vv=(road_profile(row,old,width) if row.get('track_id') else profile_source.profile_quality(old,width)[:2])
-        station_map=repair_reports[i]['station_map']
-        ss=np.interp(ss,station_map['before'],station_map['after'])
-        corrected_profiles[i]=(ss,vv)
-        if row.get('track_id'):
-            row['gt_width_profile']=json.dumps(dict(axis=axis.wkt,stations=(ss/axis.length).tolist(),
-                widths=np.asarray(vv).tolist(),reference_width=width))
-        remaining=[]
-        for w in retained_widths:
-            hits=track_intervals(w['geometry'],[old],tolerance=.75)
-            if not hits:remaining.append(w);continue
-            for low,high in _remaining(w['geometry'].length,[(h['source_start'],h['source_end']) for h in hits]):
-                remaining.append({**w,'geometry':substring(w['geometry'],low,high),'_original_row':-1})
-        retained_widths=remaining
-        if not row.get('track_id'):
-            for low,high,wa,wb in zip(ss[:-1],ss[1:],vv[:-1],vv[1:]):
-                retained_widths.append(dict(width_m=float((wa+wb)/2),geometry=substring(axis,low,high),
-                                            axis_fix='low_frequency_repair'))
-    if corrected:inserts=[r for r in centers if r.get('track_id')]
+    print('[GT/时序后重建] 重建受影响期次的正式中心线与道路面',flush=True)
+    frames,axis_audit,surface_audit=reconstruct_frames(_frame(centers,metric),widths,
+        evidence=evidence,observations=observations,directory=directory)
+    outputs=formal_metadata()
     _write_json(directory/'axis_quality_audit.json',axis_audit)
-    # An entire fitted axis owns its width and corridor, never 4 m buffer pieces.
-    edited_corridors=[{**r,'geometry':corridor(r['geometry'],*road_profile(r,r['geometry'],r['width_m']))} for r in inserts]
-    edited_widths=[]
-    for r in inserts:
-        axis=r['geometry'];ss,vv=road_profile(r,axis,r['width_m'])
-        for a,b,wa,wb in zip(ss[:-1],ss[1:],vv[:-1],vv[1:]):
-            local=substring(axis,a,b)
-            edited_widths.append({**r,'width_m':float((wa+wb)/2),'geometry':local,'length_m':local.length})
-    outputs={}
-    frames={'centerlines':_frame(centers,metric),'width_segments':_frame(retained_widths+edited_widths,metric)}
-    profiles=FinalWidths(widths)
-    profile_path=directory/'width_profile_cache.json'
-    profile_inputs=signature([Path(__file__).with_name('auto_change_geometry.py'),
-                              Path(__file__).with_name('road_surface_quality.py')])+[str(metric)]
-    saved_profiles=read_completed(profile_path,profile_inputs) or {}
-    current_profiles={}
-    profile_hits=0
-    regular=[];quality=[]
-    for center_id,row in enumerate(centers):
-        axis=row['geometry'];width=_number(row,('width_m','width_map'),6.)
-        if center_id in corrected_profiles:
-            stations,values=corrected_profiles[center_id]
-            qs,_,qq=profiles.profile_quality(uncorrected[center_id],width)
-            mapping=repair_reports[center_id]['station_map']
-            qs=np.interp(qs,mapping['before'],mapping['after'])
-            confidence=np.interp(stations,qs,qq)
-            if row.get('track_id'):confidence=np.ones(len(stations))
-        elif row.get('track_id'):
-            stations,values=road_profile(row,axis,width)
-            confidence=np.ones(len(stations))
-        else:
-            ids=sorted(profiles.tree.query(axis,predicate='dwithin',distance=.75))
-            dependencies=[(profiles.frame.geometry.iloc[int(i)].wkb_hex,
-                           [str(profiles.frame.iloc[int(i)].get(k)) for k in
-                            ('width_m','quality_grade','width_quality','valid_ratio','width_std')]) for i in ids]
-            key=hashlib.sha256(json.dumps([axis.wkb_hex,width,dependencies]).encode()).hexdigest()
-            if key in saved_profiles:
-                stations,values,confidence=map(np.asarray,saved_profiles[key]);profile_hits+=1
-            else:
-                stations,values,confidence=profiles.profile_quality(axis,width)
-            current_profiles[key]=[stations.tolist(),values.tolist(),confidence.tolist()]
-        regular.append((axis,stations,values))
-        quality.append(confidence)
-    write_completed(profile_path,profile_inputs,current_profiles,[])
-    print(f'[Fast batch timing] final_road_profile_cache_hit={profile_hits}',flush=True)
-    from .canonical_road_surface import build_road_surface
-    joined,surface_audit=build_road_surface(regular,quality,metadata=centers,evidence=evidence,observations=observations)
     _write_json(directory/'surface_quality_audit.json',surface_audit)
     print('[Final surface] '+json.dumps(surface_audit['summary'],ensure_ascii=False),flush=True)
-    pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
-    surface_rows=[dict(geometry=p)
-                  for p in pieces if not p.is_empty]
-    # Road Surface masks are evidence only. Both public surface representations
-    # use this dissolved regular network, including uncorrected Auto roads.
-    frames['surfaces']=_frame(surface_rows,metric)
-    frames['corridors']=frames['surfaces'].copy()
-    if edited_corridors:
-        _frame(edited_corridors,metric).to_file(directory/'road_geometry_audit.gpkg',layer='track_corridors',driver='GPKG')
     for key,frame in frames.items():
         path=directory/f'road_{key}.{"gpkg" if key in ("width_segments","corridors") else "shp"}'
         exported=frame.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs)
         if key in ('surfaces','corridors'):exported=_export_polygons(exported)
-        if '_original_row' in exported:
-            source=originals[key].to_crs(output_crs)
-            for i,value in exported['_original_row'].items():
-                if pd.notna(value) and value>=0:exported.at[i,'geometry']=source.geometry.iloc[int(value)]
-            exported=exported.drop(columns='_original_row')
         exported.to_file(path,encoding='UTF-8');outputs[key]=str(path.resolve())
-    if edited_corridors:outputs['geometry_audit']=str((directory/'road_geometry_audit.gpkg').resolve())
     outputs['axis_quality_audit']=str((directory/'axis_quality_audit.json').resolve())
     outputs['axis_quality_revision']=1
-    outputs['surface_quality_revision']=2
+    outputs['surface_quality_revision']=5
     outputs['surface_quality_audit']=str((directory/'surface_quality_audit.json').resolve())
     outputs['regular_surface']=True
+    outputs['analysis_surfaces']=outputs['surfaces']
     write_completed(marker, inputs, outputs, [outputs[key] for key in frames]+
                     [outputs['axis_quality_audit'],outputs['surface_quality_audit']])
     return outputs
@@ -812,20 +718,10 @@ def build_fast_temporal_outputs(manifest, job_root):
                          automatic=pair['automatic'])
             entry.update({f'{kind}_feature_count':int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
             entry['summary']=str(directory/'change_summary.json');_write_json(entry['summary'],entry)
-    for index,period in enumerate(final_periods):
-        if period.get('regular_surface') and period.get('axis_quality_revision')==1 and period.get('surface_quality_revision')==2:continue
-        original=gpd.read_file(period['centerlines'])
-        metric=original.estimate_utm_crs() if original.crs.is_geographic else original.crs
-        base=original.to_crs(metric)
-        centers=[{**r,'_original_row':i,'track_id':''} for i,r in enumerate(base.to_dict('records'))]
-        directory=root/'final_roads'/clean_name(str(period.get('grid','validation')))/str(period['period'])
-        directory.mkdir(parents=True,exist_ok=True)
-        observations=[list(gpd.read_file(p['centerlines']).to_crs(metric).geometry) for p in final_periods
-                      if p is not period and p.get('grid','validation')==period.get('grid','validation')
-                      and Path(p['centerlines']).is_file()]
-        layers=_write_final_period(period,base,{},centers,[],directory,metric,original.crs,observations)
-        entry={**period,**layers,'execution_profile':'fast','product_variant':'final','result':str(directory/'period_result.json')}
-        _write_json(entry['result'],entry);final_periods[index]=entry
+    from .formal_road_products import is_formal_result
+    for period in final_periods:
+        if not is_formal_result(period):
+            raise RuntimeError('单期正式道路已过期，请先重新生成该期正式道路，再计算变化成果')
     refresh_final_previews(final_periods)
     manifest['final_period_results']=final_periods
     # Original caches remain resumable internally, but there is one active product.
@@ -843,6 +739,9 @@ def refresh_final_previews(periods):
     """Never publish an extraction-mask preview beside regular final vectors."""
     from .fast_pipeline import _write_fast_period_previews
     for period in periods:
+        existing=period.get('previews') or {}
+        if all(existing.get(k) and Path(existing[k]).is_file() for k in ('fusion','width')):
+            continue
         frames={key:gpd.read_file(period[key]) for key in ('centerlines','surfaces','width_segments','corridors')}
         directory=Path(period['centerlines']).parent
         previews=_write_fast_period_previews(frames,directory,None)

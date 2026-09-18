@@ -2972,7 +2972,7 @@ def prepare_regional_products(
     from .width.raw_image_backend import original_images
     raw_inputs=original_images(image_dir) if width_method=='raw_image' else []
     marker = output_dir/'regional_cache.json'
-    inputs = signature([working, validation_area, __file__,*raw_inputs,
+    inputs = signature([working, validation_area,*raw_inputs,
                         WIDTH_ROOT/'raw_road_surfaces.py',WIDTH_ROOT/'raw_image_backend.py',WIDTH_ROOT/'raw_boundary_core.py',WIDTH_ROOT/'raw_width_reconstruction.py',
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
@@ -2982,6 +2982,8 @@ def prepare_regional_products(
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),
                         WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py']) + [str(image_dir),width_method]
+    import inspect
+    inputs.append(hashlib.sha256(inspect.getsource(inspect.unwrap(prepare_regional_products)).encode()).hexdigest())
     cached = read_completed(marker, inputs)
     if cached is not None:
         print('[Fast timing] period_export_reused=1', flush=True)
@@ -3022,8 +3024,7 @@ def prepare_regional_products(
     if width_method=='raw_image':
         from .width.raw_road_surfaces import build_road_surfaces
         frames['surfaces']=build_road_surfaces(frames['width_segments'],image_path=raw_inputs[0])
-        frames['centerlines']=frames['width_segments'].copy()
-        outputs['regular_surface']=True
+        # This mask is repair evidence only; formal axes/surfaces are built at export.
     for index,layer in enumerate(mapping):
         frames[layer].to_file(gpkg,layer=layer,driver='GPKG',mode='w' if index==0 else 'a')
     write_network_report(output_dir,connection_stats,connection_audits)
@@ -3036,18 +3037,38 @@ def prepare_regional_products(
 
 @timed_stage("period_export")
 def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=None, width_method='sam_molra'):
-    """Serialize completed regional products. No reconstruction or measurement."""
+    """Generate formal single-period roads after recovery and RGB measurement."""
     from .product_cache import signature,read_completed,write_completed
     output_dir=Path(output_dir)
     source=output_dir/'regional_products.gpkg'
     if not source.is_file():raise FileNotFoundError(f'Regional products must be prepared before export: {source}')
-    identity=signature([source,__file__])+[width_method,str(image_dir)]
+    from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature
+    from .road_connection_evidence import ConnectionEvidence,RoadProbability,probability_sources
+    sources=probability_sources(image_dir,width_dir)
+    identity=[signature([source]),signature([__file__]),implementation_signature(),
+              signature([p for pair in sources for p in pair]),width_method,str(image_dir)]
     marker=output_dir/'fast_export_cache.json';cached=read_completed(marker,identity)
     if cached:return cached
     mapping={'centerlines':'road_centerlines.shp','surfaces':'road_surfaces.shp',
              'width_segments':'road_width_segments.gpkg','corridors':'road_corridors.gpkg'}
     frames={key:gpd.read_file(source,layer=key) for key in mapping}
-    outputs={};gpkg=output_dir/'roads.gpkg';gpkg.unlink(missing_ok=True)
+    output_crs=frames['centerlines'].crs
+    metric=frames['centerlines'].estimate_utm_crs() if output_crs.is_geographic else output_crs
+    frames={k:v.to_crs(metric) for k,v in frames.items()}
+    from functools import lru_cache
+    @lru_cache(maxsize=1)
+    def evidence():
+        return ConnectionEvidence(unary_union(frames['surfaces'].geometry),RoadProbability(sources,metric) if sources else None)
+    print('[单期正式道路生成] 轴线质量修复 → canonical graph → 稳定宽度 → 正式道路面',flush=True)
+    frames,axis_audit,surface_audit=reconstruct_frames(frames['centerlines'],frames['width_segments'],
+        evidence=evidence,directory=output_dir)
+    for name,audit in [('axis_quality_audit',axis_audit),('surface_quality_audit',surface_audit)]:
+        (output_dir/(name+'.json')).write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf8')
+    frames={k:v.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs) for k,v in frames.items()}
+    outputs=formal_metadata()
+    outputs.update(axis_quality_audit=str((output_dir/'axis_quality_audit.json').resolve()),
+                   surface_quality_audit=str((output_dir/'surface_quality_audit.json').resolve()))
+    gpkg=output_dir/'roads.gpkg';gpkg.unlink(missing_ok=True)
     for i,(key,filename) in enumerate(mapping.items()):
         frame=frames[key];target=output_dir/filename
         if target.suffix=='.gpkg':
@@ -3062,8 +3083,9 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     outputs.update(gpkg=str(gpkg.resolve()),execution_profile='fast',width_method=width_method)
     outputs['previews']=_write_fast_period_previews(frames,output_dir,image_dir)
     outputs['road_extraction']=outputs['previews']['fusion'];outputs['road_width']=outputs['previews']['width']
-    if width_method=='raw_image':outputs.update(regular_surface=True,analysis_surfaces=outputs['corridors'])
-    write_completed(marker,identity,outputs,[*map(Path,(outputs[k] for k in mapping)),gpkg,*outputs['previews'].values()])
+    outputs['analysis_surfaces']=outputs['surfaces']
+    write_completed(marker,identity,outputs,[*map(Path,(outputs[k] for k in mapping)),gpkg,*[p for p in outputs['previews'].values() if p],
+        outputs['axis_quality_audit'],outputs['surface_quality_audit']])
     return outputs
 
 
@@ -4979,7 +5001,7 @@ def _read_fast_change_layer(
     primary: str,
     *fallbacks: str,
 ) -> gpd.GeoDataFrame:
-    # Presentation-only smoothing must not become change-detection evidence.
+    # Single-period export assigns this to the formal canonical surface.
     if primary == 'surfaces' and result.get('analysis_surfaces'):
         primary = 'analysis_surfaces'
     empty_frame = None

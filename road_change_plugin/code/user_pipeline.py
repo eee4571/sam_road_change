@@ -43,6 +43,7 @@ from app.project_relocation import (
 )
 from engine.samroad.image_resume import relocate_task_image_markers
 from engine.road_network_products import network_products_current
+from engine.formal_road_products import formal_products_current, is_formal_result
 from dependency_identity import (
     dependency_identity_equal,
     effective_config_identity,
@@ -74,7 +75,7 @@ FAST_PERIOD_STAGE_DEFINITIONS = (
     ("surface", "Final Fast Mask"),
     ("width", "中心线后处理"),
     ("regional", "区域路网恢复与RGB影像边界测宽"),
-    ("export", "道路产品导出"),
+    ("export", "单期正式道路生成"),
 )
 ATOMIC_REPLACE_ATTEMPTS = 12
 ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.05
@@ -400,6 +401,9 @@ def _run_fast_change_result(
     compensation=None,
 ) -> dict:
     """Finish the independent Auto detector before any GT reconciliation."""
+    for path in (before_result, after_result):
+        if not is_formal_result(read_json(Path(path))):
+            raise RuntimeError(f"单期正式道路缓存已过期，请先重跑该期道路导出：{path}")
     from engine.fast_pipeline import (
         augment_fast_changes_with_truth,
         detect_fast_changes,
@@ -2308,6 +2312,7 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
             and _shapefile_complete(context["surface"])
             and context["gpkg"].is_file()
             and network_products_current(context["centerline"].parent)
+            and (context.get("execution_profile") != "fast" or formal_products_current(context["centerline"].parent))
         )
     return False
 
@@ -2730,7 +2735,7 @@ def extract(args: argparse.Namespace) -> dict:
         raise
     period_state.update({
         "status": "completed", "current_stage": "export",
-        "current_stage_label": "道路产品导出", "completed_at": now_text(),
+        "current_stage_label": "单期正式道路生成" if execution_profile == "fast" else "道路产品导出", "completed_at": now_text(),
         "updated_at": now_text(),
     })
     write_json(period_state_path, period_state)
@@ -2762,9 +2767,15 @@ def extract(args: argparse.Namespace) -> dict:
         "width_source": "raw_image" if width_method=='raw_image' else "fast_measured" if execution_profile == "fast" else "full_measured",
         "width_method":width_method,
     })
-    if width_method == 'raw_image':
-        result['regular_surface'] = True
-        result['analysis_surfaces'] = result['corridors']
+    if execution_profile == 'fast':
+        # The export contract, not a raw regional layer, supplies Auto inputs.
+        exported = read_json(products / 'fast_export_cache.json')['result']
+        for key in ('formal_road_revision','formal_road_implementation','axis_quality_revision',
+                    'surface_quality_revision','regular_surface','analysis_surfaces',
+                    'axis_quality_audit','surface_quality_audit','previews'):
+            result[key] = exported[key]
+        result['surface_source'] = 'canonical_road_graph'
+
     result["fusion"] = build_fusion_metadata(final_dir)
     profile_decisions_path = infer_dir / image_txt.stem / "profile_decisions.json"
     if profile_decisions_path.is_file():
@@ -3793,6 +3804,11 @@ def _period_result_ready(entry: dict, *, require_current_network: bool = False) 
         result = read_json(result_path)
         if require_current_network and not network_products_current(Path(str(result.get('centerlines') or '')).parent):
             return False
+        if result.get('execution_profile') == 'fast':
+            if not is_formal_result(result):
+                return False
+            if require_current_network and not formal_products_current(Path(result['centerlines']).parent):
+                return False
         return all(
             Path(str(result.get(key) or "")).expanduser().is_file()
             for key in ("centerlines", "surfaces", "gpkg")
