@@ -8,7 +8,8 @@ import geopandas as gpd
 from shapely.geometry import LineString, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'code'))
-from engine.road_surface_quality import stable_width, short_noise_indices, junction_footprint, surface_axis
+from engine.road_surface_quality import stable_width
+from engine.canonical_road_surface import build_road_surface
 from engine.auto_change_geometry import FinalWidths
 from engine.continuous_road_geometry import network_surface
 from engine.road_connection_evidence import ConnectionEvidence
@@ -24,15 +25,12 @@ class Probability:
 
 
 class SurfaceQualityTests(unittest.TestCase):
-    def test_surface_axis_keeps_endpoints_and_low_frequency_curve(self):
+    def test_canonical_chain_preserves_original_curve(self):
         x=np.linspace(0.,100.,201)
-        baseline=10*np.sin(x/40)
-        a=LineString(np.c_[x,baseline+.4*np.sin(x*2)])
-        smooth=surface_axis(a,8.,ConnectionEvidence(a.buffer(4)))
-        self.assertEqual(smooth.coords[0],a.coords[0]);self.assertEqual(smooth.coords[-1],a.coords[-1])
-        self.assertLess(smooth.length,a.length)
-        self.assertLess(smooth.hausdorff_distance(a),.8)
-        self.assertGreater(smooth.bounds[3],9.)
+        a=LineString(np.c_[x,10*np.sin(x/40)])
+        _,audit=build_road_surface([(a,[0.,a.length],[8.,8.])],[[1,1]])
+        from shapely import from_wkt
+        self.assertTrue(from_wkt(audit['chains'][0]['axis_wkt']).equals_exact(a,1e-10))
 
     def test_frequent_width_noise_is_not_a_published_boundary(self):
         s=np.arange(0.,202.,2.);v=8.+2*np.sin(s*.8)
@@ -75,45 +73,48 @@ class SurfaceQualityTests(unittest.TestCase):
     def test_degree_two_splits_do_not_become_width_units(self):
         profiles=[(line(0,40),[0.,40.],[8.,8.]),(line(40,48),[0.,8.],[2.,2.]),
                   (line(48,100),[0.,52.],[8.,8.])]
-        qa=[]
-        surface=network_surface(profiles,quality=[[1,1],[0,0],[1,1]],audit=qa)
+        surface,qa=build_road_surface(profiles,[[1,1],[0,0],[1,1]])
         self.assertLess(surface.symmetric_difference(box(0,-4,100,4)).area,.01)
-        self.assertEqual(len(qa),1)
+        self.assertEqual(len(qa['chains']),1)
 
     def test_junction_portals_are_tangent_bounded_and_connected(self):
         axes=[line(0,50),line(0,-50),LineString([(0,0),(0,50)])]
         profiles=[(a,[0.,a.length],[8.,8.]) for a in axes]
         raw=network_surface(profiles)
-        surface=network_surface(profiles,quality=[[1.,1.]]*3)
+        surface,_=build_road_surface(profiles,[[1.,1.]]*3)
         self.assertTrue(surface.is_valid);self.assertEqual(surface.geom_type,'Polygon')
         self.assertEqual(len(surface.interiors),0)
         self.assertEqual(surface.bounds,raw.bounds)
         delta=surface.difference(raw)
         self.assertGreater(delta.area,0.)
         self.assertLess(delta.area,25.)
-        self.assertTrue(box(-9,-9,9,9).covers(delta))
+        self.assertLess(delta.difference(box(-9,-9,9,9)).area,1e-8)
 
     def test_nearby_parallel_roads_remain_separate(self):
         profiles=[(line(0,100,y),[0.,100.],[4.,4.]) for y in (0,8)]
-        result=network_surface(profiles,quality=[[1,1],[1,1]])
+        result,_=build_road_surface(profiles,[[1,1],[1,1]])
         self.assertEqual(len(result.geoms),2)
 
     def test_unsplit_interior_junction_is_not_moved_by_drawing_axis(self):
         a=LineString([(-50,0),(-10,.4),(0,0),(10,-.4),(50,0)])
         b=LineString([(0,-30),(0,30)])
         profiles=[(p,[0.,p.length],[8.,8.]) for p in (a,b)]
-        qa=[]
-        result=network_surface(profiles,quality=[[1,1],[1,1]],audit=qa,
-            evidence=ConnectionEvidence(a.buffer(4).union(b.buffer(4))))
+        result,qa=build_road_surface(profiles,[[1,1],[1,1]])
         self.assertTrue(result.is_valid)
-        self.assertEqual(qa[0].get('render_axis_shift_m',0),0)
+        self.assertEqual(qa['summary']['canonical_chain_count'],4)
+        self.assertEqual(qa['summary']['reconstructed_junction_count'],1)
 
     def classify(self,axes=None,prob=0.,other=None,grades=None,protected=()):
         axes=axes or [line(0,8)]
         frame=gpd.GeoDataFrame(dict(width_m=[6.]*len(axes),quality_grade=grades or ['C']*len(axes)),geometry=axes,crs=3857)
-        return short_noise_indices(axes,[6.]*len(axes),FinalWidths(frame),
-            ConnectionEvidence(box(200,200,210,210),Probability(prob)),
-            [other] if other is not None else (),protected)
+        profiles=[(a,*FinalWidths(frame).profile_quality(a,6.)[:2]) for a in axes]
+        quality=[FinalWidths(frame).profile_quality(a,6.)[2] for a in axes]
+        _,qa=build_road_surface(profiles,quality,
+            metadata=[{'protect_surface':i in protected} for i in range(len(axes))],
+            evidence=ConnectionEvidence(box(200,200,210,210),Probability(prob)),
+            observations=[other] if other is not None else ())
+        removed={i for r in qa['spurs'] if r['action']=='suppress' for i in r['source_features']}
+        return removed,qa['spurs']
 
     def test_short_noise_needs_all_evidence(self):
         removed,audit=self.classify(other=[line(100,200)])
@@ -134,6 +135,100 @@ class SurfaceQualityTests(unittest.TestCase):
 
     def test_fragmented_long_component_is_not_short_noise(self):
         self.assertFalse(self.classify(axes=[line(x,x+8) for x in range(0,80,8)],other=[line(200,300)])[0])
+
+    def test_overlap_and_duplicate_fragments_collapse_to_one_chain(self):
+        profiles=[(line(a,b),[0.,b-a],[8.,8.]) for a,b in [(0,60),(40,100),(0,60)]]
+        surface,qa=build_road_surface(profiles,[[1,1]]*3)
+        self.assertEqual(qa['summary']['canonical_chain_count'],1)
+        self.assertEqual(qa['summary']['merged_pseudo_node_count'],2)
+        self.assertLess(surface.symmetric_difference(box(0,-4,100,4)).area,1e-8)
+
+    def test_acute_corner_and_different_roads_are_not_merged(self):
+        profiles=[(line(0,50),[0.,50.],[8.,8.]),
+                  (LineString([(50,0),(50,50)]),[0.,50.],[8.,8.])]
+        _,qa=build_road_surface(profiles,[[1,1]]*2)
+        self.assertEqual(qa['summary']['canonical_chain_count'],2)
+        self.assertIn('direction_break',qa['merge_rejections'])
+        profiles[1]=(line(50,100),[0.,50.],[8.,8.])
+        _,qa=build_road_surface(profiles,[[1,1]]*2,metadata=[{'road_ref':'A'},{'road_ref':'B'}])
+        self.assertEqual(qa['summary']['canonical_chain_count'],2)
+        self.assertIn('different_road',qa['merge_rejections'])
+
+    def test_same_level_crossing_is_noded_but_overpass_is_not(self):
+        profiles=[(line(-50,50),[0.,100.],[8.,8.]),
+                  (LineString([(0,-50),(0,50)]),[0.,100.],[8.,8.])]
+        _,qa=build_road_surface(profiles,[[1,1]]*2)
+        self.assertEqual(qa['summary']['canonical_chain_count'],4)
+        self.assertEqual(qa['summary']['reconstructed_junction_count'],1)
+        _,qa=build_road_surface(profiles,[[1,1]]*2,metadata=[{'layer':0},{'layer':1}])
+        self.assertEqual(qa['summary']['canonical_chain_count'],2)
+        self.assertEqual(qa['summary']['reconstructed_junction_count'],0)
+
+    def test_oblique_interior_crossing_keeps_source_correspondence(self):
+        axes=[LineString([(0.13,0.41),(101.37,17.63)]),
+              LineString([(32.73,-17.37),(64.17,48.91)])]
+        _,qa=build_road_surface([(a,[0.,a.length],[6.,6.]) for a in axes],[[1,1]]*2)
+        self.assertEqual(qa['summary']['canonical_chain_count'],4)
+        self.assertTrue(qa['summary']['active_axis_covered'])
+
+    def test_reciprocal_collinear_roundoff_gap_but_not_parallel_snap(self):
+        profiles=[(line(0,50),[0.,50.],[8.,8.]),(line(50.1,100),[0.,49.9],[8.,8.])]
+        _,qa=build_road_surface(profiles,[[1,1]]*2)
+        self.assertEqual(qa['summary']['roundoff_gap_count'],1)
+        self.assertEqual(qa['summary']['canonical_chain_count'],1)
+        profiles[1]=(line(0,50,.1),[0.,50.],[8.,8.])
+        _,qa=build_road_surface(profiles,[[1,1]]*2)
+        self.assertEqual(qa['summary']['roundoff_gap_count'],0)
+        self.assertEqual(qa['summary']['canonical_chain_count'],2)
+
+    def test_negative_terminal_tooth_is_removed_without_touching_main_road(self):
+        main=line(-50,50);tooth=LineString([(0,0),(0,8)])
+        profiles=[(main,[0.,100.],[8.,8.]),(tooth,[0.,8.],[6.,6.])]
+        original=[p[0].wkb for p in profiles]
+        surface,qa=build_road_surface(profiles,[[1,1],[0,0]],
+            evidence=ConnectionEvidence(None,Probability(0.)),observations=[[main]])
+        self.assertEqual(qa['summary']['removed_short_spur_count'],1)
+        self.assertEqual(qa['summary']['canonical_chain_count'],1)
+        self.assertLess(surface.symmetric_difference(box(-50,-4,50,4)).area,1e-8)
+        self.assertEqual(original,[p[0].wkb for p in profiles])
+        _,kept=build_road_surface(profiles,[[1,1],[0,0]],
+            evidence=ConnectionEvidence(None,Probability(0.)),observations=[[main,tooth]])
+        self.assertEqual(kept['summary']['removed_short_spur_count'],0)
+
+    def test_branch_bodies_are_trimmed_before_offsetting(self):
+        from unittest.mock import patch
+        from engine.auto_change_geometry import corridor
+        axes=[line(0,50),line(0,-50),LineString([(0,0),(0,50)])]
+        captured=[]
+        def record(a,s,w):captured.append(a);return corridor(a,s,w)
+        with patch('engine.canonical_road_surface.corridor',side_effect=record):
+            _,qa=build_road_surface([(a,[0.,a.length],[8.,8.]) for a in axes],[[1,1]]*3)
+        from shapely.geometry import Point
+        self.assertTrue(all(a.distance(Point(0,0))>=7.99 for a in captured))
+        self.assertEqual(qa['summary']['reconstructed_junction_count'],1)
+
+    def test_junction_internal_micro_link_is_not_a_separate_width_unit(self):
+        axes=[line(-50,0),line(0,3),line(3,50),
+              LineString([(0,0),(0,40)]),LineString([(3,0),(3,-40)])]
+        result,qa=build_road_surface([(a,[0.,a.length],[8.,8.]) for a in axes],[[1,1]]*5)
+        self.assertTrue(result.is_valid)
+        self.assertEqual(qa['summary']['canonical_chain_count'],4)
+        self.assertEqual(qa['summary']['junction_internal_chain_count'],1)
+        self.assertEqual(qa['summary']['reconstructed_junction_count'],1)
+        self.assertTrue(any(len(j['internal_edges'])==1 for j in qa['junctions']))
+
+    def test_real_ring_remains_a_hole(self):
+        ring=LineString([(0,0),(100,0),(100,100),(0,100),(0,0)])
+        result,qa=build_road_surface([(ring,[0.,ring.length],[6.,6.])],[[1,1]])
+        self.assertEqual(len(result.interiors),1)
+        self.assertEqual(qa['summary']['canonical_chain_count'],1)
+
+    def test_collapsed_loop_junction_still_covers_its_internal_connectors(self):
+        axes=[line(0,3),LineString([(0,0),(1.5,1),(3,0)]),
+              LineString([(0,0),(0,-40),(3,-40),(3,0)])]
+        surface,qa=build_road_surface([(a,[0.,a.length],[8.,8.]) for a in axes],[[1,1]]*3)
+        self.assertTrue(qa['summary']['active_axis_covered'])
+        self.assertTrue(surface.buffer(1e-6).covers(axes[1]))
 
     def test_final_export_and_cache_use_quality_not_bad_local_width(self):
         from engine.fast_gt_reconciliation import _write_final_period

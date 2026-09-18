@@ -1,4 +1,4 @@
-"""Continuous road boundary construction, shared by period and change exports.
+"""Boundary construction for already-approved change interval exports.
 
 Input axes and longitudinal ranges are authoritative. Flat caps belong only to
 open ends of a continuous chain, never to every width station/source feature.
@@ -10,25 +10,21 @@ from shapely.geometry import LineString, Point, Polygon, MultiPoint
 from shapely.strtree import STRtree
 
 
-def network_surface(profiles, node_tolerance=.5, _junctions=None, *, quality=None, audit=None, evidence=None,
-                    _feature_ids=None):
+def network_surface(profiles, node_tolerance=.5, _junctions=None):
     """Join compatible incident axes before offsetting, then dissolve boundaries.
 
     Profiles are (LineString, longitudinal stations, widths). Nearby parallel
     tracks are not snapped: only coincident endpoint nodes participate. A node
     joins degree-2 chains. True junctions retain their branches and share a
     local boundary footprint; a loop is never concatenated onto a trunk axis.
-    Final period products supply saved sample quality for chain-scale width
-    regularization. Approved change intervals omit it: their widths and extent
-    remain authoritative, not reclassified by a cartographic operation.
+    Approved change intervals retain their authoritative widths and extent.
+    Final period roads are rendered by canonical_road_surface, not this layer.
     """
     from .auto_change_geometry import corridor, _clean_overlay
     from .auto_change_assembly import polygonal
     # Tiny negative roundoff in a remapped station means "from the end" to
     # Shapely.interpolate; clamp before sampling to avoid doubling the axis.
     selected=[i for i,(a,_,_) in enumerate(profiles) if a.length>1e-6]
-    _feature_ids=[i if _feature_ids is None else _feature_ids[i] for i in selected]
-    if quality is not None:quality=[np.asarray(quality[i],float) for i in selected]
     profiles=[(profiles[i][0],np.clip(np.asarray(profiles[i][1],float),0.,profiles[i][0].length),
                np.asarray(profiles[i][2],float)) for i in selected]
     if not profiles:return Polygon()
@@ -109,11 +105,9 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None, *, quality=Non
             endpoint=tip+tangent*extension
             width=float(ww[0 if end%2==0 else -1])
             junction_caps.append(corridor(LineString([tip,endpoint]),[0.,extension],[width,width]))
-        surface=network_surface([p for k,p in enumerate(profiles) if k not in absorbed],node_tolerance,_junctions,
-            quality=[q for k,q in enumerate(quality) if k not in absorbed] if quality is not None else None,
-            audit=audit,evidence=evidence,_feature_ids=[v for k,v in enumerate(_feature_ids) if k not in absorbed])
+        surface=network_surface([p for k,p in enumerate(profiles) if k not in absorbed],node_tolerance,_junctions)
         return _clean_overlay(polygonal(union_all([surface,*junction_caps])))
-    pair={};centers={};junction_polygons=[];footprints={};junction_ends=[]
+    pair={};centers={};junction_polygons=[];footprints={}
     for ends in nodes.values():
         center=np.mean([points[i].coords[0] for i in ends],axis=0)
         for i in ends:centers[i]=center
@@ -128,8 +122,7 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None, *, quality=Non
                 caps.extend([center+n,center-n])
             footprint=MultiPoint(caps).convex_hull
             footprints[root(ends[0])]=footprint
-            if footprint.area>0 and (len(ends)>2 or protected) and quality is None:junction_polygons.append(footprint)
-            if quality is not None and len(ends)>2:junction_ends.append(ends)
+            if footprint.area>0 and (len(ends)>2 or protected):junction_polygons.append(footprint)
         if len(ends)!=2 or protected:continue
         choices=[]
         for n,i in enumerate(ends):
@@ -150,86 +143,47 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None, *, quality=Non
         for _,__,ni,nj in sorted(choices,reverse=True):
             i,j=-ni,-nj
             if i not in pair and j not in pair:pair[i]=j;pair[j]=i
-    visited=set();polygons=list(junction_polygons);endpoint_widths={}
-    def emit(coords,values,reliability,ends):
+    visited=set();polygons=list(junction_polygons)
+    def emit(coords,values):
         keep=np.r_[True,np.linalg.norm(np.diff(np.asarray(coords),axis=0),axis=1)>1e-6]
         coords=np.asarray(coords)[keep];values=np.asarray(values)[keep]
-        reliability=np.asarray(reliability)[keep]
         if len(coords)<2:return
         axis=LineString(coords)
         ss=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(coords,axis=0),axis=1))]
         if axis.length<=1e-6:return
         sampling=np.linspace(0,axis.length,max(2,int(np.ceil(axis.length/2))+1))
         ww=np.interp(sampling,ss,values)
-        if quality is not None:
-            from .road_surface_quality import stable_width
-            qq=np.interp(sampling,ss,reliability)>=.99
-            ww,report=stable_width(sampling,ww,qq)
-            report.update(length_m=float(axis.length),source_features=sorted({_feature_ids[e//2] for e in ends}))
-            if audit is not None:audit.append(report)
-            endpoint_widths[ends[0]]=float(ww[0]);endpoint_widths[ends[-1]]=float(ww[-1])
-            # Remove only sub-pixel collinear chatter; pin the chain endpoints,
-            # retain real bends and verify that simplification adds no crossings.
-            from .road_surface_quality import surface_axis
-            simplified=surface_axis(axis,float(np.median(ww)),evidence)
-            if simplified.is_simple and simplified.hausdorff_distance(axis)<=.8:
-                from shapely.ops import substring
-                interior=substring(simplified,min(.5,simplified.length/3),max(simplified.length-.5,simplified.length*2/3))
-                original_interior=substring(axis,min(.5,axis.length/3),max(axis.length-.5,axis.length*2/3))
-                nearby=axis_tree.query(interior.union(original_interior))
-                own={e//2 for e in ends}
-                if all(int(j) in own or not (interior.intersects(profiles[int(j)][0]) or
-                    original_interior.intersects(profiles[int(j)][0])) for j in nearby):
-                    report['render_axis_shift_m']=float(simplified.hausdorff_distance(axis))
-                    sampling=sampling* simplified.length/axis.length
-                    axis=simplified
-        elif len(ww)>3:ww=gaussian_filter1d(ww,1.,mode='nearest')
+        if len(ww)>3:ww=gaussian_filter1d(ww,1.,mode='nearest')
         require_safe_axis(axis,float(np.median(ww)))
         polygons.append(corridor(axis,sampling,ww))
     starts=[i for i in range(len(points)) if i not in pair]+list(range(len(points)))
-    axis_tree=STRtree([p[0] for p in profiles])
     for start in starts:
         if start//2 in visited:continue
-        current=start;coords=[];values=[];reliability=[];chain_ends=[]
+        current=start;coords=[];values=[]
         while current//2 not in visited:
             k=current//2;visited.add(k);axis,stations,widths=profiles[k]
             original=np.asarray(axis.coords)
             ss=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(original,axis=0),axis=1))]
             samples=np.unique(np.r_[stations,ss])
             xy=np.array([axis.interpolate(s).coords[0] for s in samples]);ww=np.interp(samples,stations,widths)
-            qq=np.interp(samples,stations,quality[k]) if quality is not None else np.ones(len(samples))
-            if current%2:xy=xy[::-1];ww=ww[::-1];qq=qq[::-1]
+            if current%2:xy=xy[::-1];ww=ww[::-1]
             if coords:
                 joined=LineString(coords+list(xy[1:]))
                 if not joined.is_simple or axis_quality(joined,float(np.median(values+list(ww))))['abnormal']:
                     # Two individually sound network paths can cross/overlap.
                     # Keep those paths separate for offsets, then union their
                     # surfaces; never turn their topology into a folded axis.
-                    emit(coords,values,reliability,chain_ends);coords=[];values=[];reliability=[];chain_ends=[]
+                    emit(coords,values);coords=[];values=[]
                     footprint=footprints.get(root(current))
                     if footprint is not None and footprint.area>0:polygons.append(footprint)
             if coords:
                 values[-1]=(values[-1]+ww[0])/2
                 coords.extend(xy[1:]);values.extend(ww[1:])
-                reliability[-1]=min(reliability[-1],qq[0]);reliability.extend(qq[1:])
-            else:coords.extend(xy);values.extend(ww);reliability.extend(qq)
-            chain_ends.extend([current,current^1])
+            else:coords.extend(xy);values.extend(ww)
             following=pair.get(current^1)
             if following is None:break
             current=following
-        emit(coords,values,reliability,chain_ends)
-    if quality is not None:
-        from .road_surface_quality import junction_footprint
-        for ends in junction_ends:
-            arms=[]
-            for e in ends:
-                a,_,w=profiles[e//2]
-                arms.append((LineString(list(a.coords)[::-1]) if e%2 else a,
-                             endpoint_widths.get(e,float(w[0 if e%2==0 else -1]))))
-            footprint=junction_footprint(arms)
-            if not footprint.is_empty:polygons.append(footprint)
-            if audit is not None:audit.append(dict(method='junction_portal_footprint' if not footprint.is_empty
-                else 'junction_existing_union',degree=len(ends),area_m2=float(footprint.area)))
+        emit(coords,values)
     result=_clean_overlay(polygonal(union_all(polygons)))
     parts=[result] if result.geom_type=='Polygon' else list(result.geoms)
     axes_tree=STRtree([p[0] for p in profiles])

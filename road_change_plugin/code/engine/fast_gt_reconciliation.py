@@ -549,7 +549,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     from .product_cache import signature, read_completed, write_completed
     marker = directory/'regular_road_cache.json'
     inputs = signature([original['centerlines'], original['width_segments'], __file__,
-                        Path(__file__).with_name('continuous_road_geometry.py'),
+                        Path(__file__).with_name('canonical_road_surface.py'),
                         Path(__file__).with_name('road_surface_quality.py'),
                         Path(__file__).with_name('road_axis_quality.py'),
                         Path(__file__).with_name('auto_change_geometry.py'),
@@ -583,20 +583,6 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         probability=original.get('road_probability')
         return ConnectionEvidence(union_all(surface.geometry) if surface is not None else None,
             RoadProbability([(probability,None)],metric) if probability and Path(probability).is_file() else None)
-    from .road_surface_quality import short_noise_indices
-    dropped,noise_audit=short_noise_indices([r['geometry'] for r in centers],
-        [_number(r,('width_m','width_map'),6.) for r in centers],FinalWidths(widths),evidence,observations,
-        protected=[i for i,r in enumerate(centers) if r.get('track_id')])
-    if dropped:
-        removed_axes=[centers[i]['geometry'] for i in sorted(dropped)]
-        centers[:]=[r for i,r in enumerate(centers) if i not in dropped]
-        remaining=[]
-        for row in retained_widths:
-            hits=track_intervals(row['geometry'],removed_axes,tolerance=.1)
-            if not hits:remaining.append(row);continue
-            for a,b in _remaining(row['geometry'].length,[(h['source_start'],h['source_end']) for h in hits]):
-                remaining.append({**row,'_original_row':-1,'geometry':substring(row['geometry'],a,b)})
-        retained_widths=remaining
     uncorrected=[r['geometry'] for r in centers]
     repaired,axis_audit=repair_network_axes(uncorrected,
                                           [_number(r,('width_m','width_map'),6.) for r in centers],evidence)
@@ -675,12 +661,12 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         quality.append(confidence)
     write_completed(profile_path,profile_inputs,current_profiles,[])
     print(f'[Fast batch timing] final_road_profile_cache_hit={profile_hits}',flush=True)
-    from .continuous_road_geometry import network_surface
-    surface_audit=[]
-    joined=network_surface(regular,quality=quality,audit=surface_audit,evidence=evidence)
-    _write_json(directory/'surface_quality_audit.json',dict(chains=surface_audit,short_components=noise_audit))
+    from .canonical_road_surface import build_road_surface
+    joined,surface_audit=build_road_surface(regular,quality,metadata=centers,evidence=evidence,observations=observations)
+    _write_json(directory/'surface_quality_audit.json',surface_audit)
+    print('[Final surface] '+json.dumps(surface_audit['summary'],ensure_ascii=False),flush=True)
     pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
-    surface_rows=[dict(geometry=Polygon(p.exterior,[r for r in p.interiors if Polygon(r).area>=1.]))
+    surface_rows=[dict(geometry=p)
                   for p in pieces if not p.is_empty]
     # Road Surface masks are evidence only. Both public surface representations
     # use this dissolved regular network, including uncorrected Auto roads.
@@ -701,7 +687,7 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     if edited_corridors:outputs['geometry_audit']=str((directory/'road_geometry_audit.gpkg').resolve())
     outputs['axis_quality_audit']=str((directory/'axis_quality_audit.json').resolve())
     outputs['axis_quality_revision']=1
-    outputs['surface_quality_revision']=1
+    outputs['surface_quality_revision']=2
     outputs['surface_quality_audit']=str((directory/'surface_quality_audit.json').resolve())
     outputs['regular_surface']=True
     write_completed(marker, inputs, outputs, [outputs[key] for key in frames]+
@@ -827,7 +813,7 @@ def build_fast_temporal_outputs(manifest, job_root):
             entry.update({f'{kind}_feature_count':int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
             entry['summary']=str(directory/'change_summary.json');_write_json(entry['summary'],entry)
     for index,period in enumerate(final_periods):
-        if period.get('regular_surface') and period.get('axis_quality_revision')==1 and period.get('surface_quality_revision')==1:continue
+        if period.get('regular_surface') and period.get('axis_quality_revision')==1 and period.get('surface_quality_revision')==2:continue
         original=gpd.read_file(period['centerlines'])
         metric=original.estimate_utm_crs() if original.crs.is_geographic else original.crs
         base=original.to_crs(metric)

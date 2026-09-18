@@ -68,7 +68,7 @@ def main():
     print('holes',sum(r['holes_before'] for r in summaries),'->',sum(r['holes_after'] for r in summaries),
           'invalid',sum(not r['valid'] for r in summaries),flush=True)
     if args.continuous:
-        from engine.continuous_road_geometry import network_surface
+        from engine.canonical_road_surface import build_road_surface
         by_feature={r['feature']:r for r in audit};profiles=[];quality=[]
         for i,row in roads.iterrows():
             ss,ww,qq=widths.profile_quality(before.geometry.iloc[i],float(row.width_m))
@@ -77,8 +77,7 @@ def main():
                 ss=np.interp(ss,mapping['before'],mapping['after'])
             profiles.append((row.geometry,ss,ww))
             quality.append(qq)
-        surface_audit=[]
-        joined=network_surface(profiles,quality=quality,audit=surface_audit,evidence=evidence)
+        joined,surface_audit=build_road_surface(profiles,quality,metadata=roads.to_dict('records'),evidence=evidence)
         (out/'surface_quality_audit.json').write_text(json.dumps(surface_audit,indent=2),encoding='utf8')
         pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
         gpd.GeoDataFrame(geometry=pieces,crs=roads.crs).to_file(out/'full_continuous_surface.gpkg',layer='surfaces')
