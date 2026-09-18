@@ -69,14 +69,17 @@ def main():
           'invalid',sum(not r['valid'] for r in summaries),flush=True)
     if args.continuous:
         from engine.continuous_road_geometry import network_surface
-        by_feature={r['feature']:r for r in audit};profiles=[]
+        by_feature={r['feature']:r for r in audit};profiles=[];quality=[]
         for i,row in roads.iterrows():
-            ss,ww,_=widths.profile(before.geometry.iloc[i],float(row.width_m))
+            ss,ww,qq=widths.profile_quality(before.geometry.iloc[i],float(row.width_m))
             if i in by_feature:
                 mapping=by_feature[i]['station_map']
                 ss=np.interp(ss,mapping['before'],mapping['after'])
             profiles.append((row.geometry,ss,ww))
-        joined=network_surface(profiles)
+            quality.append(qq)
+        surface_audit=[]
+        joined=network_surface(profiles,quality=quality,audit=surface_audit,evidence=evidence)
+        (out/'surface_quality_audit.json').write_text(json.dumps(surface_audit,indent=2),encoding='utf8')
         pieces=[joined] if joined.geom_type=='Polygon' else list(joined.geoms)
         gpd.GeoDataFrame(geometry=pieces,crs=roads.crs).to_file(out/'full_continuous_surface.gpkg',layer='surfaces')
         print('continuous_parts',len(pieces),'valid',joined.is_valid,flush=True)

@@ -52,9 +52,10 @@ class FinalWidths:
         self.frame = frame.explode(index_parts=False).reset_index(drop=True)
         self.tree = STRtree(self.frame.geometry.values)
 
-    def profile(self, axis, fallback):
+    def _sample(self, axis, with_quality=False):
         stations = _stations(axis)
         values = np.full(len(stations), np.nan)
+        quality = np.full(len(stations), -1., dtype=float)
         for i, station in enumerate(stations):
             point = axis.interpolate(station)
             direction = _direction(axis, station)
@@ -69,7 +70,23 @@ class FinalWidths:
                 if cosine >= .95 and np.isfinite(width) and width > 0:
                     choices.append((line.distance(point), -cosine, int(index), width))
             if choices:
-                values[i] = min(choices)[-1]
+                choice = min(choices)
+                values[i] = choice[-1]
+                if with_quality:
+                    from .road_surface_quality import reliable_width
+                    good = reliable_width(self.frame.iloc[choice[-2]])
+                    quality[i] = -1. if good is None else float(good)
+        return stations, values, quality
+
+    def profile_quality(self, axis, fallback):
+        """Unsmooth saved widths and A/B reliability; -1 means unavailable."""
+        stations, values, quality = self._sample(axis, with_quality=True)
+        found = np.isfinite(values)
+        values = np.interp(stations, stations[found], values[found]) if found.any() else np.full(len(stations), fallback)
+        return stations, values, quality
+
+    def profile(self, axis, fallback):
+        stations, values, _ = self._sample(axis)
         found = np.isfinite(values)
         values = (np.interp(stations, stations[found], values[found]) if found.any()
                   else np.full(len(stations), float(fallback)))
