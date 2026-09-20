@@ -511,9 +511,10 @@ def _repair_degree_two(edges, active, metadata, evidence):
         neighbours=[int(j) for j in tree.query(old,predicate='dwithin',distance=max(4.,2*width))
                     if int(j) in active-ids and edges[int(j)].level==edges[start[0]].level]
         contacts={j:_contacts(old,edges[j].axis) for j in neighbours}
-        support=prep(old.buffer(max(2.,width/2)))
         def validate(candidate):
-            if not support.covers(candidate):return False
+            # Spatial/evidence bounds belong to repair_axis. The old jagged
+            # axis's half-width buffer is not independent road evidence and can
+            # exclude every safe low-frequency connection across a tooth.
             for j,previous in contacts.items():
                 now=_contacts(candidate,edges[j].axis)
                 if not now.difference(previous.buffer(1e-5)).is_empty or not previous.difference(now.buffer(1e-5)).is_empty:return False
@@ -761,9 +762,9 @@ def _repair_canonical_shapes(chains, original_widths, evidence):
         neighbours=[int(j) for j in tree.query(old,predicate='dwithin',distance=width*2)
                     if int(j)!=i and chains[int(j)].ends[0][0]==c.ends[0][0]]
         contacts={j:_contacts(old,chains[j].axis) for j in neighbours}
-        supported=prep(old.buffer(max(2.,width/2)))
         def validate(candidate):
-            if not supported.covers(candidate):return False
+            # Keep true contacts; let the shared local repair validate evidence
+            # and displacement rather than pinning the erroneous tooth shape.
             for j,previous in contacts.items():
                 now=_contacts(candidate,chains[j].axis)
                 if not now.difference(previous.buffer(1e-5)).is_empty or not previous.difference(now.buffer(1e-5)).is_empty:return False

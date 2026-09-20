@@ -221,6 +221,14 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
         for scale in (.25,.5,1.):
             found=accept(_pinned_smooth(route,max(1.,scale*width)),'local_medial_refit')
             if found:return found
+    # Averaging can cut across a neighbouring branch at a shared junction.
+    # Retain the observed approach bend while removing short alternating
+    # vertices. These candidates still pass the same contact, offset, evidence
+    # and displacement checks; never relax topology to accept a smooth fit.
+    for tolerance in (width*.05,width*.1,width*.2,width*.3):
+        fit=np.asarray(axis.simplify(tolerance,preserve_topology=True).coords)
+        found=accept(fit,'local_vertex_refit',True)
+        if found:return found
     # Endpoint directions come from stable approach portions, outside the detected
     # reversals. A clamped cubic retains curved approaches; chord is last resort.
     chord=xy[-1]-xy[0];length=np.linalg.norm(chord)
@@ -238,7 +246,7 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
     raise error
 
 
-def repair_axis(axis, width, evidence=None, validator=lambda candidate: True, force=False):
+def _repair_axis_pass(axis, width, evidence=None, validator=lambda candidate: True, force=False):
     """Constrained low-frequency fit for classified faults; endpoints are fixed.
 
     Unlike the small-wobble pass, the fault displacement bound is proportional
@@ -275,6 +283,54 @@ def repair_axis(axis, width, evidence=None, validator=lambda candidate: True, fo
     candidate=LineString(parts)
     return candidate,dict(qa,corrected=True,maximum_shift_m=float(axis.hausdorff_distance(candidate)),
         length_before_m=float(axis.length),length_after_m=float(candidate.length),repairs=reports)
+
+
+def repair_axis(axis, width, evidence=None, validator=lambda candidate: True, force=False):
+    """Repair local faults and recheck the *assembled* axis after each pass.
+
+    Shortening a tooth can expose an alternating turn at the join with the
+    unchanged road. A locally safe fit therefore is not a completed axis.
+    Compose station maps back to the original axis so widths and feature splits
+    keep their correspondence through successive, still-local repairs.
+    """
+    current=axis;source=np.array([0.,axis.length]);target=source.copy()
+    intervals=[];history=[];initial=axis_quality(axis,width)
+    for attempt in range(max(2,min(32,len(axis.coords)))):
+        candidate,report=_repair_axis_pass(current,width,evidence,validator,force=force if attempt==0 else False)
+        if not report.get('corrected'):
+            if not history:return candidate,report
+            break
+        before=[0.];after=[0.];offset=0.;cursor=0.
+        for repair in report['repairs']:
+            low,high=repair['start_m'],repair['end_m']
+            intervals.append(tuple(np.interp([low,high],target,source)))
+            offset+=low-cursor;before.append(low);after.append(offset)
+            offset+=repair['length_after_m'];before.append(high);after.append(offset);cursor=high
+        before.append(current.length);after.append(offset+current.length-cursor)
+        # Duplicate endpoint knots are identical, but remove them for a strict
+        # monotone interpolation domain (including repairs touching endpoints).
+        before,index=np.unique(before,return_index=True);after=np.asarray(after)[index]
+        knots=np.unique(np.r_[source,np.interp(before,target,source)])
+        target=np.interp(np.interp(knots,source,target),before,after);source=knots
+        history.append(report);current=candidate
+        if not axis_quality(current,width)['abnormal']:break
+    if axis_quality(current,width)['abnormal']:
+        error=AxisQualityError('局部轴线拼接后仍有异常折返')
+        error.diagnostic=dict(axis_wkt=axis.wkt,corrected_wkt=current.wkt,width=width,passes=history)
+        raise error
+    if len(history)==1:return current,history[0]
+    merged=[]
+    for low,high in sorted(intervals):
+        if merged and low<=merged[-1][1]+1e-7:merged[-1][1]=max(merged[-1][1],high)
+        else:merged.append([low,high])
+    methods=sorted({r['method'] for p in history for r in p['repairs']})
+    quality=('direction_inferred' if any(r['quality_state']=='direction_inferred'
+              for p in history for r in p['repairs']) else 'evidence_supported')
+    repairs=[dict(start_m=a,end_m=b,length_after_m=float(np.interp(b,source,target)-np.interp(a,source,target)),
+                  method='+'.join(methods),quality_state=quality) for a,b in merged]
+    return current,dict(initial,corrected=True,maximum_shift_m=float(axis.hausdorff_distance(current)),
+        length_before_m=axis.length,length_after_m=current.length,repairs=repairs,
+        repair_passes=history,station_map=dict(before=source.tolist(),after=target.tolist()))
 
 
 def repair_network_axes(axes, widths, evidence):
@@ -330,6 +386,13 @@ def repair_network_axes(axes, widths, evidence):
                 raise
             parts.extend(list(part.coords) if not parts else list(part.coords)[1:])
             cursor=0.;offset=new_stations[-1]
+            if report.get('station_map'):
+                mapping=report['station_map']
+                old_stations.extend(a+s for s in mapping['before'][1:])
+                new_stations.extend(offset+s for s in mapping['after'][1:])
+                changed_ranges.extend((a+r['start_m'],a+r['end_m']) for r in report['repairs'])
+                reports.append(report)
+                continue
             for repair in report.get('repairs',[]):
                 low,high=repair['start_m'],repair['end_m']
                 changed_ranges.append((a+low,a+high))

@@ -3042,7 +3042,7 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     output_dir=Path(output_dir)
     source=output_dir/'regional_products.gpkg'
     if not source.is_file():raise FileNotFoundError(f'Regional products must be prepared before export: {source}')
-    from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature
+    from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature,export_polygons
     from .road_connection_evidence import ConnectionEvidence,RoadProbability,probability_sources
     sources=probability_sources(image_dir,width_dir)
     identity=[signature([source]),signature([__file__]),implementation_signature(),
@@ -3065,6 +3065,8 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     for name,audit in [('axis_quality_audit',axis_audit),('surface_quality_audit',surface_audit)]:
         (output_dir/(name+'.json')).write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf8')
     frames={k:v.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs) for k,v in frames.items()}
+    for key in ('surfaces','corridors'):
+        frames[key]=export_polygons(frames[key])
     outputs=formal_metadata()
     outputs.update(axis_quality_audit=str((output_dir/'axis_quality_audit.json').resolve()),
                    surface_quality_audit=str((output_dir/'surface_quality_audit.json').resolve()))

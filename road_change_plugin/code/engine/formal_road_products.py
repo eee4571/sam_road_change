@@ -10,6 +10,16 @@ from pathlib import Path
 FORMAL_ROAD_REVISION = 1
 
 
+def export_polygons(frame):
+    """Normalize sub-millimetre projection roundoff, shared by both exports."""
+    from shapely import set_precision
+    from .auto_change_assembly import polygonal
+    result=frame.copy()
+    grid=1e-9 if result.crs.is_geographic else .0001
+    result.geometry=result.geometry.map(lambda g:polygonal(set_precision(polygonal(g),grid)))
+    return result
+
+
 def implementation_signature():
     from .product_cache import signature
     return signature([Path(__file__).with_name(name) for name in (

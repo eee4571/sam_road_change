@@ -13,7 +13,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
-from shapely import from_wkt, line_merge, make_valid, normalize, union_all, set_precision
+from shapely import from_wkt, line_merge, make_valid, normalize, union_all
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import substring
 from shapely.strtree import STRtree
@@ -21,6 +21,7 @@ from shapely.strtree import STRtree
 from .auto_change_geometry import FinalWidths, corridor, _direction, _stations, _clean_overlay
 from .auto_change_assembly import polygonal
 from .gt_road_geometry import record_polygon, road_profile
+from .formal_road_products import export_polygons as _export_polygons
 
 
 @dataclass(frozen=True)
@@ -55,15 +56,6 @@ def _changes(rows,crs):
 
 def _write_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-
-
-def _export_polygons(frame):
-    # A sub-millimetre coordinate grid prevents nearly coincident rings from
-    # changing nesting when OGR serializes geographic Shapefile polygons.
-    result=frame.copy()
-    grid=1e-9 if result.crs.is_geographic else .0001
-    result.geometry=result.geometry.map(lambda g:polygonal(set_precision(polygonal(g),grid)))
-    return result
 
 
 def _id(geometry, prefix='AX'):
