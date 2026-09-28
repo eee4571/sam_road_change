@@ -11,3 +11,27 @@ __pycache__/
 _work/
 _logs/
 outputs/
+
+# Experiments: source/config/docs/tests only; all generated artifacts stay local.
+/experiments/**/outputs/
+/experiments/**/cache/
+/experiments/**/tmp/
+/experiments/**/temp/
+/experiments/**/logs/
+/experiments/**/*.log
+/experiments/**/*.npy
+/experiments/**/*.npz
+/experiments/**/*.tif
+/experiments/**/*.tiff
+/experiments/**/*.vrt
+/experiments/**/*.png
+/experiments/**/*.jpg
+/experiments/**/*.jpeg
+/experiments/**/*.shp
+/experiments/**/*.shx
+/experiments/**/*.dbf
+/experiments/**/*.prj
+/experiments/**/*.cpg
+/experiments/**/*.gpkg
+/experiments/**/*.geojson
+/experiments/**/*.sqlite*

@@ -1,0 +1,17 @@
+{
+  "sample_m": 2.5,
+  "raster_resolution_m": 0.75,
+  "default_roi_m": 800.0,
+  "halo_m": 160.0,
+  "max_gap_m": 100.0,
+  "direction_cosine": 0.94,
+  "max_lateral_m": 12.0,
+  "max_width_ratio": 2.0,
+  "rounds": 3,
+  "probability_threshold": 0.2,
+  "strong_probability": 0.45,
+  "support_fraction": 0.85,
+  "max_unsupported_m": 7.5,
+  "max_route_ratio": 1.2,
+  "max_turn_degrees": 50.0
+}
