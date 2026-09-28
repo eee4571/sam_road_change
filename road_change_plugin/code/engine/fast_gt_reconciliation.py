@@ -575,13 +575,13 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
         evidence=evidence,observations=observations,directory=directory)
     outputs=formal_metadata()
     _write_json(directory/'axis_quality_audit.json',axis_audit)
-    _write_json(directory/'surface_quality_audit.json',surface_audit)
-    print('[Final surface] '+json.dumps(surface_audit['summary'],ensure_ascii=False),flush=True)
     for key,frame in frames.items():
         path=directory/f'road_{key}.{"gpkg" if key in ("width_segments","corridors") else "shp"}'
         exported=frame.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs)
-        if key in ('surfaces','corridors'):exported=_export_polygons(exported)
+        if key in ('surfaces','corridors'):exported=_export_polygons(exported,surface_audit)
         exported.to_file(path,encoding='UTF-8');outputs[key]=str(path.resolve())
+    _write_json(directory/'surface_quality_audit.json',surface_audit)
+    print('[Final surface] '+json.dumps(surface_audit['summary'],ensure_ascii=False),flush=True)
     outputs['axis_quality_audit']=str((directory/'axis_quality_audit.json').resolve())
     outputs['axis_quality_revision']=1
     outputs['surface_quality_revision']=5

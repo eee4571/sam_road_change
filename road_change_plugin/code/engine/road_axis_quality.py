@@ -3,9 +3,12 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d, distance_transform_edt
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from shapely import covers, distance, points, union_all
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, MultiLineString
 from shapely.ops import substring
 from shapely.strtree import STRtree
+
+
+from .geometry_recovery import GEOMETRY_ERRORS, current_recovery, attempted_methods
 
 
 class AxisQualityError(ValueError):
@@ -17,9 +20,11 @@ def _contacts(a,b):
     # Compare actual contacts, not the length of buffers along shallow angles.
     contacts=[a.intersection(b)]
     for line,other in ((a,b),(b,a)):
-        for xy in (line.coords[0],line.coords[-1]):
-            p=Point(xy)
-            if p.distance(other)<=1e-6:contacts.append(p)
+        parts=[line] if line.geom_type=='LineString' else list(line.geoms)
+        for part in parts:
+            for xy in (part.coords[0],part.coords[-1]):
+                p=Point(xy)
+                if p.distance(other)<=1e-6:contacts.append(p)
     return union_all(contacts)
 
 
@@ -171,7 +176,7 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
     xy=np.asarray([axis.interpolate(s).coords[0] for s in ss])
     before=evidence.measure(axis) if evidence is not None else dict(joint_support=0.,unsupported_run_m=axis.length)
     attempts=[];fallback=None
-    def accept(fit,method,conservative=False):
+    def evaluate(fit,method,conservative=False):
         nonlocal fallback
         candidate=_join_tangents(LineString(fit),axis,width,pin_start,pin_end)
         qa=axis_quality(candidate,width)
@@ -203,6 +208,11 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
         attempts.append(dict(method=method,rejected='insufficient_evidence'))
         if conservative:fallback=(candidate,report)
         return None
+    def accept(fit,method,conservative=False):
+        try:return evaluate(fit,method,conservative)
+        except GEOMETRY_ERRORS as error:
+            attempts.append(dict(method=method,rejected=type(error).__name__,reason=str(error)))
+            return None
     step=ss[1]-ss[0]
     reference=None
     for scale in (1.,2.):
@@ -213,10 +223,16 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
     # Sample at a bounded density before fitting the evidence ridge.
     samples=np.linspace(0.,reference.length,max(7,int(reference.length/2)+1))
     reference=LineString([reference.interpolate(s).coords[0] for s in samples])
-    ridge=_evidence_axis(reference,width,evidence)
-    found=accept(ridge,'surface_probability_refit')
-    if found:return found
-    route=_evidence_route(axis,width,evidence)
+    try:
+        ridge=_evidence_axis(reference,width,evidence)
+        found=accept(ridge,'surface_probability_refit')
+        if found:return found
+    except GEOMETRY_ERRORS as error:
+        attempts.append(dict(method='surface_probability_refit',rejected=type(error).__name__,reason=str(error)))
+    try:route=_evidence_route(axis,width,evidence)
+    except GEOMETRY_ERRORS as error:
+        attempts.append(dict(method='local_medial_refit',rejected=type(error).__name__,reason=str(error)))
+        route=None
     if route is not None:
         for scale in (.25,.5,1.):
             found=accept(_pinned_smooth(route,max(1.,scale*width)),'local_medial_refit')
@@ -226,9 +242,12 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
     # vertices. These candidates still pass the same contact, offset, evidence
     # and displacement checks; never relax topology to accept a smooth fit.
     for tolerance in (width*.05,width*.1,width*.2,width*.3):
-        fit=np.asarray(axis.simplify(tolerance,preserve_topology=True).coords)
-        found=accept(fit,'local_vertex_refit',True)
-        if found:return found
+        try:
+            fit=np.asarray(axis.simplify(tolerance,preserve_topology=True).coords)
+            found=accept(fit,'local_vertex_refit',True)
+            if found:return found
+        except GEOMETRY_ERRORS as error:
+            attempts.append(dict(method='local_vertex_refit',rejected=type(error).__name__,reason=str(error)))
     # Endpoint directions come from stable approach portions, outside the detected
     # reversals. A clamped cubic retains curved approaches; chord is last resort.
     chord=xy[-1]-xy[0];length=np.linalg.norm(chord)
@@ -356,83 +375,185 @@ def repair_network_axes(axes, widths, evidence):
             following=[p for p in ends if p[0]!=i]
             if not following:break
             i,e=following[0]
-        chain=LineString(coords);width=float(np.median([widths[i] for i,_,_,_ in members]))
-        qa=axis_quality(chain,width)
-        if not qa['abnormal']:continue
-        if evidence_factory is not None:
-            evidence=evidence_factory();evidence_factory=None
-        member_ids={r[0] for r in members};fixed=[0.,chain.length]
-        neighbours=set(map(int,tree.query(chain.buffer(max(2.,width*1.5))))) - member_ids
-        for j in neighbours:
-            contact=chain.intersection(result[j])
-            if contact.geom_type=='Point':fixed.append(chain.project(contact))
-            elif contact.geom_type=='MultiPoint':fixed.extend(chain.project(p) for p in contact.geoms)
-            elif not contact.is_empty:raise AxisQualityError('异常轴线存在重叠道路，无法保持拓扑自动修复')
-        fixed=sorted(set(fixed));parts=[];old_stations=[0.];new_stations=[0.];reports=[];changed_ranges=[]
-        for a,b in zip(fixed,fixed[1:]):
-            original_part=substring(chain,a,b)
-            topology_problems=[]
-            def topology_safe(candidate):
-                for j in neighbours:
-                    old=_contacts(original_part,result[j]);new=_contacts(candidate,result[j])
-                    if not new.difference(old.buffer(1e-4)).is_empty or not old.difference(new.buffer(1e-4)).is_empty:
-                        topology_problems.append(dict(neighbour=j,old=old.wkt,new=new.wkt,
-                            other=result[j].wkt,part=original_part.wkt,candidate=candidate.wkt))
-                        return False
-                return True
-            try:part,report=repair_axis(original_part,width,evidence,topology_safe,force=True)
-            except AxisQualityError as error:
-                error.diagnostic.update(topology=topology_problems[-1:] if topology_problems else [])
-                raise
-            parts.extend(list(part.coords) if not parts else list(part.coords)[1:])
-            cursor=0.;offset=new_stations[-1]
-            if report.get('station_map'):
-                mapping=report['station_map']
-                old_stations.extend(a+s for s in mapping['before'][1:])
-                new_stations.extend(offset+s for s in mapping['after'][1:])
-                changed_ranges.extend((a+r['start_m'],a+r['end_m']) for r in report['repairs'])
-                reports.append(report)
-                continue
-            for repair in report.get('repairs',[]):
-                low,high=repair['start_m'],repair['end_m']
-                changed_ranges.append((a+low,a+high))
-                offset+=low-cursor
-                old_stations.append(a+low);new_stations.append(offset)
-                offset+=repair['length_after_m']
-                old_stations.append(a+high);new_stations.append(offset);cursor=high
-            old_stations.append(b);new_stations.append(offset+b-a-cursor);reports.append(report)
-        corrected=LineString(parts)
-        if axis_quality(corrected,width)['abnormal']:
-            error=AxisQualityError('真实路口约束下仍有异常折返')
-            error.diagnostic=dict(axis_wkt=chain.wkt,corrected_wkt=corrected.wkt,width=width,
-                                  fixed=fixed,parts=reports,qa=axis_quality(corrected,width),members=list(member_ids))
-            raise error
-        for j in neighbours:
-            old=_contacts(chain,result[j]);new=_contacts(corrected,result[j])
-            if not new.difference(old.buffer(1e-5)).is_empty or not old.difference(new.buffer(1e-5)).is_empty:
-                raise AxisQualityError('轴线修复会改变真实路口连接，已阻止发布')
-        for i,e,a,b in members:
-            if not any(low<b and high>a for low,high in changed_ranges):continue
-            low,high=np.interp([a,b],old_stations,new_stations)
-            part=substring(corrected,float(low),float(high))
-            xy=list(part.coords)
-            original_xy=list(axes[i].coords)[::-1] if e else list(axes[i].coords)
-            if not any(lo<a<hi for lo,hi in changed_ranges):xy[0]=original_xy[0]
-            if not any(lo<b<hi for lo,hi in changed_ranges):xy[-1]=original_xy[-1]
-            part=LineString(xy)
-            if e:part=LineString(list(part.coords)[::-1])
-            result[i]=part
-            old_map=np.unique(np.r_[a,[s for s in old_stations if a<s<b],b])
-            new_map=np.interp(old_map,old_stations,new_stations)-low
-            old_map=old_map-a
-            if e:old_map=b-a-old_map[::-1];new_map=part.length-new_map[::-1]
-            new_map=np.clip(new_map,0.,part.length)
-            new_map[[0,-1]]=[0.,part.length]
-            audit.append(dict(feature=i,corrected=True,reasons=qa['reasons'],
-                maximum_shift_m=float(axes[i].hausdorff_distance(part)),
-                length_before_m=float(axes[i].length),length_after_m=float(part.length),parts=reports,
-                station_map=dict(before=old_map.tolist(),after=new_map.tolist())))
+        checkpoint=len(audit)
+        previous={k:result[k] for k,_,_,_ in members}
+        try:
+            chain=LineString(coords);width=float(np.median([widths[i] for i,_,_,_ in members]))
+            qa=axis_quality(chain,width)
+            if not qa['abnormal']:continue
+            if evidence_factory is not None:
+                evidence=evidence_factory();evidence_factory=None
+            member_ids={r[0] for r in members};fixed=[0.,chain.length]
+            neighbours=set(map(int,tree.query(chain.buffer(max(2.,width*1.5))))) - member_ids
+            neighbours={j for j in neighbours if result[j] is not None}
+            for j in neighbours:
+                contact=chain.intersection(result[j])
+                if contact.geom_type=='Point':fixed.append(chain.project(contact))
+                elif contact.geom_type=='MultiPoint':fixed.extend(chain.project(p) for p in contact.geoms)
+                elif not contact.is_empty:raise AxisQualityError('异常轴线存在重叠道路，无法保持拓扑自动修复')
+            fixed=sorted(set(fixed));parts=[];old_stations=[0.];new_stations=[0.];reports=[];changed_ranges=[]
+            for a,b in zip(fixed,fixed[1:]):
+                original_part=substring(chain,a,b)
+                topology_problems=[]
+                def topology_safe(candidate):
+                    for j in neighbours:
+                        old=_contacts(original_part,result[j]);new=_contacts(candidate,result[j])
+                        if not new.difference(old.buffer(1e-4)).is_empty or not old.difference(new.buffer(1e-4)).is_empty:
+                            topology_problems.append(dict(neighbour=j,old=old.wkt,new=new.wkt,
+                                other=result[j].wkt,part=original_part.wkt,candidate=candidate.wkt))
+                            return False
+                    return True
+                try:part,report=repair_axis(original_part,width,evidence,topology_safe,force=True)
+                except AxisQualityError as error:
+                    error.diagnostic=getattr(error,'diagnostic',{})
+                    error.diagnostic.update(topology=topology_problems[-1:] if topology_problems else [])
+                    raise
+                parts.extend(list(part.coords) if not parts else list(part.coords)[1:])
+                cursor=0.;offset=new_stations[-1]
+                if report.get('station_map'):
+                    mapping=report['station_map']
+                    old_stations.extend(a+s for s in mapping['before'][1:])
+                    new_stations.extend(offset+s for s in mapping['after'][1:])
+                    changed_ranges.extend((a+r['start_m'],a+r['end_m']) for r in report['repairs'])
+                    reports.append(report)
+                    continue
+                for repair in report.get('repairs',[]):
+                    low,high=repair['start_m'],repair['end_m']
+                    changed_ranges.append((a+low,a+high))
+                    offset+=low-cursor
+                    old_stations.append(a+low);new_stations.append(offset)
+                    offset+=repair['length_after_m']
+                    old_stations.append(a+high);new_stations.append(offset);cursor=high
+                old_stations.append(b);new_stations.append(offset+b-a-cursor);reports.append(report)
+            corrected=LineString(parts)
+            if axis_quality(corrected,width)['abnormal']:
+                error=AxisQualityError('真实路口约束下仍有异常折返')
+                error.diagnostic=dict(axis_wkt=chain.wkt,corrected_wkt=corrected.wkt,width=width,
+                                      fixed=fixed,parts=reports,qa=axis_quality(corrected,width),members=list(member_ids))
+                raise error
+            for j in neighbours:
+                old=_contacts(chain,result[j]);new=_contacts(corrected,result[j])
+                if not new.difference(old.buffer(1e-5)).is_empty or not old.difference(new.buffer(1e-5)).is_empty:
+                    raise AxisQualityError('局部轴线修复会改变真实路口连接')
+            for i,e,a,b in members:
+                if not any(low<b and high>a for low,high in changed_ranges):continue
+                low,high=np.interp([a,b],old_stations,new_stations)
+                part=substring(corrected,float(low),float(high))
+                xy=list(part.coords)
+                original_xy=list(axes[i].coords)[::-1] if e else list(axes[i].coords)
+                if not any(lo<a<hi for lo,hi in changed_ranges):xy[0]=original_xy[0]
+                if not any(lo<b<hi for lo,hi in changed_ranges):xy[-1]=original_xy[-1]
+                part=LineString(xy)
+                if e:part=LineString(list(part.coords)[::-1])
+                result[i]=part
+                old_map=np.unique(np.r_[a,[s for s in old_stations if a<s<b],b])
+                new_map=np.interp(old_map,old_stations,new_stations)-low
+                old_map=old_map-a
+                if e:old_map=b-a-old_map[::-1];new_map=part.length-new_map[::-1]
+                new_map=np.clip(new_map,0.,part.length)
+                new_map[[0,-1]]=[0.,part.length]
+                audit.append(dict(feature=i,corrected=True,reasons=qa['reasons'],
+                    maximum_shift_m=float(axes[i].hausdorff_distance(part)),
+                    length_before_m=float(axes[i].length),length_after_m=float(part.length),parts=reports,
+                    station_map=dict(before=old_map.tolist(),after=new_map.tolist())))
+        except GEOMETRY_ERRORS as error:
+            del audit[checkpoint:]
+            for k,value in previous.items():result[k]=value
+            try:
+                chain=LineString(coords)
+                width=float(np.median([widths[k] for k,_,_,_ in members]))
+                member_ids={k for k,_,_,_ in members}
+                neighbours=set(map(int,tree.query(chain.buffer(max(2.,width*1.5))))) - member_ids
+                pieces,issues=conservative_axis_parts(chain,width,[result[j] for j in neighbours if result[j] is not None],error)
+            except GEOMETRY_ERRORS as local:
+                pieces=[];issues=[dict(repair_status='skipped',attempted_methods=attempted_methods(error),
+                                     exception_type=type(local).__name__,reason=str(local))]
+            for k,reverse,a,b in members:
+                selected=[];maps=[]
+                for low,high,part in pieces:
+                    left,right=max(a,low),min(b,high)
+                    if right-left<=1e-7:continue
+                    begin,end=np.interp([left,right],[low,high],[0.,part.length])
+                    section=substring(part,float(begin),float(end))
+                    if section.geom_type!='LineString' or section.length<=1e-7:continue
+                    if reverse:section=LineString(list(section.coords)[::-1])
+                    selected.append(section)
+                    old=[left-a,right-a] if not reverse else [b-right,b-left]
+                    maps.append(dict(before=old,after=[0.,section.length]))
+                if reverse:selected.reverse();maps.reverse()
+                result[k]=(selected[0] if len(selected)==1 else MultiLineString(selected)) if selected else None
+                status='fallback' if selected else 'skipped'
+                details=[dict(r,source_ids=[k]) for r in issues]
+                audit.append(dict(feature=k,corrected=bool(selected),axis_quality='low',repair_status=status,
+                    piece_maps=maps,parts=[],failures=details))
+                recovery=current_recovery()
+                if recovery is not None:
+                    for r in details:recovery.record('axis_repair',[k],error,r['repair_status'],r['attempted_methods'])
+                else:
+                    print(f'[WARN] 道路 {k} 轴线修复降级: {status} ({error})',flush=True)
     return result,audit
+
+
+def conservative_axis_parts(axis,width,neighbours,error):
+    """Isolate faulty windows; keep safe approaches and exact topology anchors.
+
+    Returned source station intervals keep measured widths aligned even when
+    an irreparable interval is omitted. No rejected source axis is republished.
+    """
+    methods=attempted_methods(error)
+    methods.append('topology_anchored_local_chord')
+    try:
+        qa=axis_quality(axis,width)
+        stations=qa.get('stations') or qa.get('oscillation_stations') or []
+        windows=[[max(0.,s-max(3.,width)),min(axis.length,s+max(3.,width))] for s in stations]
+        windows += [[max(0.,a-width),min(axis.length,b+width)] for a,b in qa.get('crossing_intervals',[])]
+        # A failure with no classifiable interval is scoped to this chain only.
+        if not windows:windows=[[0.,axis.length]]
+        merged=[]
+        for low,high in sorted(windows):
+            if merged and low<=merged[-1][1]:merged[-1][1]=max(merged[-1][1],high)
+            else:merged.append([low,high])
+        pieces=[];issues=[];cursor=0.
+        def append_safe(low,high,repair=False):
+            if high-low<=1e-7:return
+            old=substring(axis,low,high)
+            candidate=old
+            if repair:
+                anchors={0.,old.length}
+                for other in neighbours:
+                    hit=_contacts(old,other)
+                    pts=[hit] if hit.geom_type=='Point' else list(hit.geoms) if hit.geom_type=='MultiPoint' else []
+                    if not hit.is_empty and not pts:raise AxisQualityError('Overlapping local topology')
+                    anchors.update(old.project(p) for p in pts)
+                candidate=LineString([old.interpolate(s).coords[0] for s in sorted(anchors)])
+            require_safe_axis(candidate,width)
+            if not candidate.is_simple or not candidate.is_valid:raise AxisQualityError('Unsafe conservative axis')
+            if repair:
+                if old.hausdorff_distance(candidate)>max(3.,2*width):raise AxisQualityError('Conservative displacement exceeded')
+                for other in neighbours:
+                    before=_contacts(old,other);after=_contacts(candidate,other)
+                    if not after.difference(before.buffer(1e-5)).is_empty or not before.difference(after.buffer(1e-5)).is_empty:
+                        raise AxisQualityError('Conservative connection changes contacts')
+            pieces.append((low,high,candidate))
+        for low,high in merged:
+            for a,b,repair in ((cursor,low,False),(low,high,True)):
+                if b-a<=1e-7:continue
+                try:
+                    append_safe(a,b,repair)
+                    if repair:issues.append(dict(start_m=a,end_m=b,repair_status='fallback',attempted_methods=methods))
+                except GEOMETRY_ERRORS as local:
+                    issues.append(dict(start_m=a,end_m=b,repair_status='skipped',attempted_methods=methods,
+                                       exception_type=type(local).__name__,reason=str(local)))
+            cursor=high
+        if cursor<axis.length:
+            try:append_safe(cursor,axis.length)
+            except GEOMETRY_ERRORS as local:
+                issues.append(dict(start_m=cursor,end_m=axis.length,repair_status='skipped',attempted_methods=methods,
+                                   exception_type=type(local).__name__,reason=str(local)))
+        return pieces,issues
+    except GEOMETRY_ERRORS as local:
+        return [],[dict(repair_status='skipped',attempted_methods=methods,
+                        exception_type=type(local).__name__,reason=str(local))]
 
 
 def require_safe_axis(axis,width):

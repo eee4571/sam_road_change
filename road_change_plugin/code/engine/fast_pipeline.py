@@ -3042,13 +3042,18 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     output_dir=Path(output_dir)
     source=output_dir/'regional_products.gpkg'
     if not source.is_file():raise FileNotFoundError(f'Regional products must be prepared before export: {source}')
-    from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature,export_polygons
+    from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature,export_polygons,formal_products_current
     from .road_connection_evidence import ConnectionEvidence,RoadProbability,probability_sources
     sources=probability_sources(image_dir,width_dir)
     identity=[signature([source]),signature([__file__]),implementation_signature(),
               signature([p for pair in sources for p in pair]),width_method,str(image_dir)]
     marker=output_dir/'fast_export_cache.json';cached=read_completed(marker,identity)
     if cached:return cached
+    if formal_products_current(output_dir):
+        saved=json.loads(marker.read_text(encoding='utf8'))
+        if saved['inputs'][3:]==identity[3:]:
+            print('[单期正式道路生成] 复用已完成正式成果',flush=True)
+            return saved['result']
     mapping={'centerlines':'road_centerlines.shp','surfaces':'road_surfaces.shp',
              'width_segments':'road_width_segments.gpkg','corridors':'road_corridors.gpkg'}
     frames={key:gpd.read_file(source,layer=key) for key in mapping}
@@ -3062,11 +3067,11 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     print('[单期正式道路生成] 轴线质量修复 → canonical graph → 稳定宽度 → 正式道路面',flush=True)
     frames,axis_audit,surface_audit=reconstruct_frames(frames['centerlines'],frames['width_segments'],
         evidence=evidence,directory=output_dir)
-    for name,audit in [('axis_quality_audit',axis_audit),('surface_quality_audit',surface_audit)]:
-        (output_dir/(name+'.json')).write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf8')
     frames={k:v.drop(columns=['gt_width_profile'],errors='ignore').to_crs(output_crs) for k,v in frames.items()}
     for key in ('surfaces','corridors'):
-        frames[key]=export_polygons(frames[key])
+        frames[key]=export_polygons(frames[key],surface_audit)
+    for name,audit in [('axis_quality_audit',axis_audit),('surface_quality_audit',surface_audit)]:
+        (output_dir/(name+'.json')).write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf8')
     outputs=formal_metadata()
     outputs.update(axis_quality_audit=str((output_dir/'axis_quality_audit.json').resolve()),
                    surface_quality_audit=str((output_dir/'surface_quality_audit.json').resolve()))
