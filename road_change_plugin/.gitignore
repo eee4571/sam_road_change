@@ -35,3 +35,10 @@ outputs/
 /experiments/**/*.gpkg
 /experiments/**/*.geojson
 /experiments/**/*.sqlite*
+/experiments/**/.pytest_cache/
+/experiments/**/.ruff_cache/
+/experiments/**/*.tmp
+/experiments/**/*.gpkg-wal
+/experiments/**/*.gpkg-shm
+/experiments/**/*.aux.xml
+/experiments/**/*.ovr

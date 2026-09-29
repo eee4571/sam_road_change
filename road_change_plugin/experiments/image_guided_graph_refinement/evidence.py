@@ -52,6 +52,7 @@ class ImageGrid:
         # Existing normalization is an in-memory descriptor, not IR-MAD fitting.
         self.gray, gray_valid = normalized_gray(self.rgb.transpose(2, 0, 1))
         self.valid &= gray_valid
+        self.valid_float = self.valid.astype(np.float32)
         self.gx, self.gy = gradients(np.nan_to_num(self.gray).astype(np.float32))
         magnitude = np.hypot(self.gx, self.gy)
         self.scale = max(float(np.quantile(magnitude[self.valid], .8)), .01) if self.valid.any() else 1.
@@ -59,7 +60,7 @@ class ImageGrid:
     def sample(self, array, xy):
         col, row = (~self.transform) * (xy[:, 0], xy[:, 1])
         value = map_coordinates(array, [row-.5, col-.5], order=1, mode="constant", cval=np.nan)
-        valid = map_coordinates(self.valid.astype(float), [row-.5, col-.5], order=1,
+        valid = map_coordinates(self.valid_float, [row-.5, col-.5], order=1,
                                 mode="constant", cval=0) > .999
         return np.where(valid, value, np.nan)
 

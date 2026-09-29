@@ -1,5 +1,44 @@
 # 基于影像证据的道路图修正实验（第一版）
 
+## 实际修复实验
+
+新增 `run_repair.py`，与下文第一轮诊断 CLI 并存；不改变正式 pipeline、正式中心线或缓存。
+它实际重建中央轴、重挂外部支路、处理窄小伪环、按方向约束搜索 RGB gap route，并对固定拓扑节点之间的折线做小范围 RGB 一致性平滑。
+支持 `--bbox`、`--center X Y --radius R`，不指定时沿用候选密集 ROI 选择。坐标均为加载输入后选定的米制 CRS。
+
+```powershell
+& road_change_plugin/runtime/env/samroad_env/python.exe `
+  road_change_plugin/experiments/image_guided_graph_refinement/run_repair.py `
+  --project project/plugtest --period 20230416 `
+  --bbox 258791.0108 2613777.3135 259591.0108 2614577.3135 --whole-period
+```
+
+`--whole-period` 先修复指定 ROI，再以默认 900m 分块扫描其余区域（`--tile-size 400..1500`）；不指定则只修改 ROI。
+无论哪种模式，`final_centerlines.gpkg` 都导出完整期次网络，实际扫描范围以 `inputs.json` 和各 tile 的 ROI 为准。
+每次创建独立 `outputs/repair_<UTC>_<id>/`，包括：
+
+- `final_centerlines.gpkg`、`baseline_centerlines.gpkg`；
+- `changes.gpkg`：added、deleted、replaced_old、replaced_new（无对应修改时不创建空层）；
+- `whole_period_before_after.png`、各 `tile_*/before_after.png` 和路口 `local_*.png`；
+- `audit.json`、`summary.json`、输入指纹、源码 SHA256、候选、分块验收和收敛记录。
+
+输出沿用输入的缓存宽度属性，没有在新轴上重新测宽；这些属性不能当作修复后道路的重新测量结果。
+
+算法先从同层侧轴对和已有轴线链提供位置/方向先验，在原始 RGB 上寻找横向均匀、有两侧反差且纵向连续的道路带。
+允许在同方向、已有网络附近继续召回跨路口的道路段；单靠低 SAM 不否定道路。SAM/MOLRA 只加正分，正式 surface 和缓存宽度仅作辅助/搜索尺度。
+比较同一搜索尺度下旧轴和新轴的 raw RGB support，并为同路带侧轴替换保存横断面连续性证据；有稳定非道路隔离带的真实平行道路保留。
+重建路口采用同层 medial axis 的交点和路口范围，所有外部支路接触点保留并重挂；没有按示意图未标道路来删除厂区内部道路。
+几何无效、自交增加、连通分量增加、重复候选长度增加的分块撤回，候选及失败原因仍保留。`applied=false` 的审计记录不是最终修改。
+
+限制：RGB ribbon 是结构证据，不是新的道路语义模型；明亮屋顶/院落、阴影、未标注层级仍可能造成歧义。
+小环/端点/近平行候选数不等于错误数，拓扑改善和 ribbon 分数提高也不等于精度或召回率。完整成果、图和报告应一起查看。
+第一轮诊断仍可由 `run_experiment.py` 原样复现；新修复实验不使用旧的“低 SAM 即负证据”删除策略。
+
+```powershell
+& road_change_plugin/runtime/env/samroad_env/python.exe -m unittest discover `
+  -s road_change_plugin/experiments/image_guided_graph_refinement -p 'test*.py'
+```
+
 独立、离线、只读项目输入的实验。**没有接入正式 pipeline，也不发布或覆盖正式成果。**
 不调用 SAMRoad、MOLRA、IR-MAD、测宽或道路面重建任务。新增计算限于候选生成、已有影像的局部描述、路径搜索和诊断统计。
 
