@@ -1,1 +1,8 @@
-launcher_settings.json
+# Keep the test tool and instructions; imagery, launcher state and all result
+# archives remain local. Add reviewed source/configuration exceptions explicitly.
+/*
+!/.gitignore
+!/*.py
+!/*.pyw
+!/*.bat
+!/README.md

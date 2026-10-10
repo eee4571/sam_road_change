@@ -1,19 +1,35 @@
-# Experiment inputs and generated artifacts stay local; publish source/configuration only.
-*.tif
-*.tiff
-*.png
-*.jpg
-*.jpeg
-*.webp
-*.gpkg
-*.geojson
-*.shp
-*.shx
-*.dbf
-*.prj
-*.cpg
-*.npz
-*.npy
-*.bin
-*.pdf
-*.zip
+# New experiments are source-only by default, including unknown result formats.
+# A child .gitignore may explicitly allow a reviewed configuration file.
+**/*
+!**/
+!**/.gitignore
+!**/*.py
+!**/*.pyw
+!**/README.md
+
+# Never admit generated code snapshots through the source allowlist.
+**/outputs/
+**/output/
+**/results/
+**/results_archive/
+**/artifacts/
+**/runs/
+**/cache/
+**/caches/
+**/__pycache__/
+**/.*/
+**/tmp/
+**/temp/
+**/logs/
+**/data/
+**/input/
+**/inputs/
+**/datasets/
+**/annotations/
+**/labels/
+**/source_snapshot/
+**/snapshots/
+**/runtime/
+**/models/
+**/env/
+**/venv/

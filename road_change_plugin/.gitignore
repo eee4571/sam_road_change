@@ -12,33 +12,38 @@ _work/
 _logs/
 outputs/
 
-# Experiments: source/config/docs/tests only; all generated artifacts stay local.
+# Experiments: deny by default, including unlisted formats and result reports.
+# Allow source/tests, README instructions and explicitly reviewed configuration.
+# Do not allow *.json or *.md globally: audit/labels/reports are local results.
+/experiments/**/*
+!/experiments/**/
+!/experiments/**/*.py
+!/experiments/**/README.md
+!/experiments/image_guided_graph_refinement/config.json
+
+# Generated/data directories stay excluded even when they contain .py snapshots
+# or README.md files. Keep these AFTER the source allowlist.
 /experiments/**/outputs/
+/experiments/**/output/
+/experiments/**/results/
+/experiments/**/artifacts/
+/experiments/**/runs/
 /experiments/**/cache/
+/experiments/**/caches/
+/experiments/**/__pycache__/
+/experiments/**/.*/
 /experiments/**/tmp/
 /experiments/**/temp/
 /experiments/**/logs/
-/experiments/**/*.log
-/experiments/**/*.npy
-/experiments/**/*.npz
-/experiments/**/*.tif
-/experiments/**/*.tiff
-/experiments/**/*.vrt
-/experiments/**/*.png
-/experiments/**/*.jpg
-/experiments/**/*.jpeg
-/experiments/**/*.shp
-/experiments/**/*.shx
-/experiments/**/*.dbf
-/experiments/**/*.prj
-/experiments/**/*.cpg
-/experiments/**/*.gpkg
-/experiments/**/*.geojson
-/experiments/**/*.sqlite*
-/experiments/**/.pytest_cache/
-/experiments/**/.ruff_cache/
-/experiments/**/*.tmp
-/experiments/**/*.gpkg-wal
-/experiments/**/*.gpkg-shm
-/experiments/**/*.aux.xml
-/experiments/**/*.ovr
+/experiments/**/data/
+/experiments/**/input/
+/experiments/**/inputs/
+/experiments/**/datasets/
+/experiments/**/annotations/
+/experiments/**/labels/
+/experiments/**/source_snapshot/
+/experiments/**/snapshots/
+/experiments/**/runtime/
+/experiments/**/models/
+/experiments/**/env/
+/experiments/**/venv/

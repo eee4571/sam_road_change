@@ -9,6 +9,12 @@ conda-env/
 # Large model weights are kept locally and distributed separately
 models/
 /runtime/models/
+/runtime/model/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
 
 # Python caches, test output, and coverage
 __pycache__/
@@ -28,6 +34,11 @@ outputs/
 runs/
 logs/
 _logs/
+cache/
+caches/
+.cache/
+results_archive/
+/成果输出/
 *.log
 *.tmp
 *.temp
@@ -44,6 +55,32 @@ validation_data/
 private_data/
 local_data/
 /project/
+
+# Generated GIS datasets, regardless of their location. UI image assets remain
+# trackable; do not blanket-ignore PNG/JPEG/JSON used by source/resources.
+*.tif
+*.tiff
+*.gpkg
+*.gpkg-wal
+*.gpkg-shm
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.vrt
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.aux.xml
+*.ovr
+
+# Historic experiment figures/audits are local; keep their usage notes only.
+/docs/experiment_results/**/*
+!/docs/experiment_results/**/
+!/docs/experiment_results/**/README.md
 
 # Local secrets and credentials
 .env
