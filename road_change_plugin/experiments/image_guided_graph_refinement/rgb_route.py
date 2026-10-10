@@ -7,6 +7,55 @@ from evidence import stations, longest_hole
 from ribbon_diagnostic import raw_ribbon_profile
 from graph import build, candidates
 from refine import safe_gap
+from color_ribbon import sample_color
+
+
+def longitudinal_ribbon(gray, probes, fractions, evidence):
+    """Repeated transverse structure over 15--20 m, robust to cars/markings.
+
+    This operates on observed profiles, never on a derived road surface. Raw
+    station support remains available separately so aggregation is auditable.
+    """
+    from scipy.ndimage import median_filter
+    pooled = median_filter(np.nan_to_num(gray), size=(7,)+(1,)*(gray.ndim-1), mode='nearest')
+    score, finite, contrast, spread = ribbon_cost_features(pooled, fractions)
+    inside = pooled[..., (fractions >= .2) & (fractions <= .8)]
+    mid = np.median(inside, axis=-1)
+    dl = mid-np.median(pooled[..., fractions < -.05], axis=-1)
+    dr = mid-np.median(pooled[..., fractions > 1.05], axis=-1)
+    supported = (dl*dr > 0) & (contrast >= .18) & (spread <= .2)
+    color = sample_color(evidence, probes, fractions, longitudinal_window=7)
+    if color is not None:
+        score = np.maximum(score, color[0]); supported |= color[1]
+    curb_score, curb_support = paired_curb_features(pooled, fractions, spread)
+    score = np.maximum(score, curb_score)
+    supported |= curb_support
+    supported &= np.isfinite(gray).all(axis=-1)
+    return score, supported
+
+
+def paired_curb_features(pooled, fractions, spread=None):
+    """Shared paired-edge descriptor; accepts already pooled transverse RGB gray."""
+    if spread is None:
+        spread = ribbon_cost_features(pooled, fractions)[3]
+    # Asphalt and vegetation can have similar average luminance. Repeated curb
+    # edges still bound a low-texture road interior; broad flank medians miss it.
+    # Require TWO localized edges and a uniform interior, not one building step.
+    change = abs(pooled[..., 4:]-pooled[..., :-4])
+    edge_fractions = fractions[2:-2]
+    left_mask = (edge_fractions >= -.05) & (edge_fractions <= .2)
+    right_mask = (edge_fractions >= .8) & (edge_fractions <= 1.05)
+    left_edge = change[..., left_mask].max(axis=-1)
+    right_edge = change[..., right_mask].max(axis=-1)
+    locations = []
+    for mask, peak in ((left_mask, left_edge), (right_mask, right_edge)):
+        weights = np.maximum(change[..., mask]-.5*peak[..., None], 0.)
+        locations.append(np.sum(weights*edge_fractions[mask], axis=-1)/np.maximum(weights.sum(axis=-1), 1e-9))
+    edge_center = .5*(locations[0]+locations[1])
+    bilateral = np.minimum(left_edge, right_edge)
+    curb_support = (bilateral >= .12) & (spread <= .12)
+    curb_score = np.clip(bilateral/.3, 0., 1.)*np.exp(-spread/.12)*np.exp(-((edge_center-.5)/.12)**2)
+    return curb_score, curb_support
 
 
 def ribbon_cost_features(gray, fractions):
@@ -19,7 +68,10 @@ def ribbon_cost_features(gray, fractions):
     dr = median-np.median(filled[..., fractions > 1.05], axis=-1)
     spread = np.quantile(inside, .8, axis=-1)-np.quantile(inside, .2, axis=-1)
     contrast = np.minimum(abs(dl), abs(dr))
-    score = np.clip(contrast/.4, 0, 1)*np.exp(-spread/.25)*(dl*dr > 0)*finite
+    same_material = abs(filled-median[..., None]) < .12
+    material_center = np.sum(same_material*fractions, axis=-1)/np.maximum(same_material.sum(axis=-1), 1)
+    centrality = np.exp(-((material_center-.5)/.25)**2)
+    score = np.clip(contrast/.4, 0, 1)*np.exp(-spread/.25)*(dl*dr > 0)*finite*centrality
     return score, finite, contrast, spread
 
 
@@ -31,12 +83,26 @@ def ribbon_evidence(line, width, evidence):
     valid = np.isfinite(gray).all(axis=1)
     raw = raw_ribbon_profile(np.nan_to_num(gray), fractions)
     supported = np.array(raw['supported_sections']) & valid
+    grayscale_support = float(supported.mean())
+    color = sample_color(evidence, probe, fractions)
+    if color is not None:
+        supported |= color[1] & valid
+    strength = ribbon_cost_features(gray, fractions)[0]
+    if color is not None:
+        strength = np.maximum(strength, color[0])
     p, m, surface = evidence.values(xy)
     # Absence of SAM/MOLRA does not subtract from RGB support. Derived surfaces
     # are reported only; they never create independent support.
     positive = (p >= .65) | (m >= .65)
     combined = supported | (positive & valid)
+    coherent_strength, coherent_support = longitudinal_ribbon(gray, probe, fractions, evidence)
     return dict(raw_rgb_support=float(supported.mean()), valid_fraction=float(valid.mean()),
+                longitudinal_rgb_support=float(coherent_support.mean()),
+                longitudinal_center_strength=float(coherent_strength.mean()),
+                longitudinal_maximum_unsupported_m=longest_hole(coherent_support, line.length),
+                centered_ribbon_strength=float(strength.mean()),
+                grayscale_support=grayscale_support,
+                chromatic_support=float(color[1].mean()) if color is not None else None,
                 continuous_support=float(combined.mean()), maximum_unsupported_m=longest_hole(combined, line.length),
                 sam_positive_mean=float(np.nanmean(p)) if np.isfinite(p).any() else None,
                 molra_positive_mean=float(np.nanmean(m)) if np.isfinite(m).any() else None,
@@ -62,6 +128,9 @@ def constrained_route(candidate, evidence):
     probe = xy[:, :, None, :]+normal*(fractions[None, None, :, None]-.5)*candidate.width
     gray = evidence.image.sample(evidence.image.gray, probe.reshape(-1, 2)).reshape(count, len(offsets), -1)
     score, finite, _, _ = ribbon_cost_features(gray, fractions)
+    color = sample_color(evidence, probe, fractions)
+    if color is not None:
+        score = np.maximum(score, color[0])
     p, m, _ = evidence.values(xy.reshape(-1, 2))
     score += .15*np.nan_to_num(p).reshape(score.shape)+.15*np.nan_to_num(m).reshape(score.shape)
     cost = 1.3-score+.04*(offsets/half)**2

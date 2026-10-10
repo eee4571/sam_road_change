@@ -515,12 +515,8 @@ def reconcile_periods(periods, changes, output_dir):
             layers={k:v for k,v in original.items() if k not in ('period','road_state','product_variant','execution_profile','status','auto_source','result')}
         else:
             layers=_write_final_period(original,base,cuts,rows,inserts,directory,metric,first.crs,observations)
-        physical_rows=gpd.read_file(layers['centerlines']).to_crs(metric).to_dict('records')
         local_states=[r for r in state_rows if r['period']==period]
-        for state in local_states:
-            physical=[r['geometry'] for r in physical_rows if r.get('track_id')==state['track_id']]
-            if physical:state['geometry']=line_merge(union_all(physical))
-        states=_frame(local_states,metric)
+        states=_final_road_states(local_states,gpd.read_file(layers['centerlines']).to_crs(metric))
         if states.empty:
             for key in ('track_id','period','status','width_m','source'):states[key]=pd.Series(dtype='str')
         state_path=directory/'road_state.gpkg';states.to_file(state_path,layer='road_state',driver='GPKG')
@@ -533,6 +529,34 @@ def reconcile_periods(periods, changes, output_dir):
     pd.DataFrame(edit_audit).to_csv(output/'axis_interval_edits.csv',index=False)
     pd.DataFrame(assignments).to_csv(output/'change_track_assignments.csv',index=False)
     return outputs
+
+
+def _final_road_states(states, centerlines):
+    """Materialize state geometry and representative width from final roads.
+
+    Lifecycle widths drive the reconstruction/profile scaling. After splitting
+    and regularizing those profiles, the published track width is the
+    length-weighted mean of its final centerline widths, as used by temporal QA.
+    Presence remains an event constraint, never inferred from missing output.
+    """
+    groups={key:group for key,group in centerlines.groupby('track_id',sort=False)} if 'track_id' in centerlines else {}
+    rows=[]
+    for state in states:
+        row=dict(state)
+        physical=groups.get(row['track_id'])
+        present=physical is not None and not physical.empty
+        if present != (row['status']=='present'):
+            raise ValueError(f"Road state contradicts period centerline: {row['track_id']}/{row['period']}")
+        if present:
+            lengths=physical.geometry.length.to_numpy()
+            widths=physical.width_m.to_numpy(dtype=float)
+            if not (np.isfinite(lengths).all() and (lengths>0).all() and
+                    np.isfinite(widths).all() and (widths>0).all()):
+                raise ValueError(f"Invalid final road width or length: {row['track_id']}/{row['period']}")
+            row['geometry']=line_merge(union_all(physical.geometry))
+            row['width_m']=float(np.average(widths,weights=lengths))
+        rows.append(row)
+    return _frame(rows,centerlines.crs)
 
 
 @timed_stage("final_road")

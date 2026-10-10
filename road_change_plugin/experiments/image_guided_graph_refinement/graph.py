@@ -33,7 +33,12 @@ def build(frame):
     profiles = [(r.geometry, np.array([0., r.geometry.length]), np.array([r.width_m, r.width_m]))
                 for _, r in frame.iterrows()]
     metadata = frame.drop(columns="geometry").to_dict("records")
-    return _build_graph(profiles, [np.zeros(2) for _ in profiles], metadata)
+    edges=_build_graph(profiles, [np.zeros(2) for _ in profiles], metadata)
+    for edge in edges:
+        identities={str(metadata[i].get('carriageway_id')) for i in edge.sources
+                    if metadata[i].get('carriageway_id') is not None and str(metadata[i].get('carriageway_id')) not in ('nan','None','')}
+        edge.carriageway_id=next(iter(identities)) if len(identities)==1 else ''
+    return edges
 
 
 def as_frame(edges, crs):
@@ -101,7 +106,8 @@ def candidates(edges, roi, config, kinds=("spur", "gap", "duplicate"), focus=Non
     if "duplicate" in kinds and edges:
         # Dry-run the existing duplicate rules; do not use their returned geometry.
         profiles = [(e.axis, e.stations, e.widths) for e in edges]
-        metadata = [dict(layer=e.level[0], bridge=e.level[1], tunnel=e.level[2]) for e in edges]
+        metadata = [dict(layer=e.level[0], bridge=e.level[1], tunnel=e.level[2],
+                         canonical_road_id=getattr(e,'carriageway_id','')) for e in edges]
         _, _, reports = _collapse_duplicates(profiles, [e.quality for e in edges], metadata)
         for report in reports:
             i, j = report["source_feature"], report["canonical_source"]

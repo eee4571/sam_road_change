@@ -12,10 +12,12 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d, binary_closing
 from shapely import union_all, points, distance, wkt
 from shapely.geometry import LineString, Point
+from shapely.ops import substring
 
 from evidence import stations
 from ribbon_diagnostic import diagnose, raw_ribbon_profile
-from rgb_route import ribbon_cost_features
+from rgb_route import ribbon_cost_features, longitudinal_ribbon
+from color_ribbon import sample_color, descriptor_scales
 
 
 @dataclass
@@ -79,7 +81,8 @@ def parallel_ribbon_veto(proposal, frame, evidence):
         for line in line_parts(row.geometry.intersection(search)):
             if line.length < 20 or abs(direction(line)@direction(proposal.axis)) < .95:
                 continue
-            support = ribbon_evidence(line, float(row.width_m), evidence)['raw_rgb_support']
+            scales = descriptor_scales(float(row.width_m)) if getattr(evidence, 'multichannel_ribbon', False) else [float(row.width_m)]
+            support = max(ribbon_evidence(line, scale, evidence)['raw_rgb_support'] for scale in scales)
             if support < .65:
                 continue
             xy = np.array([line.interpolate(line.project(Point(p))).coords[0] for p in center])
@@ -90,12 +93,24 @@ def parallel_ribbon_veto(proposal, frame, evidence):
             for sign in (-1, 1):
                 valid = aligned & (offset*sign > max(3., float(row.width_m)*.4)) & np.isfinite(gray)
                 if valid.any():
-                    sides[sign].append((valid, gray))
-    for valid_left, left in sides[-1]:
-        for valid_right, right in sides[1]:
+                    sides[sign].append((valid, gray, xy))
+    for valid_left, left, left_xy in sides[-1]:
+        for valid_right, right, right_xy in sides[1]:
             valid = valid_left & valid_right & np.isfinite(middle_gray)
             dl, dr = middle_gray-left, middle_gray-right
             separator = valid & (dl*dr > 0) & (np.minimum(abs(dl), abs(dr)) >= .18)
+            # Color-aware independent ribbons also protect green medians with
+            # similar grayscale brightness. Side samples retain their RGB values.
+            # Gray-only callers preserve the original first-round behaviour.
+            if getattr(evidence, 'multichannel_ribbon', False) and hasattr(evidence.image, 'rgb'):
+                image = evidence.image
+                span = getattr(image, '_ribbon_rgb_range', (None, np.ones(3)*255))[1]
+                def rgb_at(xy):
+                    return np.column_stack([image.sample(image.rgb[..., k], xy) for k in range(3)])/span
+                middle_rgb, left_rgb, right_rgb = rgb_at(center), rgb_at(left_xy), rgb_at(right_xy)
+                dl_rgb, dr_rgb = middle_rgb-left_rgb, middle_rgb-right_rgb
+                color_difference = np.minimum(np.linalg.norm(dl_rgb, axis=1), np.linalg.norm(dr_rgb, axis=1))/np.sqrt(3)
+                separator |= valid & (np.sum(dl_rgb*dr_rgb, axis=1) > 0) & (color_difference >= .10)
             if separator.mean() >= .65:
                 return dict(action='retain_parallel_roads', applied=False, candidate_id=proposal.key,
                     candidate_wkt=proposal.axis.wkt, evidence=dict(stable_separator_fraction=float(separator.mean()),
@@ -104,34 +119,46 @@ def parallel_ribbon_veto(proposal, frame, evidence):
     return None
 
 
+def straight_priors(axis, maximum_residual=4.):
+    """Split bent chains into direction priors; do not split/modify the network."""
+    _, xy, _, _ = stations(axis.simplify(1.), 5.)
+    def split(coords):
+        line = LineString(coords)
+        if line.length < 20:
+            return []
+        v = coords[-1]-coords[0]
+        if np.linalg.norm(v) < 1e-6:
+            k = int(np.linalg.norm(coords-coords[0], axis=1).argmax())
+            if k == 0:
+                return []
+            return split(coords[:k+1])+split(coords[k:])
+        v /= max(np.linalg.norm(v), 1e-9)
+        residual = abs((coords-coords[0])@np.array([-v[1], v[0]]))
+        if residual.max() <= maximum_residual:
+            return [line]
+        k = int(residual.argmax())
+        if k == 0 or k == len(coords)-1:
+            k = len(coords)//2
+        return split(coords[:k+1])+split(coords[k:])
+    return split(xy)
+
+
 def seed_groups(edges, evidence, roi):
     reports = diagnose(edges, evidence, roi.buffer(80))
     seeds = [(wkt.loads(r['result_wkt']), r['geometry_scores']['separation_m'], r['candidate_id']) for r in reports]
-    # Include a road already carrying one approximate axis. Only sustained RGB
-    # ribbons qualify; existing width sets a search scale, not a positive vote.
+    # Seed position/direction from geometry, then test RGB at the SEARCHED axis.
+    # Requiring the uncorrected axis at its cached width to have two road edges
+    # prevents precisely the offset and narrow roads we are trying to recover.
     from local_graph_repair import seed_chains
     for i, edge in enumerate(seed_chains(edges)):
-        if edge.axis.length < 65 or edge.axis.is_ring or not roi.intersects(edge.axis):
+        if edge.axis.length < 20 or not roi.intersects(edge.axis):
             continue
-        axis = edge.axis.simplify(3)
-        v = direction(axis)
-        xy = np.asarray(axis.coords)
-        normal = np.array([-v[1], v[0]])
-        if np.ptp(xy@normal) > 12:
-            continue
-        _, centers, _, normals = stations(axis, 5)
         scale = float(np.median(edge.widths))
         if not 5 <= scale <= 40:
             continue
-        fractions = np.linspace(-.5, 1.5, 61)
-        probes = centers[:, None, :] + normals[:, None, :]*(fractions[None, :, None]-.5)*scale
-        gray = evidence.image.sample(evidence.image.gray, probes.reshape(-1, 2)).reshape(len(centers), -1)
-        if not np.isfinite(gray).all():
-            continue
-        raw = raw_ribbon_profile(gray, fractions)
-        if raw['raw_ribbon_support_fraction'] >= .65:
-            centers += normals*(np.array(raw['center_fractions'])-.5)[:, None]*scale
-            seeds.append((LineString(centers), scale, f'existing_axis_{i}'))
+        for axis in line_parts(edge.axis.intersection(roi.buffer(20))):
+            for j, part in enumerate(straight_priors(axis)):
+                seeds.append((part, scale, f'existing_axis_{i}_{j}'))
     # Pairwise grouping uses direction AND lateral separation. It never joins
     # adjacent parallel roads just because their buffers overlap.
     parent = list(range(len(seeds)))
@@ -148,7 +175,7 @@ def seed_groups(edges, evidence, roi):
             if abs(va@direction(b)) < .98 or max(wa, wb)/min(wa, wb) > 1.8:
                 continue
             delta = np.asarray(a.centroid.coords[0])-np.asarray(b.centroid.coords[0])
-            if abs(delta@normal) <= 6 and a.distance(b) <= 160:
+            if abs(delta@normal) <= 6 and a.distance(b) <= 60:
                 parent[root(i)] = root(j)
     groups = {}
     for i, seed in enumerate(seeds):
@@ -156,7 +183,7 @@ def seed_groups(edges, evidence, roi):
     return list(groups.values()), reports
 
 
-def fit_medial(group, evidence, roi):
+def fit_medial(group, evidence, roi, aperture=None):
     coords = np.concatenate([np.asarray(a.coords) for a, _, _ in group])
     origin = np.median(coords, axis=0)
     _, _, vt = np.linalg.svd(coords-origin, full_matrices=False)
@@ -164,7 +191,8 @@ def fit_medial(group, evidence, roi):
     if tangent[0] < 0:
         tangent = -tangent
     normal = np.array([-tangent[1], tangent[0]])
-    scale = float(np.median([s for _, s, _ in group]))
+    prior_scale = float(np.median([s for _, s, _ in group]))
+    scale = prior_scale if aperture is None else aperture
     seed_s = (coords-origin)@tangent
     span = np.ptp(seed_s)
     if span < 20:
@@ -175,15 +203,28 @@ def fit_medial(group, evidence, roi):
     if chord.geom_type != 'LineString':
         return []
     ends = (np.asarray(chord.coords)-origin)@tangent
-    along = np.arange(ends.min(), ends.max()+3, 3.)
+    along = np.arange(max(ends.min(), seed_s.min()-20), min(ends.max(), seed_s.max()+20)+3, 3.)
     base = origin+along[:, None]*tangent
-    reach = min(40., max(20., scale*1.5))
+    reach = min(15., max(4., prior_scale*.65)) if aperture is not None else min(40., max(20., scale*1.5))
     offsets = np.arange(-reach, reach+.5, .75)
     fractions = np.linspace(-.5, 1.5, 41)
     lateral = offsets[:, None]+(fractions[None, :]-.5)*scale
     probes = base[:, None, None, :]+normal*lateral[None, :, :, None]
     gray = evidence.image.sample(evidence.image.gray, probes.reshape(-1, 2)).reshape(len(base), len(offsets), -1)
     score, finite, contrast, spread = ribbon_cost_features(gray, fractions)
+    color = sample_color(evidence, probes, fractions)
+    if color is not None:
+        score = np.maximum(score, color[0])
+    coherent_score, coherent_support = longitudinal_ribbon(gray, probes, fractions, evidence)
+    score = .5*score+.5*coherent_score
+    centers_grid = base[:, None, :]+normal*offsets[None, :, None]
+    vegetation = np.zeros(score.shape, bool)
+    if hasattr(evidence.image, 'rgb'):
+        rgb = np.stack([evidence.image.sample(evidence.image.rgb[..., k], centers_grid.reshape(-1, 2))
+                        for k in range(3)], axis=1).reshape(*score.shape, 3)/255.
+        green = 2*rgb[..., 1]-rgb[..., 0]-rgb[..., 2]
+        vegetation = green > .1
+        score -= 2*np.maximum(green, 0.)
     score -= .08*(offsets[None, :]/max(scale/2, 1))**2
     # Position-state dynamic programming restricts direction during search.
     jumps = np.arange(-2, 3)
@@ -207,6 +248,11 @@ def fit_medial(group, evidence, roi):
     safe = np.isfinite(chosen_gray).all(axis=1)
     raw = raw_ribbon_profile(np.where(safe[:, None], chosen_gray, 0), fractions)
     supported = np.array(raw['supported_sections']) & safe
+    if color is not None:
+        supported |= color[1][np.arange(len(base)), selected] & safe
+    raw_supported = supported.copy()
+    supported |= coherent_support[np.arange(len(base)), selected] & safe
+    supported &= ~vegetation[np.arange(len(base)), selected]
     # At a junction, side contrast disappears while the pavement continues.
     # Fill only short bounded holes; never extrapolate through a long missing road.
     connected = binary_closing(supported, structure=np.ones(15), border_value=0)
@@ -235,6 +281,8 @@ def fit_medial(group, evidence, roi):
         if not anchored and prior_fraction < .8 and not bounded_continuation:
             continue
         axis = LineString(selected_xy[ids]).simplify(.5)
+        if vegetation[ids, selected[ids]].mean() >= .15:
+            continue
         clipped = axis.intersection(roi)
         for part in line_parts(clipped):
             if part.length < 60 or not part.is_simple:
@@ -242,7 +290,9 @@ def fit_medial(group, evidence, roi):
             envelope = part.buffer(scale*.58, cap_style='flat', join_style='round').intersection(roi)
             p, m, surface = evidence.values(selected_xy[ids])
             result.append(AxisProposal(part, envelope, scale, float(supported[ids].mean()),
-                dict(raw_support_fraction=float(supported[ids].mean()),
+                dict(raw_support_fraction=float(raw_supported[ids].mean()),
+                     longitudinal_ribbon_support_fraction=float(supported[ids].mean()),
+                     center_vegetation_fraction=float(vegetation[ids, selected[ids]].mean()),
                      mean_flank_contrast=float(np.mean(contrast[ids, selected[ids]])),
                      mean_interior_spread=float(np.mean(spread[ids, selected[ids]])),
                      sam_positive_mean=float(np.nanmean(p)) if np.isfinite(p).any() else None,
@@ -250,6 +300,83 @@ def fit_medial(group, evidence, roi):
                      auxiliary_surface_support=float(surface.mean()),
                      scale_source='existing_side_axis_separation_or_cached_width',
                      width_recomputed=False), [key for _, _, key in group]))
+    return result
+
+
+def same_pavement_between(first, second, evidence):
+    """Positive continuity BETWEEN competing axes; dark/green medians veto it."""
+    _, xy, tangents, _ = stations(first, 3.)
+    projected = np.array([second.interpolate(second.project(Point(p))).coords[0] for p in xy])
+    delta = projected-xy
+    valid_match = abs(np.sum(delta*tangents, axis=1)) <= np.maximum(1., np.linalg.norm(delta, axis=1)*.3)
+    if valid_match.sum() < 5:
+        return 0.
+    xy, projected = xy[valid_match], projected[valid_match]
+    fractions = np.linspace(0., 1., 21)
+    probes = xy[:, None]*(1-fractions[None, :, None])+projected[:, None]*fractions[None, :, None]
+    gray = evidence.image.sample(evidence.image.gray, probes.reshape(-1, 2)).reshape(len(xy), -1)
+    valid = np.isfinite(gray).all(axis=1)
+    spread = np.nanquantile(gray, .9, axis=1)-np.nanquantile(gray, .1, axis=1)
+    return float(np.mean(valid & (spread < .15)))
+
+
+def join_collinear_proposals(proposals, evidence, roi):
+    """One axis through overlapping same-pavement fits, not two competing paths."""
+    result = list(proposals)
+    merged = True
+    while merged:
+        merged = False
+        for i, a in enumerate(result):
+            for j, b in enumerate(result[:i]):
+                if abs(direction(a.axis)@direction(b.axis)) < .98:
+                    continue
+                overlap = a.axis.intersection(b.axis.buffer(min(a.band_scale, b.band_scale)*.45)).length
+                same_overlap = (overlap >= .3*min(a.axis.length, b.axis.length) and
+                                same_pavement_between(a.axis, b.axis, evidence) >= .8)
+                same_continuation = False
+                tips = [(np.asarray(x), np.asarray(y)) for x in (a.axis.coords[0], a.axis.coords[-1])
+                        for y in (b.axis.coords[0], b.axis.coords[-1])]
+                x, y = min(tips, key=lambda pair: np.linalg.norm(pair[1]-pair[0]))
+                delta = y-x; gap = np.linalg.norm(delta)
+                if 0 < gap <= 25 and abs(delta@direction(a.axis))/gap > .95:
+                    from rgb_route import ribbon_evidence
+                    connector = LineString([x, y])
+                    same_continuation = max(ribbon_evidence(connector, p.band_scale, evidence)['longitudinal_rgb_support']
+                                            for p in (a, b)) >= .65
+                if not same_overlap and not same_continuation:
+                    continue
+                tangent = direction(b.axis); normal = np.array([-tangent[1], tangent[0]])
+                origin = np.asarray(b.axis.coords[0])
+                samples = [stations(p.axis, 2.)[1] for p in (a, b)]
+                values = []
+                for p, xy in zip((a, b), samples):
+                    s, offsets = (xy-origin)@tangent, (xy-origin)@normal
+                    order = np.argsort(s)
+                    values.append((s[order], offsets[order], p.support))
+                ss = np.linspace(min(v[0].min() for v in values), max(v[0].max() for v in values),
+                                 max(3, int((max(v[0].max() for v in values)-min(v[0].min() for v in values))/2)+1))
+                numerator, denominator = np.zeros(len(ss)), np.zeros(len(ss))
+                for s, offsets, support in values:
+                    weight = np.clip(np.minimum(ss-s.min(), s.max()-ss)/12, 0., 1.)*support
+                    weight[(ss < s.min()) | (ss > s.max())] = 0.
+                    numerator += weight*np.interp(ss, s, offsets); denominator += weight
+                offsets = numerator/np.maximum(denominator, 1e-9)
+                fallback_s = np.concatenate([v[0] for v in values])
+                fallback_offsets = np.concatenate([v[1] for v in values])
+                order = np.argsort(fallback_s)
+                for k in np.flatnonzero(denominator == 0):
+                    offsets[k] = np.interp(ss[k], fallback_s[order], fallback_offsets[order])
+                axis = LineString(origin+ss[:, None]*tangent+offsets[:, None]*normal).simplify(.25)
+                strongest = max((a, b), key=lambda p: p.support)
+                c = AxisProposal(axis, union_all([a.envelope, b.envelope,
+                    axis.buffer(strongest.band_scale*.58, cap_style='flat')]).intersection(roi),
+                    strongest.band_scale, max(a.support, b.support),
+                    dict(strongest.evidence, joined_same_pavement_axes=[a.axis.wkt, b.axis.wkt]), a.seed_ids+b.seed_ids, a.level)
+                result = [p for k, p in enumerate(result) if k not in (i, j)]+[c]
+                merged = True
+                break
+            if merged:
+                break
     return result
 
 
@@ -264,14 +391,28 @@ def propose_axes(edges, evidence, roi):
         return all_proposals, all_reports
     evidence.network_prior = union_all([e.axis for e in edges])
     groups, reports = seed_groups(edges, evidence, roi)
-    proposals = [p for group in groups for factor in (1., .75, 1.5)
-                 for p in fit_medial([(a, scale*factor, key) for a, scale, key in group], evidence, roi)]
+    # Fixed descriptor apertures, not a width remeasurement. Narrow pavement can
+    # sit inside a much wider axis-derived formal surface.
+    proposals = [p for group in groups for aperture in (4., 6., 9., 13., 18., 26., 36.)
+                 for p in fit_medial(group, evidence, roi, aperture)]
+    from rgb_route import ribbon_evidence
+    proposals = [p for p in proposals if ribbon_evidence(p.axis, p.band_scale, evidence)['longitudinal_rgb_support'] >= .6]
+    # Lane markings can bound narrow strips INSIDE a verified wider pavement.
+    # They are competing representations of that pavement, not extra roads.
+    # Prefer its outer ribbon when it contains the narrow axis longitudinally.
+    proposals = [p for p in proposals if not any(q is not p and q.band_scale >= 1.4*p.band_scale
+        and abs(direction(p.axis)@direction(q.axis)) > .98
+        and p.axis.intersection(q.axis.buffer(q.band_scale*.4, cap_style='flat')).length > .8*p.axis.length
+        for q in proposals)]
     # Select one proposal for each overlapping continuation using raw support.
     chosen = []
     for p in sorted(proposals, key=lambda p: (-p.axis.length*p.support, p.key)):
-        if any(p.axis.intersection(q.axis.buffer(min(p.band_scale, q.band_scale)/3)).length > .7*p.axis.length for q in chosen):
+        if any(abs(direction(p.axis)@direction(q.axis)) > .95 and
+               p.axis.intersection(q.axis.buffer(max(p.band_scale, q.band_scale)*.58)).length > .7*p.axis.length and
+               same_pavement_between(p.axis, q.axis, evidence) >= .8 for q in chosen):
             continue
         chosen.append(p)
+    chosen = join_collinear_proposals(chosen, evidence, roi)
     # Complete a supported junction approach to the other medial axis. This is
     # geometric intersection of continued road directions, not endpoint snapping.
     for p in chosen:
@@ -322,6 +463,16 @@ def replace_corridors(frame, proposals, roi, evidence=None):
             all_edits.extend(edits)
             all_contacts.extend(contacts)
         return gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=frame.crs), all_edits, all_contacts
+    # Source features are not graph edges: branches frequently join the MIDDLE
+    # of a feature. Node them before building outside-component/attachment maps;
+    # otherwise real contacts are invisible and are mistaken for isolated slivers.
+    from graph import build
+    noded = []
+    for edge in build(frame.reset_index(drop=True)):
+        row = frame.iloc[edge.sources[0]].to_dict()
+        row['geometry'] = edge.axis
+        noded.append(row)
+    frame = gpd.GeoDataFrame(noded, geometry='geometry', crs=frame.crs)
     domain = union_all([p.envelope for p in proposals])
     rows, edits, contacts = [], [], []
     junctions = []
@@ -359,10 +510,13 @@ def replace_corridors(frame, proposals, roi, evidence=None):
                     # continuity test. A planted curb at the outer edge does not.
                     continuous = valid & (np.mean(abs(gray-gray[:, -1:]) < .2, axis=1) >= .8)
                     old_score = ribbon_evidence(part, float(row.width_m), evidence)['raw_rgb_support']
-                    medial_score = ribbon_evidence(LineString(central), proposal.band_scale, evidence)['raw_rgb_support']
-                    if continuous.mean() < .8 or medial_score < .65 or medial_score-old_score < .25:
+                    medial_score = ribbon_evidence(LineString(central), proposal.band_scale, evidence)['longitudinal_rgb_support']
+                    # Two axes can both score well while occupying ONE pavement
+                    # ribbon. Their equivalence is demonstrated by the intervening
+                    # RGB, not by requiring the discarded axis to look non-road.
+                    if continuous.mean() < .8 or medial_score < .65:
                         continue
-                    ribbons.append(part.buffer(.05))
+                    ribbons.append(part.buffer(.05).intersection(roi))
                     edits.append(dict(action='identify_boundary_alias', old_wkt=part.wkt,
                         evidence=dict(single_ribbon_cross_section_fraction=float(continuous.mean()),
                                       old_raw_rgb_support=old_score, medial_raw_rgb_support=medial_score),
@@ -404,6 +558,8 @@ def replace_corridors(frame, proposals, roi, evidence=None):
     for component in nx.connected_components(graph):
         ids = {i for node in component for i in nodes[node]}
         lines = [outside_rows[i]['geometry'] for i in ids]
+        if not all(roi.covers(line) for line in lines):
+            continue
         if any(Point(n).distance(preserved) < .02 for n in component):
             continue
         touches = sum(Point(n).distance(domain.boundary) < .02 for n in component)
@@ -425,6 +581,8 @@ def replace_corridors(frame, proposals, roi, evidence=None):
                     if ids & slivers or not ids:
                         continue
                     lines = [outside_rows[i]['geometry'] for i in ids]
+                    if not all(roi.covers(line) for line in lines):
+                        continue
                     if sum(line.length for line in lines) > 100:
                         continue
                     samples = np.concatenate([stations(line, 2)[1] for line in lines])
@@ -453,10 +611,24 @@ def replace_corridors(frame, proposals, roi, evidence=None):
                 point = Point(part.coords[end])
                 if point.distance(domain.boundary) < .02:
                     closest = min(proposals, key=lambda p: point.distance(p.axis))
-                    target = closest.axis.interpolate(closest.axis.project(point))
-                    for center, radius in junctions:
-                        if target.distance(center) < radius:
-                            target = center
+                    position = closest.axis.project(point)
+                    # At a corridor cap continue the original approach into the
+                    # new axis, instead of a perpendicular step and dangling stub.
+                    inward = np.asarray(part.interpolate(min(8., part.length) if end == 0 else max(0., part.length-8.)).coords[0])
+                    incoming = np.asarray(point.coords[0])-inward
+                    incoming /= max(np.linalg.norm(incoming), 1e-9)
+                    axis_tangent = direction(closest.axis)
+                    if abs(incoming@axis_tangent) >= .8 and point.distance(roi.boundary) > .02:
+                        run = min(15., closest.axis.length*.2)
+                        if position < run:
+                            position = run
+                        elif closest.axis.length-position < run:
+                            position = closest.axis.length-run
+                    target = closest.axis.interpolate(position)
+                    compatible=[center for center,radius in junctions
+                                if target.distance(center)<radius and center.distance(closest.axis)<.01]
+                    if compatible:
+                        target=min(compatible,key=target.distance)
                     if point.distance(target) > .1:
                         attachments.append((point, target, data))
     # Two nearby cut contacts often belong to the same fragmented branch. Join
@@ -479,6 +651,23 @@ def replace_corridors(frame, proposals, roi, evidence=None):
         hub = Point(source_mean*.75+np.asarray(target.coords[0])*.25) if len(group) > 1 else target
         for point, _, data in group:
             connector = LineString([point, hub])
+            if len(group) == 1 and point.distance(hub) > 4:
+                part = data['geometry']
+                at_start = point.distance(Point(part.coords[0])) < .02
+                inner = part.interpolate(min(8., part.length) if at_start else max(0., part.length-8.))
+                incoming = np.asarray(point.coords[0])-np.asarray(inner.coords[0])
+                incoming /= max(np.linalg.norm(incoming), 1e-9)
+                outgoing = direction(closest.axis)
+                if incoming@outgoing < 0:
+                    outgoing = -outgoing
+                if incoming@outgoing >= .8:
+                    a, b = np.asarray(point.coords[0]), np.asarray(hub.coords[0])
+                    reach = np.linalg.norm(b-a)/3
+                    t = np.linspace(0., 1., max(5, int(3*reach)))[:, None]
+                    curved = LineString((1-t)**3*a+3*(1-t)**2*t*(a+incoming*reach)+
+                        3*(1-t)*t**2*(b-outgoing*reach)+t**3*b)
+                    if roi.covers(curved):
+                        connector=curved
             if connector.length > .01:
                 rows.append(dict(data, geometry=connector, repair_role='branch_reattachment'))
                 contacts.append(dict(source_id=int(data['source_id']), old_contact=list(point.coords[0]),
@@ -489,11 +678,25 @@ def replace_corridors(frame, proposals, roi, evidence=None):
             contacts.append(dict(source_id=int(group[0][2]['source_id']), geometry_wkt=connector.wkt,
                                  new_contact=list(target.coords[0]), shared_stem=True))
     for i, proposal in enumerate(proposals):
+        anchors = [Point(c['new_contact']) for c in contacts if 'new_contact' in c
+                   and Point(c['new_contact']).distance(proposal.axis) < .01]
+        anchors += [p for p, _ in junctions if p.distance(proposal.axis) < .01]
+        if len(anchors) >= 2 and not proposal.evidence.get('whole_corridor', False):
+            positions = [proposal.axis.project(p) for p in anchors]
+            lo, hi = min(positions), max(positions)
+            if Point(proposal.axis.coords[0]).distance(roi.boundary) < .01:
+                lo = 0.
+            if Point(proposal.axis.coords[-1]).distance(roi.boundary) < .01:
+                hi = proposal.axis.length
+            if hi-lo > 5:
+                proposal.axis = substring(proposal.axis, lo, hi)
         proposal.axis = pin_axis_contacts(proposal.axis,
             [c['new_contact'] for c in contacts if 'new_contact' in c]+[p.coords[0] for p, _ in junctions])
         nearest = frame.distance(proposal.axis.centroid).idxmin()
         row = frame.loc[nearest].to_dict()
         row.update(geometry=proposal.axis, source_id=-i-1, repair_role='rgb_medial_axis')
+        if proposal.evidence.get('carriageway_count')==2:
+            row['carriageway_id']=proposal.evidence['corridor_id']+':'+str(proposal.evidence['carriageway_index'])
         rows.append(row)
         edits.append(dict(candidate_id=proposal.key, action='add_medial_axis', new_wkt=proposal.axis.wkt,
                           envelope_wkt=proposal.envelope.wkt, evidence=proposal.evidence,

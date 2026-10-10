@@ -14,6 +14,23 @@ from medial_repair import line_parts
 from report import background, draw, write_json
 
 
+def save_roi_result(folder, before, after, evidence, roi, config, selection, audit, convergence):
+    """Common product contract for a fresh solve or cached-candidate revalidation."""
+    for name, value in (('baseline', before), ('final', after)):
+        value.to_file(folder/f'{name}_centerlines.gpkg', layer='context', driver='GPKG')
+        clipped = value.copy()
+        clipped.geometry = clipped.geometry.intersection(roi)
+        clipped = clipped[~clipped.is_empty].explode(index_parts=False)
+        clipped = clipped[clipped.geometry.geom_type == 'LineString']
+        clipped.to_file(folder/f'{name}_centerlines.gpkg', layer='roi', driver='GPKG')
+    write_json(folder/'audit.json', audit)
+    summary = dict(selection, before=topology(before, roi, config), after=topology(after, roi, config),
+                   convergence=convergence, **geometry_products(folder, before, after, audit))
+    write_json(folder/'summary.json', summary)
+    compare(folder/'before_after.png', before, after, evidence, roi, selection['id']+' / '+selection['category'])
+    return summary
+
+
 def compare(path, before, after, evidence, roi, title):
     fig, axes = plt.subplots(1, 2, figsize=(18, 9))
     for ax, frame, label in zip(axes, (before, after), ('Before', 'After')):
@@ -53,6 +70,9 @@ def geometry_products(output, before, after, audit):
     for name, records in layers.items():
         if records:
             gpd.GeoDataFrame(records, geometry='geometry', crs=before.crs).to_file(
+                output/'changes.gpkg', layer=name, driver='GPKG')
+        else:
+            gpd.GeoDataFrame({'action': [], 'geometry': []}, geometry='geometry', crs=before.crs).to_file(
                 output/'changes.gpkg', layer=name, driver='GPKG')
     displacement = np.array(distances) if distances else np.zeros(1)
     return dict(added_length_m=added_length, deleted_length_m=deleted_length,

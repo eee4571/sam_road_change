@@ -14,15 +14,18 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
-def discover(project, period, area=None):
+def discover(project, period, area=None, record=None):
     project = Path(project).resolve()
     manifest = project / "_work/current/pipeline_result.json"
-    rows = [r for r in read_json(manifest).get("period_results", [])
-            if str(r.get("period")) == period and (area is None or str(r.get("grid")) == area)]
-    if len(rows) != 1:
-        raise ValueError(f"Expected one current period result; found {len(rows)}. Specify --area; available: "
-                         f"{[(r.get('grid'), r.get('period')) for r in read_json(manifest).get('period_results', [])]}")
-    record = rows[0]
+    if record is None:
+        rows = [r for r in read_json(manifest).get("period_results", [])
+                if str(r.get("period")) == period and (area is None or str(r.get("grid")) == area)]
+        if len(rows) != 1:
+            raise ValueError(f"Expected one current period result; found {len(rows)}. Specify --area; available: "
+                             f"{[(r.get('grid'), r.get('period')) for r in read_json(manifest).get('period_results', [])]}")
+        record = rows[0]
+    elif str(record.get('period')) != str(period) or (area is not None and str(record.get('grid')) != str(area)):
+        raise ValueError('Saved input record belongs to a different period/area')
     run = Path(record["run_root"])
     products = run / "products"
     lines = Path(record["centerlines"])

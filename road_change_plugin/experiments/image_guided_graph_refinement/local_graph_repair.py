@@ -37,7 +37,7 @@ def thin_regions(network, roi):
     return sorted(regions, key=lambda p: p.area)
 
 
-def clean_local(frame, evidence, roi, rounds=8):
+def clean_local(frame, evidence, roi, rounds=8, include_teeth=True):
     """Replace thin two-route aliases; never remove a normal road loop by size alone."""
     untouched = frame[~frame.intersects(roi.buffer(2))]
     local = frame[frame.intersects(roi.buffer(2))].reset_index(drop=True)
@@ -107,7 +107,7 @@ def clean_local(frame, evidence, roi, rounds=8):
                     reason='two_nearby_alias_routes_or_small_junction_cycle_with_preserved_external_contacts'))
         # Remove only sub-resolution terminal teeth, never generic short roads.
         for node, ends in nodes.items():
-            if len(ends) != 1:
+            if not include_teeth or len(ends) != 1:
                 continue
             i, end = ends[0]
             if (i in removed or edges[i].axis.length > 2*evidence.image.resolution or

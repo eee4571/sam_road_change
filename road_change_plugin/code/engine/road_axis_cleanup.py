@@ -80,9 +80,23 @@ def correct_oscillating_chains(roads, evidence):
     from .road_axis_quality import repair_network_axes
     repaired,quality_audit=repair_network_axes([LineString(r.points) for r in roads],
                                               [r.width_m for r in roads],evidence)
-    strong={r['feature'] for r in quality_audit}
-    roads=[_RegionalRoadSeed(np.asarray(repaired[i].coords),r.width_m,r.source_ids,'axis_quality_repaired')
-           if i in strong else r for i,r in enumerate(roads)]
+    strong={r['feature'] for r in quality_audit if r.get('corrected')}
+    retained=[]
+    original_indices=[]
+    for i,road in enumerate(roads):
+        geometry=repaired[i]
+        # Network QA may omit an unsafe axis or retain disconnected safe parts.
+        # Never restore rejected input or join those parts across an unsafe gap.
+        if geometry is None or geometry.is_empty:
+            continue
+        parts=list(geometry.geoms) if geometry.geom_type=='MultiLineString' else [geometry]
+        for part in parts:
+            if part.geom_type!='LineString':
+                raise ValueError(f'Axis repair returned {part.geom_type}, expected line geometry')
+            retained.append(_RegionalRoadSeed(np.asarray(part.coords),road.width_m,road.source_ids,
+                                             'axis_quality_repaired') if i in strong else road)
+            original_indices.append(i)
+    roads=retained
     evidence.axis_quality_audit=quality_audit
     lines = [LineString(r.points) for r in roads]
     tree = STRtree(lines)
@@ -115,4 +129,4 @@ def correct_oscillating_chains(roads, evidence):
         changed[i] = candidate
         result[i] = _RegionalRoadSeed(np.asarray(candidate.coords), road.width_m,
                                       road.source_ids, 'low_frequency_axis')
-    return result, len(set(changed)|strong)
+    return result, len({original_indices[i] for i in changed}|strong)
