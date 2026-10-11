@@ -6,6 +6,9 @@
 !/runtime/model/PLACEHOLDER
 
 # Runtime products and caches.
+/gui_env/
+/dist/
+/build/
 __pycache__/
 *.py[cod]
 _work/

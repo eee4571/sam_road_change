@@ -3155,7 +3155,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
     entry = matches[0]
     if entry.get('fast_finalization_state') == 'pending' and not _recover_completed_fast_change(manifest, entry):
         raise ValueError('Fast Final Changes 尚未生成，不能评价临时变化。')
-    output = Path(str(entry.get("output") or "")).expanduser().resolve()
+    output = Path(str(getattr(args, '_evaluation_output', None) or entry.get("output") or "")).expanduser().resolve()
     gpkg = Path(str(entry.get("gpkg") or output / "road_changes.gpkg")).expanduser().resolve()
     entry_layers = entry.get("layers") if isinstance(entry.get("layers"), dict) else {}
     changes_path = Path(str(
@@ -3224,6 +3224,11 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         truth, evaluation_truth_type_field = apply_truth_value_mapping(
             truth, original_truth_type_field, truth_value_map,
         )
+    from engine.reviewed_truth import apply_truth_filter
+    original_evaluation_truth = truth
+    truth, review_truth_metadata = apply_truth_filter(
+        truth, (entry.get('manual_review') or {}).get('truth_filter'), evaluation_truth_type_field,
+    )
     if changes_path.is_file():
         predicted = gpd.read_file(changes_path)
     elif gpkg.is_file():
@@ -3252,6 +3257,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         evaluation_truth_type_field,
         float(args.evaluation_tolerance),
         class_mode="three",
+        truth_extent=original_evaluation_truth if review_truth_metadata else None,
     )
     auto_rows = None
     auto_metadata = None
@@ -3274,6 +3280,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
                 evaluation_truth_type_field,
                 float(args.evaluation_tolerance),
                 class_mode="three",
+                truth_extent=original_evaluation_truth if review_truth_metadata else None,
             )
         else:
             stored_evaluation = (
@@ -3369,6 +3376,11 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
             rows[0]["change_recall"] = rows[0]["recall"]
             metadata["fast_truth_metrics"] = True
             metadata["centerline_offset_unit"] = "px"
+    if entry.get('manual_review'):
+        metadata['evaluation_source'] = 'manual_reviewed_changes_vs_ground_truth'
+    if review_truth_metadata:
+        metadata['evaluation_source'] = 'manual_reviewed_changes_vs_reviewed_truth'
+        metadata['manual_review_truth'] = review_truth_metadata
     metrics_path = output / "evaluation_metrics.csv"
     with metrics_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))

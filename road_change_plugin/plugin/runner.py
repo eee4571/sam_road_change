@@ -9,6 +9,7 @@ import uuid
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer
 from .signals import TaskSignals
 from .production_policy import task_arguments, configuration, check_existing_task
+from .diagnostics import known_failure
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "__SAMROAD_USER__"
@@ -39,6 +40,7 @@ class Runner(TaskSignals):
         self._cancelled = False
         self._completion = {}
         self._failure = ""
+        self._diagnostic_hint = ''
         self._output_tail = deque(maxlen=100)
         self._buffer = ""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -92,6 +94,7 @@ class Runner(TaskSignals):
         self._cancelled = False
         self._completion = {}
         self._failure = ""
+        self._diagnostic_hint = ''
         self._output_tail.clear()
         self._buffer = ""
         self._decoder.reset()
@@ -132,6 +135,9 @@ class Runner(TaskSignals):
     def consume_line(self, line):
         # Diagnostics only: task state still comes from events and process exit.
         self._output_tail.append(line[-4096:])
+        hint = known_failure(line)
+        if hint:
+            self._diagnostic_hint = hint + '\n' + line[:2048]
         try:
             event = parse_line(line)
         except (ValueError, TypeError) as exc:
@@ -164,7 +170,7 @@ class Runner(TaskSignals):
             return
         self._terminal = True
         self.state = "failed"
-        detail = '\n'.join(self._output_tail)[-24000:]
+        detail = '\n'.join(filter(None, (self._diagnostic_hint, '\n'.join(self._output_tail)[-24000:])))
         if self.process.error() != QProcess.ProcessError.UnknownError:
             detail = '\n'.join(filter(None, (detail, self.process.errorString())))
         self.task_failed.emit(self._payload(message=message, detail=detail or message, status="failed"))

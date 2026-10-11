@@ -551,6 +551,7 @@ def _event_parts(
     observations: list[dict] | None = None,
 ) -> list[dict]:
     reference_geometries = [item["geometry"] for item in references]
+    reference_indices = {item['road_id']: i for i, item in enumerate(references)}
     tree = STRtree(np.asarray(reference_geometries, dtype=object)) if reference_geometries else None
     event_lookup = {
         (item["road_id"], item["from_per"], item["to_per"], item["event_typ"]): item
@@ -559,7 +560,8 @@ def _event_parts(
     rows = []
     observed={(r['road_id'],r['period']):r for r in (observations or [])}
     for entry in change_entries:
-        path = Path(str(entry.get("output", ""))) / "road_changes.shp"
+        path = Path(str((entry.get('layers') or {}).get('changes') or entry.get('road_changes')
+                        or Path(str(entry.get("output", ""))) / "road_changes.shp"))
         required = [path, path.with_suffix(".dbf"), path.with_suffix(".shx")]
         missing = [str(item) for item in required if not item.is_file()]
         if missing:
@@ -576,16 +578,17 @@ def _event_parts(
             if geometry is None or geometry.is_empty:
                 continue
             probe = geometry.boundary if hasattr(geometry, "boundary") else geometry
-            indices = tree.query(geometry.buffer(tolerance), predicate="intersects") if tree is not None else []
+            buffered = geometry.buffer(tolerance)
+            indices = tree.query(buffered, predicate="intersects") if tree is not None else []
             ranked = []
             for raw_index in indices:
                 index = int(raw_index)
                 reference = reference_geometries[index]
-                support = float(reference.intersection(geometry.buffer(tolerance)).length)
+                support = float(reference.intersection(buffered).length)
                 ranked.append((support, -float(reference.distance(probe)), index))
             road_id = ""
             explicit_track=str(source.get('track_id') or '')
-            explicit_index=next((i for i,r in enumerate(references) if r['road_id']==explicit_track),None)
+            explicit_index = reference_indices.get(explicit_track)
             if explicit_index is not None:
                 ref_index=explicit_index
                 road_id=explicit_track
@@ -691,6 +694,9 @@ def build_temporal_grid(
     tolerance: float = 3.0,
     width_absolute: float = 1.0,
     width_ratio: float = 0.1,
+    *,
+    reuse_observations: dict | None = None,
+    progress=None,
 ) -> dict:
     period_entries = sorted(period_entries, key=lambda item: natural_key(str(item["period"])))
     if len(period_entries) < 2:
@@ -702,24 +708,50 @@ def build_temporal_grid(
     first_raw = gpd.read_file(paths[0])
     output_crs = first_raw.crs
     analysis_crs = _metric_crs(first_raw)
-    period_frames = {
-        str(entry["period"]): _read_period(path, analysis_crs)
-        for entry, path in zip(period_entries, paths)
-    }
-    periods = list(period_frames)
-    reconciled_refs,reconciled_obs=_reconciled_tracks(period_entries,period_frames,analysis_crs)
-    untracked_frames=({p:f.loc[f.track_id.eq('')].copy() for p,f in period_frames.items()} if reconciled_refs else period_frames)
-    references = _build_reference(untracked_frames, tolerance)
-    references.extend(reconciled_refs)
-    if not references:
-        raise ValueError(f"{grid_name} 的所有期次均没有有效道路中心线")
     output_dir = Path(output_dir).resolve()
-    _assign_road_ids(references, output_dir / "road_life.shp", analysis_crs, tolerance)
-    observations = _observations([r for r in references if not str(r['road_id']).startswith('RC')],untracked_frames,tolerance)
-    observations.extend(reconciled_obs)
+    periods = [str(entry['period']) for entry in period_entries]
+    report = progress or (lambda message: None)
+    if reuse_observations is not None:
+        # Review changes only pair decisions. Existing road identities and
+        # per-period observations remain authoritative and need no rematching.
+        report('正在读取已有道路匹配结果…')
+        life_frame = gpd.read_file(reuse_observations['life_shp']).to_crs(analysis_crs)
+        obs_frame = gpd.read_file(reuse_observations['observations_shp']).to_crs(analysis_crs)
+        references = life_frame[['road_id', 'geometry']].to_dict('records')
+        observations = obs_frame.to_dict('records')
+        expected = {(r['road_id'], p) for r in references for p in periods}
+        actual = {(r['road_id'], r['period']) for r in observations}
+        if not references or actual != expected or len(actual) != len(observations):
+            raise ValueError('已有长时序道路记录与当前期次不一致，请先完成道路处理')
+    else:
+        report('正在建立各期道路匹配结果…')
+        period_frames = {
+            str(entry['period']): _read_period(path, analysis_crs)
+            for entry, path in zip(period_entries, paths)
+        }
+        reconciled_refs, reconciled_obs = _reconciled_tracks(period_entries, period_frames, analysis_crs)
+        untracked_frames = ({p: f.loc[f.track_id.eq('')].copy() for p, f in period_frames.items()}
+                            if reconciled_refs else period_frames)
+        references = _build_reference(untracked_frames, tolerance)
+        references.extend(reconciled_refs)
+        if not references:
+            raise ValueError(f'{grid_name} 的所有期次均没有有效道路中心线')
+        _assign_road_ids(references, output_dir / 'road_life.shp', analysis_crs, tolerance)
+        observations = _observations([r for r in references if not str(r['road_id']).startswith('RC')],
+                                     untracked_frames, tolerance)
+        observations.extend(reconciled_obs)
+    report('正在更新变化事件…')
     events = _events(observations, periods, width_absolute, width_ratio)
     event_parts = _event_parts(change_entries, references, events, analysis_crs, tolerance, observations)
+    reviewed_pairs = {(str(e['before_period']), str(e['after_period']))
+                      for e in change_entries if e.get('manual_review')}
+    supported_events = {part['event_id'] for part in event_parts}
+    # A reviewed pair is authoritative: do not recreate rejected changes from
+    # the unchanged per-period road observations during temporal rebuilding.
+    events = [e for e in events if (e['from_per'], e['to_per']) not in reviewed_pairs
+              or e['event_id'] in supported_events or e['event_typ'] == 'uncertain']
     _apply_event_evidence(events, event_parts, bool(change_entries))
+    report('正在更新道路变化统计…')
     life = _life_rows(references, observations, events, periods, tolerance)
     for row in life:
         row["grid_id"] = str(grid_name)[:80]
@@ -735,15 +767,24 @@ def build_temporal_grid(
         "geometry": row["geometry"],
     } for row in events if row["qa_state"] == "review" and row["event_typ"] != "uncertain")
 
+    report('正在写入长时序成果…')
     _write_shp(output_dir / "road_life.shp", life,
                {name: ("str" if name not in {"present_n", "event_n", "max_conf", "min_conf"} and not name.startswith(("W", "C")) else "float64")
                 for name in life[0] if name != "geometry"}, analysis_crs, "LineString", output_crs)
-    _write_shp(output_dir / "road_obs.shp", observations, {
-        "road_id": "str", "period": "str", "status": "str", "width_m": "float64",
-        "length_m": "float64", "coverage": "float64", "match_sc": "float64",
-        "extract_cf": "float64", "geom_dev_m": "float64", "source_fid": "str", "qa_state": "str",
-        "qa_reason": "str", "dir_sim": "float64",
-    }, analysis_crs, "LineString", output_crs)
+    if reuse_observations is not None:
+        from app.result_publisher import copy_dataset
+        import shutil
+        copy_dataset(reuse_observations['observations_shp'], output_dir / 'road_obs.shp')
+        shutil.copy2(reuse_observations['width_evolution'], output_dir / 'width_evolution.csv')
+    else:
+        _write_shp(output_dir / "road_obs.shp", observations, {
+            "road_id": "str", "period": "str", "status": "str", "width_m": "float64",
+            "length_m": "float64", "coverage": "float64", "match_sc": "float64",
+            "extract_cf": "float64", "geom_dev_m": "float64", "source_fid": "str", "qa_state": "str",
+            "qa_reason": "str", "dir_sim": "float64",
+        }, analysis_crs, "LineString", output_crs)
+        pd.DataFrame([{k: v for k, v in row.items() if k != 'geometry'} for row in observations]).to_csv(
+            output_dir / 'width_evolution.csv', index=False, encoding='utf-8-sig')
     _write_shp(output_dir / "road_event.shp", events, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "before_st": "str", "after_st": "str", "before_w": "float64",
@@ -762,9 +803,6 @@ def build_temporal_grid(
         "road_id": "str", "period": "str", "reason": "str", "match_sc": "float64",
         "coverage": "float64", "qa_state": "str",
     }, analysis_crs, "LineString", output_crs)
-    pd.DataFrame([{k:v for k,v in row.items() if k!='geometry'} for row in observations]).to_csv(
-        output_dir/'width_evolution.csv',index=False,encoding='utf-8-sig')
-
     result = {
         "grid": grid_name, "output": str(output_dir),
         "life_shp": str(output_dir / "road_life.shp"),

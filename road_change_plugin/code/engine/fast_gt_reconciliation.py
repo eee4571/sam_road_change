@@ -732,6 +732,7 @@ def build_fast_temporal_outputs(manifest, job_root):
             published=_publish_assisted_changes(frame,directory,pair['before_period'],pair['after_period'])
             entry.update(published,product_variant='final',change_interval_count=len(frame),final_period_results=updated,
                          automatic=pair['automatic'])
+            entry.pop('manual_review', None)
             entry.update({f'{kind}_feature_count':int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
             entry['summary']=str(directory/'change_summary.json');_write_json(entry['summary'],entry)
     from .formal_road_products import is_formal_result

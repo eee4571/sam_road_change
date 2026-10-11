@@ -1382,13 +1382,22 @@ def evaluate_changes(
     evaluation_tolerance: float = 5.0,
     class_mode: str = "four",
     object_iou_threshold: float = 0.1,
+    *,
+    truth_extent: gpd.GeoDataFrame | None = None,
 ) -> tuple[list[dict], dict]:
     evaluation_started = time.perf_counter()
     if predicted.crs is None or truth.crs is None:
         raise ValueError("Predicted changes and truth must define a CRS.")
     predicted = _clean_evaluation_geometries(predicted)
     truth = _clean_evaluation_geometries(truth)
-    predicted, truth, metric_crs, _output_crs = _analysis_crs(predicted, truth)
+    if truth_extent is None:
+        predicted, truth, metric_crs, _output_crs = _analysis_crs(predicted, truth)
+    else:
+        # Reference corrections change truth membership, not the evaluation
+        # domain or its projection. Keep unrelated false positives in scope.
+        predicted, truth_extent, metric_crs, _output_crs = _analysis_crs(
+            predicted, _clean_evaluation_geometries(truth_extent))
+        truth = _to_crs_if_needed(truth, metric_crs)
     predicted = _clean_evaluation_geometries(predicted)
     truth = _clean_evaluation_geometries(truth)
     field = _truth_type_field(truth, truth_type_field)
@@ -1410,7 +1419,8 @@ def evaluate_changes(
             _clean_evaluation_geometries(validation_area).to_crs(predicted.crs)))
         validation_extent_source = "validation_area"
     else:
-        extent_source = truth if not truth.empty else predicted
+        extent_truth = truth if truth_extent is None else truth_extent
+        extent_source = extent_truth if not extent_truth.empty else predicted
         if extent_source.empty:
             validation = box(0.0, 0.0, 1.0, 1.0)
             validation_extent_source = "empty_default"
@@ -1423,7 +1433,7 @@ def evaluate_changes(
             )
             validation = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
             validation_extent_source = (
-                "truth_bounds" if not truth.empty else "prediction_bounds"
+                "truth_bounds" if not extent_truth.empty else "prediction_bounds"
             )
 
     predicted = _clip_frame(predicted, validation)

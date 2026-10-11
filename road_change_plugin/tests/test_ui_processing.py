@@ -11,8 +11,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from PySide6.QtWidgets import QApplication, QScrollArea, QTabBar, QStackedWidget
-from PySide6.QtCore import QThreadPool
+from PySide6.QtWidgets import QApplication, QScrollArea, QTabBar, QStackedWidget, QMessageBox
+from PySide6.QtCore import QThreadPool, QSettings
 from plugin import create_plugin
 from plugin.ui.project_browser import scan_project, check_files, pairs
 
@@ -54,6 +54,10 @@ class ProcessingUiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.settings = QSettings(str(self.root / 'test_ui.ini'), QSettings.Format.IniFormat)
+        preferences = patch('plugin.widget.QSettings', return_value=self.settings)
+        preferences.start()
+        self.addCleanup(preferences.stop)
         fixture(self.root)
         check = patch('plugin.controller.Controller.inspect_data', return_value={'issues': []})
         check.start()
@@ -83,18 +87,18 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertTrue(self.widget.locate_button.isEnabled())
         self.assertTrue(self.widget.project_entry.isHidden())
         self.assertFalse(self.widget.project_details.isHidden())
-        self.assertEqual(self.widget.project_path.text(), str(self.root))
+        self.assertIn(str(self.root), self.widget.project_name.toolTip())
         self.assertFalse(hasattr(self.widget, 'project'))  # no editable project-path control
         self.assertFalse(hasattr(self.widget, 'scan_button'))
         self.assertIn('2 个区域', self.widget.summary.text())
         self.assertEqual(self.widget.data_state.text(), '数据已就绪')
         self.assertEqual(self.widget.logs_button.text(), '日志')
-        self.widget._reveal(self.widget.records_fold)
+        self.widget._show_logs()
         self.widget._load_project('')
         self.wait_ready()
         self.assertFalse(self.widget.project_entry.isHidden())
         for item in (self.widget.project_details, self.widget.processing_group, self.widget.result_group,
-                     self.widget.footer, self.widget.logs_button, self.widget.more_button, self.widget.records_fold):
+                     self.widget.footer, self.widget.logs_button, self.widget.more_button, self.widget.log_panel):
             self.assertTrue(item.isHidden())
 
     def test_scan_check_and_fixed_processing(self):
@@ -328,6 +332,13 @@ class ProcessingUiTests(unittest.TestCase):
         self.widget._reset_results()
         self.widget._update_controls()
         self.assertEqual(self.widget.run_button.text(), '开始处理')
+        self.widget.show()
+        self.widget.resize(300, 600)
+        self.widget._show_logs()
+        APP.processEvents()
+        APP.processEvents()
+        self.assertTrue(self.widget.run_button.isVisible())
+        self.assertTrue(self.widget.rect().contains(self.widget.run_button.mapTo(self.widget, self.widget.run_button.rect().bottomRight())))
         with patch.object(self.widget.controller, 'run') as run, patch('plugin.widget.QMessageBox.question') as confirm:
             self.widget.run_button.click()
             self.assertEqual(run.call_args.args[0], 'all')
@@ -384,7 +395,7 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertIn('2020 → 2022', page.impact.text())
         self.assertIn('长时序成果', page.impact.text())
         self.assertIn('精度评价', page.impact.text())
-        with patch.object(self.widget.controller, 'run') as run:
+        with patch.object(self.widget.controller, 'run') as run, patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
             page.save_button.click()
             action, data = run.call_args.args
             self.assertEqual((action, data['grid'], data['selected_periods']), ('rerun-selection', '北区', ['2022']))
@@ -399,7 +410,7 @@ class ProcessingUiTests(unittest.TestCase):
         pair.click()
         self.assertEqual(sum(b.isChecked() for b in page.buttons.buttons()), 2)
         self.assertEqual(len(page.scope['periods']), 1)
-        with patch.object(self.widget.controller, 'run') as run:
+        with patch.object(self.widget.controller, 'run') as run, patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
             page.save_button.click()
             action, data = run.call_args.args
             self.assertEqual(action, 'rerun-selection')
@@ -462,17 +473,29 @@ class ProcessingUiTests(unittest.TestCase):
         data['evaluation_summary']['json'] = str(report)
         manifest.write_text(json.dumps(data))
         self.widget._refresh_results()
-        self.assertIn('变化图斑准确率  90.0%', self.widget.metrics.text())
-        self.assertIn('变化道路提取完整度  86.0%', self.widget.metrics.text())
-        self.assertIn('中心线平均偏移距离  1.25 px', self.widget.metrics.text())
-        self.assertIn('变化类型正确率  92.0%', self.widget.metrics.text())
-        self.assertNotIn('F1', self.widget.metrics.text())
-        self.widget.project_path.setText('C:\\projects\\' + 'long_project_name_' * 8)
+        self.assertEqual(self.widget.metric_cards.values['precision'].text(), '90.0')
+        self.assertEqual(self.widget.metric_cards.values['completeness'].text(), '86.0')
+        self.assertEqual(self.widget.metric_cards.values['recall'].text(), '80.0')
+        self.assertEqual(self.widget.metric_cards.values['offset'].text(), '1.25')
+        self.assertEqual(self.widget.metric_cards.values['type_accuracy'].text(), '92.0')
+        self.assertEqual(self.widget.metric_cards.units['precision'].text(), '%')
+        self.assertEqual(self.widget.metric_cards.units['offset'].text(), 'px')
+        self.assertEqual(self.widget._evaluation_path, report)
+        self.assertTrue(self.widget.report_button.isEnabled())
+        self.widget.project_name.setText('long_project_name_' * 8)
         self.widget.show()
         self.widget.resize(300, 600)
         APP.processEvents()
         APP.processEvents()
         self.assertEqual(self.widget.scroll.horizontalScrollBar().maximum(), 0)
+
+        # Reloading a report without these metrics must clear earlier values.
+        report.write_text(json.dumps({'metrics': [{'class': 'all', 'change_recall': 0}]}))
+        self.widget._refresh_results()
+        self.assertEqual(self.widget.metric_cards.values['recall'].text(), '0.0')
+        self.assertEqual(self.widget.metric_cards.values['offset'].text(), '未评价')
+        self.assertTrue(self.widget.metric_cards.units['offset'].isHidden())
+        self.assertEqual(self.widget.metric_cards.values['type_accuracy'].text(), '未评价')
 
     def test_status_is_structured_and_hidden_widget_keeps_processing(self):
         with patch.object(self.widget.controller, 'cancel') as cancel:
@@ -491,8 +514,8 @@ class ProcessingUiTests(unittest.TestCase):
             self.assertTrue(self.widget.timer.isActive())
             cancel.assert_not_called()
         self.widget._failed({'message': '示例错误', 'detail': '错误详情'})
-        self.assertIn('错误详情', self.widget.error_detail.toPlainText())
-        self.assertFalse(self.widget.failure_details.isHidden())
+        self.assertIn('错误详情', self.widget.log_panel.error)
+        self.assertFalse(self.widget.log_panel.details.isHidden())
 
     def test_narrow_pages_and_fixed_actions(self):
         self.widget.show()
@@ -622,7 +645,7 @@ class ProcessingUiTests(unittest.TestCase):
     def test_host_style_and_auxiliary_visibility(self):
         app_style = APP.styleSheet()
         self.assertFalse(self.widget.advanced.toggle.isChecked())
-        self.assertFalse(self.widget.records_fold.toggle.isChecked())
+        self.assertFalse(self.widget.log_toggle.isChecked())
         self.widget.setProperty('hostStyled', True)
         self.assertEqual(self.widget.styleSheet(), '')
         self.widget.setProperty('hostStyled', False)

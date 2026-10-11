@@ -7,6 +7,7 @@ from .runner import ROOT, Runner
 from .signals import TaskSignals
 from .result_parser import read_results, formal_results
 from .project_state import ProjectState
+from .review_controller import ReviewController
 from .production_policy import task_arguments, configuration, check_existing_task
 
 
@@ -14,6 +15,8 @@ class Controller(TaskSignals):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.runner = Runner(self)
+        self.review = ReviewController(self.runner, self)
+        self.review.updated.connect(self._review_updated)
         self.project_state = None
         self._project_lock = None
         self.runner.task_finished.connect(self._completed)
@@ -123,6 +126,10 @@ class Controller(TaskSignals):
         return task_arguments(args)
 
     def run(self, action, data):
+        if self.review.active:
+            self.task_failed.emit({'plugin_id': 'road_change', 'task_id': '', 'status': 'failed',
+                                   'message': '请先关闭人工复核窗口，再开始处理', 'detail': '人工复核正在使用当前成果'})
+            return
         if self.runner.running:
             self.task_log.emit({'level': 'WARNING', 'message': '当前处理尚未结束'})
             return
@@ -229,7 +236,13 @@ class Controller(TaskSignals):
         except (OSError, ValueError, TypeError) as exc:
             self.task_log.emit({"task_id": task_id, "level": "ERROR", "message": f"成果索引读取失败：{exc}"})
 
+    def _review_updated(self, results):
+        for result in results:
+            self.result_ready.emit({'plugin_id': 'road_change', 'task_id': '', **result})
+        self.task_log.emit({'level': 'INFO', 'message': '人工复核已应用，正式变化、长时序和可用的精度评价已更新。'})
+
     def shutdown(self):
+        self.review.close()
         self.runner.shutdown()
         self._unlock_project()
 

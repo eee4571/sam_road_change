@@ -8,6 +8,10 @@ RESULT_TYPES = ("road_centerline", "road_surface", "road_width", "road_change", 
 def formal_results(store):
     """Filter old snapshots to the current formal products; keep internal data intact."""
     manifest = store.manifest()
+    if manifest.is_file() and store.state().get('status') == 'completed':
+        # The committed manifest is authoritative, including after a review save
+        # completed just before the host closed and refreshed its path snapshot.
+        return read_results(manifest)
     allowed = {(p['result_type'], p['path']): p for p in read_results(manifest, include_pending=True)} if manifest.is_file() else {}
     result = []
     for item in store.results():

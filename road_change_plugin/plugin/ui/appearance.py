@@ -13,16 +13,27 @@ def dock_style(palette, font):
     secondary, border, hover = mix(.50), mix(.18), mix(.07)
     accent = palette.color(QPalette.ColorRole.Highlight).name()
     on_accent = palette.color(QPalette.ColorRole.HighlightedText).name()
-    title_size = max(10, font.pointSizeF() if font.pointSizeF() > 0 else 10) + 1
+    body_size = max(9, font.pointSizeF() if font.pointSizeF() > 0 else 10)
+    title_size = body_size + 3
+    caption_size = max(8, body_size - 1)
     arrow = (Path(__file__).resolve().parents[2] / "resources/chevron_down.svg").as_posix()
     return f"""
         QWidget#roadChangeDock, QWidget#roadChangeBody {{ background: {mix(.035)}; color: {text.name()}; }}
-        #roadChangeDock QGroupBox {{ border: none; border-top: 1px solid {mix(.14)}; border-radius: 0; margin-top: 10px; font-weight: 600; }}
+        #roadChangeDock QGroupBox {{ border: none; border-top: 1px solid {mix(.14)}; border-radius: 0; margin-top: 10px; font-size: {body_size + 1}pt; font-weight: 500; }}
         #roadChangeDock QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 0; padding: 0 8px 0 0; background: {mix(.035)}; }}
-        #roadChangeDock QLabel {{ background: transparent; color: {text.name()}; }}
+        #roadChangeDock QGroupBox[role="processingGroup"] {{ background: {base.name()}; border: 1px solid {border}; border-radius: 8px; margin-top: 10px; }}
+        #roadChangeDock QGroupBox[role="processingGroup"]::title {{ left: 12px; padding: 0 5px; background: {base.name()}; }}
+        #roadChangeDock QLabel {{ background: transparent; color: {text.name()}; font-size: {body_size}pt; font-weight: 400; }}
         #roadChangeDock QLabel[role="title"] {{ font-size: {title_size}pt; font-weight: 600; }}
-        #roadChangeDock QLabel[role="sectionHeading"] {{ font-weight: 600; }}
-        #roadChangeDock QLabel[role="secondary"] {{ color: {secondary}; }}
+        #roadChangeDock QLabel[role="sectionHeading"] {{ font-size: {body_size + 1}pt; font-weight: 500; }}
+        #roadChangeDock QLabel[role="secondary"], #roadChangeDock QLabel[role="metricUnit"], #roadChangeDock QLabel[role="logText"] {{ color: {secondary}; font-size: {caption_size}pt; }}
+        #roadChangeDock QLabel[role="metricValue"] {{ font-size: {body_size + 1}pt; font-weight: 500; }}
+        #roadChangeDock QLabel[role="badge"] {{ border-radius: 6px; background: {hover}; padding: 2px 6px; }}
+        #roadChangeDock QLabel[status="success"] {{ color: {'#75d4a3' if base.lightness() < 128 else '#19764d'}; }}
+        #roadChangeDock QLabel[status="running"] {{ color: {accent}; }}
+        #roadChangeDock QLabel[status="error"] {{ color: {'#ff9090' if base.lightness() < 128 else '#b32626'}; }}
+        #roadChangeDock QLabel[status="warning"] {{ color: {'#f0c36e' if base.lightness() < 128 else '#976000'}; }}
+        #roadChangeDock QSplitter::handle:vertical {{ background: {border}; height: 6px; }}
         #roadChangeDock QLineEdit, #roadChangeDock QComboBox {{
             background: {base.name()}; color: {text.name()}; border: 1px solid {border};
             border-radius: 2px; min-height: 28px; padding: 0 8px; placeholder-text-color: {mix(.38)};
@@ -48,6 +59,8 @@ def dock_style(palette, font):
         #roadChangeDock QToolButton[role="toolbarAction"]::menu-indicator {{ image: none; width: 0; }}
         #roadChangeDock QToolButton::menu-indicator {{ width: 8px; height: 5px; subcontrol-position: right center; }}
         #roadChangeDock QPushButton[role="resultAction"] {{ min-height: 26px; padding: 0 8px; }}
+        #roadChangeDock QPushButton[role="logAction"] {{ min-height: 22px; font-size: {caption_size}pt; border-color: transparent; background: transparent; padding: 0 6px; }}
+        #roadChangeDock QPushButton[role="logAction"]:hover {{ background: {hover}; border-color: {border}; }}
         #roadChangeDock QPushButton[role="primary"] {{
             background: {accent}; color: {on_accent}; border-color: {accent};
             font-weight: 600; min-height: 28px; padding: 0 14px;
