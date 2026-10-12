@@ -11,13 +11,26 @@ from scipy.ndimage import map_coordinates
 
 class TileMosaic:
     def __init__(self, paths):
-        self.sources=[rasterio.open(p) for p in paths]
+        self.sources=[]
+        try:
+            for path in paths:self.sources.append(rasterio.open(path))
+            self._initialize_grid()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize_grid(self):
+        if not self.sources:raise ValueError('RGB width requires at least one image tile')
         first=self.sources[0]
         self.crs=first.crs;self.count=first.count;self.dtypes=first.dtypes
-        if first.transform.b or first.transform.d:raise ValueError('RGB tiles require an aligned north-up grid')
         offsets=[]
         for ds in self.sources:
-            if ds.crs!=first.crs or ds.res!=first.res or ds.dtypes!=first.dtypes:
+            if ds.crs is None:raise ValueError(f'RGB tile lacks CRS: {ds.name}')
+            if ds.count<3 or ds.dtypes[:3]!=('uint8',)*3:
+                raise ValueError(f'RGB width requires three uint8 bands: {ds.name}')
+            if ds.transform.b or ds.transform.d or ds.transform.a<=0 or ds.transform.e>=0:
+                raise ValueError(f'RGB tiles require an aligned north-up grid: {ds.name}')
+            if ds.crs!=first.crs or ds.res!=first.res or ds.dtypes!=first.dtypes or ds.count!=first.count:
                 raise ValueError('RGB tiles must share CRS, resolution and dtype')
             x,y=(~first.transform)*(ds.transform.c,ds.transform.f)
             if abs(x-round(x))+abs(y-round(y))>1e-5:raise ValueError('RGB tiles are not on one pixel grid')

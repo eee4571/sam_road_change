@@ -53,7 +53,14 @@ def load_roads(path, layer, config):
     source = gpd.read_file(path, layer=layer)
     if source.crs is None:
         raise ValueError('Centerlines require an explicit CRS')
-    metric_crs = source.estimate_utm_crs()
+    if source.empty:raise ValueError('No centerlines available for RGB width')
+    if (source.geometry.isna().any() or source.geometry.is_empty.any() or
+            not source.geom_type.isin(['LineString','MultiLineString']).all() or
+            not np.isfinite(shapely.get_coordinates(source.geometry)).all()):
+        raise ValueError('RGB width requires nonempty finite line geometries')
+    metric_crs = (source.crs if source.crs.is_projected and
+                  all(abs(a.unit_conversion_factor-1)<1e-9 for a in source.crs.axis_info)
+                  else source.estimate_utm_crs())
     source = source.to_crs(metric_crs)
     # Union deduplicates reverse predictions and nodes actual intersections.
     network = shapely.union_all(source.geometry)
@@ -67,7 +74,7 @@ def load_roads(path, layer, config):
             degree[key] = degree.get(key, 0) + 1
     junctions = np.array([xy for xy, n in degree.items() if n >= 3]).reshape(-1, 2)
     merged = list(shapely.get_parts(shapely.line_merge(network)))
-    merged = sorted((l for l in merged if l.length > 0 and l.length >= config.min_length),
+    merged = sorted((l for l in merged if l.length > 1e-7 and l.length >= config.min_length),
                     key=lambda l: (-l.length, l.wkt))
     total = len(merged)
     if config.max_roads:
@@ -81,7 +88,8 @@ def sample_line(line, c):
     # Smooth at 1 m resolution, preserve the two network endpoints, then resample by arc length.
     s = np.linspace(0, line.length, max(3, int(np.ceil(line.length)) + 1))
     xy = shapely.get_coordinates(shapely.line_interpolate_point(line, s))
-    smooth = gaussian_filter1d(xy, c.smooth_sigma / (s[1] - s[0]), axis=0, mode='nearest')
+    smooth = (gaussian_filter1d(xy, c.smooth_sigma / (s[1] - s[0]), axis=0, mode='nearest')
+              if line.length>=c.spacing else xy.copy())
     smooth[0], smooth[-1] = xy[0], xy[-1]
     smoothed = LineString(smooth)
     distance = np.arange(0, smoothed.length + 1e-8, c.spacing)
@@ -94,16 +102,20 @@ def sample_line(line, c):
     return distance, xy, normal
 
 
+class NoImageCoverage(ValueError):
+    """A valid line has no image support, not an I/O or configuration failure."""
+
+
 class ImageReader:
     def __init__(self, path, metric_crs):
         from .raw_feature_cache import TileMosaic,FeatureCache
         self.ds = TileMosaic(path if isinstance(path,(list,tuple)) else [path])
-        self.feature_cache=FeatureCache(self.ds)
-        if self.ds.count < 3 or self.ds.dtypes[:3] != ('uint8',)*3:
-            raise ValueError('Experiment requires three uint8 RGB bands in order 1,2,3')
-        if self.ds.crs is None:
-            raise ValueError('Image requires an explicit CRS')
-        self.to_image = Transformer.from_crs(metric_crs, self.ds.crs, always_xy=True)
+        try:
+            self.feature_cache=FeatureCache(self.ds)
+            self.to_image = Transformer.from_crs(metric_crs, self.ds.crs, always_xy=True)
+        except BaseException:
+            self.ds.close()
+            raise
 
     def pixels(self, xy):
         x, y = self.to_image.transform(xy[..., 0], xy[..., 1])
@@ -128,9 +140,10 @@ class ImageReader:
 
     def features(self,xy,pad=5):
         pix=self.pixels(xy)
+        if not np.isfinite(pix).all():raise ValueError('Nonfinite RGB pixel coordinates; check image and road CRS')
         lo=np.maximum(np.floor(pix.reshape(-1,2).min(0)-pad),0).astype(int)
         hi=np.minimum(np.ceil(pix.reshape(-1,2).max(0)+pad+1),[self.ds.width,self.ds.height]).astype(int)
-        if np.any(hi<=lo):raise ValueError('Centerline does not overlap image')
+        if np.any(hi<=lo):raise NoImageCoverage('Centerline does not overlap image')
         return (*self.feature_cache.features(lo,hi),pix-lo)
 
 
@@ -143,7 +156,12 @@ def extract_profiles(reader, xy, normal, c):
     radius = c.search_radius + 2.0
     offsets = np.arange(-radius, radius+c.cross_step/2, c.cross_step)
     points = xy[:, None, :] + normal[:, None, :]*offsets[None, :, None]
-    rgbf,lab,edge,canny,texture,valid_mask,pix=reader.features(points)
+    try:
+        rgbf,lab,edge,canny,texture,valid_mask,pix=reader.features(points)
+    except NoImageCoverage:
+        shape=(len(xy),len(offsets))
+        return (offsets,np.full(shape,-1.),np.zeros(shape+(4,)),np.zeros(shape,bool),
+                np.full(shape+(3,),np.nan),np.zeros(shape+(3,)))
     coordinates = [pix[..., 1], pix[..., 0]]
     def sample(a, order=1, fill=np.nan):
         return map_coordinates(a, coordinates, order=order, mode='constant', cval=fill)

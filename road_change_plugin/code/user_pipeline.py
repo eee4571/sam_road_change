@@ -2288,6 +2288,11 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
         if not ready or context.get("execution_profile") != "fast":
             return ready
         try:
+            from engine.product_cache import read_completed
+            marker=context['width_dir']/'width_completed.json'
+            if not marker.is_file():return False
+            saved=read_json(marker)
+            if read_completed(marker,saved.get('inputs')) is None:return False
             return (
                 (context["width_dir"] / "fast_products.gpkg").is_file()
                 and all(
@@ -2300,7 +2305,10 @@ def _period_stage_output_complete(stage_key: str, context: dict) -> bool:
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             return False
     if stage_key == "regional":
-        return (context["centerline"].parent / "regional_products.gpkg").is_file() and (context["centerline"].parent / "regional_products.json").is_file()
+        from engine.product_cache import read_completed
+        marker=context['centerline'].parent/'regional_cache.json'
+        try:return read_completed(marker,read_json(marker)['inputs']) is not None
+        except (OSError,ValueError,KeyError,TypeError):return False
     if stage_key == "finalize":
         return (
             (context["final_dir"] / "batch_optimized_summary.json").is_file()
@@ -2558,10 +2566,16 @@ def extract(args: argparse.Namespace) -> dict:
     if period_state.get('width_method','sam_molra')!=width_method:
         period_state['stages']['export']='pending'
     period_state['width_method']=width_method
+    from engine.width.width_reliability import implementation_identity
+    width_identity=implementation_identity()
+    if execution_profile=='fast' and period_state.get('width_implementation')!=width_identity:
+        for stage in ('width','regional','export'):period_state['stages'][stage]='pending'
+    period_state['width_implementation']=width_identity
     if execution_profile=='fast' and width_method=='raw_image' and period_state.get('rgb_pipeline_revision')!=2:
         for stage in ('surface','width','regional','export'):period_state['stages'][stage]='pending'
         period_state['rgb_pipeline_revision']=2
     print(f'[Width backend] {width_method}',flush=True)
+    print(f'[Width implementation] entry={Path(__file__).resolve()} python={sys.executable} identity={width_identity}',flush=True)
     period_state.update({
         "status": "running",
         "workspace": str(workspace),
@@ -2683,6 +2697,10 @@ def extract(args: argparse.Namespace) -> dict:
                 and _period_stage_output_complete(stage_key, stage_context)
             ):
                 emit("stage", stage=stage_label, status="skipped", reason="续跑复用已完成且完整的阶段成果", **event_context)
+                warning=period_state.get('warnings',{}).get(stage_key)
+                if warning:
+                    emit('warning',stage=stage_label,**event_context,**warning,
+                         message=f"复用已完成测宽成果，部分道路使用估计宽度；异常 {warning.get('exception_count',0)}。详情：{warning.get('details','')}")
                 continue
             upstream_reexecuted = True
             period_state.update({
@@ -2710,6 +2728,20 @@ def extract(args: argparse.Namespace) -> dict:
                 )
                 raise RuntimeError(f"{stage_label}命令已结束，但必要输出不完整，不能标记为完成")
             period_state["stages"][stage_key] = "completed"
+            quality_path=(products/'width_quality_summary.json' if stage_key=='regional'
+                          else products/'width_export_summary.json' if stage_key=='export' and execution_profile=='fast'
+                          else width_dir/'batch_width_summary.json' if stage_key=='width' else None)
+            if quality_path is not None and quality_path.is_file():
+                quality=read_json(quality_path)
+                if quality.get('status')=='completed_with_warnings':
+                    period_state.setdefault('warnings',{})[stage_key]={
+                        'status':'completed_with_warnings','details':str(quality_path),
+                        'exception_count':quality.get('exception_count',0),
+                        'low_confidence_road_count':quality.get('low_confidence_road_count',0)}
+                    emit('warning',stage=stage_label,status='completed_with_warnings',
+                         message=f"测宽完成，部分道路使用估计宽度；异常 {quality.get('exception_count',0)}，低可信道路 {quality.get('low_confidence_road_count',0)}。详情：{quality_path}",
+                         details=str(quality_path),**event_context)
+                else:period_state.setdefault('warnings',{}).pop(stage_key,None)
             period_state["last_completed_stage"] = stage_key
             period_state["last_completed_stage_label"] = stage_label
             period_state["updated_at"] = now_text()
@@ -2766,6 +2798,9 @@ def extract(args: argparse.Namespace) -> dict:
         "surface_source": "probability_fast" if execution_profile == "fast" else "sam_molra",
         "width_source": "raw_image" if width_method=='raw_image' else "fast_measured" if execution_profile == "fast" else "full_measured",
         "width_method":width_method,
+        "width_implementation":width_identity,
+        "width_status":"completed_with_warnings" if period_state.get('warnings') else 'completed',
+        "width_warnings":period_state.get('warnings',{}),
     })
     if execution_profile == 'fast':
         # The export contract, not a raw regional layer, supplies Auto inputs.
@@ -3814,6 +3849,9 @@ def _period_result_ready(entry: dict, *, require_current_network: bool = False) 
         if not result_path.is_file():
             return False
         result = read_json(result_path)
+        if require_current_network and result.get('execution_profile')=='fast':
+            from engine.width.width_reliability import implementation_identity
+            if result.get('width_implementation')!=implementation_identity():return False
         if require_current_network and not network_products_current(Path(str(result.get('centerlines') or '')).parent):
             return False
         if result.get('execution_profile') == 'fast':

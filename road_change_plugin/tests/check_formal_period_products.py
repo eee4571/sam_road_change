@@ -50,6 +50,17 @@ class FormalPeriodTests(unittest.TestCase):
         with patch('engine.fast_pipeline._write_fast_period_previews',side_effect=self.preview):
             return export_fast_products(self.width,self.output)
 
+    def test_export_reports_and_caches_profile_fallback_warning(self):
+        self.regional([line(0,100)])
+        with patch('engine.auto_change_geometry.FinalWidths.profile_quality',side_effect=IndexError('profile index')):
+            result=self.export()
+        report=json.loads(Path(result['width_quality_summary']).read_text(encoding='utf8'))
+        self.assertEqual(result['width_status'],'completed_with_warnings')
+        self.assertEqual(report['exception_count'],1)
+        self.assertEqual(report['exceptions'][0]['exception_type'],'IndexError')
+        self.assertEqual(report['quality_counts'],{'C':1})
+        self.assertTrue(formal_products_current(self.output))
+
     def test_spur_is_removed_from_axes_surface_widths_and_preview_together(self):
         self.regional(); result = self.export()
         axes = gpd.read_file(result['centerlines'])
@@ -131,6 +142,10 @@ class FormalPeriodTests(unittest.TestCase):
         (self.output/'fast_export_cache.json').unlink()
         context = dict(centerline=Path(result['centerlines']),surface=Path(result['surfaces']),
                        gpkg=Path(result['gpkg']),execution_profile='fast',image_stems=[])
+        self.assertFalse(user_pipeline._period_stage_output_complete('regional',context))
+        from engine.product_cache import write_completed
+        write_completed(self.output/'regional_cache.json',[],{'status':'completed'},
+                        [self.output/'regional_products.gpkg',self.output/'regional_products.json'])
         self.assertTrue(user_pipeline._period_stage_output_complete('regional',context))
         with patch.object(user_pipeline,'network_products_current',return_value=True):
             self.assertFalse(user_pipeline._period_stage_output_complete('export',context))

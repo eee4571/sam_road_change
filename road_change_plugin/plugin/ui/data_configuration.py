@@ -74,7 +74,10 @@ class DataConfiguration(ProjectPage):
         self.reference.setMinimumWidth(0)
         self.reference.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.reference.currentIndexChanged.connect(self._reference_changed)
-        form.addRow('IR-MAD 参考期', self.reference)
+        form.addRow('辐射统一参考影像', self.reference)
+        self.reference.setToolTip('用当前道路模型在相同位置试跑，优先推荐提取道路总长度更多的期次；这不是准确率评价。保存后固定，也可手动更换。')
+        self.reference_note = note()
+        form.addRow(self.reference_note)
         self.periods = self._table(['期次', '影像', ''])
         self.periods_label = QLabel('影像期次')
         form.addRow(self.periods_label, self.periods)
@@ -168,11 +171,12 @@ class DataConfiguration(ProjectPage):
         self.delete_area_button.setEnabled(bool(self.area.count()))
         self.boundary.edit.setText(next((p for a, p in self._model['areas'] if a == area), ''))
         self.reference.clear()
-        self.reference.addItem('请选择参考期', '')
+        self.reference.addItem('自动选择（推荐）', '')
         rows = sorted([r for r in self._model['periods'] if r[0] == area], key=lambda r: natural(r[1]))
         for row in rows:
             self.reference.addItem(row[1], row[1])
         self.reference.setCurrentIndex(max(0, self.reference.findData(self._model['area_irmad_references'].get(area, ''))))
+        self._reference_note()
         self.periods.setRowCount(len(rows))
         for i, (_, period, source) in enumerate(rows):
             self.periods.setItem(i, 0, QTableWidgetItem(period))
@@ -217,7 +221,17 @@ class DataConfiguration(ProjectPage):
     def _reference_changed(self):
         if not self._loading:
             self._model['area_irmad_references'][self.area.currentText()] = self.reference.currentData() or ''
+            self._reference_note()
             self.changed()
+
+    def _reference_note(self):
+        period = self.reference.currentData()
+        saved = self._model.get('config', {}).get('automatic_reference_selections', {}).get(self.area.currentText(), {})
+        confidence = '候选差距较小，可手动更换。' if saved.get('close_candidates') else '可在上方更换期次。'
+        basis = '（抽样提取道路更多）' if saved.get('method', '').startswith('road_length_probe_') else ''
+        self.reference_note.setText('' if not period else
+            f'已自动选择：{period}{basis}。{confidence}' if saved.get('period') == period else '')
+        self.reference_note.setVisible(bool(self.reference_note.text()))
 
     def add_area(self, name, boundary=''):
         name = name.strip()

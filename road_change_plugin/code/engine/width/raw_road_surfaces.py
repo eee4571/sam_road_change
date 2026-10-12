@@ -170,13 +170,15 @@ def image_pixel_size(image_path, metric_crs):
     return float(min(np.linalg.norm(points[1:] - points[0], axis=1)))
 
 
-def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None):
+def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None, diagnostics=None):
     """Presentation surfaces from continuous axes and asymmetric width profiles.
 
     The input is the fine *line* observations, never corridor polygons. Width
     data used by Fast2 is not mutated; smoothing is exclusive to this product.
     """
     started = time.perf_counter()
+    from .width_reliability import ROAD_ERRORS, issue
+    diagnostics=[] if diagnostics is None else diagnostics
     if width_segments.empty:
         return gpd.GeoDataFrame({'surface_id': [], 'area_m2': []}, geometry=[], crs=width_segments.crs)
     metric_crs = (width_segments.estimate_utm_crs() if width_segments.crs.is_geographic or
@@ -189,8 +191,18 @@ def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None):
     if not np.isfinite(pixel_size) or pixel_size <= 0:
         raise ValueError('Invalid road surface pixel size')
     chains, ends, axes, road_widths = [], [], [], []
+    fallback_axes=[]
     for axis, ss, left, right in _profile_runs(frame):
-        polygon, terminals = _display_boundaries(axis, ss, left, right, pixel_size)
+        try:
+            polygon, terminals = _display_boundaries(axis, ss, left, right, pixel_size)
+            if polygon.is_empty:raise ValueError('Empty offset surface')
+        except ROAD_ERRORS as exc:
+            related=frame.iloc[int(frame.sindex.nearest(axis)[1][0])]
+            diagnostics.append(issue(related.get('parent_id',''),related.get('tile_id',''),'surface',exc,
+                geometry=axis,fallback='symmetric_buffer'))
+            polygon=axis.buffer(float(np.median(left+right))/2)
+            terminals=[]
+            fallback_axes.append(axis)
         chains.append(polygon)
         axes.append(axis)
         road_widths.append(float(np.median(left + right)))
@@ -226,6 +238,11 @@ def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None):
     result['area_m2'] = result.to_crs(metric_crs).area.values
     result = result.loc[result.area_m2 > pixel_size**2 * 1e-6].reset_index(drop=True)
     result['surface_id'] = [f'RRS{i:07d}' for i in range(len(result))]
+    low=frame.loc[frame.quality_grade.eq('C')] if 'quality_grade' in frame else frame
+    low_tree=STRtree([*low.geometry.values,*fallback_axes])
+    low_metric=result.to_crs(metric_crs)
+    result['width_qual']=['C' if len(low_tree.query(p,predicate='intersects')) else 'A' for p in low_metric.geometry]
+    result['qa_state']=np.where(result.width_qual.eq('C'),'review','auto')
     print(f'[Raw width] presentation surfaces: {len(chains)} chains, {len(zones)} junctions -> {len(result)} polygons; '
           f'unsupported_fragments={discarded_fragments} boundary_rebuild={boundary_seconds:.6f}s surface_total={time.perf_counter()-started:.6f}s', flush=True)
     return result

@@ -197,11 +197,43 @@ class CurrentNetworkProductTests(NetworkProductTests):
             self.assertFalse(network_products_current(output))
 
 
+from test_raw_image_width_backend import RawWidthBackendTests
+
+
+class CurrentRawWidthBackendTests(RawWidthBackendTests):
+    def test_propagated_width_is_displayed_but_not_change_evidence(self):
+        # The workbench fixture promoted a chain with C sections to B. The plugin
+        # now preserves that uncertainty and the actual contributing sources.
+        import pandas as pd
+        import geopandas as gpd
+        from types import SimpleNamespace
+        from shapely.geometry import Point
+        from shapely import STRtree
+        from engine.width.raw_image_backend import observation_segments
+        from engine.road_network_products import rebuild_network_width_products
+        from engine.fast_auto_v2 import _reliable_width_at
+        line=LineString([(0,0),(60,0)])
+        samples=pd.DataFrame([dict(road_id='r',s_m=i*25.,center_x=i*25.,center_y=0.,
+            final_left_distance=3.,final_right_distance=5.,final_width=8.,final_confidence=.5,
+            width_source=source,outlier_reason='',solver_converged=True)
+            for i,source in enumerate(('measured','interpolated','propagated'))])
+        measured=observation_segments(samples,{'r':line},32650)
+        roads=gpd.GeoDataFrame(geometry=[line],crs=32650)
+        segments,corridors=rebuild_network_width_products(roads,measured)
+        self.assertEqual(measured.quality_grade.tolist(),['A','B','C'])
+        self.assertEqual(segments.quality_grade.tolist(),['C'])
+        self.assertIn('propagated',corridors.width_source.iloc[0])
+        self.assertAlmostEqual(corridors.area.sum(),480.)
+        scene=SimpleNamespace(widths=segments,width_geometries=segments.geometry.values,width_tree=STRtree(segments.geometry.values))
+        self.assertEqual(_reliable_width_at(scene,np.array([Point(2,0),Point(25,0),Point(55,0)],object)).tolist(),[False]*3)
+        self.assertEqual(corridors.total_bounds.tolist(),[0.,-5.,60.,3.])
+
+
 if __name__=='__main__':
     suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(OptimizationTests),
         unittest.defaultTestLoader.loadTestsFromTestCase(CurrentNetworkProductTests),
         unittest.defaultTestLoader.loadTestsFromName('test_rgb_production_chain'),
-        unittest.defaultTestLoader.loadTestsFromName('test_raw_image_width_backend')])
+        unittest.defaultTestLoader.loadTestsFromTestCase(CurrentRawWidthBackendTests)])
     result=unittest.TextTestRunner(verbosity=1).run(suite)
     for name,module in list(sys.modules.items()):
         if name.startswith('engine.') and getattr(module,'__file__',None):

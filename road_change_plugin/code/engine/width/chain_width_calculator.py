@@ -8,7 +8,64 @@ import cv2
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from molra_centerline_width import maybe_snap_to_mask, scan_one_side
+def robust_width(values):
+    """Median of finite positive evidence, rejecting isolated MAD outliers."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values) & (values > 0)]
+    if not values.size:
+        return None
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    if mad > 0:
+        values = values[np.abs(values-median) <= 3.5*1.4826*mad]
+    return float(np.median(values)) if values.size else median
+
+
+def resolve_chain_fallbacks(lines, reliable, *, local_estimates=None, default_width_m=6.0):
+    """Shared metre-unit policy for RGB and mask chains; never re-donate estimates.
+
+    Callers first retain/interpolate this road's reliable sections. Directionally
+    continuous endpoint donors precede local mask evidence, then regional evidence.
+    All cross-road and default estimates are C quality, unsuitable for auto width change.
+    """
+    from scipy.spatial import cKDTree
+    if not np.isfinite(default_width_m) or default_width_m <= 0:
+        raise ValueError('Project default width must be finite and positive (metres)')
+    local_estimates = local_estimates or {}
+    donors = {key: robust_width(values) for key, values in reliable.items()}
+    donors = {key: value for key, value in donors.items() if value is not None}
+    regional = robust_width(list(donors.values()))
+    endpoints, owners, directions = [], [], []
+    for key, line in lines.items():
+        span = min(20., line.length)
+        for end, inner in ((0., span), (line.length, line.length-span)):
+            point = np.asarray(line.interpolate(end).coords[0])
+            direction = np.asarray(line.interpolate(inner).coords[0])-point
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                endpoints.append(point); owners.append(key); directions.append(direction/norm)
+    tree = cKDTree(endpoints) if endpoints else None
+    neighbours = {}
+    if tree is not None:
+        for i, point in enumerate(endpoints):
+            key = owners[i]
+            for j in tree.query_ball_point(point, .05):
+                other = owners[j]
+                if other != key and other in donors and float(np.dot(directions[i], directions[j])) <= -.8:
+                    neighbours.setdefault(key, []).append(donors[other])
+    result = {}
+    for key in lines:
+        evidence = ((donors.get(key), 'same_road_median', 'B'),
+                    (robust_width(neighbours.get(key, [])), 'chain_neighbor', 'C'),
+                    (robust_width(local_estimates.get(key, [])), 'local_mask_edt', 'C'),
+                    (regional, 'region_median', 'C'),
+                    (float(default_width_m), 'project_default', 'C'))
+        for value, source, grade in evidence:
+            if value is not None and np.isfinite(value) and value > 0:
+                result[key] = dict(width_m=value, width_source=source, quality_grade=grade,
+                                   fallback_reason='no_reliable_cross_section')
+                break
+    return result
 
 
 @dataclass
@@ -448,18 +505,19 @@ def _optimal_segments(values: np.ndarray, min_size: int = 3) -> list[tuple[int, 
 
 
 def calculate_chain_hybrid_widths(request):
+    from molra_centerline_width import maybe_snap_to_mask, scan_one_side
     from final_width_calculator import FinalWidthResult
 
+    from engine.width.width_reliability import (ROAD_ERRORS, InputContractError, issue,
+        validate_graph, validate_mask, project_default_width)
+    from shapely.geometry import LineString
     nodes = np.asarray(request.nodes_rc, dtype=np.float32)
-    edges = np.asarray(request.edges, dtype=np.int32)
-    surface = None if request.road_surface is None else np.asarray(request.road_surface, dtype=np.uint8)
-    if surface is None or len(edges) == 0:
-        return FinalWidthResult(
-            edge_widths=[{"edge_id": i, "width_px": 0.0, "width_units": 0.0, "source": "chain_hybrid_v2", "status": "width_unresolved"} for i in range(len(edges))],
-            samples=[], segments=[], algorithm="chain_hybrid_v2",
-            metadata={"measured_edge_count": 0, "unresolved_edge_count": len(edges)},
-        )
-
+    diagnostics=[]
+    original_count=len(request.edges)
+    edges,original_ids=validate_graph(nodes,request.edges,diagnostics)
+    if request.road_surface is None:
+        raise InputContractError('Road surface raster is required for mask width calculation')
+    surface=validate_mask(request.road_surface)
     cfg = request.config
     # Boundary reconstruction requires dense, nearly uniform samples on every
     # junction-to-junction chain. Keep legacy configurations inside the 4-6 px contract.
@@ -472,7 +530,8 @@ def calculate_chain_hybrid_widths(request):
     max_snap = float(getattr(cfg, "max_snap_distance_px", 4.0))
     junction_buffer = float(getattr(cfg, "junction_buffer_px", 20.0))
     pixel_size = float(getattr(cfg, "pixel_size", 1.0))
-    distance = cv2.distanceTransform((surface > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    if not np.isfinite(pixel_size) or pixel_size<=0:raise InputContractError('Invalid metre pixel size')
+    distance = cv2.distanceTransform(np.pad((surface > 0).astype(np.uint8),1), cv2.DIST_L2, 5)[1:-1,1:-1]
     degrees = np.bincount(edges.ravel(), minlength=len(nodes))
     chains = build_road_chains(nodes, edges)
     samples: list[dict] = []
@@ -484,212 +543,175 @@ def calculate_chain_hybrid_widths(request):
     chain_end_nodes: dict[int, tuple[int, int]] = {}
     chain_geometry: dict[int, tuple[np.ndarray, float]] = {}
 
+    local_estimates={}
     for chain in chains:
         points, cumulative = _chain_geometry(chain, nodes)
         total = float(cumulative[-1])
-        if total < 1.0:
+        if total <= 0:
             continue
         chain_end_nodes[chain.chain_id] = (chain.node_ids[0], chain.node_ids[-1])
         chain_geometry[chain.chain_id] = (points, total)
         for edge_id in chain.edge_ids:
             edge_chain_id[edge_id] = chain.chain_id
-        count = max(1, int(math.ceil(total / sample_step)))
-        positions = (np.arange(count, dtype=np.float32) + 0.5) * total / count
-        records: list[dict] = []
-        left_raw = np.zeros(count, dtype=np.float32)
-        right_raw = np.zeros(count, dtype=np.float32)
-        sample_grades = np.full(count, "C", dtype="<U1")
-        for local_id, position in enumerate(positions.tolist()):
-            point, offset = _point_at(points, cumulative, position)
-            tangent = _tangent_at(points, cumulative, position, tangent_radius)
-            normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32)
-            row, col, snapped, snap_distance = maybe_snap_to_mask(float(point[0]), float(point[1]), surface, snap_radius)
-            rr, cc = int(round(row)), int(round(col))
-            inside = bool(0 <= rr < surface.shape[0] and 0 <= cc < surface.shape[1] and surface[rr, cc] > 0)
-            left = right = 0.0
-            left_stop = right_stop = "outside_mask"
-            if inside:
-                left, left_stop = scan_one_side(surface, row, col, normal, -1.0, max_search, 1.0)
-                right, right_stop = scan_one_side(surface, row, col, normal, 1.0, max_search, 1.0)
-            normal_width = left + right + 1.0 if inside else 0.0
-            edt_width = 2.0 * float(distance[rr, cc]) if inside else 0.0
-            asymmetry = abs(left - right) / max(left + right, 1.0)
-            agreement = abs(normal_width - edt_width) / max(float(np.median([normal_width, edt_width])), 1.0)
-            local_width = max(normal_width, edt_width, 1.0)
-            junction_extent = float(np.clip(
-                float(getattr(cfg, "junction_width_factor", 1.75)) * local_width,
-                sample_step,
-                max(junction_buffer * 2.0, sample_step),
-            ))
-            near_junction = bool(
-                (degrees[chain.node_ids[0]] >= 3 and position < junction_extent)
-                or (degrees[chain.node_ids[-1]] >= 3 and total - position < junction_extent)
-            )
-            boundary_valid = bool(
-                inside and not near_junction and snap_distance <= max_snap
-                and left_stop == "mask_boundary" and right_stop == "mask_boundary"
-            )
-            if boundary_valid and agreement_limit >= 0:
-                grade = "A" if agreement <= agreement_limit else "B"
-            else:
-                grade = "C"
-            # Split the center pixel evenly so dL + dR remains the measured full width.
-            left_distance = left + 0.5 if inside else 0.0
-            right_distance = right + 0.5 if inside else 0.0
-            left_raw[local_id] = left_distance
-            right_raw[local_id] = right_distance
-            sample_grades[local_id] = grade
-            flags = []
-            if not inside: flags.append("outside_surface")
-            if near_junction: flags.append("junction_excluded")
-            if asymmetry > max_asymmetry: flags.append("asymmetric")
-            if agreement > agreement_limit: flags.append("normal_edt_disagreement")
-            if snap_distance > max_snap: flags.append("large_snap")
-            edge_id = chain.edge_ids[min(offset, len(chain.edge_ids) - 1)]
-            records.append({
-                "sample_id": len(samples) + local_id, "chain_id": chain.chain_id, "edge_id": edge_id,
-                "chain_distance_px": position, "row": float(point[0]), "col": float(point[1]),
-                "row_used": float(row), "col_used": float(col), "normal_width_px": normal_width,
-                "normal_row": float(normal[0]), "normal_col": float(normal[1]),
-                "edt_width_px": edt_width, "hybrid_raw_width_px": normal_width if boundary_valid else 0.0,
-                "left_raw_px": left_distance, "right_raw_px": right_distance,
-                "asymmetry_ratio": asymmetry, "agreement_ratio": agreement,
-                "valid_width": boundary_valid, "quality_grade": grade, "interpolated": False,
-                "quality_flags": ";".join(flags), "width_px": 0.0, "width_units": 0.0,
-            })
-
-        mad_scale = float(getattr(cfg, "outlier_mad_scale", 3.5))
-        left_profile, left_kept, left_outlier = _fit_side_profile(
-            positions, left_raw, sample_grades, mad_scale
-        )
-        right_profile, right_kept, right_outlier = _fit_side_profile(
-            positions, right_raw, sample_grades, mad_scale
-        )
-        kept = left_kept & right_kept
-        outlier = left_outlier | right_outlier
-        usable = (left_profile > 0) & (right_profile > 0)
-        for index, record in enumerate(records):
-            if outlier[index]:
-                record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "side_hampel_outlier"]))
-                record["quality_grade"] = "C"
-            elif sample_grades[index] == "B":
-                record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "weak_boundary_constraint"]))
-            record["interpolated"] = bool(not kept[index])
-            if record["interpolated"]:
-                record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "continuity_only_interpolated"]))
-                record["quality_grade"] = "C"
-            record["left_px"] = float(left_profile[index]) if usable[index] else 0.0
-            record["right_px"] = float(right_profile[index]) if usable[index] else 0.0
-            record["width_px"] = record["left_px"] + record["right_px"]
-            record["width_units"] = record["width_px"] * pixel_size
-            record["left_boundary_row"] = float(record["row_used"] - record["normal_row"] * record["left_px"])
-            record["left_boundary_col"] = float(record["col_used"] - record["normal_col"] * record["left_px"])
-            record["right_boundary_row"] = float(record["row_used"] + record["normal_row"] * record["right_px"])
-            record["right_boundary_col"] = float(record["col_used"] + record["normal_col"] * record["right_px"])
-            if record["width_px"] > 0 and record["quality_grade"] in {"A", "B"}:
-                edge_values[record["edge_id"]].append(record["width_px"])
-        samples.extend(records)
-
-        usable_ids = np.where(usable & (sample_grades != "C") & ~outlier)[0]
-        if usable_ids.size:
-            smoothed = left_profile + right_profile
-            chain_median = float(np.median(smoothed[usable_ids]))
-            chain_widths[chain.chain_id] = (chain_median, "B", "chain_hybrid_v2_chain_fallback")
-            for edge_id in chain.edge_ids:
-                edge_chain_fallback[edge_id] = chain_median
-            profile = smoothed[usable_ids]
-            for start, end in _optimal_segments(profile, min_size=max(2, int(getattr(cfg, "width_change_min_samples", 3)))):
-                ids = usable_ids[start:end]
-                if ids.size == 0:
-                    continue
-                values = smoothed[ids]
-                first, last = records[int(ids[0])], records[int(ids[-1])]
-                segments.append({
-                    "width_segment_id": len(segments), "chain_id": chain.chain_id,
-                    "start_sample_index": int(ids[0]), "end_sample_index": int(ids[-1]),
-                    "sample_count": int(ids.size), "start_distance_px": first["chain_distance_px"],
-                    "end_distance_px": last["chain_distance_px"], "start_row": first["row_used"],
-                    "start_col": first["col_used"], "end_row": last["row_used"], "end_col": last["col_used"],
-                    "median_width_px": float(np.median(values)), "mean_width_px": float(np.mean(values)),
-                    "median_width_units": float(np.median(values) * pixel_size),
-                    "width_cv": float(np.std(values) / max(float(np.mean(values)), 1.0)),
-                    "edge_ids_json": json.dumps(chain.edge_ids, separators=(",", ":")),
-                    "quality_grade": "B" if any(records[int(item)]["interpolated"] for item in ids) else "A",
-                    "width_source": "chain_hybrid_v2",
+        try:
+            count = max(1, int(math.ceil(total / sample_step)))
+            if count > 20000:raise ValueError('road_profile_sample_budget_exceeded')
+            positions = (np.arange(count, dtype=np.float32) + 0.5) * total / count
+            records: list[dict] = []
+            left_raw = np.zeros(count, dtype=np.float32)
+            right_raw = np.zeros(count, dtype=np.float32)
+            sample_grades = np.full(count, "C", dtype="<U1")
+            for local_id, position in enumerate(positions.tolist()):
+                point, offset = _point_at(points, cumulative, position)
+                tangent = _tangent_at(points, cumulative, position, tangent_radius)
+                normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32)
+                row, col, snapped, snap_distance = maybe_snap_to_mask(float(point[0]), float(point[1]), surface, snap_radius)
+                rr, cc = int(round(row)), int(round(col))
+                inside = bool(0 <= rr < surface.shape[0] and 0 <= cc < surface.shape[1] and surface[rr, cc] > 0)
+                left = right = 0.0
+                left_stop = right_stop = "outside_mask"
+                if inside:
+                    left, left_stop = scan_one_side(surface, row, col, normal, -1.0, max_search, 1.0)
+                    right, right_stop = scan_one_side(surface, row, col, normal, 1.0, max_search, 1.0)
+                normal_width = left + right + 1.0 if inside else 0.0
+                edt_width = 2.0 * float(distance[rr, cc]) if inside else 0.0
+                asymmetry = abs(left - right) / max(left + right, 1.0)
+                agreement = abs(normal_width - edt_width) / max(float(np.median([normal_width, edt_width])), 1.0)
+                local_width = max(normal_width, edt_width, 1.0)
+                junction_extent = float(np.clip(
+                    float(getattr(cfg, "junction_width_factor", 1.75)) * local_width,
+                    sample_step,
+                    max(junction_buffer * 2.0, sample_step),
+                ))
+                near_junction = bool(
+                    (degrees[chain.node_ids[0]] >= 3 and position < junction_extent)
+                    or (degrees[chain.node_ids[-1]] >= 3 and total - position < junction_extent)
+                )
+                boundary_valid = bool(
+                    inside and not near_junction and snap_distance <= max_snap
+                    and left_stop == "mask_boundary" and right_stop == "mask_boundary"
+                )
+                if boundary_valid and agreement_limit >= 0:
+                    grade = "A" if agreement <= agreement_limit else "B"
+                else:
+                    grade = "C"
+                # Split the center pixel evenly so dL + dR remains the measured full width.
+                left_distance = left + 0.5 if inside else 0.0
+                right_distance = right + 0.5 if inside else 0.0
+                left_raw[local_id] = left_distance
+                right_raw[local_id] = right_distance
+                sample_grades[local_id] = grade
+                flags = []
+                if not inside: flags.append("outside_surface")
+                if near_junction: flags.append("junction_excluded")
+                if asymmetry > max_asymmetry: flags.append("asymmetric")
+                if agreement > agreement_limit: flags.append("normal_edt_disagreement")
+                if snap_distance > max_snap: flags.append("large_snap")
+                edge_id = chain.edge_ids[min(offset, len(chain.edge_ids) - 1)]
+                records.append({
+                    "sample_id": len(samples) + local_id, "chain_id": chain.chain_id, "edge_id": edge_id,
+                    "chain_distance_px": position, "row": float(point[0]), "col": float(point[1]),
+                    "row_used": float(row), "col_used": float(col), "normal_width_px": normal_width,
+                    "normal_row": float(normal[0]), "normal_col": float(normal[1]),
+                    "edt_width_px": edt_width, "hybrid_raw_width_px": normal_width if boundary_valid else 0.0,
+                    "left_raw_px": left_distance, "right_raw_px": right_distance,
+                    "asymmetry_ratio": asymmetry, "agreement_ratio": agreement,
+                    "valid_width": boundary_valid, "quality_grade": grade, "interpolated": False,
+                    "quality_flags": ";".join(flags), "width_px": 0.0, "width_units": 0.0,
                 })
-        else:
-            # A correct centerline can still fail the strict normal/EDT agreement tests.
-            # Use robust centerline EDT away from junctions before falling back to neighbours.
-            edt_candidates = np.asarray([
-                float(record["edt_width_px"])
-                for record in records
-                if float(record["edt_width_px"]) > 0
-                and "junction_excluded" not in str(record["quality_flags"])
-                and "outside_surface" not in str(record["quality_flags"])
-                and "large_snap" not in str(record["quality_flags"])
-            ], dtype=np.float32)
-            if edt_candidates.size:
-                median = float(np.median(edt_candidates))
-                mad = float(np.median(np.abs(edt_candidates - median)))
-                if mad > 0:
-                    edt_candidates = edt_candidates[np.abs(edt_candidates - median) <= 3.5 * 1.4826 * mad]
-                width = float(np.median(edt_candidates)) if edt_candidates.size else median
-                chain_widths[chain.chain_id] = (width, "C", "chain_hybrid_v2_edt_fallback")
 
-    # Resolve chains with no usable surface crossing from direction-continuous
-    # neighbours. At junctions, an unrestricted median can assign a wide main
-    # road's width to a narrow branch merely because they share one node.
-    node_to_chains: dict[int, set[int]] = {}
-    for chain_id, end_nodes in chain_end_nodes.items():
-        for node_id in end_nodes:
-            node_to_chains.setdefault(node_id, set()).add(chain_id)
-    chain_by_id = {chain.chain_id: chain for chain in chains}
-    direction_cosine = float(np.clip(getattr(cfg, "neighbor_direction_cosine", 0.80), 0.0, 1.0))
-    direction_rejected_count = 0
-    direction_inherited_count = 0
-    for _ in range(max(1, len(chains))):
-        pending: dict[int, float] = {}
-        unresolved_chain_ids = [chain.chain_id for chain in chains if chain.chain_id not in chain_widths]
-        for chain_id in unresolved_chain_ids:
-            candidates: list[tuple[float, float]] = []
-            chain = chain_by_id[chain_id]
-            for node_id in chain_end_nodes.get(chain_id, ()):
-                direction = _endpoint_direction(chain, nodes, node_id, sample_step * 4.0)
-                for neighbour_id in node_to_chains.get(node_id, set()):
-                    if neighbour_id == chain_id or neighbour_id not in chain_widths:
-                        continue
-                    neighbour = chain_by_id[neighbour_id]
-                    neighbour_direction = _endpoint_direction(
-                        neighbour, nodes, node_id, sample_step * 4.0
-                    )
-                    cosine = abs(float(np.dot(direction, neighbour_direction)))
-                    if cosine < direction_cosine:
-                        direction_rejected_count += 1
-                        continue
-                    candidates.append((cosine, float(chain_widths[neighbour_id][0])))
-            if candidates:
-                best_cosine = max(item[0] for item in candidates)
-                aligned_widths = [
-                    width for cosine, width in candidates if cosine >= best_cosine - 0.05
-                ]
-                pending[chain_id] = float(np.median(np.asarray(aligned_widths, dtype=np.float32)))
-        if not pending:
-            break
-        for chain_id, width in pending.items():
-            chain_widths[chain_id] = (
-                width, "C", "chain_hybrid_v2_directional_neighbor_fallback",
+            mad_scale = float(getattr(cfg, "outlier_mad_scale", 3.5))
+            left_profile, left_kept, left_outlier = _fit_side_profile(
+                positions, left_raw, sample_grades, mad_scale
             )
-            direction_inherited_count += 1
+            right_profile, right_kept, right_outlier = _fit_side_profile(
+                positions, right_raw, sample_grades, mad_scale
+            )
+            kept = left_kept & right_kept
+            outlier = left_outlier | right_outlier
+            usable = (left_profile > 0) & (right_profile > 0)
+            for index, record in enumerate(records):
+                if outlier[index]:
+                    record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "side_hampel_outlier"]))
+                    record["quality_grade"] = "C"
+                elif sample_grades[index] == "B":
+                    record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "weak_boundary_constraint"]))
+                record["interpolated"] = bool(not kept[index])
+                if record["interpolated"]:
+                    record["quality_flags"] = ";".join(filter(None, [record["quality_flags"], "continuity_only_interpolated"]))
+                    record["quality_grade"] = "C"
+                record["left_px"] = float(left_profile[index]) if usable[index] else 0.0
+                record["right_px"] = float(right_profile[index]) if usable[index] else 0.0
+                record["width_px"] = record["left_px"] + record["right_px"]
+                record["width_units"] = record["width_px"] * pixel_size
+                record["left_boundary_row"] = float(record["row_used"] - record["normal_row"] * record["left_px"])
+                record["left_boundary_col"] = float(record["col_used"] - record["normal_col"] * record["left_px"])
+                record["right_boundary_row"] = float(record["row_used"] + record["normal_row"] * record["right_px"])
+                record["right_boundary_col"] = float(record["col_used"] + record["normal_col"] * record["right_px"])
+                if record["width_px"] > 0 and record["quality_grade"] in {"A", "B"}:
+                    edge_values[record["edge_id"]].append(record["width_px"])
+            samples.extend(records)
 
-    known_widths = [value[0] for value in chain_widths.values() if value[0] > 0]
-    if known_widths:
-        tile_fallback = float(np.median(np.asarray(known_widths, dtype=np.float32)))
-    else:
-        positive_distance = distance[distance > 0]
-        tile_fallback = float(2.0 * np.percentile(positive_distance, 90)) if positive_distance.size else 1.0
-    for chain in chains:
-        if chain.chain_id not in chain_widths:
-            chain_widths[chain.chain_id] = (tile_fallback, "C", "chain_hybrid_v2_tile_fallback")
+            usable_ids = np.where(usable & (sample_grades != "C") & ~outlier)[0]
+            if usable_ids.size:
+                smoothed = left_profile + right_profile
+                chain_median = float(np.median(smoothed[usable_ids]))
+                chain_widths[chain.chain_id] = (chain_median, "B", "chain_hybrid_v2_chain_fallback")
+                for edge_id in chain.edge_ids:
+                    edge_chain_fallback[edge_id] = chain_median
+                profile = smoothed[usable_ids]
+                for start, end in _optimal_segments(profile, min_size=max(2, int(getattr(cfg, "width_change_min_samples", 3)))):
+                    ids = usable_ids[start:end]
+                    if ids.size == 0:
+                        continue
+                    values = smoothed[ids]
+                    first, last = records[int(ids[0])], records[int(ids[-1])]
+                    segments.append({
+                        "width_segment_id": len(segments), "chain_id": chain.chain_id,
+                        "start_sample_index": int(ids[0]), "end_sample_index": int(ids[-1]),
+                        "sample_count": int(ids.size), "start_distance_px": first["chain_distance_px"],
+                        "end_distance_px": last["chain_distance_px"], "start_row": first["row_used"],
+                        "start_col": first["col_used"], "end_row": last["row_used"], "end_col": last["col_used"],
+                        "median_width_px": float(np.median(values)), "mean_width_px": float(np.mean(values)),
+                        "median_width_units": float(np.median(values) * pixel_size),
+                        "width_cv": float(np.std(values) / max(float(np.mean(values)), 1.0)),
+                        "edge_ids_json": json.dumps(chain.edge_ids, separators=(",", ":")),
+                        "quality_grade": "B" if any(records[int(item)]["interpolated"] for item in ids) else "A",
+                        "width_source": "chain_hybrid_v2",
+                    })
+            else:
+                # A correct centerline can still fail the strict normal/EDT agreement tests.
+                # Use robust centerline EDT away from junctions before falling back to neighbours.
+                edt_candidates = np.asarray([
+                    float(record["edt_width_px"])
+                    for record in records
+                    if float(record["edt_width_px"]) > 0
+                    and "junction_excluded" not in str(record["quality_flags"])
+                    and "outside_surface" not in str(record["quality_flags"])
+                    and "large_snap" not in str(record["quality_flags"])
+                ], dtype=np.float32)
+                if edt_candidates.size:
+                    median = float(np.median(edt_candidates))
+                    mad = float(np.median(np.abs(edt_candidates - median)))
+                    if mad > 0:
+                        edt_candidates = edt_candidates[np.abs(edt_candidates - median) <= 3.5 * 1.4826 * mad]
+                    width = float(np.median(edt_candidates)) if edt_candidates.size else median
+                    local_estimates[chain.chain_id] = [width * pixel_size]
+
+        except ROAD_ERRORS as exc:
+            diagnostics.append(issue(chain.chain_id, getattr(request,'tile_id',''), 'chain_measurement', exc))
+
+    lines={key:LineString(points*pixel_size) for key,(points,total) in chain_geometry.items()}
+    reliable={key:[value[0]*pixel_size] for key,value in chain_widths.items() if value[1] in ('A','B')}
+    default_width=float(getattr(cfg,'default_width_m',project_default_width()))
+    fallbacks=resolve_chain_fallbacks(lines,reliable,local_estimates=local_estimates,default_width_m=default_width)
+    for key,estimate in fallbacks.items():
+        if key not in chain_widths:
+            chain_widths[key]=(estimate['width_m']/pixel_size,estimate['quality_grade'],estimate['width_source'])
+    tile_fallback=default_width/pixel_size
+    direction_cosine=.8
+    direction_rejected_count=0
+    direction_inherited_count=sum(r['width_source']=='chain_neighbor' for r in fallbacks.values())
 
     segmented_chain_ids = {int(row["chain_id"]) for row in segments}
     for chain_id, (width, grade, source) in chain_widths.items():
@@ -736,10 +758,20 @@ def calculate_chain_hybrid_widths(request):
             "edge_id": edge_id, "width_px": width, "width_units": width * pixel_size,
             "source": source, "status": status, "quality_grade": grade,
         })
+    for row in edge_widths:row['edge_id']=original_ids[row['edge_id']]
+    for row in samples:row['edge_id']=original_ids[row['edge_id']]
+    for row in segments:
+        row['edge_ids_json']=json.dumps([original_ids[i] for i in json.loads(row['edge_ids_json'])])
+    valid_ids=set(original_ids)
+    edge_widths.extend(dict(edge_id=i,width_px=0.,width_units=0.,source='invalid_geometry',
+                           status='invalid_geometry',quality_grade='C')
+                       for i in range(original_count) if i not in valid_ids)
+    edge_widths.sort(key=lambda row:row['edge_id'])
     issue_count = sum(bool(row["quality_flags"]) and not row["interpolated"] for row in samples)
     return FinalWidthResult(
         edge_widths=edge_widths, samples=samples, segments=segments, algorithm="chain_hybrid_v2",
         metadata={
+            "exceptions":diagnostics, "status":"completed_with_warnings" if diagnostics or grade_counts['C'] else 'completed',
             "road_chain_count": len(chains), "measured_edge_count": measured,
             "unresolved_edge_count": len(edges) - measured, "issue_sample_count": issue_count,
             "sample_step_px": sample_step, "hybrid_agreement_ratio": agreement_limit,

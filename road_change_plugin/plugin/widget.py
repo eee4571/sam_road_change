@@ -683,9 +683,7 @@ class RoadChangeWidget(QWidget):
                 local_issues = model.get("issues", []) + check_files(model)
                 if local_issues:
                     return local_issues
-                self.controller.build_command("all", data)
-                report = self.controller.inspect_data(data)
-                return report.get("issues", [])
+                return self.controller.inspect_data(data)
             except Exception as exc:
                 # The existing check adapter can return stderr; expose its reason,
                 # not an entire traceback in the compact project area.
@@ -697,8 +695,28 @@ class RoadChangeWidget(QWidget):
         self._background(inspect, (), self._checked)
 
     def _checked(self, issues):
+        report = issues if isinstance(issues, dict) else {}
         if isinstance(issues, dict):
             issues = issues.get("issues", [])
+        if not issues:
+            references = report.get('area_irmad_references', self.model.get('area_irmad_references', {}))
+            issues = [f'{area}：未能自动确定参考期，请手动选择参考期' for area, _ in self.model['areas']
+                      if references.get(area) not in {p for a, p, _ in self.model['periods'] if a == area}]
+            if not issues and report.get('reference_selections'):
+                try:
+                    model = copy.deepcopy(self.model)
+                    model['area_irmad_references'] = references
+                    model['automatic_reference_selections'] = {
+                        **model.get('config', {}).get('automatic_reference_selections', {}),
+                        **report['reference_selections']}
+                    store = ProjectState(model['root'], self.output.text())
+                    store.remember_configuration()
+                    config = save_configuration(model, {key: field.text() for key, field in self.parameters.items()})
+                    self.model = model
+                    self.model['config'] = config
+                    self.configuration.load(self.model)
+                except (OSError, ValueError, TypeError) as exc:
+                    issues = [f'自动选择的参考期保存失败：{exc}']
         issues = list(dict.fromkeys(issues))
         if not issues and self._processing_dirty:
             try:
@@ -778,6 +796,8 @@ class RoadChangeWidget(QWidget):
             state, title, description = 'running', '', '道路变化检测正在处理'
         elif self.browsing:
             state, title, description = 'checking', '正在检查', '正在读取项目并检查数据'
+            if any(not self.model.get('area_irmad_references', {}).get(area) for area, _ in self.model['areas']):
+                description = '正在试跑少量窗口，比较各期提取的道路长度（首次需加载模型）'
         elif self._resume_task:
             local = self._resume_task.get('action', 'all') != 'all'
             state, title = 'resume', '继续重跑' if local else '继续处理'
@@ -889,6 +909,10 @@ class RoadChangeWidget(QWidget):
 
     def _progress(self, payload):
         event = payload.get("event", {})
+        if event.get('kind')=='warning' and event.get('status')=='completed_with_warnings':
+            self.progress_note.setText(event.get('message','测宽完成，部分道路使用估计宽度'))
+            self.log_panel.set_error(event.get('message','')+'\n'+event.get('details',''))
+            return
         self.stage_text.setText(payload.get("stage") or "处理中")
         area = event.get("grid") or event.get("area_id")
         if area:
@@ -964,6 +988,9 @@ class RoadChangeWidget(QWidget):
             self.progress.setValue(1000)
         self.progress_note.setText("成果已生成" if finished else "已停止，已完成成果可供续跑")
         self.status.setText("处理完成，当前成果已生成" if finished else "任务已取消")
+        if finished and payload.get('width_warnings'):
+            self.progress_note.setText('测宽完成，部分道路使用估计宽度；请查看日志中的质量详情')
+            self.status.setText('处理完成，存在测宽警告')
         self._log({**payload, "message": self.state_text.text()})
         self._refresh_results(latest=True)
         self._update_controls()

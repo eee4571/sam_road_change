@@ -99,10 +99,11 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     from .road_axis_quality import repair_network_axes
     from .canonical_road_surface import build_road_geometry
     from .product_cache import read_completed, write_completed, signature
+    from .width.width_reliability import ROAD_ERRORS, InputContractError, project_default_width
 
     crs = centers.crs
-    if crs is None or crs.is_geographic:
-        raise ValueError('Formal roads require a projected metric CRS')
+    if crs is None or not crs.is_projected or any(abs(a.unit_conversion_factor-1)>1e-9 for a in crs.axis_info):
+        raise InputContractError('Formal roads require a projected metric CRS')
     from .geometry_recovery import current_recovery,GEOMETRY_ERRORS,geometry_item
     rows=[]
     for i,row in enumerate(centers.to_dict('records')):
@@ -118,12 +119,13 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
         if str(row.get('track_id', '')).lower() in ('none','nan','<na>'):
             row['track_id'] = ''
     axes = [row['geometry'] for row in rows]
+    default_width=project_default_width()
     fallback = []
     for row in rows:
-        value = row.get('width_m', row.get('width_map', 6.))
+        value = row.get('width_m', row.get('width_map', default_width))
         try: value = float(value)
-        except (ValueError, TypeError): value = 6.
-        fallback.append(value if np.isfinite(value) and value > 0 else 6.)
+        except (ValueError, TypeError): value = default_width
+        fallback.append(value if np.isfinite(value) and value > 0 else default_width)
     first_issue=len(current_recovery().failures)
     print(f'[正式道路] 轴线质量检查：{len(axes)} 条',flush=True)
     repaired, axis_audit = repair_network_axes(axes, fallback, evidence)
@@ -140,7 +142,21 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     saved = (read_completed(cache_path, profile_inputs) or {}) if cache_path else {}
     current = {}; profiles = []; quality = []; kept_rows=[]; kept_axes=[]; kept_repairs={}
     for i, (row, old, axis, width) in enumerate(zip(rows, axes, repaired, fallback)):
-        with geometry_item("width_profile",[row["source_feature"]]):
+        mark=len(kept_rows)
+        def retain_width_axis():
+            # A failed profile mapping cannot delete an already valid repaired axis.
+            del profiles[mark:];del quality[mark:];del kept_rows[mark:];del kept_axes[mark:]
+            for key in list(kept_repairs):
+                if key>=mark:kept_repairs.pop(key)
+            if axis is None:return
+            parts=[axis] if axis.geom_type=='LineString' else list(axis.geoms)
+            for part in parts:
+                profiles.append((part,np.array([0.,part.length]),np.array([width,width])))
+                quality.append(np.zeros(2))
+                kept_rows.append(dict(row,geometry=part,_width_fallback=True))
+                kept_axes.append(part)
+        with geometry_item("width_profile",[row["source_feature"]],on_error=retain_width_axis,
+                           status='fallback',error_types=ROAD_ERRORS):
             if axis is None:continue
             if row.get('track_id'):
                 ss, vv = road_profile(row, old, width)
@@ -182,16 +198,28 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     center_rows = []; width_rows = []
     for chain_id, chain in enumerate(chains):
         center_mark=len(center_rows);width_mark=len(width_rows)
-        def rollback():
+        def retain_chain():
             del center_rows[center_mark:];del width_rows[width_mark:]
-        with geometry_item('formal_chain',chain.sources,on_error=rollback):
+            from .width.chain_width_calculator import robust_width
+            width=robust_width(chain.widths) or default_width
+            row=dict(segment_id=chain_id,width_m=width,length_m=chain.axis.length,
+                     geometry=chain.axis,source_ids=','.join(map(str,sorted(chain.sources))),
+                     width_qual='C',quality_grade='C',width_quality='C',valid_ratio=0.,
+                     width_source='axis_width_estimate',qa_state='review',
+                     qa_reason='formal_width_segment_mapping_failed')
+            center_rows.append(row);width_rows.append(row.copy())
+        with geometry_item('formal_chain',chain.sources,on_error=retain_chain,
+                           status='fallback',error_types=ROAD_ERRORS):
             sources = sorted(chain.sources)
             owner = next((i for i in sources if rows[i].get('track_id')), sources[0])
             row = {k:v for k,v in rows[owner].items() if k not in ('geometry','_original_row','gt_width_profile',
-                                                                'source_feature','axis_quality','repair_status')}
+                                                                'source_feature','axis_quality','repair_status','_width_fallback')}
             row.update(segment_id=chain_id, width_m=float(np.median(chain.widths)),
                        length_m=chain.axis.length, geometry=chain.axis,
                        source_ids=','.join(map(str,sources)))
+            reliable_fraction=min(float(np.mean(np.asarray(quality[i])>0)) for i in sources)
+            row.update(width_qual='A' if reliable_fraction>=1 else 'C',
+                       qa_state='auto' if reliable_fraction>=1 else 'review')
             if row.get('track_id'):
                 row['gt_width_profile'] = json.dumps(dict(axis=chain.axis.wkt,
                     stations=(chain.stations/chain.axis.length).tolist(), widths=chain.widths.tolist(),
@@ -214,6 +242,9 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                     cosine = abs(float(_direction(old,station) @ _direction(line,line.project(probe))))
                     if cosine >= .95: candidates.append((line.distance(probe),-cosine,int(k)))
                 evidence_row = sampler.frame.iloc[min(candidates)[2]].to_dict() if candidates else {}
+                if rows[source].get('_width_fallback'):
+                    evidence_row.update(quality_grade='C',width_quality='C',valid_ratio=0.,
+                        width_source='axis_width_estimate',qa_state='review',qa_reason='width_profile_mapping_failed')
                 local = substring(chain.axis,a,b)
                 # A missing observation stays missing. A chain owner's grade must
                 # never leak into an unsupported station of the merged chain.
@@ -225,7 +256,10 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     def frame(items):
         return gpd.GeoDataFrame(items,geometry='geometry',crs=crs) if items else gpd.GeoDataFrame(geometry=[],crs=crs)
     polygons = [surface] if surface.geom_type == 'Polygon' else list(surface.geoms)
-    surfaces = frame([dict(geometry=p) for p in polygons if not p.is_empty])
+    low_axes=[row['geometry'] for row in center_rows if row.get('width_qual')=='C']
+    from shapely import STRtree
+    low_tree=STRtree(low_axes)
+    surfaces = frame([dict(geometry=p,width_qual='C' if len(low_tree.query(p,predicate='intersects')) else 'A') for p in polygons if not p.is_empty])
     frames = dict(centerlines=frame(center_rows), width_segments=frame(width_rows),
                   surfaces=surfaces, corridors=surfaces.copy())
     audit['summary']['formal_width_segment_count']=len(width_rows)

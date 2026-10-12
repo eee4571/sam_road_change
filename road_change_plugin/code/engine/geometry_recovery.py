@@ -1,6 +1,7 @@
 """Feature-local geometry failures, distinct from I/O and environment failures."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+import traceback
 from shapely.errors import GEOSException
 
 # Do not swallow OSError, MemoryError, ImportError or arbitrary RuntimeError.
@@ -29,6 +30,7 @@ class Recovery:
         if not methods:
             methods=attempted_methods(error) or [stage]
         row = dict(stage=stage, source_ids=list(sources), exception_type=type(error).__name__,
+                   traceback=''.join(traceback.format_exception(type(error),error,error.__traceback__)),
                    reason=str(error), attempted_methods=list(methods), repair_status=status,
                    axis_quality='low', final_action=final_action or ('conservative_local_rebuild' if status=='fallback' else 'skip_local_geometry'))
         self.failures.append(row)
@@ -52,10 +54,13 @@ def recovery_scope(recovery):
 
 
 @contextmanager
-def geometry_item(stage, sources, on_error=None, status='skipped'):
+def geometry_item(stage, sources, on_error=None, status='skipped', error_types=GEOMETRY_ERRORS):
     """A transaction boundary around a single geometry, never around file I/O."""
     try:yield
-    except GEOMETRY_ERRORS as error:
+    except error_types as error:
+        if getattr(error,'code',None)==-4 or any(token in str(error).lower() for token in
+            ('out of memory','failed to allocate','bad_alloc','insufficient memory')):
+            raise
         recovery = _current.get()
         if recovery is None:raise
         if on_error is not None:on_error()

@@ -15,6 +15,8 @@ from ..diagnostics import failure_summary, known_failure
 def log_entry(payload):
     """Classify presentation only; never infer process state from console text."""
     message = str(payload.get('message', ''))
+    if message.startswith('[Width warning]'):
+        return 'WARNING', message
     level = str(payload.get('level', 'INFO')).upper()
     event = payload.get('event')
     if not event:
@@ -55,6 +57,7 @@ class RunLogPanel(QWidget):
         self.entries = []
         self.errors = self.warnings = 0
         self.error = ''
+        self.width_reports = set()
         self.setMinimumSize(0, 100)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -91,6 +94,7 @@ class RunLogPanel(QWidget):
 
     def reset(self, payloads=()):
         self.entries.clear()
+        self.width_reports.clear()
         self.errors = self.warnings = 0
         for payload in payloads:
             self._remember(payload)
@@ -98,6 +102,11 @@ class RunLogPanel(QWidget):
         self.countsChanged.emit(self.errors, self.warnings)
 
     def _remember(self, payload):
+        event=payload.get('event') or {}
+        if event.get('status')=='completed_with_warnings' and event.get('details'):
+            self.width_reports.add(str(event['details']))
+            self.error=event.get('message','测宽质量报告')
+            self.details.show()
         level, text = log_entry(payload)
         if level == 'PROGRESS' and self.entries and self.entries[-1] == (level, text):
             return None
@@ -159,16 +168,21 @@ class RunLogPanel(QWidget):
         if not self.error:
             return
         dialog = QDialog(self)
-        dialog.setWindowTitle('错误诊断信息')
+        dialog.setWindowTitle('测宽质量与诊断信息' if self.width_reports else '错误诊断信息')
         dialog.resize(680, 420)
         box = QVBoxLayout(dialog)
         summary = QLabel(failure_summary(self.error))
         summary.setWordWrap(True)
         box.addWidget(summary)
-        text = QPlainTextEdit(self.error)
+        content=self.error
+        from pathlib import Path
+        for path in sorted(self.width_reports):
+            try:content+='\n\n'+path+'\n'+Path(path).read_text(encoding='utf8')
+            except OSError as exc:content+='\n'+path+'\n无法读取质量报告：'+str(exc)
+        text = QPlainTextEdit(content)
         text.setReadOnly(True)
         box.addWidget(text, 1)
         copy = QPushButton('复制诊断信息')
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.error))
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(content))
         box.addWidget(copy)
         dialog.exec()
