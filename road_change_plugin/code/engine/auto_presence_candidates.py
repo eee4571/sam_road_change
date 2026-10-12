@@ -4,7 +4,7 @@ Geometry defines intervals; station evidence annotates them and excludes known
 present/present spans. Weak evidence, invalid observations and junctions are QA
 states, not deletion rules. This module has no reference-truth input.
 """
-from collections import Counter
+from collections import Counter,OrderedDict
 from dataclasses import dataclass
 
 import geopandas as gpd
@@ -40,17 +40,27 @@ class LongitudinalCoverage:
 
     def __init__(self, lines, tolerance):
         self.tolerance = tolerance
-        self.edges, self.directions = [], []
+        self.chunks=[];self.cache=OrderedDict()
         for line in lines:
             coords = np.asarray(line.coords)[:, :2]
-            for a, b in zip(coords[:-1], coords[1:]):
-                direction = b-a
-                length = np.linalg.norm(direction)
-                if length > 1e-7:
-                    self.edges.append(LineString([a, b]))
-                    self.directions.append(direction/length)
-        self.tree = STRtree(self.edges)
-        self.directions = np.asarray(self.directions)
+            for start in range(0,len(coords)-1,256):
+                self.chunks.append(LineString(coords[start:start+257]))
+        self.tree = STRtree(self.chunks)
+
+    def _aligned_buffers(self,edge,direction,tolerance):
+        for raw in self.tree.query(edge,predicate='dwithin',distance=tolerance):
+            index=int(raw)
+            if index not in self.cache:
+                xy=np.asarray(self.chunks[index].coords);local=[]
+                for a,b in zip(xy[:-1],xy[1:]):
+                    delta=b-a;length=np.linalg.norm(delta)
+                    if length>1e-7:local.append((LineString([a,b]),delta/length))
+                self.cache[index]=local
+                if len(self.cache)>32:self.cache.popitem(last=False)
+            self.cache.move_to_end(index)
+            for target,heading in self.cache[index]:
+                if abs(heading@direction)>=.90 and target.distance(edge)<=tolerance:
+                    yield target.buffer(tolerance)
 
     def uncovered(self, axis, tolerance=None):
         tolerance = self.tolerance if tolerance is None else tolerance
@@ -61,14 +71,11 @@ class LongitudinalCoverage:
             length = edge.length
             if length <= 1e-7:
                 continue
-            ids = self.tree.query(edge, predicate="dwithin", distance=tolerance)
-            if len(ids):
-                aligned = ids[np.abs(self.directions[ids] @ ((b-a)/length)) >= .90]
-                if len(aligned):
-                    support = union_all([self.edges[i].buffer(tolerance) for i in aligned])
-                    for part in line_parts(edge.intersection(support)):
-                        positions = [float(np.dot(np.asarray(p)[:2]-a, (b-a)/length)) for p in part.coords]
-                        covered.append((offset+max(0., min(positions)), offset+min(length, max(positions))))
+            from .geometry_recovery import geometry_union
+            support=geometry_union(self._aligned_buffers(edge,(b-a)/length,tolerance))
+            for part in line_parts(edge.intersection(support)):
+                positions = [float(np.dot(np.asarray(p)[:2]-a, (b-a)/length)) for p in part.coords]
+                covered.append((offset+max(0., min(positions)), offset+min(length, max(positions))))
             offset += length
         result, position = [], 0.
         for start, end in merge_intervals(covered):

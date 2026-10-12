@@ -1,5 +1,6 @@
 """Metric axis QA before offsets; repair oscillations, never repair polygons."""
 import numpy as np
+from .geometry_memory import bounded_linspace
 from scipy.ndimage import gaussian_filter1d, distance_transform_edt
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from shapely import covers, distance, points, union_all
@@ -85,7 +86,7 @@ def axis_quality(axis, width):
 
 def _pinned_smooth(xy, sigma):
     fitted=gaussian_filter1d(xy,sigma,axis=0,mode='nearest')
-    fraction=np.linspace(0.,1.,len(xy))[:,None]
+    fraction=bounded_linspace(0.,1.,len(xy))[:,None]
     fitted+=(1-fraction)*(xy[0]-fitted[0])+fraction*(xy[-1]-fitted[-1])
     fitted[[0,-1]]=xy[[0,-1]]
     return fitted
@@ -96,7 +97,7 @@ def _evidence_axis(reference, width, evidence):
     xy=np.asarray(reference.coords)
     tangent=np.gradient(xy,axis=0)
     normal=np.c_[-tangent[:,1],tangent[:,0]]/np.maximum(np.linalg.norm(tangent,axis=1)[:,None],1e-9)
-    offsets=np.linspace(-width,width,25)
+    offsets=bounded_linspace(-width,width,25)
     probes=xy[:,None,:]+normal[:,None,:]*offsets[None,:,None]
     flat=probes.reshape(-1,2);score=np.zeros(len(flat));supported=np.zeros(len(flat),bool)
     if evidence is not None and evidence.surface is not None:
@@ -142,14 +143,14 @@ def _evidence_route(axis,width,evidence):
     route=np.asarray(route);xy=np.c_[xx[route[:,1]],yy[route[:,0]]]
     xy[[0,-1]]=ends
     line=LineString(xy)
-    return np.asarray([line.interpolate(s).coords[0] for s in np.linspace(0,line.length,max(7,int(line.length)+1))])
+    return np.asarray([line.interpolate(s).coords[0] for s in bounded_linspace(0,line.length,max(7,int(line.length)+1))])
 
 
 def _join_tangents(candidate,original,width,pin_start,pin_end):
     """C1 joins to unchanged approach segments, wholly inside the faulty window."""
     length=candidate.length
     if length<1e-6:return candidate
-    ss=np.linspace(0,length,max(7,int(length)+1))
+    ss=bounded_linspace(0,length,max(7,int(length)+1))
     xy=np.asarray([candidate.interpolate(s).coords[0] for s in ss])
     old=np.asarray(original.coords)
     reach=min(width*1.5,length/3)
@@ -173,7 +174,11 @@ def _join_tangents(candidate,original,width,pin_start,pin_end):
 
 
 def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False):
-    ss=np.linspace(0.,axis.length,max(7,int(np.ceil(axis.length))+1))
+    from .geometry_memory import within_budget, GeometrySamplingLimit
+    if not within_budget(axis.length):
+        raise GeometrySamplingLimit('axis_repair_interval_exceeds_station_budget')
+    if hasattr(evidence,'local'):evidence=evidence.local(axis,width)
+    ss=bounded_linspace(0.,axis.length,max(7,int(np.ceil(axis.length))+1))
     xy=np.asarray([axis.interpolate(s).coords[0] for s in ss])
     before=evidence.measure(axis) if evidence is not None else dict(joint_support=0.,unsupported_run_m=axis.length)
     attempts=[];fallback=None
@@ -222,7 +227,7 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
         if found:return found
         reference=LineString(fit)
     # Sample at a bounded density before fitting the evidence ridge.
-    samples=np.linspace(0.,reference.length,max(7,int(reference.length/2)+1))
+    samples=bounded_linspace(0.,reference.length,max(7,int(reference.length/2)+1))
     reference=LineString([reference.interpolate(s).coords[0] for s in samples])
     try:
         ridge=_evidence_axis(reference,width,evidence)
@@ -254,8 +259,8 @@ def _repair_interval(axis,width,evidence,validator,pin_start=False,pin_end=False
     chord=xy[-1]-xy[0];length=np.linalg.norm(chord)
     for method,fit in [('stable_direction_connection',CubicSpline([0.,1.],xy[[0,-1]],
             bc_type=((1,(xy[min(len(xy)-1,max(2,int(width/step)))]-xy[0])/max(width,1.)*length),
-                     (1,(xy[-1]-xy[max(0,len(xy)-1-max(2,int(width/step)))])/max(width,1.)*length)))(np.linspace(0,1,max(7,int(length)+1)))),
-                       ('conservative_chord',np.linspace(xy[0],xy[-1],max(2,int(length)+1)))]:
+                     (1,(xy[-1]-xy[max(0,len(xy)-1-max(2,int(width/step)))])/max(width,1.)*length)))(bounded_linspace(0,1,max(7,int(length)+1)))),
+                       ('conservative_chord',bounded_linspace(xy[0],xy[-1],max(2,int(length)+1)))]:
         found=accept(fit,method,True)
         if found:return found
     if fallback:

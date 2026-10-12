@@ -8,6 +8,7 @@ short extraction fragments can turn across a median while the road stays straigh
 from dataclasses import dataclass
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
+from .disk_records import DiskMap,DiskRows,record_scope
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.strtree import STRtree
 from shapely.ops import substring
@@ -59,47 +60,64 @@ def _follow_paired_tracks(model, points, tangents):
     centers = np.mean(model.offsets)+np.arange(-45.,46.,1.5)
     spacings = np.unique(np.r_[model.spacing,np.arange(max(8,model.spacing*.7),min(65,model.spacing*1.8)+1,2.)])
     center_grid, spacing_grid = np.meshgrid(centers,spacings,indexing='ij')
-    scores = []
-    for s in stations:
-        mask = parallel & (abs(station-s)<65) & (abs(lateral-np.mean(model.offsets))<90)
-        values = lateral[mask]
-        weights = np.maximum(0,1-abs(station[mask]-s)/65)
-        lane_scores = []
-        for sign in (-.5,.5):
-            distance = abs(values[:,None,None]-(center_grid+sign*spacing_grid))
-            evidence = np.where(distance<=4.5,np.exp(-.5*(distance/3.5)**2),0.)
-            lane_scores.append(np.minimum(12,(evidence*weights[:,None,None]).sum(axis=0)))
-        scores.append(2*np.minimum(*lane_scores))
-    cost = -.8*np.asarray(scores)
-    current = cost[0]+.001*(center_grid-np.mean(model.offsets))**2+.005*(spacing_grid-model.spacing)**2
-    backs = []
-    count_c,count_w = current.shape
-    ids = np.arange(current.size).reshape(current.shape)
-    for local in cost[1:]:
-        best = np.full_like(current,np.inf)
-        back = np.zeros(current.shape,dtype=np.int32)
-        for dc in range(-3,4):
-            for dw in range(-1,2):
-                dest = (slice(max(0,dc),min(count_c,count_c+dc)),slice(max(0,dw),min(count_w,count_w+dw)))
-                src = (slice(max(0,-dc),min(count_c,count_c-dc)),slice(max(0,-dw),min(count_w,count_w-dw)))
-                proposal = current[src]+.4*dc**2+.4*(spacing_grid[dest]-spacing_grid[src])**2
-                improve = proposal<best[dest]
-                best[dest] = np.minimum(best[dest],proposal)
-                back[dest] = np.where(improve,ids[src],back[dest])
-        current = local+best
-        backs.append(back.ravel())
-    index = int(current.argmin())
-    path = [index]
-    for back in backs[::-1]:
-        index = int(back[index]); path.append(index)
+    def costs():
+        for s in stations:
+            mask = parallel & (abs(station-s)<65) & (abs(lateral-np.mean(model.offsets))<90)
+            values = lateral[mask]
+            weights = np.maximum(0,1-abs(station[mask]-s)/65)
+            lane_scores = []
+            for sign in (-.5,.5):
+                total=np.zeros(center_grid.shape)
+                # Bound the samples x centres x spacings broadcast. Ordinary
+                # sections take one block with the exact original reduction.
+                for start in range(0,len(values),256):
+                    distance = abs(values[start:start+256,None,None]-(center_grid+sign*spacing_grid))
+                    evidence = np.where(distance<=4.5,np.exp(-.5*(distance/3.5)**2),0.)
+                    total+=(evidence*weights[start:start+256,None,None]).sum(axis=0)
+                lane_scores.append(np.minimum(12,total))
+            yield -.8*(2*np.minimum(*lane_scores))
+    cost=iter(costs())
+    current = next(cost)+.001*(center_grid-np.mean(model.offsets))**2+.005*(spacing_grid-model.spacing)**2
+    from .disk_records import scratch_array
+    with scratch_array((len(stations)-1,current.size),'int32') as backs:
+        count_c,count_w = current.shape
+        ids = np.arange(current.size).reshape(current.shape)
+        for row,local in enumerate(cost):
+            best = np.full_like(current,np.inf)
+            back = np.zeros(current.shape,dtype=np.int32)
+            for dc in range(-3,4):
+                for dw in range(-1,2):
+                    dest = (slice(max(0,dc),min(count_c,count_c+dc)),slice(max(0,dw),min(count_w,count_w+dw)))
+                    src = (slice(max(0,-dc),min(count_c,count_c-dc)),slice(max(0,-dw),min(count_w,count_w-dw)))
+                    proposal = current[src]+.4*dc**2+.4*(spacing_grid[dest]-spacing_grid[src])**2
+                    improve = proposal<best[dest]
+                    best[dest] = np.minimum(best[dest],proposal)
+                    back[dest] = np.where(improve,ids[src],back[dest])
+            current = local+best
+            backs[row]=back.ravel()
+        index = int(current.argmin())
+        path = [index]
+        for back in backs[::-1]:
+            index = int(back[index]); path.append(index)
     ci,wi = np.unravel_index(np.asarray(path[::-1]),current.shape)
     model.stations = stations
     model.centers = gaussian_filter1d(centers[ci],1.2,mode='nearest')
     model.spacings = gaussian_filter1d(spacings[wi],1.2,mode='nearest')
 
 
+@record_scope
 def infer_track_corridors(roads, maximum_gap=300.0):
     if not roads:
+        return []
+    from .geometry_memory import within_budget
+    eligible=[road for road in roads if within_budget(LineString(road.points).length)]
+    if len(eligible)!=len(roads):
+        print(f'[WARN] corridor fitting excluded {len(roads)-len(eligible)} oversized evidence axes; original roads retained',flush=True)
+    roads=eligible
+    if not roads:return []
+    sample_count=sum(max(2,int(LineString(road.points).length/4)+1) for road in roads)
+    if sample_count>2_000_000:
+        print('[WARN] corridor fitting exceeds 2M evidence samples; retain original regional network',flush=True)
         return []
     origin = np.mean(np.vstack([r.points[[0, -1]] for r in roads]), axis=0)
     samples, directions, seeds = [], [], []
@@ -125,7 +143,7 @@ def infer_track_corridors(roads, maximum_gap=300.0):
     if not seeds:
         return []
     points, tangents = np.asarray(samples), np.asarray(directions)
-    models = []
+    models = [];model_members=DiskMap()
     for _, center, axis in sorted(seeds, key=lambda s: -s[0]):
         if axis[0] < -1e-8 or (abs(axis[0])<=1e-8 and axis[1]<0):
             axis = -axis
@@ -163,8 +181,9 @@ def infer_track_corridors(roads, maximum_gap=300.0):
                     duplicate = True
                     break
         if not duplicate:
-            models.append(dict(axis=axis, center=center, rho=rho, start=start, end=end, coverage=coverage, mask=mask.copy()))
-    pairs = []
+            model_members[len(models)]=np.flatnonzero(mask)
+            models.append(dict(axis=axis, center=center, rho=rho, start=start, end=end, coverage=coverage,mask=len(models)))
+    pairs = DiskRows()
     # Unit directions within four degrees have chord distance <= this radius.
     # Keep the original ordered pairs and exact dot-product predicate below.
     from scipy.spatial import cKDTree
@@ -179,9 +198,9 @@ def infer_track_corridors(roads, maximum_gap=300.0):
             axis = first['axis'] + second['axis']
             axis /= np.linalg.norm(axis)
             normal = np.asarray([-axis[1], axis[0]])
-            s1, s2 = points[first['mask']] @ axis, points[second['mask']] @ axis
+            s1, s2 = points[model_members[first['mask']]] @ axis, points[model_members[second['mask']]] @ axis
             overlap = min(s1.max(), s2.max()) - max(s1.min(), s2.min())
-            offsets = np.sort([np.median(points[m['mask']] @ normal) for m in (first, second)])
+            offsets = np.sort([np.median(points[model_members[m['mask']]] @ normal) for m in (first, second)])
             spacing = offsets[1] - offsets[0]
             if not 8 <= spacing <= 65 or overlap < 220:
                 continue
@@ -191,9 +210,10 @@ def infer_track_corridors(roads, maximum_gap=300.0):
                 continue
             score = min(first['coverage'], second['coverage']) * overlap / max(np.ptp(s1), np.ptp(s2))
             corridor = TrackCorridor(origin, axis, offsets, min(s1.min(), s2.min()), max(s1.max(), s2.max()), score)
-            pairs.append((score, i, j, corridor))
+            pairs.append(dict(score=score,first=i,second=j,corridor=corridor))
     result, used = [], set()
-    for _, i, j, corridor in sorted(pairs, key=lambda p: -p[0]*(p[3].end-p[3].start)):
+    for pair in pairs.sorted(lambda p:p['score']*(p['corridor'].end-p['corridor'].start),reverse=True):
+        i,j,corridor=pair['first'],pair['second'],pair['corridor']
         if i in used or j in used:
             continue
         middle = corridor.origin + .5*(corridor.start+corridor.end)*corridor.axis + np.mean(corridor.offsets)*corridor.normal

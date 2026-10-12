@@ -129,10 +129,16 @@ class Runner(TaskSignals):
         return {"task_id": self.task_id, "plugin_id": "road_change", **values}
 
     def _read(self):
-        self._buffer += self._decoder.decode(bytes(self.process.readAllStandardOutput()))
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            self.consume_line(line.rstrip("\r"))
+        while self.process.bytesAvailable():
+            self._buffer += self._decoder.decode(bytes(self.process.read(64*1024)))
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                self.consume_line(line.rstrip("\r"))
+            if len(self._buffer)>1024*1024:
+                if self._buffer.startswith(PREFIX):
+                    self._failure='后端结构化事件超过 1 MiB，无法可靠解析；请查看后端日志'
+                self.consume_line(self._buffer[:4096]+' … [日志显示分段]')
+                self._buffer=''
 
     def consume_line(self, line):
         # Diagnostics only: task state still comes from events and process exit.

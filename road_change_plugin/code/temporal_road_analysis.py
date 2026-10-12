@@ -20,6 +20,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyogrio
+from engine.disk_records import DiskRows, LazyFrames, observation_index, record_scope, batches
 from shapely import STRtree, make_valid
 from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
@@ -98,6 +99,7 @@ def _numeric(row: pd.Series, fields: tuple[str, ...], default: float = 0.0) -> f
 
 
 def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
+    from engine.road_surface_quality import reliable_width
     frame = gpd.read_file(path)
     if frame.crs is None:
         raise ValueError(f"道路中心线缺少 CRS：{path}")
@@ -110,6 +112,7 @@ def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
                 "source_fid": str(row.get("global_id", source_index)),
                 "part_idx": int(part_index),
                 "width_m": _numeric(row, WIDTH_FIELDS, 0.0),
+                "width_reliable": (True if (quality := reliable_width(row)) is None else bool(quality)),
                 "extract_cf": _numeric(row, CONF_FIELDS, 0.0),
                 "track_id": str(row.get("track_id") or "") if pd.notna(row.get("track_id")) else "",
                 "geometry": geometry,
@@ -325,7 +328,7 @@ def _observations(
     period_frames: dict[str, gpd.GeoDataFrame],
     tolerance: float,
 ) -> list[dict]:
-    observations = []
+    observations = DiskRows()
     for period, frame in period_frames.items():
         source_geometries = list(frame.geometry)
         source_tree = STRtree(np.asarray(source_geometries, dtype=object)) if source_geometries else None
@@ -361,6 +364,9 @@ def _observations(
                 "geometry": geometry,
             }
             period_rows.append(item)
+            if row is not None and not row.get('width_reliable',True):
+                item['qa_state']='low_confidence'
+                item['qa_reason']='unreliable_width'
 
         # A segmented source line may legitimately support several disjoint
         # references.  Reuse is only rejected when the references themselves
@@ -380,30 +386,30 @@ def _observations(
                 if duplicate:
                     item["status"] = "absent"
                     item["qa_state"] = "low_confidence"
-                    item["qa_reason"] = "duplicate_source_ownership"
+                    item["qa_reason"] = ';'.join(filter(None, (item.get('qa_reason'), 'duplicate_source_ownership')))
                 else:
                     accepted.append(item)
         observations.extend(period_rows)
-    by_road: dict[str, list[dict]] = {}
-    for row in observations:
-        by_road.setdefault(row["road_id"], []).append(row)
     period_order = {period: index for index, period in enumerate(period_frames)}
-    for rows in by_road.values():
-        rows.sort(key=lambda row: period_order[row["period"]])
+    for road_id in observations.road_ids():
+        indexed=observations.road_rows(road_id)
+        indexed.sort(key=lambda pair: period_order[pair[1]['period']])
+        rows=[r for _,r in indexed]
         for index in range(1, len(rows) - 1):
             if rows[index - 1]["status"] == "present" and rows[index]["status"] == "absent" and rows[index + 1]["status"] == "present":
                 rows[index]["qa_state"] = "low_confidence"
-                rows[index]["qa_reason"] = "single_period_dropout"
-    for row in observations:
-        row.pop("_source_idx", None)
-        row.pop("_reference_idx", None)
+                rows[index]["qa_reason"] = ';'.join(filter(None, (rows[index].get('qa_reason'), 'single_period_dropout')))
+        for (index,row) in indexed:
+            row.pop("_source_idx", None)
+            row.pop("_reference_idx", None)
+            observations[index]=row
     return observations
 
 
 def _events(observations: list[dict], periods: list[str], absolute: float, ratio: float) -> list[dict]:
-    by_road_period = {(row["road_id"], row["period"]): row for row in observations}
-    road_ids = sorted({row["road_id"] for row in observations})
-    events = []
+    by_road_period = observation_index(observations)
+    road_ids = by_road_period.road_ids()
+    events = DiskRows(mutable=True)
     counter = 0
     for road_id in road_ids:
         for before_period, after_period in zip(periods, periods[1:]):
@@ -420,7 +426,8 @@ def _events(observations: list[dict], periods: list[str], absolute: float, ratio
                     width_diff = float(after_width - before_width)
                     relative = abs(width_diff) / max(float(before_width), float(after_width), 0.1)
                     if abs(width_diff) >= absolute and relative >= ratio:
-                        event_type = "widened" if width_diff > 0 else "narrowed"
+                        event_type = ('uncertain' if any('unreliable_width' in str(r.get('qa_reason','')) for r in (before,after))
+                                      else "widened" if width_diff > 0 else "narrowed")
             elif before["status"] != after["status"] and "uncertain" in {before["status"], after["status"]}:
                 event_type = "uncertain"
             if event_type is None:
@@ -450,20 +457,21 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
     """
     if not all(entry.get('road_state') for entry in period_entries):
         return [], []
-    states={str(entry['period']):gpd.read_file(entry['road_state'],layer='road_state').to_crs(analysis_crs)
-            for entry in period_entries}
-    track_ids=sorted({str(t) for frame in states.values() for t in frame.track_id})
-    state_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in states.items()}
-    road_groups={p:{k:v for k,v in f.groupby('track_id',sort=False)} for p,f in period_frames.items()}
-    references=[];observations=[]
-    for track_id in track_ids:
-        first=next(groups[track_id].iloc[0] for groups in state_groups.values() if track_id in groups)
-        references.append(dict(road_id=track_id,born_period=next(iter(states)),geometry=first.geometry))
-        for period,state in states.items():
-            rows=state_groups[period].get(track_id,state.iloc[:0])
+    references={};observations=DiskRows();expected=None
+    for entry in period_entries:
+        period=str(entry['period'])
+        state=gpd.read_file(entry['road_state'],layer='road_state').to_crs(analysis_crs)
+        state_groups={str(k):v for k,v in state.groupby('track_id',sort=False)}
+        if expected is None:expected=set(state_groups)
+        if set(state_groups)!=expected:raise ValueError(f'Reconciled road state incomplete: {period}')
+        roads=period_frames[period]
+        road_groups={str(k):v for k,v in roads.groupby('track_id',sort=False)}
+        for track_id in sorted(expected):
+            rows=state_groups[track_id]
             if len(rows)!=1:raise ValueError(f'Reconciled road state incomplete: {track_id}/{period}')
-            row=rows.iloc[0]; roads=period_frames[period]
-            actual=road_groups[period].get(track_id,roads.iloc[:0])
+            row=rows.iloc[0]
+            references.setdefault(track_id,dict(road_id=track_id,born_period=str(period_entries[0]['period']),geometry=row.geometry))
+            actual=road_groups.get(track_id,roads.iloc[:0])
             present=row.status=='present'
             if present != (not actual.empty):raise ValueError(f'Road state contradicts period centerline: {track_id}/{period}')
             width=float(np.average(actual.width_m,weights=actual.length)) if present else np.nan
@@ -472,9 +480,16 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
                 length_m=float(row.geometry.length) if present else 0.,coverage=1. if present else 0.,match_sc=1.,extract_cf=.95,
                 geom_dev_m=0.,source_fid=','.join(actual.source_fid),qa_state='event_constrained',
                 qa_reason=';'.join(str(v) for v in (row.get('state_source','reconciled'),
-                    row.get('observation_conflict','')) if v and str(v)!='nan'),
+                    row.get('observation_conflict',''),
+                    'unreliable_width' if present and not actual.width_reliable.all() else '') if v and str(v)!='nan'),
                 dir_sim=1.,geometry=row.geometry))
-    return references,observations
+    # Original externally visible order: track, then configured period order.
+    ordered=DiskRows()
+    order={str(e['period']):i for i,e in enumerate(period_entries)}
+    for track_id in sorted(expected or ()):
+        ordered.extend(r for _,r in sorted(observations.road_rows(track_id),key=lambda pair:order[pair[1]['period']]))
+    observations.close()
+    return [references[k] for k in sorted(references)],ordered
 
 
 def _field_name(prefix: str, period: str, used: set[str]) -> str:
@@ -491,8 +506,9 @@ def _field_name(prefix: str, period: str, used: set[str]) -> str:
 
 
 def _life_rows(references: list[dict], observations: list[dict], events: list[dict], periods: list[str], tolerance: float) -> list[dict]:
-    by_road_period = {(row["road_id"], row["period"]): row for row in observations}
-    event_by_key = {(row["road_id"], row["from_per"], row["to_per"]): row for row in events}
+    by_road_period = observation_index(observations)
+    event_by_key = (events.index(('road_id','from_per','to_per')) if isinstance(events,DiskRows) else
+                    {(row['road_id'],row['from_per'],row['to_per']):row for row in events})
     event_counts: dict[str, int] = {}
     event_reviews: set[str] = set()
     for event in events:
@@ -508,7 +524,7 @@ def _life_rows(references: list[dict], observations: list[dict], events: list[di
         (before, after): _field_name("E", f"{before[-4:]}{after[-4:]}", used)
         for before, after in zip(periods, periods[1:])
     }
-    rows = []
+    rows = DiskRows(mutable=True)
     for reference in references:
         road_id = reference["road_id"]
         road_observations = [by_road_period[(road_id, period)] for period in periods]
@@ -553,12 +569,12 @@ def _event_parts(
     reference_geometries = [item["geometry"] for item in references]
     reference_indices = {item['road_id']: i for i, item in enumerate(references)}
     tree = STRtree(np.asarray(reference_geometries, dtype=object)) if reference_geometries else None
-    event_lookup = {
+    event_lookup = events.index(('road_id','from_per','to_per','event_typ')) if isinstance(events,DiskRows) else {
         (item["road_id"], item["from_per"], item["to_per"], item["event_typ"]): item
         for item in events
     }
-    rows = []
-    observed={(r['road_id'],r['period']):r for r in (observations or [])}
+    rows = DiskRows()
+    observed=observation_index(observations or [])
     for entry in change_entries:
         path = Path(str((entry.get('layers') or {}).get('changes') or entry.get('road_changes')
                         or Path(str(entry.get("output", ""))) / "road_changes.shp"))
@@ -599,6 +615,10 @@ def _event_parts(
                 _support, _distance, ref_index = max(consistent or ranked)
                 road_id = references[ref_index]["road_id"]
             event_type = str(source.get("change_typ", ""))
+            unreliable = event_type in {'widened','narrowed','width_changed'} and any(
+                'unreliable_width' in str(observed.get((road_id,period),{}).get('qa_reason',''))
+                for period in (before_period,after_period))
+            if unreliable:event_type='uncertain'
             event_key = (road_id, before_period, after_period, event_type)
             if event_type == "width_changed" and event_key not in event_lookup and road_id:
                 # The pair result intentionally carries no widened/narrowed direction.
@@ -638,7 +658,7 @@ def _event_parts(
                 event=dict(event_id=f'EV{len(events)+1:08d}',road_id=road_id,from_per=before_period,to_per=after_period,
                     event_typ=event_type,before_st=before.get('status','absent'),after_st=after.get('status','absent'),
                     before_w=b,after_w=a,width_diff=a-b,event_cf=min(before.get('match_sc',0.),after.get('match_sc',0.)),
-                    evidence='pair_class_observation_disagreement',qa_state='low_confidence',geometry=references[ref_index]['geometry'])
+                    evidence='unreliable_width' if unreliable else 'pair_class_observation_disagreement',qa_state='low_confidence',geometry=references[ref_index]['geometry'])
                 events.append(event);event_lookup[event_key]=event
             for part_index, part in enumerate(_polygon_parts(geometry)):
                 rows.append({
@@ -646,18 +666,19 @@ def _event_parts(
                     "road_id": road_id, "from_per": before_period, "to_per": after_period,
                     "event_typ": event_type,
                     "source_id": f"{source.get('change_id', source_index)}:{part_index}",
-                    "area_m2": float(part.area), "qa_state": "auto" if road_id else "review",
+                    "area_m2": float(part.area), "qa_state": "auto" if road_id and not unreliable else "review",
                     "geometry": part,
                 })
     return rows
 
 
 def _apply_event_evidence(events: list[dict], event_parts: list[dict], has_pair_results: bool) -> None:
-    supported = {str(row.get("event_id", "")) for row in event_parts if row.get("event_id")}
+    supported = (event_parts.index(('event_id',)) if isinstance(event_parts,DiskRows) else
+                 {(str(row.get('event_id','')),) for row in event_parts if row.get('event_id')})
     for event in events:
         if event["event_typ"] == "uncertain":
             continue
-        if event["event_id"] in supported:
+        if (event["event_id"],) in supported:
             if event.get('evidence')!='pair_class_observation_disagreement':event["evidence"] = "temporal_state_and_pair_change"
             continue
         event["evidence"] = "state_only_no_pair_part" if has_pair_results else "state_only_no_pair_input"
@@ -666,6 +687,14 @@ def _apply_event_evidence(events: list[dict], event_parts: list[dict], has_pair_
 
 
 def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geometry_type: str, output_crs=None) -> None:
+    first=True
+    for batch in batches(rows):
+        _write_shp_batch(path,batch,columns,crs,geometry_type,output_crs,append=not first)
+        first=False
+    if first:_write_shp_batch(path,[],columns,crs,geometry_type,output_crs)
+
+
+def _write_shp_batch(path, rows, columns, crs, geometry_type, output_crs=None, *, append=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
         frame = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
@@ -680,12 +709,14 @@ def _write_shp(path: Path, rows: list[dict], columns: dict[str, str], crs, geome
         frame = frame.to_crs(output_crs)
     pyogrio.write_dataframe(
         frame, path, driver="ESRI Shapefile", encoding="UTF-8", geometry_type=geometry_type,
+        append=append,
     )
 
 
 
 @timed_stage("temporal")
 @_geometry_scope
+@record_scope
 def build_temporal_grid(
     grid_name: str,
     period_entries: list[dict],
@@ -716,21 +747,21 @@ def build_temporal_grid(
         # per-period observations remain authoritative and need no rematching.
         report('正在读取已有道路匹配结果…')
         life_frame = gpd.read_file(reuse_observations['life_shp']).to_crs(analysis_crs)
-        obs_frame = gpd.read_file(reuse_observations['observations_shp']).to_crs(analysis_crs)
         references = life_frame[['road_id', 'geometry']].to_dict('records')
-        observations = obs_frame.to_dict('records')
-        expected = {(r['road_id'], p) for r in references for p in periods}
-        actual = {(r['road_id'], r['period']) for r in observations}
-        if not references or actual != expected or len(actual) != len(observations):
+        observations = DiskRows()
+        offset=0
+        while True:
+            batch=pyogrio.read_dataframe(reuse_observations['observations_shp'],skip_features=offset,max_features=2048).to_crs(analysis_crs)
+            if batch.empty:break
+            observations.extend(batch.to_dict('records'));offset+=len(batch)
+        if not references or not observations.validate_observations([r['road_id'] for r in references],periods):
             raise ValueError('已有长时序道路记录与当前期次不一致，请先完成道路处理')
     else:
         report('正在建立各期道路匹配结果…')
-        period_frames = {
-            str(entry['period']): _read_period(path, analysis_crs)
-            for entry, path in zip(period_entries, paths)
-        }
+        period_paths={str(entry['period']):path for entry,path in zip(period_entries,paths)}
+        period_frames = LazyFrames(period_paths, lambda period:_read_period(period_paths[period], analysis_crs))
         reconciled_refs, reconciled_obs = _reconciled_tracks(period_entries, period_frames, analysis_crs)
-        untracked_frames = ({p: f.loc[f.track_id.eq('')].copy() for p, f in period_frames.items()}
+        untracked_frames = (LazyFrames(period_frames, lambda p:period_frames[p].loc[period_frames[p].track_id.eq('')].copy())
                             if reconciled_refs else period_frames)
         references = _build_reference(untracked_frames, tolerance)
         references.extend(reconciled_refs)
@@ -745,22 +776,23 @@ def build_temporal_grid(
     event_parts = _event_parts(change_entries, references, events, analysis_crs, tolerance, observations)
     reviewed_pairs = {(str(e['before_period']), str(e['after_period']))
                       for e in change_entries if e.get('manual_review')}
-    supported_events = {part['event_id'] for part in event_parts}
+    supported_events = (event_parts.index(('event_id',)) if isinstance(event_parts,DiskRows)
+                        else {(part['event_id'],) for part in event_parts})
     # A reviewed pair is authoritative: do not recreate rejected changes from
     # the unchanged per-period road observations during temporal rebuilding.
-    events = [e for e in events if (e['from_per'], e['to_per']) not in reviewed_pairs
-              or e['event_id'] in supported_events or e['event_typ'] == 'uncertain']
+    events = DiskRows((e for e in events if (e['from_per'], e['to_per']) not in reviewed_pairs
+              or (e['event_id'],) in supported_events or e['event_typ'] == 'uncertain'),mutable=True)
     _apply_event_evidence(events, event_parts, bool(change_entries))
     report('正在更新道路变化统计…')
     life = _life_rows(references, observations, events, periods, tolerance)
     for row in life:
         row["grid_id"] = str(grid_name)[:80]
-    reviews = [{
+    reviews = DiskRows({
         "road_id": row["road_id"], "period": row["period"],
         "reason": row.get("qa_reason") or "ambiguous_or_weak_match",
         "match_sc": row["match_sc"], "coverage": row["coverage"], "qa_state": "review",
         "geometry": row["geometry"],
-    } for row in observations if row["status"] == "uncertain"]
+    } for row in observations if row["status"] == "uncertain")
     reviews.extend({
         "road_id": row["road_id"], "period": row["to_per"], "reason": row["evidence"],
         "match_sc": row["event_cf"], "coverage": 0.0, "qa_state": "review",
@@ -783,8 +815,12 @@ def build_temporal_grid(
             "extract_cf": "float64", "geom_dev_m": "float64", "source_fid": "str", "qa_state": "str",
             "qa_reason": "str", "dir_sim": "float64",
         }, analysis_crs, "LineString", output_crs)
-        pd.DataFrame([{k: v for k, v in row.items() if k != 'geometry'} for row in observations]).to_csv(
-            output_dir / 'width_evolution.csv', index=False, encoding='utf-8-sig')
+        with (output_dir/'width_evolution.csv').open('w',encoding='utf-8-sig',newline='') as stream:
+            first=True
+            for batch in batches(observations):
+                pd.DataFrame([{k:v for k,v in row.items() if k!='geometry'} for row in batch]).to_csv(
+                    stream,index=False,header=first)
+                first=False
     _write_shp(output_dir / "road_event.shp", events, {
         "event_id": "str", "road_id": "str", "from_per": "str", "to_per": "str",
         "event_typ": "str", "before_st": "str", "after_st": "str", "before_w": "float64",

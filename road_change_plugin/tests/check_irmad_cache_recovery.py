@@ -14,6 +14,21 @@ from engine import cache_commit, irmad_preprocessing as rrn
 import test_irmad_preprocessing as regressions
 
 
+class NumericalTests(regressions.IRMADTests):
+    def test_promoted_kernel_ast_is_identical_to_experiment(self):
+        # Window/decoder orchestration changed; statistical kernels did not.
+        import ast
+        from engine import irmad_core as core
+        original=ROOT.parent/'experiments/radiometric_normalization_ab/irmad_rrn.py'
+        def nodes(path):
+            return {n.name:ast.dump(n,include_attributes=False) for n in ast.parse(path.read_text(encoding='utf8')).body
+                    if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
+        before=nodes(original);after=nodes(Path(core.__file__))
+        self.assertEqual(set(before)&set(after),set(after))
+        for name in set(after)-{'windows','paired_blocks','write_normalized'}:
+            self.assertEqual(after[name],before[name],name)
+
+
 class RecoveryTests(unittest.TestCase):
     setUp = regressions.IRMADTests.setUp
 
@@ -46,7 +61,7 @@ class RecoveryTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(regressions.IRMADTests),
+    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(NumericalTests),
                                unittest.defaultTestLoader.loadTestsFromTestCase(RecoveryTests)])
     assert Path(rrn.__file__).resolve().is_relative_to(ROOT / 'code')
     raise SystemExit(not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful())

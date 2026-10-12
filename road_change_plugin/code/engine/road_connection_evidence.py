@@ -1,6 +1,7 @@
 """Read-only image evidence for proposed regional connectors (no inference)."""
 from pathlib import Path
 import numpy as np
+from .geometry_memory import bounded_linspace
 from shapely import covers, points, line_interpolate_point
 from shapely.geometry import LineString
 from shapely.prepared import prep
@@ -111,7 +112,7 @@ class ConnectionEvidence:
     def measure(self,curve):
         line=curve if isinstance(curve,LineString) else LineString(curve)
         length=line.length
-        distances=np.linspace(0,length,max(5,int(length/3)+1))
+        distances=bounded_linspace(0,length,max(5,int(length/3)+1))
         xy=np.asarray([p.coords[0] for p in line_interpolate_point(line,distances)])
         inside=np.zeros(len(xy),bool) if self.surface is None else covers(self.surface.context,points(xy))
         raw_surface_support=float(inside.mean())

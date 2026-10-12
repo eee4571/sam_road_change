@@ -11,6 +11,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+from .disk_records import record_scope, DiskRows, FrameSpool, FramePair
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 from shapely import from_wkt, line_merge, make_valid, normalize, union_all
@@ -143,6 +144,8 @@ def _gt_axes(geometry, width):
     resolution=max(.5,np.sqrt(max((maxx-minx)*(maxy-miny),1.)/2_000_000))
     transform=from_origin(minx-2*resolution,maxy+2*resolution,resolution,resolution)
     shape=(int(np.ceil((maxy-miny)/resolution))+4,int(np.ceil((maxx-minx)/resolution))+4)
+    from .evaluation_memory import check_grid
+    check_grid(shape,2_100_000)
     mask=rasterize([(geometry,1)],out_shape=shape,transform=transform,dtype='uint8')
     paths=_trace_skeleton_paths(skeletonize(mask>0))
     axes=[]
@@ -358,25 +361,27 @@ def _atomize_adjacent_changes(changes):
     A later change on half a road must not create a second overlapping identity.
     These boundaries encode different lifecycles; they are not perturbations.
     """
-    references=[];mapping=[]
-    source=[]
+    references=[];mapping=DiskRows()
+    source=DiskRows()
     for pair_id,pair in enumerate(changes):
         for _,row in pair['frame'].iterrows():
-            source.append((pair_id,row.to_dict(),from_wkt(row.match_axis_wkt)))
-    for pair_id,row,axis in sorted(source,key=lambda item:-item[2].length):
+            source.append(dict(pair_id=pair_id,row=row.to_dict(),axis=from_wkt(row.match_axis_wkt)))
+    for item in source.sorted(lambda item:item['axis'].length,reverse=True):
+        pair_id,row,axis=item['pair_id'],item['row'],item['axis']
         hits=track_intervals(axis,[r['axis'] for r in references])
         covered=[]
         for hit in hits:
             ref=references[hit['target']]
             ref['cuts'].extend([hit['start'],hit['end']])
-            mapping.append((pair_id,row,hit['target'],hit['source_start'],hit['source_end'],hit['start'],hit['end']))
+            mapping.append(dict(values=(pair_id,row,hit['target'],hit['source_start'],hit['source_end'],hit['start'],hit['end'])))
             covered.append((hit['source_start'],hit['source_end']))
         for start,end in _remaining(axis.length,covered):
             local=substring(axis,start,end)
-            mapping.append((pair_id,row,len(references),start,end,0.,local.length))
+            mapping.append(dict(values=(pair_id,row,len(references),start,end,0.,local.length)))
             references.append(dict(axis=local,cuts=[0.,local.length]))
-    records={i:[] for i in range(len(changes))}
-    for pair_id,row,ref_id,s0,s1,t0,t1 in mapping:
+    records={i:DiskRows() for i in range(len(changes))}
+    for item in mapping:
+        pair_id,row,ref_id,s0,s1,t0,t1=item['values']
         ref=references[ref_id];cuts=sorted(set(np.clip(ref['cuts'],t0,t1)))
         source_axis=from_wkt(row['match_axis_wkt']);actual=from_wkt(row['axis_wkt'])
         # Respect reversed digitization when sharing a canonical track.
@@ -390,9 +395,10 @@ def _atomize_adjacent_changes(changes):
             records[pair_id].append({**row,'change_id':f"{row['change_id']}_{track_id[2:10]}",
                 'atomic_track':track_id,'axis_wkt':local.wkt,'match_axis_wkt':match.wkt,'length_m':local.length,
                 'geometry':record_polygon(row,local)})
-    for pair_id,pair in enumerate(changes):pair['frame']=_changes(records[pair_id],pair['frame'].crs)
+    for pair_id,pair in enumerate(changes):pair['frame']=_changes(list(records[pair_id]),pair['frame'].crs)
 
 
+@record_scope
 def reconcile_periods(periods, changes, output_dir):
     """Apply all adjacent-pair constraints together to immutable Auto inputs.
 
@@ -404,9 +410,11 @@ def reconcile_periods(periods, changes, output_dir):
     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
     first=gpd.read_file(periods[0]['centerlines'])
     metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
-    frames={str(p['period']):gpd.read_file(p['centerlines']).to_crs(metric).explode(index_parts=False).reset_index(drop=True) for p in periods}
+    from .disk_records import LazyFrames,DiskMap,DiskRows,write_csv_rows
+    paths={str(p['period']):p['centerlines'] for p in periods}
+    frames=LazyFrames(paths,lambda p:gpd.read_file(paths[p]).to_crs(metric).explode(index_parts=False).reset_index(drop=True))
     if len(changes)>1:_atomize_adjacent_changes(changes)
-    tracks=[];constraints={};assignments=[];events={}
+    tracks=[];constraints=DiskMap();assignments=DiskRows();events={}
     for pair in changes:
         data=pair['frame'].to_crs(metric)
         for index,row in data.iterrows():
@@ -431,9 +439,8 @@ def reconcile_periods(periods, changes, output_dir):
     from .road_axis_quality import repair_network_axes
     from .road_connection_evidence import ConnectionEvidence
     def track_evidence():
-        surfaces=[gpd.read_file(p['surfaces']).to_crs(metric).geometry for p in periods if p.get('surfaces')]
-        support=union_all([g for series in surfaces for g in series]) if surfaces else None
-        return ConnectionEvidence(support)
+        from .vector_evidence import WindowedConnectionEvidence
+        return WindowedConnectionEvidence([p['surfaces'] for p in periods if p.get('surfaces')],metric)
     track_axes,track_qa=repair_network_axes([t['axis'] for t in tracks],
         [max(max(e['width_before'],e['width_after']) for e in events[t['track_id']]) for t in tracks],
         track_evidence)
@@ -467,8 +474,9 @@ def reconcile_periods(periods, changes, output_dir):
             from .gt_road_geometry import record_polygon
             pair['frame'].at[index,'geometry']=record_polygon(pair['frame'].loc[index])
         pair['frame']=pair['frame'].drop(index=discard)
-    outputs=[];edit_audit=[];state_rows=[]
+    outputs=[];edit_audit=DiskRows()
     for period,base in frames.items():
+        state_rows=[]
         axes=list(base.geometry);cuts={};inserts=[]
         for track in tracks:
             key=(track['track_id'],period);constraint=constraints.get(key)
@@ -509,7 +517,8 @@ def reconcile_periods(periods, changes, output_dir):
         rows.extend(inserts)
         directory=output/period;directory.mkdir(exist_ok=True)
         original=next(p for p in periods if str(p['period'])==period)
-        observations=[list(f.geometry) for key,f in frames.items() if key!=period]
+        from .vector_evidence import PeriodEvidence
+        observations=PeriodEvidence([key for key in frames if key!=period],lambda key:list(frames[key].geometry))
         from .formal_road_products import is_formal_result
         if not cuts and not inserts and is_formal_result(original):
             layers={k:v for k,v in original.items() if k not in ('period','road_state','product_variant','execution_profile','status','auto_source','result')}
@@ -526,8 +535,8 @@ def reconcile_periods(periods, changes, output_dir):
         if original.get('road_probability'):
             entry['road_probability']=original['road_probability']
         entry['result']=str((directory/'period_result.json').resolve());_write_json(entry['result'],entry);outputs.append(entry)
-    pd.DataFrame(edit_audit).to_csv(output/'axis_interval_edits.csv',index=False)
-    pd.DataFrame(assignments).to_csv(output/'change_track_assignments.csv',index=False)
+    write_csv_rows(output/'axis_interval_edits.csv',edit_audit)
+    write_csv_rows(output/'change_track_assignments.csv',assignments)
     return outputs
 
 
@@ -577,8 +586,11 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     edits = [{k: (v.wkb_hex if k == 'geometry' else v) for k,v in row.items()} for row in inserts]
     inputs += signature([original[k] for k in ('surfaces','road_probability') if original.get(k) and Path(original[k]).is_file()])
     inputs.append(hashlib.sha256(json.dumps([row_values,cuts,edits], sort_keys=True, default=str).encode()).hexdigest())
-    inputs.append([len(period) for period in observations])
-    inputs.append(hashlib.sha256(b''.join(a.wkb for period in observations for a in period)).hexdigest())
+    evidence_digest=hashlib.sha256();evidence_counts=[]
+    for period in observations:
+        evidence_counts.append(len(period))
+        for axis in period:evidence_digest.update(axis.wkb)
+    inputs.extend([evidence_counts,evidence_digest.hexdigest()])
     inputs.append(implementation_signature())
     cached = read_completed(marker, inputs)
     if cached is not None:
@@ -689,6 +701,7 @@ def _final_change_frame(entry, corrected, edits):
 
 
 @timed_stage("finalization_and_temporal")
+@record_scope
 def build_fast_temporal_outputs(manifest, job_root):
     """Finalize GT-local edits, publish final changes, then build ONE temporal."""
     from temporal_road_analysis import build_from_manifest,clean_name
@@ -714,12 +727,12 @@ def build_fast_temporal_outputs(manifest, job_root):
         local_changes=[e for e in entries if str(e.get('grid','validation'))==grid]
         first=gpd.read_file(local_periods[0]['centerlines'])
         metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
-        pairs=[]
+        pairs=[];pair_store=FrameSpool()
         for entry in local_changes:
             automatic=entry.get('automatic',entry.copy())
             frame=(gpd.read_file(entry['correction_audit'],layer='corrected_intervals').to_crs(metric)
                    if entry.get('correction_audit') else _auto_axes(automatic,metric))
-            pairs.append(dict(frame=frame,before_period=entry['before_period'],after_period=entry['after_period'],
+            pairs.append(FramePair(pair_store,len(pairs),frame,before_period=entry['before_period'],after_period=entry['after_period'],
                               original=entry,automatic=automatic))
         target=root/'final_roads'/clean_name(grid)
         active=[p for p in pairs if not p['frame'].empty]

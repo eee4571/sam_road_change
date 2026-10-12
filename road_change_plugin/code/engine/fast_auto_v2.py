@@ -5,6 +5,7 @@ within-period width variability require no stations or new width measurements.
 Raster evidence never supplies published geometry. Truth is not an input.
 """
 from collections import Counter
+from .disk_records import DiskMap,record_scope
 from dataclasses import dataclass
 import time
 
@@ -164,6 +165,7 @@ def _network_intervals(axis,target,tolerance,buffers,counts):
     for target_id in target.tree.query(axis,predicate='dwithin',distance=tolerance+1e-6):
         target_id=int(target_id);other=target.lines[target_id]
         if target_id not in buffers:buffers[target_id]=other.buffer(tolerance+.1)
+        if len(buffers)>256:buffers.pop(next(iter(buffers)))
         for part in line_parts(axis.intersection(buffers[target_id])):
             if part.length<1.:continue
             xy=np.asarray(part.coords)
@@ -358,6 +360,7 @@ def _strong_runs(indexes, strong):
     if run:yield run
 
 
+@record_scope
 def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None,compensation=None):
     modules=Fast2Compensation(compensation)
     if patch_verifier is not None and patch_verifier.compensation.config != modules.config:
@@ -371,7 +374,7 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
     if not evidence.ready:return records,audit,width_audit,dict(counts)
     counts['v2_evidence_resolution_m']=float(evidence.resolution);buffers={}
     from .fast_multitemporal import reconcile_temporal
-    tick=time.perf_counter();profiles={}
+    tick=time.perf_counter();profiles=DiskMap()
     for axis_id,axis in enumerate(before.lines):
         matched=_network_intervals(axis,after,tolerance,buffers,counts)
         profiles[axis_id]=_paired_profiles(axis,matched,before,after,minimum_length)

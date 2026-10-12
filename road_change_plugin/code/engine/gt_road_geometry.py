@@ -20,6 +20,8 @@ def compact_road_fit(geometry):
     origin=np.asarray(geometry.centroid.coords[0]);coords=np.asarray(geometry.exterior.coords)-origin
     projected=coords@direction; lo,hi=projected.min(),projected.max()
     step=min(2.,max(.5,(hi-lo)/30))
+    from .geometry_memory import within_budget
+    if not within_budget(hi-lo,step):return None
     stations=np.linspace(lo+.01,hi-.01,max(3,int(np.ceil((hi-lo)/step))+1))
     centers=[];widths=[]
     radius=lengths.max()*2

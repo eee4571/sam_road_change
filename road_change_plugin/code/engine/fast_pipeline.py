@@ -2498,6 +2498,10 @@ def _fast_road_export(path,width_row,transform,pixel_size,map_pixel_size,tile_id
     return common,corridor,width_row
 
 
+from .disk_records import record_scope
+
+
+@record_scope
 def measure_fast_widths(
     image_dir: Path,
     surface_dir: Path,
@@ -2534,7 +2538,9 @@ def measure_fast_widths(
             width_method,requested_pixel_size,molra_tile,molra_overlap,molra_threshold,default_width]
     batch_started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
-    layer_records: dict[str, list[dict]] = {key: [] for key in ("centerlines", "surfaces", "width_segments", "corridors")}
+    from .disk_records import DiskRows, write_gpkg_rows
+    layer_records = {key: DiskRows() if width_method=='raw_image' else []
+                     for key in ("centerlines", "surfaces", "width_segments", "corridors")}
     (output_dir/'width_completed.json').unlink(missing_ok=True)
     target_crs = None
     image_rows = []
@@ -2957,6 +2963,9 @@ def measure_fast_widths(
     working = output_dir / "fast_products.partial.gpkg"
     working.unlink(missing_ok=True)
     for index, (layer, records) in enumerate(layer_records.items()):
+        if width_method=='raw_image':
+            write_gpkg_rows(working,layer,records,target_crs)
+            continue
         frame = gpd.GeoDataFrame(records, geometry="geometry", crs=target_crs) if records else gpd.GeoDataFrame(
             {"tile": [], "exec_prof": []}, geometry=gpd.GeoSeries([], crs=target_crs), crs=target_crs,
         )
@@ -3159,7 +3168,10 @@ def prepare_regional_products(
     gpkg = output_dir / "regional_products.gpkg"
     gpkg.unlink(missing_ok=True)
     outputs = {}
-    frames = {layer: gpd.read_file(working, layer=layer) for layer in mapping}
+    # RGB replaces widths/corridors below; loading their old full-region copies
+    # only doubles resident geometry and cannot contribute evidence.
+    required=('centerlines','surfaces') if width_method=='raw_image' else mapping
+    frames = {layer: gpd.read_file(working, layer=layer) for layer in required}
     geometry_diagnostics=[]
     frames['centerlines']=clean_frame(frames['centerlines'],geometry_diagnostics)
     if validation_area is not None and validation_area.is_file():
@@ -3181,7 +3193,7 @@ def prepare_regional_products(
     if centers.crs is None or not centers.geom_type.isin(['LineString','MultiLineString']).all():
         raise ValueError('Regional centerlines require line geometries and an explicit CRS')
     from shapely import get_coordinates
-    if not np.isfinite(get_coordinates(centers.geometry)).all():
+    if any(not np.isfinite(get_coordinates(geometry)).all() for geometry in centers.geometry):
         raise ValueError('Regional centerlines contain nonfinite coordinates')
     network_dir=output_dir/'network_checkpoint'
     network_dir.mkdir(exist_ok=True)
@@ -3194,7 +3206,9 @@ def prepare_regional_products(
             'road_axis_quality.py','geometry_recovery.py','road_connection_evidence.py','bounded_grid.py','raster_memory.py',
             'road_track_corridors.py','road_geometry.py')]])
     # Include the actual clipped input, so clipping/CRS changes invalidate recovery.
-    network_inputs += [str(centers.crs),hashlib.sha256(b''.join(centers.geometry.to_wkb())).hexdigest()]
+    geometry_digest=hashlib.sha256()
+    for geometry in centers.geometry:geometry_digest.update(geometry.wkb)
+    network_inputs += [str(centers.crs),geometry_digest.hexdigest()]
     network_cached=read_completed(network_marker,network_inputs)
     if network_cached is not None:
         frames['centerlines']=gpd.read_file(network_file,layer='centerlines')

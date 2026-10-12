@@ -1,5 +1,7 @@
 # 道路提取与变化检测全流程内存审计
 
+> 本文保留改造前的审计结论。2026-10-12 已实施的修复、实测结果和仍存在的边界见 [FULL_PIPELINE_MEMORY_SAFETY.md](FULL_PIPELINE_MEMORY_SAFETY.md)。
+
 日期：2026-10-12。审计基线：`main` 的 `c7646f8e8f58a18b576d082a977c4743c06ece3b`。
 
 ## 结论与范围

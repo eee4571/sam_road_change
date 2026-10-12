@@ -59,16 +59,18 @@ class RecoveryExportTests(unittest.TestCase):
         axis,_=self.audits(result)
         self.assertEqual(axis['summary']['skipped_count'],1)
 
-    def test_bad_corridor_skips_only_its_chain(self):
+    def test_bad_corridor_retains_chain_with_estimated_width(self):
         self.regional([line(0,100),line(0,100,100)])
         real=surface._chain_surface
         def corridor(axis,*args,**kw):
             if axis.centroid.y>50:raise AxisQualityError('forced corridor failure')
             return real(axis,*args,**kw)
         with patch.object(surface,'_chain_surface',side_effect=corridor):result=self.export()
-        self.assertEqual(len(gpd.read_file(result['centerlines'])),1)
+        centers=gpd.read_file(result['centerlines'])
+        self.assertEqual(len(centers),2)
+        self.assertTrue(centers.loc[centers.geometry.centroid.y>50,'width_qual'].eq('C').all())
         _,audit=self.audits(result)
-        self.assertEqual(audit['summary']['skipped_count'],1)
+        self.assertEqual(audit['summary']['fallback_count'],1)
         self.assertEqual(audit['failures'][0]['source_ids'],[1])
 
     def test_bad_junction_keeps_branch_bodies(self):
@@ -93,7 +95,7 @@ class RecoveryExportTests(unittest.TestCase):
         with patch.object(surface,'_chain_surface',side_effect=MemoryError('exhausted')):
             with self.assertRaises(MemoryError):self.export()
         frame=gpd.GeoDataFrame(geometry=[line(0,100)])
-        with self.assertRaisesRegex(ValueError,'projected metric CRS'):reconstruct_frames(frame,frame)
+        with self.assertRaisesRegex(RuntimeError,'projected metric CRS'):reconstruct_frames(frame,frame)
 
     def test_fault_isolated_without_losing_healthy_approaches(self):
         axis=LineString([(0,0),(30,0),(30,5),(35,5),(35,0),(40,0),(40,5),(45,5),(45,0),(80,0)])
@@ -105,12 +107,13 @@ class RecoveryExportTests(unittest.TestCase):
         self.assertTrue(all(not axis_quality(p,6)['abnormal'] for _,_,p in pieces))
         self.assertTrue(issues)
 
-    def test_bugfix_does_not_restart_completed_period_export(self):
+    def test_algorithm_change_rebuilds_formal_products_only(self):
         self.regional([line(0,100)]);first=self.export()
         with patch('engine.formal_road_products.implementation_signature',return_value=['new bugfix']), \
-             patch('engine.formal_road_products.reconstruct_frames',side_effect=AssertionError('completed period rebuilt')):
+             patch('engine.formal_road_products.reconstruct_frames',wraps=reconstruct_frames) as rebuild:
             self.assertTrue(formal_products_current(self.output))
-            self.assertEqual(self.export(),first)
+            self.export()
+            self.assertEqual(rebuild.call_count,1)
 
     def test_missing_checkpoint_still_retries_failed_export(self):
         self.regional([line(0,100)]);self.export()
@@ -131,13 +134,15 @@ class RecoveryExportTests(unittest.TestCase):
         _,audit=self.audits(result)
         self.assertTrue(any(r['stage']=='canonical_chain' for r in audit['failures']))
 
-    def test_all_skipped_geometries_export_empty_layers_with_warnings(self):
+    def test_all_corridor_failures_retain_valid_axes_with_warnings(self):
         self.regional([line(0,100)])
         with patch.object(surface,'_chain_surface',side_effect=AxisQualityError('unrepairable corridor')):result=self.export()
-        self.assertTrue(gpd.read_file(result['centerlines']).empty)
-        self.assertTrue(gpd.read_file(result['surfaces']).empty)
+        self.assertFalse(gpd.read_file(result['centerlines']).empty)
+        self.assertFalse(gpd.read_file(result['surfaces']).empty)
+        from engine.road_surface_quality import reliable_width
+        self.assertTrue(all(reliable_width(row) is False for row in gpd.read_file(result['width_segments']).to_dict('records')))
         _,audit=self.audits(result)
-        self.assertGreater(audit['summary']['skipped_count'],0)
+        self.assertGreater(audit['summary']['fallback_count'],0)
 
     def test_bad_projected_polygon_is_isolated(self):
         from engine.formal_road_products import export_polygons

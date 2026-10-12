@@ -684,6 +684,8 @@ def _valid_raster_footprint(path: Path, target_crs=None):
                     ) from exc
             if dataset.width <= 0 or dataset.height <= 0 or dataset.count <= 0:
                 raise ValueError(f"影像尺寸或波段数无效：{path}")
+            from engine.raster_memory import check_native_blocks
+            check_native_blocks(dataset)
             dataset.read(
                 1,
                 window=((0, min(1, dataset.height)), (0, min(1, dataset.width))),
@@ -1624,8 +1626,8 @@ def normalize_validation_sources(
     except ImportError as exc:
         raise RuntimeError("验证区分析范围规范化需要本项目内的 rasterio/shapely 环境") from exc
     area = _read_validation_area(Path(validation_area).expanduser().resolve())
-    if tile_size <= 0:
-        raise ValueError("验证区分析切片大小必须大于 0")
+    if tile_size <= 0 or tile_size > 4096:
+        raise ValueError("验证区分析切片大小必须在 1..4096 内；保持原始分辨率，使用更多切片")
     periods = dict(sorted(periods.items(), key=lambda pair: period_sort_key(pair[0])))
     sources = {period: listed_rasters(source) for period, source in periods.items()}
     if any(not rasters for rasters in sources.values()):
@@ -1644,6 +1646,8 @@ def normalize_validation_sources(
     for rasters in sources.values():
         for raster in rasters:
             with rasterio.open(raster) as dataset:
+                from engine.raster_memory import check_native_blocks
+                check_native_blocks(dataset)
                 if dataset.crs is None:
                     raise ValueError(f"影像缺少 CRS：{raster}")
                 left, bottom, right, top = transform_bounds(
@@ -1755,32 +1759,32 @@ def normalize_validation_sources(
         window_total = int(np.ceil(height / tile_size) * np.ceil(width / tile_size))
         window_number = 0
         with ExitStack() as stack:
-            datasets = [stack.enter_context(rasterio.open(raster)) for raster in rasters]
-            virtual_sources = []
+            from engine.raster_memory import RasterPool
+            from engine.width.raw_memory import bounded_gdal_cache
+            stack.enter_context(bounded_gdal_cache())
             virtual_data_indexes = []
             source_bounds = []
-            for dataset in datasets:
-                indexes = [
-                    index for index, color in enumerate(dataset.colorinterp, start=1)
-                    if color != ColorInterp.alpha
-                ]
-                has_alpha = any(color == ColorInterp.alpha for color in dataset.colorinterp)
+            for raster in rasters:
+                with rasterio.open(raster) as dataset:
+                    virtual_data_indexes.append([index for index,color in enumerate(dataset.colorinterp,start=1)
+                                                 if color != ColorInterp.alpha])
+                    source_bounds.append(box(*transform_bounds(dataset.crs,analysis_crs,*dataset.bounds,densify_pts=21)))
+            def open_virtual(source_id, resources):
+                dataset=resources.enter_context(rasterio.open(rasters[source_id]))
                 options = {
                     "crs": analysis_crs,
                     "transform": transform,
                     "width": width,
                     "height": height,
                     "resampling": Resampling.nearest,
+                    "warp_mem_limit": 32,
                 }
                 # Existing Alpha already supplies the validity mask.  Asking
                 # GDAL to add another Alpha band raises WarpOptionsError.
-                if not has_alpha:
+                if ColorInterp.alpha not in dataset.colorinterp:
                     options["add_alpha"] = True
-                virtual_sources.append(stack.enter_context(WarpedVRT(dataset, **options)))
-                virtual_data_indexes.append(indexes)
-                source_bounds.append(box(*transform_bounds(
-                    dataset.crs, analysis_crs, *dataset.bounds, densify_pts=21,
-                )))
+                return resources.enter_context(WarpedVRT(dataset, **options))
+            virtual_sources=stack.enter_context(RasterPool(open_virtual))
             for row_off in range(0, height, tile_size):
                 for col_off in range(0, width, tile_size):
                     window_number += 1
@@ -1827,7 +1831,7 @@ def normalize_validation_sources(
                         if footprint.intersects(active_geometry)
                     ]
                     for source_id in selected_sources:
-                        virtual_source = virtual_sources[source_id]
+                        virtual_source = virtual_sources.get(source_id)
                         indexes = virtual_data_indexes[source_id]
                         try:
                             valid = virtual_source.dataset_mask(window=window) != 0
@@ -1837,11 +1841,12 @@ def normalize_validation_sources(
                                 masked=False,
                             )
                         except Exception as exc:
-                            read_errors.append(
-                                f"{rasters[source_id]} / 窗口行 {row_off}、列 {col_off}："
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            continue
+                            # A failed decode is not absent coverage. In
+                            # particular never cache MemoryError as no_data.
+                            raise RuntimeError(
+                                f"影像读取失败（保留已完成切片）：{rasters[source_id]} / "
+                                f"窗口行 {row_off}、列 {col_off}: {type(exc).__name__}: {exc}"
+                            ) from exc
                         source_valid = inside_tile & valid
                         if not bool(source_valid.any()):
                             continue

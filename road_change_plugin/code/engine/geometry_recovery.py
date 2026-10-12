@@ -81,9 +81,25 @@ def geometry_union(items, stage='polygon_union', sources=()):
     """Normal bulk union; isolate only failing operands if GEOS rejects it."""
     from shapely import union_all
     from shapely.geometry import GeometryCollection
-    items=list(items)
+    from .disk_records import batches
+    # Bound the GEOS operand fan-in. The final geometry is still exact and
+    # necessarily proportional to output complexity; no vertex simplification.
+    items=iter(items);first=list(next(iter(batches(items,257)),[]))
+    if len(first)>256:
+        from itertools import chain
+        groups=[]
+        offset=0
+        for group in batches(chain(first,items),256):
+            ids=sources[offset:offset+len(group)] if sources else [[i] for i in range(offset,offset+len(group))]
+            groups.append(geometry_union(group,stage,ids));offset+=len(group)
+        while len(groups)>256:
+            groups=[geometry_union(group,stage) for group in batches(groups,256)]
+        return union_all(groups)
+    items=first
     try:return union_all(items)
-    except GEOMETRY_ERRORS:
+    except GEOMETRY_ERRORS as error:
+        from .width.width_reliability import require_road_local
+        require_road_local(error)
         if _current.get() is None:raise
     result=GeometryCollection()
     for i,item in enumerate(items):

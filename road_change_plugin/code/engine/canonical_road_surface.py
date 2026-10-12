@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 import numpy as np
+from .geometry_memory import bounded_linspace
 from shapely import union_all, line_interpolate_point, line_locate_point, set_precision
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import substring, polygonize
@@ -97,7 +98,7 @@ def _collapse_duplicates(profiles, quality, metadata):
                 # Both axes must lie within the narrower road's own half-width.
                 # A fixed 2m limit misses duplicates of a 20-30m wide road.
                 tolerance=min(12.,.5*min(width,float(np.median(profiles[j][2]))))
-                ss=np.linspace(0,axis.length,max(9,int(axis.length/3)+1))
+                ss=bounded_linspace(0,axis.length,max(9,int(axis.length/3)+1))
                 pts=line_interpolate_point(axis,ss)
                 loc=line_locate_point(ref,pts)
                 projected=line_interpolate_point(ref,loc)
@@ -168,7 +169,7 @@ def _collapse_duplicates(profiles, quality, metadata):
                 stations={float(axis.project(Point(p))):p for p in axis.coords}
                 stations.update(contacts[i]);new=LineString([p for _,p in sorted(stations.items())])
             if new.equals_exact(axis,1e-10):result.append((axis,ss,ww));grades.append(quality[i]);continue
-            s=np.linspace(0,new.length,max(2,int(np.ceil(new.length/2))+1))
+            s=bounded_linspace(0,new.length,max(2,int(np.ceil(new.length/2))+1))
             loc=line_locate_point(axis,line_interpolate_point(new,s))
             result.append((new,s,np.interp(loc,ss,ww)))
             grades.append(np.interp(loc,ss,quality[i]))
@@ -251,7 +252,7 @@ def _build_graph(profiles, quality, metadata):
                 sources.sort()
                 if not sources:
                     raise ValueError(f'Noded road edge lost its source correspondence: {axis.wkt}; hits={list(hits)}')
-                s = np.linspace(0., axis.length, max(2, int(np.ceil(axis.length/2.))+1))
+                s = bounded_linspace(0., axis.length, max(2, int(np.ceil(axis.length/2.))+1))
                 points = line_interpolate_point(axis, s)
                 widths, grades = [], []
                 for i in sources:
@@ -334,7 +335,11 @@ def _chain(edges, route):
         else:stations.extend(s);widths.extend(w);grades.extend(q)
         offset += edge.axis.length
     axis = LineString(coords)
-    s = np.linspace(0.,axis.length,max(2,int(np.ceil(axis.length/2.))+1))
+    from .geometry_memory import within_budget
+    dense = within_budget(axis.length, 2.)
+    s = (bounded_linspace(0.,axis.length,max(2,int(np.ceil(axis.length/2.))+1))
+         if dense else np.asarray(stations))
+    if not dense:grades=np.zeros(len(grades))
     first,last = route[0],route[-1]
     return Chain(axis,s,np.interp(s,stations,widths),np.interp(s,stations,grades),
         tuple(sorted({src for k,_ in route for src in edges[k].sources})),
@@ -354,7 +359,9 @@ def _prune_terminals(edges, metadata, evidence, observations):
     for ends in nodes.values():
         if len(ends)==2 and ends[0][0]!=ends[1][0]:
             pair[ends[0]]=ends[1];pair[ends[1]]=ends[0]
-    temporal=[STRtree(lines) for lines in observations if len(lines)]
+    from .vector_evidence import PeriodEvidence
+    temporal=(observations if isinstance(observations,PeriodEvidence) else
+              PeriodEvidence(range(len(observations)),lambda i:observations[i]))
     ev=None;loaded=False;audit=[];handled=set()
 
     def decide_impl(ids,kind,axis=None):
@@ -376,14 +383,13 @@ def _prune_terminals(edges, metadata, evidence, observations):
         # Trace begins at the tip: discard the supported main-road root when
         # assessing a tooth, rather than counting its crossing as road evidence.
         if kind=='terminal_spur':parts=[substring(parts[0],0,parts[0].length*.65)]
-        points=[p for part in parts for p in line_interpolate_point(part,np.linspace(0,part.length,9))]
+        points=[p for part in parts for p in line_interpolate_point(part,bounded_linspace(0,part.length,9))]
         reason='topology_short_'+kind
         protected=any(_constrained(metadata[i]) for i in sources)
         if protected:reason='event_constrained'
         elif all(float(np.mean(edges[k].quality>=.99))>=.8 for k in ids):
             protected=True;reason='strong_rgb_support'
-        elif any(np.mean([len(t.query(p,predicate='dwithin',distance=min(1.5,width/5)))>0 for p in points])>=.85
-                 for t in temporal):
+        elif temporal.supported(points,min(1.5,width/5)):
             protected=True;reason='strong_other_period_support'
         score=[]
         if not protected:
@@ -544,7 +550,7 @@ def _repair_degree_two(edges, active, metadata, evidence):
             # Interval fits can individually be simple but meet another part of a
             # returning chain. Accept the assembled axis only after full-chain QA.
             if not fixed.is_simple or axis_quality(fixed,float(np.max(chain.widths)))['abnormal'] or not validate(fixed):continue
-            s=np.linspace(0,fixed.length,max(2,int(np.ceil(fixed.length/2))+1))
+            s=bounded_linspace(0,fixed.length,max(2,int(np.ceil(fixed.length/2))+1))
             location=line_locate_point(old,line_interpolate_point(fixed,s))
             keep=min(ids)
             edges[keep]=Edge(fixed,s,np.interp(location,chain.stations,chain.widths),
@@ -823,7 +829,7 @@ def _repair_canonical_shapes(chains, original_widths, evidence):
                     width_transfer_reverted=qa['abnormal'],axis_quality='low',repair_status=status))
                 continue
             if not report.get('corrected'):continue
-            stations=np.linspace(0,fixed.length,max(2,int(np.ceil(fixed.length/2))+1))
+            stations=bounded_linspace(0,fixed.length,max(2,int(np.ceil(fixed.length/2))+1))
             old_locations=line_locate_point(old,line_interpolate_point(fixed,stations))
             c.widths=np.interp(old_locations,c.stations,c.widths)
             c.quality=np.interp(old_locations,c.stations,c.quality)
@@ -1131,7 +1137,7 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
         if not hasattr(c,'recovery_parts'):
             surviving.append(c);reports.append(report);continue
         for low,high,part in c.recovery_parts:
-            ss=np.linspace(0,part.length,max(2,int(np.ceil(part.length/2))+1))
+            ss=bounded_linspace(0,part.length,max(2,int(np.ceil(part.length/2))+1))
             locations=np.interp(ss,[0.,part.length],[low,high])
             ends=(_node(c.ends[0][0],part.coords[0]),_node(c.ends[1][0],part.coords[-1]))
             surviving.append(Chain(part,ss,np.interp(locations,c.stations,c.widths),
@@ -1251,6 +1257,39 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
 
 
 def build_road_geometry(profiles, quality, *, metadata=None, evidence=None, observations=()):
+    from .geometry_memory import within_budget
+    oversized = [i for i,(axis,ss,ww) in enumerate(profiles) if not within_budget(axis.length, 1.)]
+    if oversized:
+        # Keep source positions stable for normal graph edges and audits. Sparse
+        # long axes already exceed RGB measurement limits: publish explicit C
+        # estimates without any length-proportional resampling or axis deletion.
+        normal=list(profiles);grades=list(quality)
+        for i in oversized:
+            normal[i]=(LineString(),np.array([0.,1.]),np.ones(2));grades[i]=np.zeros(2)
+        surface,chains,audit=build_road_geometry(normal,grades,metadata=metadata,evidence=evidence,observations=observations)
+        for i in oversized:
+            axis,ss,ww=profiles[i]
+            if axis.is_empty or not axis.is_valid or not np.isfinite(np.asarray(axis.coords)).all():
+                raise ValueError('Invalid oversized road geometry')
+            values=np.asarray(ww,float)
+            if not len(values) or not np.isfinite(values).all() or np.any(values<=0):
+                raise ValueError('Oversized road requires finite positive fallback widths')
+            # The temporary surface follows every original centerline vertex.
+            width=float(np.median(values));s=np.array([0.,axis.length]);w=np.array([width,width])
+            c=Chain(axis,s,w,np.zeros(2),(i,),(_node(_level((metadata or [{}]*len(profiles))[i]),axis.coords[0]),
+                                              _node(_level((metadata or [{}]*len(profiles))[i]),axis.coords[-1])),())
+            c.width_fallback_reason='geometry_station_budget_exceeded'
+            from .geometry_memory import GeometrySamplingLimit
+            if current_recovery() is not None:
+                current_recovery().record('geometry_sampling',[i],GeometrySamplingLimit(c.width_fallback_reason),
+                    status='fallback',final_action='retain_valid_geometry')
+            chains.append(c)
+            body=axis.buffer(width/2,cap_style='flat',join_style='round')
+            surface=geometry_union([surface,body])
+            audit.setdefault('memory_fallbacks',[]).append(dict(source_feature=i,quality_grade='C',
+                width_source='geometry_budget_estimate',fallback_reason=c.width_fallback_reason))
+        audit['summary']['canonical_chain_count']=len(chains)
+        return surface,chains,audit
     recovery=current_recovery() or Recovery()
     first=len(recovery.failures)
     with recovery_scope(recovery):

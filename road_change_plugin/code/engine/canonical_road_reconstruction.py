@@ -127,6 +127,9 @@ def _resample_polyline(points: np.ndarray, spacing: float) -> np.ndarray:
     length = float(cumulative[-1])
     if length <= 0:
         return points[[0]].copy()
+    from .geometry_memory import within_budget,GeometrySamplingLimit
+    if not within_budget(length,max(float(spacing),1e-6)):
+        raise GeometrySamplingLimit('polyline_resampling_exceeds_station_budget')
     positions = np.arange(0.0, length, max(float(spacing), 1e-6))
     positions = np.r_[positions, length]
     return np.column_stack([
@@ -2385,6 +2388,8 @@ def _smooth_low_frequency_track(
 ) -> _RegionalRoadSeed:
     """Remove metre-scale skeleton wobble while fixing both topology endpoints."""
     spacing = 2.5 / max(unit_size_m, 1e-9)
+    from .geometry_memory import within_budget
+    if not within_budget(_polyline_length(road.points),spacing):return road
     points = _resample_polyline(np.asarray(road.points, dtype=np.float64), spacing)
     if points.shape[0] < 5:
         return road

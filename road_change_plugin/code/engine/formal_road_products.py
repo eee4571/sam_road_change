@@ -41,7 +41,7 @@ def implementation_signature():
     return signature([Path(__file__).with_name(name) for name in (
         'formal_road_products.py', 'canonical_road_surface.py', 'road_axis_quality.py', 'geometry_recovery.py', 'bounded_grid.py',
         'road_surface_quality.py', 'auto_change_geometry.py', 'auto_change_assembly.py',
-        'gt_road_geometry.py', 'road_connection_evidence.py', 'fast_pipeline.py')]) + [FORMAL_ROAD_REVISION]
+        'gt_road_geometry.py', 'road_connection_evidence.py', 'geometry_memory.py', 'vector_evidence.py', 'fast_pipeline.py')]) + [FORMAL_ROAD_REVISION]
 
 
 def formal_metadata():

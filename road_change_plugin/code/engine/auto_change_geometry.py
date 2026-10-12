@@ -30,7 +30,8 @@ def _clean_overlay(geometry):
 
 
 def _stations(axis):
-    return np.linspace(0., axis.length, max(2, int(np.ceil(axis.length / 4.)) + 1))
+    from .geometry_memory import stations
+    return stations(axis.length, max(2, int(np.ceil(axis.length / 4.)) + 1))
 
 
 def _smooth(values):
@@ -53,6 +54,11 @@ class FinalWidths:
         self.tree = STRtree(self.frame.geometry.values)
 
     def _sample(self, axis, with_quality=False):
+        from .geometry_memory import within_budget
+        if not within_budget(axis.length):
+            # No measurement is inferred from two sparse endpoint probes. The
+            # caller's explicit display estimate is C, preserving the full axis.
+            return np.array([0.,axis.length]),np.full(2,np.nan),np.zeros(2)
         stations = _stations(axis)
         values = np.full(len(stations), np.nan)
         quality = np.full(len(stations), -1., dtype=float)

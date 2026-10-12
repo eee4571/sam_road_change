@@ -256,11 +256,12 @@ def measure_region(centerlines,image_dir,output_dir,*,default_width_m=None,surfa
         Path(__file__).with_name('chain_width_calculator.py'),Path(__file__).with_name('width_reliability.py'),
         Path(__file__).with_name('raw_memory.py')])
     import hashlib
-    identities += [str(VERSION),str(centerlines.crs),hashlib.sha256(json.dumps(centerlines.geometry.to_wkb(hex=True).tolist()).encode()).hexdigest(),
+    from ..geometry_memory import json_geometry_digest
+    identities += [str(VERSION),str(centerlines.crs),json_geometry_digest(centerlines.geometry),
                    json.dumps(asdict(c),sort_keys=True),json.dumps(asdict(rc),sort_keys=True),float(default_width_m)]
     if surface_evidence is not None:
         if surface_evidence.crs is None:raise InputContractError('Surface evidence requires CRS')
-        identities += [str(surface_evidence.crs),hashlib.sha256(json.dumps(surface_evidence.geometry.to_wkb(hex=True).tolist()).encode()).hexdigest()]
+        identities += [str(surface_evidence.crs),json_geometry_digest(surface_evidence.geometry)]
     marker=output/'completed.json';cached=read_completed(marker,identities)
     if cached:return gpd.read_file(cached['observations'],layer='width_observations')
     marker.unlink(missing_ok=True)
@@ -318,7 +319,8 @@ def measure_region(centerlines,image_dir,output_dir,*,default_width_m=None,surfa
     frames_by_id={};reused=0;last_report=time.perf_counter()
     reader=ImageReader(files,crs)
     try:
-        workers=min(4,os.cpu_count() or 1)
+        from ..resource_policy import worker_count
+        workers=worker_count(min(4,os.cpu_count() or 1))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             items=iter(road_map.items())
             futures={}

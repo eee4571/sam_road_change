@@ -13,10 +13,18 @@ from .raw_memory import MemoryPolicy, WORKSPACES, CACHE_LOCK, CACHES, admit_cach
 class TileMosaic:
     def __init__(self, paths):
         self.sources=[]
+        from types import SimpleNamespace
+        from ..raster_memory import RasterPool,check_native_blocks
+        self._io=RLock()
+        self._pool=RasterPool(lambda path,stack:stack.enter_context(rasterio.open(path)),capacity=8)
         self._cache_context=bounded_gdal_cache()
         self._cache_context.__enter__()
         try:
-            for path in paths:self.sources.append(rasterio.open(path))
+            for path in paths:
+                with rasterio.open(path) as ds:
+                    check_native_blocks(ds)
+                    self.sources.append(SimpleNamespace(**{name:getattr(ds,name) for name in
+                        ('name','crs','count','dtypes','transform','res','width','height')}))
             self._initialize_grid()
         except BaseException:
             self.close()
@@ -53,15 +61,17 @@ class TileMosaic:
             x0,y0=max(x,dx),max(y,dy);x1,y1=min(x+w,dx+ds.width),min(y+h,dy+ds.height)
             if x1<=x0 or y1<=y0:continue
             win=Window(x0-dx,y0-dy,x1-x0,y1-y0)
-            data=ds.read([1,2,3],window=win).transpose(1,2,0)
-            mask=(ds.read_masks([1,2,3],window=win)>0).all(0)
+            with self._io:
+                source=self._pool.get(ds.name)
+                data=source.read([1,2,3],window=win).transpose(1,2,0)
+                mask=(source.read_masks([1,2,3],window=win)>0).all(0)
             sl=np.s_[y0-y:y1-y,x0-x:x1-x]
             use=mask & ~valid[sl];rgb[sl][use]=data[use];valid[sl]|=mask
         return rgb,valid
 
     def close(self):
         try:
-            for ds in self.sources:ds.close()
+            self._pool.close()
         finally:
             if self._cache_context is not None:
                 self._cache_context.__exit__(None,None,None)

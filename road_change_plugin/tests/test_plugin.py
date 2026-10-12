@@ -154,6 +154,17 @@ class PluginTests(unittest.TestCase):
         runner.consume_line(PREFIX+'{"kind":"stage","stage_index":9,"stage_total":4}')
         self.assertEqual(progress[-1]["progress"], 1.0)
 
+    def test_giant_plain_log_and_file_tail_are_bounded(self):
+        from plugin.log_memory import tail_lines
+        runner=FakeRunner();runner.script="import sys;sys.stdout.write('x'*3000000);sys.stdout.flush()"
+        runner.start([]);wait_done(runner)
+        self.assertEqual(runner.state,'completed')
+        self.assertLessEqual(len(runner._buffer),1024*1024)
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'log.txt'
+            path.write_bytes(b'x'*3000000+b'\nlast\n')
+            self.assertEqual(tail_lines(path),['last'])
+
     def test_qprocess_success_and_fragmented_unicode(self):
         runner = FakeRunner()
         runner.script = "import os,time; data='__SAMROAD_USER__{\"kind\":\"complete\",\"stage\":\"all\",\"message\":\"道路\"}'.encode(); os.write(1,data[:-3]); time.sleep(.03); os.write(1,data[-3:])"

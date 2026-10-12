@@ -63,9 +63,8 @@ class Worker:
             try:
                 code = future.result()
             except Exception:
-                if pending_key == key:
-                    self.pending = None
-                    raise
+                self.pending = None
+                raise
             print(f'[Fast batch timing] gpu_pipeline_wait={time.perf_counter()-started:.6f}s', flush=True)
             self.metrics['gpu_pipeline_wait'] += time.perf_counter()-started
             if pending_key == key:
@@ -87,26 +86,39 @@ class Worker:
             return
         if (self.planner and self.centerline_command is not None
                 and command[1:4] == ['-m','engine.fast_pipeline','width'] and self.pending is None):
+            from .resource_policy import try_speculation, GIB
+            lease=try_speculation(ram_bytes=3*GIB)
+            if lease is None:
+                print('[Memory] next-period prefetch deferred; foreground retains checkpoints', flush=True)
+                return
             centerline, self.centerline_command = self.centerline_command, None
             planner, self.planner = self.planner, None
             try:
                 preparation_started=time.perf_counter()
                 following = planner(centerline)
                 self.metrics['next_period_preparation']+=time.perf_counter()-preparation_started
-            except Exception as exc:
-                # Preparation failure belongs to the following period's normal
-                # execution/retry, never to the already completed current stage.
-                print(f'[Fast batch] prefetch preparation deferred: {exc}', flush=True)
-                return
+            except BaseException:
+                lease.close()
+                raise
             if following:
-                self.pending = (command_key(following), self.executor.submit(self._execute_prefetch, following, cwd, env))
+                try:
+                    self.pending = (command_key(following), self.executor.submit(self._execute_prefetch, following, cwd, env,lease))
+                except BaseException:
+                    lease.close()
+                    raise
+            else:lease.close()
 
-    def _execute_prefetch(self,command,cwd,env):
+    def _execute_prefetch(self,command,cwd,env,lease=None):
         started=time.perf_counter()
         try:return self._execute(command,cwd,env)
-        finally:self.metrics['next_period_prefetch']+=time.perf_counter()-started
+        finally:
+            if lease is not None:lease.close()
+            self.metrics['next_period_prefetch']+=time.perf_counter()-started
 
     def _execute(self, command, cwd, env):
+        env=dict(env)
+        for key in ('ROAD_RESOURCE_LEDGER','ROAD_PIPELINE_RAM_MB','ROAD_PIPELINE_VRAM_MB','ROAD_PIPELINE_PARALLEL'):
+            if key in os.environ:env[key]=os.environ[key]
         if self.process is None:
             root = Path(__file__).resolve().parents[1]
             self.process = subprocess.Popen([command[0], '-m', 'engine.batch_runtime'],
@@ -210,14 +222,19 @@ def batch_models(function):
         if _active is not None:
             return function(*args, **kwargs)
         started = time.perf_counter()
-        _active = Worker()
+        from .resource_policy import ResourceSession
+        session=ResourceSession();session.__enter__()
         try:
+            _active = Worker()
             return function(*args, **kwargs)
         finally:
             worker, _active = _active, None
-            worker.close()
-            worker.metrics['total'] = time.perf_counter()-started
-            print('[Fast batch summary] '+json.dumps(dict(worker.metrics),sort_keys=True), flush=True)
+            try:
+                if worker is not None:worker.close()
+            finally:session.__exit__(None,None,None)
+            if worker is not None:
+                worker.metrics['total'] = time.perf_counter()-started
+                print('[Fast batch summary] '+json.dumps(dict(worker.metrics),sort_keys=True), flush=True)
             print(f'[Fast batch timing] total={time.perf_counter()-started:.6f}s', flush=True)
     return wrapped
 

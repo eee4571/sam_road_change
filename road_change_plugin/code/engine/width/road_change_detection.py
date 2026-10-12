@@ -1164,31 +1164,27 @@ def _matched_object_pairs(
         _support_geometries([geometry], line_tolerance)
         for geometry in truth.geometry
     ]
-    candidates = []
     truth_tree = STRtree(truth_support)
-    for predicted_index, predicted_geometry in enumerate(predicted_support):
-        for raw_index in truth_tree.query(predicted_geometry):
-            truth_index = int(raw_index)
-            truth_geometry = truth_support[truth_index]
-            intersection = float(predicted_geometry.intersection(truth_geometry).area)
-            if intersection <= 0:
-                continue
-            union = float(predicted_geometry.union(truth_geometry).area)
-            iou = intersection / union if union else 0.0
-            if iou >= iou_threshold:
-                candidates.append((iou, predicted_index, truth_index))
-    matched_predicted = set()
-    matched_truth = set()
-    pairs = []
-    for _iou, predicted_index, truth_index in sorted(candidates, reverse=True):
-        if predicted_index in matched_predicted or truth_index in matched_truth:
-            continue
-        matched_predicted.add(predicted_index)
-        matched_truth.add(truth_index)
-        pairs.append((predicted_index, truth_index))
-    return pairs
+    def candidates():
+        for predicted_index, predicted_geometry in enumerate(predicted_support):
+            for raw_index in truth_tree.query(predicted_geometry):
+                truth_index = int(raw_index)
+                truth_geometry = truth_support[truth_index]
+                intersection = float(predicted_geometry.intersection(truth_geometry).area)
+                if intersection <= 0:
+                    continue
+                union = float(predicted_geometry.union(truth_geometry).area)
+                iou = intersection / union if union else 0.0
+                if iou >= iou_threshold:
+                    yield (iou, predicted_index, truth_index)
+    from engine.evaluation_memory import greedy_pairs
+    return greedy_pairs(candidates())
 
 
+from engine.evaluation_memory import bounded_metric, check_grid
+
+
+@bounded_metric
 def _centerline_offset_metrics(
     predicted: gpd.GeoDataFrame,
     truth: gpd.GeoDataFrame,
@@ -1234,36 +1230,8 @@ def _centerline_offset_metrics(
         for index in range(len(truth))
     ]
     truth_match_supports = [geometry.buffer(evaluation_tolerance) for geometry in truth_supports]
-    predicted_links = [set() for _ in predicted_supports]
-    truth_links = [set() for _ in truth_supports]
-    for predicted_index, predicted_geometry in enumerate(predicted_supports):
-        for truth_index, truth_geometry in enumerate(truth_match_supports):
-            if predicted_geometry.intersects(truth_geometry):
-                predicted_links[predicted_index].add(truth_index)
-                truth_links[truth_index].add(predicted_index)
-
-    # Connected bipartite groups handle one truth polygon corresponding to two
-    # carriageway polygons (and the inverse) without forcing one-to-one matching.
-    groups: list[tuple[set[int], set[int]]] = []
-    visited_truth: set[int] = set()
-    for start in range(len(truth_supports)):
-        if start in visited_truth or not truth_links[start]:
-            continue
-        group_truth: set[int] = set()
-        group_predicted: set[int] = set()
-        truth_stack = [start]
-        while truth_stack:
-            truth_index = truth_stack.pop()
-            if truth_index in group_truth:
-                continue
-            group_truth.add(truth_index)
-            visited_truth.add(truth_index)
-            for predicted_index in truth_links[truth_index]:
-                if predicted_index in group_predicted:
-                    continue
-                group_predicted.add(predicted_index)
-                truth_stack.extend(predicted_links[predicted_index] - group_truth)
-        groups.append((group_predicted, group_truth))
+    from engine.evaluation_memory import intersection_groups
+    groups=intersection_groups(predicted_supports,truth_match_supports)
 
     if not groups:
         result["centerline_offset_reason"] = "没有空间对应的预测与真值变化对象"
@@ -1298,6 +1266,7 @@ def _centerline_offset_metrics(
             resolution *= scale
             width = max(1, int(math.ceil((maxx - minx) / resolution)) + 4)
             height = max(1, int(math.ceil((maxy - miny) / resolution)) + 4)
+        check_grid((height, width))
         transform = from_origin(minx - 2 * resolution, maxy + 2 * resolution, resolution, resolution)
 
         def axis(geometry: BaseGeometry) -> np.ndarray:
@@ -1694,6 +1663,7 @@ def evaluate_fast_truth_metrics(
     }
 
 
+@bounded_metric
 def evaluate_fast_assisted_centerline_metrics(
     predicted: gpd.GeoDataFrame,
     truth: gpd.GeoDataFrame,
@@ -1783,6 +1753,7 @@ def evaluate_fast_assisted_centerline_metrics(
         column_stop = min(width, int(math.ceil(max_x)) + padding + 1)
         row_stop = min(height, int(math.ceil(max_y)) + padding + 1)
         local_shape = (row_stop - row_start, column_stop - column_start)
+        check_grid(local_shape)
         if local_shape[0] <= 0 or local_shape[1] <= 0:
             empty = np.zeros((0, 0), dtype=bool)
             return empty, empty

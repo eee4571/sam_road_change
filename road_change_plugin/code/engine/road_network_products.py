@@ -91,7 +91,8 @@ def recover_centerline_frame(frame, surfaces=None, *, authoritative=False, proba
     widths = np.where(np.isfinite(widths) & (widths>0),widths,6.)
     seeds = [_RegionalRoadSeed(np.asarray(row.geometry.coords),float(widths[i]),(i,))
              for i,row in metric.iterrows()]
-    surface = unary_union(surfaces.to_crs(projected).geometry) if surfaces is not None and not surfaces.empty else None
+    from .geometry_recovery import geometry_union
+    surface = geometry_union(surfaces.to_crs(projected).geometry) if surfaces is not None and not surfaces.empty else None
     from .road_connection_evidence import ConnectionEvidence, RoadProbability, ArrayRoadProbability
     from shapely.affinity import scale
     probability=(ArrayRoadProbability(probability_arrays,frame.crs,projected,unit) if probability_arrays

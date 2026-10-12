@@ -25,6 +25,19 @@ from shapely.strtree import STRtree
 class ImageTiles:
     def __init__(self,payload,crs):
         self.stack=ExitStack();self.rows=[];self.crs=crs;self.reads=0
+        from .raster_memory import RasterPool,check_native_blocks
+        from .width.raw_memory import bounded_gdal_cache
+        self.stack.enter_context(bounded_gdal_cache())
+        def open_pair(index,resources):
+            image,surface,_=self.rows[index]
+            ds=resources.enter_context(rasterio.open(image));check_native_blocks(ds)
+            mask=resources.enter_context(rasterio.open(surface)) if surface else None
+            if mask is not None:
+                check_native_blocks(mask)
+                mask=resources.enter_context(WarpedVRT(mask,src_crs=ds.crs,src_transform=ds.transform,
+                    crs=ds.crs,transform=ds.transform,width=ds.width,height=ds.height,warp_mem_limit=16))
+            return ds,mask
+        self.pool=self.stack.enter_context(RasterPool(open_pair,capacity=4))
         directory=Path(str(payload.get('width_review') or '__missing__'))
         try:
             for path in sorted(directory.glob('*_summary.json')):
@@ -32,16 +45,17 @@ class ImageTiles:
                 if not row.get('image'):continue
                 image=Path(row['image'])
                 if not image.is_file():continue
-                ds=self.stack.enter_context(rasterio.open(image))
-                if not ds.crs:continue
                 surface=Path(str(row.get('enhanced_molra_surface_mask') or row.get('molra_surface_mask') or '__missing__'))
-                mask=self.stack.enter_context(rasterio.open(surface)) if surface.is_file() else None
-                if mask is not None and mask.shape!=ds.shape:mask=None
-                if mask is not None:
-                    mask=self.stack.enter_context(WarpedVRT(mask,src_crs=ds.crs,src_transform=ds.transform,
-                        crs=ds.crs,transform=ds.transform,width=ds.width,height=ds.height))
-                bounds=transform_bounds(ds.crs,crs,*ds.bounds)
-                self.rows.append((ds,mask,box(*bounds)))
+                with rasterio.open(image) as ds:
+                    check_native_blocks(ds)
+                    if not ds.crs:continue
+                    bounds=transform_bounds(ds.crs,crs,*ds.bounds)
+                    if surface.is_file():
+                        with rasterio.open(surface) as mask:
+                            check_native_blocks(mask)
+                            if mask.shape!=ds.shape:surface=None
+                    else:surface=None
+                self.rows.append((image,surface,box(*bounds)))
             self.tree=STRtree([r[2] for r in self.rows])
         except Exception:
             self.close();raise
@@ -51,7 +65,7 @@ class ImageTiles:
     def read(self,bounds,shape,transform):
         rgb=np.full((3,*shape),np.nan,np.float32);surface=np.full(shape,np.nan,np.float32)
         for index in sorted(self.tree.query(box(*bounds))):
-            ds,mask,_=self.rows[index]
+            ds,mask=self.pool.get(int(index))
             channels=list(range(1,min(3,ds.count)+1));data=np.full((len(channels),*shape),np.nan,np.float32)
             reproject(rasterio.band(ds,channels),data,src_transform=ds.transform,src_crs=ds.crs,
                       dst_transform=transform,dst_crs=self.crs,dst_nodata=np.nan,

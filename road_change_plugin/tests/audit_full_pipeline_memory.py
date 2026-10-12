@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'code'))
 sys.path.insert(0, str(ROOT / 'code/engine/width'))
+sys.path.insert(0, str(ROOT / 'code/engine/samroad'))
 import geopandas as gpd
 import numpy as np
 from rasterio.transform import Affine
@@ -28,6 +29,7 @@ class AllocationIntercepted(BaseException):
 
 def capture_allocation(module, attribute, operation, dimensions):
     requests = []
+    prevented=None
 
     def intercepted(*args, **kwargs):
         requests.append(dimensions(args, kwargs))
@@ -38,7 +40,9 @@ def capture_allocation(module, attribute, operation, dimensions):
             operation()
         except AllocationIntercepted:
             pass
-    return dict(reached_allocation=bool(requests), requests=requests)
+        except ValueError as error:
+            prevented=str(error)
+    return dict(reached_allocation=bool(requests), requests=requests,preflight_rejection=prevented)
 
 
 def pure_inference_functions():
@@ -51,7 +55,7 @@ def pure_inference_functions():
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     if len(body) != len(names):
         raise RuntimeError('Inference planning functions changed; update this audit.')
-    namespace = {}
+    namespace = dict(args=SimpleNamespace(max_image_megapixels=25.))
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
 
@@ -87,7 +91,7 @@ def audit():
         shape_costs.append(dict(size=size, patches=count,
             fusion_float32_bytes=3*size*size*4,
             retained_two_channel_float32_masks_bytes=count*2*p*p*4,
-            note='Excludes retained embeddings, model weights, batch activations and CPU arrays.'))
+            note='Historical eager-cache lower bound; current implementation spills bounded batches.'))
     findings['inference_array_lower_bounds'] = dict(
         infer_batch_size=config['INFER_BATCH_SIZE'], patch_size=config['PATCH_SIZE'],
         sample_margin=config['SAMPLE_MARGIN'], cases=shape_costs)

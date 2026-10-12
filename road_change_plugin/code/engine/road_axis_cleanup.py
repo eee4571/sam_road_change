@@ -32,6 +32,11 @@ def _axis_candidate(road):
     line = LineString(original)
     if line.length < 25 or np.array_equal(original[0], original[-1]):
         return None
+    from .geometry_memory import within_budget
+    if not within_budget(line.length):
+        # Optional wobble smoothing must never expand a valid sparse axis into
+        # billions of points. Original geometry and provenance remain unchanged.
+        return None
     distances = np.arange(0., line.length, 1.)
     distances = np.r_[distances, line.length]
     points = np.asarray([line.interpolate(s).coords[0] for s in distances])

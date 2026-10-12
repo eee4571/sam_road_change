@@ -1,0 +1,386 @@
+{
+  "date": "2026-10-12",
+  "baseline_commit": "9b6dc28a0844a6b0520459ec85267a71e1a73d17",
+  "test_executions": 460,
+  "suites": [
+    {
+      "log": "memory_final_check_axis_lifecycle.py.log",
+      "tests": 44,
+      "seconds": 19.1,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_axis_repair_seams.py.log",
+      "tests": 6,
+      "seconds": 1.913,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_fast2_structure.py.log",
+      "tests": 23,
+      "seconds": 1.274,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_final_road_states.py.log",
+      "tests": 21,
+      "seconds": 13.277,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_formal_period_products.py.log",
+      "tests": 17,
+      "seconds": 11.428,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_geometry_recovery.py.log",
+      "tests": 12,
+      "seconds": 5.372,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_irmad_cache_recovery.py.log",
+      "tests": 11,
+      "seconds": 1.431,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_processing_optimizations.py.log",
+      "tests": 25,
+      "seconds": 5.96,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_road_network_degeneracy.py.log",
+      "tests": 41,
+      "seconds": 2.707,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_surface_generalization.py.log",
+      "tests": 6,
+      "seconds": 0.509,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_surface_quality.py.log",
+      "tests": 48,
+      "seconds": 1.829,
+      "passed": true
+    },
+    {
+      "log": "memory_final_check_width_resilience.py.log",
+      "tests": 17,
+      "seconds": 4.655,
+      "passed": true
+    },
+    {
+      "log": "memory_final_test_cache_commit.py.log",
+      "tests": 7,
+      "seconds": 0.292,
+      "passed": true
+    },
+    {
+      "log": "memory_final_test_pipeline_memory_safety.py.log",
+      "tests": 10,
+      "seconds": 1.335,
+      "passed": true
+    },
+    {
+      "log": "memory_final_test_rgb_memory_safety.py.log",
+      "tests": 11,
+      "seconds": 8.629,
+      "passed": true
+    },
+    {
+      "log": "memory_final_test_width_local_exceptions.py.log",
+      "tests": 15,
+      "seconds": 21.734,
+      "passed": true
+    },
+    {
+      "log": "memory_final_test_width_production.py.log",
+      "tests": 33,
+      "seconds": 9.809,
+      "passed": true
+    },
+    {
+      "log": "memory_current_backend.log",
+      "tests": 34,
+      "seconds": 15.31,
+      "passed": true
+    },
+    {
+      "log": "memory_full_extended.log",
+      "tests": 21,
+      "seconds": 5.503,
+      "passed": true
+    },
+    {
+      "log": "memory_gui_test_plugin.py.log",
+      "tests": 16,
+      "seconds": 2.675,
+      "passed": true
+    },
+    {
+      "log": "memory_gui_test_width_warning_ui.py.log",
+      "tests": 3,
+      "seconds": 0.008,
+      "passed": true
+    },
+    {
+      "log": "memory_gui_test_ui_processing.py.log",
+      "tests": 35,
+      "seconds": 16.103,
+      "passed": true
+    },
+    {
+      "log": "memory_gui_test_evaluation_summary.py.log",
+      "tests": 4,
+      "seconds": 0.043,
+      "passed": true
+    }
+  ],
+  "gpu_4096": {
+    "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "shape": [
+      4096,
+      4096,
+      3
+    ],
+    "baseline": {
+      "seconds": 12.127359699923545,
+      "peak_allocated": 3833285632,
+      "peak_reserved": 4747952128
+    },
+    "current": {
+      "seconds": 13.077837699558586,
+      "peak_allocated": 3531295744,
+      "peak_reserved": 4747952128
+    },
+    "comparison": [
+      {
+        "output": 0,
+        "shape": [
+          1678,
+          2
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 1,
+        "shape": [
+          3129,
+          2
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 2,
+        "shape": [
+          3129
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 3,
+        "shape": [
+          3301,
+          2
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 4,
+        "shape": [
+          3301
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 5,
+        "shape": [
+          4096,
+          4096
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      },
+      {
+        "output": 6,
+        "shape": [
+          4096,
+          4096
+        ],
+        "exact": true,
+        "maximum_absolute_error": 0.0
+      }
+    ]
+  },
+  "record_rss": [
+    {
+      "rows": 10000,
+      "peak_rss": 26099712,
+      "baseline_rss": 17678336,
+      "seconds": 0.14570340001955628
+    },
+    {
+      "rows": 200000,
+      "peak_rss": 26124288,
+      "baseline_rss": 17666048,
+      "seconds": 6.6976323002018034
+    }
+  ],
+  "cached_600m_baseline": {
+    "after": {
+      "rows": 55,
+      "geometry_wkb_exact": true,
+      "all_common_attributes_exact": true
+    },
+    "width_segments": {
+      "rows": 4,
+      "geometry_wkb_exact": true,
+      "all_common_attributes_exact": true
+    },
+    "corridors": {
+      "rows": 4,
+      "geometry_wkb_exact": true,
+      "all_common_attributes_exact": true
+    }
+  },
+  "cached_two_period_flow": {
+    "extent_m": 200,
+    "periods": [
+      "20221020",
+      "20230222"
+    ],
+    "models_executed": false,
+    "seconds": {
+      "off": 16.32437360007316,
+      "auto": 13.091710499953479
+    },
+    "peak_process_rss": 1163132928,
+    "layers": [
+      {
+        "period": "20221020",
+        "layer": "centerlines",
+        "features": 7,
+        "exact": true
+      },
+      {
+        "period": "20221020",
+        "layer": "width_segments",
+        "features": 338,
+        "exact": true
+      },
+      {
+        "period": "20221020",
+        "layer": "surfaces",
+        "features": 3,
+        "exact": true
+      },
+      {
+        "period": "20221020",
+        "layer": "corridors",
+        "features": 3,
+        "exact": true
+      },
+      {
+        "period": "20230222",
+        "layer": "centerlines",
+        "features": 7,
+        "exact": true
+      },
+      {
+        "period": "20230222",
+        "layer": "width_segments",
+        "features": 296,
+        "exact": true
+      },
+      {
+        "period": "20230222",
+        "layer": "surfaces",
+        "features": 2,
+        "exact": true
+      },
+      {
+        "period": "20230222",
+        "layer": "corridors",
+        "features": 2,
+        "exact": true
+      }
+    ],
+    "changes": 0,
+    "changes_exact": true
+  },
+  "allocation_probes": {
+    "scope": "Full production Fast + raw_image + IR-MAD pipeline",
+    "meaning": "Diagnostic findings, not a memory-safety certification",
+    "model_inference_executed": false,
+    "large_allocations_executed": false,
+    "findings": {
+      "regional_axis_before_rgb": {
+        "reached_allocation": false,
+        "requests": [],
+        "preflight_rejection": null
+      },
+      "formal_change_stations": {
+        "reached_allocation": false,
+        "requests": [],
+        "preflight_rejection": "geometry_station_budget_exceeded: 250000001 > 100000"
+      },
+      "irmad_wide_input_strip": {
+        "shape": [
+          1,
+          524288
+        ],
+        "pixels": 524288,
+        "paired_rgb_uint8_bytes": 3145728,
+        "exposure": "custom/bypassed normalization; normal plugin tiles are 4096 or smaller"
+      },
+      "inference_array_lower_bounds": {
+        "infer_batch_size": 16,
+        "patch_size": 512,
+        "sample_margin": 64,
+        "cases": [
+          {
+            "size": 4096,
+            "patches": 121,
+            "fusion_float32_bytes": 201326592,
+            "retained_two_channel_float32_masks_bytes": 253755392,
+            "note": "Historical eager-cache lower bound; current implementation spills bounded batches."
+          },
+          {
+            "size": 8192,
+            "patches": 441,
+            "fusion_float32_bytes": 805306368,
+            "retained_two_channel_float32_masks_bytes": 924844032,
+            "note": "Historical eager-cache lower bound; current implementation spills bounded batches."
+          }
+        ]
+      },
+      "rescale_before_target_size_check": {
+        "reached_allocation": false,
+        "requests": [],
+        "preflight_rejection": "GSD resampling grid 81920x81920 exceeds the inference memory contract (25 MP); split into georeferenced tiles before inference",
+        "enabled_in_current_config": false
+      },
+      "evaluation_area_cap_bypass": {
+        "reached_allocation": false,
+        "requests": [],
+        "preflight_rejection": null
+      },
+      "assisted_evaluation_bbox": {
+        "reached_allocation": false,
+        "requests": [],
+        "preflight_rejection": null
+      }
+    }
+  }
+}

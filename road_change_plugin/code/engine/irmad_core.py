@@ -20,12 +20,22 @@ def uniform_iteration_sample(z, limit):
     return z[indices]
 
 def windows(ds):
-    for row in range(0, ds.height, 128):
-        yield Window(0, row, ds.width, min(128, ds.height-row))
+    # Preserve the original row-major population order for deterministic PIF
+    # samples. Wide inputs use one row split into bounded column windows.
+    pixels = 128*4096
+    rows = min(128, max(1, pixels//ds.width))
+    for row in range(0, ds.height, rows):
+        for col in range(0, ds.width, pixels):
+            yield Window(col, row, min(pixels, ds.width-col), min(rows, ds.height-row))
 
 
 def paired_blocks(ref, target):
-    with rasterio.open(ref) as a, rasterio.open(target) as b:
+    from .raster_memory import check_native_blocks
+    from .width.raw_memory import bounded_gdal_cache
+    with bounded_gdal_cache(), rasterio.open(ref) as a, rasterio.open(target) as b:
+        check_native_blocks(a);check_native_blocks(b)
+        if (a.shape,a.crs,a.transform)!=(b.shape,b.crs,b.transform) or a.count!=3 or b.count!=3:
+            raise ValueError('IR-MAD requires matching georeferenced RGB grids')
         for w in windows(a):
             valid = (a.read_masks(window=w)>0).all(0) & (b.read_masks(window=w)>0).all(0)
             x, y = a.read(window=w), b.read(window=w)
@@ -119,7 +129,10 @@ def write_normalized(source, dest, gain, offset):
     dest.parent.mkdir(parents=True, exist_ok=True)
     clips = np.zeros((3, 2), dtype=np.int64)
     valid_count = 0
-    with rasterio.open(source) as src:
+    from .width.raw_memory import bounded_gdal_cache
+    with bounded_gdal_cache(), rasterio.open(source) as src:
+        from .raster_memory import check_native_blocks
+        check_native_blocks(src)
         profile = src.profile.copy()
         # Lossless compression avoids introducing another JPEG quantization step.
         profile.update(compress='deflate', photometric='RGB')
@@ -149,7 +162,7 @@ def write_normalized(source, dest, gain, offset):
                     tags = {k:v for k,v in src.tags(b, ns=namespace).items() if not k.startswith('STATISTICS_')}
                     if tags: dst.update_tags(b, ns=namespace, **tags)
             dst.update_tags(RRN_METHOD='IR-MAD PIF orthogonal TLS', RRN_REFERENCE='20250118')
-    with rasterio.open(source) as a, rasterio.open(dest) as b:
+    with bounded_gdal_cache(), rasterio.open(source) as a, rasterio.open(dest) as b:
         assert (a.crs, a.transform, a.shape, a.nodata, a.dtypes, a.colorinterp) == (b.crs, b.transform, b.shape, b.nodata, b.dtypes, b.colorinterp)
         for w in windows(a):
             assert np.array_equal(a.read_masks(window=w), b.read_masks(window=w))

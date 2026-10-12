@@ -624,7 +624,8 @@ class RoadChangeWidget(QWidget):
         log = Path(model['root']) / '_logs/plugin_ui/current.log'
         self._task_log_path = None
         try:
-            self._log_lines = log.read_text(encoding='utf-8').splitlines()[-2000:] if log.is_file() else []
+            from .log_memory import tail_lines
+            self._log_lines = tail_lines(log)
         except OSError:
             self._log_lines = []
         self._refresh_results()

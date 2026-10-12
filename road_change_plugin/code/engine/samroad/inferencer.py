@@ -86,7 +86,7 @@ parser.add_argument(
     "--max_image_megapixels",
     type=float,
     default=25.0,
-    help="Fail fast above this single-image size to avoid exhausting RAM/VRAM. Set 0 to disable.",
+    help="Fail fast above this single-image size to avoid exhausting RAM/VRAM. 0 uses the hard 25 MP ceiling.",
 )
 parser.add_argument(
     "--resume-existing-images", action="store_true",
@@ -266,6 +266,8 @@ def run_inference_on_images(
         if isinstance(item, dict):
             return item
         img_path, img_id, image_config = item
+        from inference_memory import preflight_image
+        preflight_image(img_path, args.max_image_megapixels)
         img = read_rgb_img(img_path)
         original_height, original_width = img.shape[:2]
         image_megapixels = original_height * original_width / 1_000_000.0
@@ -273,7 +275,7 @@ def run_inference_on_images(
             raise RuntimeError(
                 f"Input image is {original_width}x{original_height} ({image_megapixels:.1f} MP), "
                 f"above the safety limit of {args.max_image_megapixels:g} MP. "
-                "Split it into smaller georeferenced tiles, or set --max_image_megapixels 0 only if sufficient RAM is available."
+                "Split it into smaller georeferenced tiles, keeping the original resolution."
             )
         infer_img, resize_factor, input_gsd, model_gsd = rescale_image_to_model_gsd(img, img_path, config)
         if resize_factor != 1.0:
@@ -923,6 +925,8 @@ def rescale_image_to_model_gsd(img, path, config):
     height, width = img.shape[:2]
     new_width = max(1, int(round(width * resize_factor)))
     new_height = max(1, int(round(height * resize_factor)))
+    from inference_memory import check_image_shape
+    check_image_shape(new_width, new_height, args.max_image_megapixels, stage='GSD resampling')
     interpolation = cv2.INTER_CUBIC if resize_factor > 1.0 else cv2.INTER_AREA
     return cv2.resize(img, (new_width, new_height), interpolation=interpolation), resize_factor, input_gsd, model_gsd
 
@@ -1033,9 +1037,17 @@ def prepare_toponet_batch_mask(
     return updated_mask
 
 def infer_one_img(net, img, config, *, diagnostic_shape=None):
+    from inference_memory import TensorSpool
+    with TensorSpool() as spool:
+        return _infer_one_img(net, img, config, spool, diagnostic_shape=diagnostic_shape)
+
+
+def _infer_one_img(net, img, config, spool, *, diagnostic_shape=None):
     # TODO(congrui): centralize these configs
     image_height, image_width = img.shape[:2]
-    batch_size = config.INFER_BATCH_SIZE
+    from engine.resource_policy import inference_batch_size
+    batch_size = inference_batch_size(config.INFER_BATCH_SIZE, config.PATCH_SIZE)
+    print(f'[Memory] inference batch={batch_size}; exact feature spill enabled', flush=True)
     # list of (i, (x_begin, y_begin), (x_end, y_end))
     all_patch_info = get_full_coverage_patch_info(
         image_width,
@@ -1055,8 +1067,6 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     pixel_counter = torch.zeros(img.shape[0:2], dtype=torch.float32).to(args.device, non_blocking=False)
     # stores img embeddings for toponet
     # list of [B, D, h, w], len=batch_num
-    img_features = list()
-    img_mask = list()
     _synchronize_cuda_for_timing()
     mask_start_seconds = time.perf_counter()
     for batch_index in range(batch_num):
@@ -1069,9 +1079,9 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
             batch_img_patches = batch_img_patches.to(args.device, non_blocking=False)
             # [B, H, W, 2]
             mask_scores, patch_img_features = net.infer_masks_and_img_features(batch_img_patches)
-            img_features.append(patch_img_features)
             mask_scores11 = mask_scores.permute(0, 3, 1, 2)#(0,3,1,2)
-            img_mask.append(mask_scores11)
+            spool.append(patch_img_features, mask_scores11)
+            del patch_img_features, mask_scores11
         # Aggregate masks
         for patch_index, patch_info in enumerate(batch_patch_info):
             _, (x0, y0), (x1, y1) = patch_info
@@ -1079,6 +1089,7 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
             fused_keypoint_mask[y0:y1, x0:x1] += keypoint_patch
             fused_road_mask[y0:y1, x0:x1] += road_patch
             pixel_counter[y0:y1, x0:x1] += torch.ones(road_patch.shape[0:2], dtype=torch.float32, device=args.device)
+        del keypoint_patch,road_patch,mask_scores,batch_img_patches
 
     valid_pixels = pixel_counter > 0
     fused_keypoint_mask = torch.where(
@@ -1222,9 +1233,10 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
     ## Pass 2: infer toponet to predict topology of points from stored img features
     edge_scores = defaultdict(float)
     edge_counts = defaultdict(float)
-    for batch_index in range(batch_num):
+    from inference_memory import topology_batches
+    for batch_index,patch_slice in topology_batches(all_patch_info,batch_size,graph_rtree):
         offset = batch_index * batch_size
-        batch_patch_info = all_patch_info[offset : offset + batch_size]
+        batch_patch_info = all_patch_info[offset : offset + batch_size][patch_slice]
 
         topo_data = {
             'points': [],
@@ -1274,27 +1286,21 @@ def infer_one_img(net, img, config, *, diagnostic_shape=None):
             continue
         # infer toponet
         # [B, D, h, w]
-        batch_features = img_features[batch_index]
+        batch_features = spool.read(batch_index, 0, args.device)[patch_slice]
         batch_mask = prepare_toponet_batch_mask(
-            img_mask[batch_index],
+            spool.read(batch_index, 1, args.device)[patch_slice],
             batch_patch_info,
             fast_graph_probability,
             execution_profile=args.execution_profile,
         )
         # [B, N_sample, N_pair, 2]
-        batch_points = torch.tensor(collated['points'], device=args.device)
-        batch_pairs = torch.tensor(collated['pairs'], device=args.device)
-        batch_valid = torch.tensor(collated['valid'], device=args.device)
-        with torch.no_grad():
-            # [B, N_samples, N_pairs, 1]
-            topo_scores = net.infer_toponet(batch_features, batch_points, batch_pairs, batch_valid,batch_mask) 
-        # all-invalid (padded, no neighbors) queries returns nan scores
-        # [B, N_samples, N_pairs]
-        topo_scores = torch.where(torch.isnan(topo_scores), -100.0, topo_scores).squeeze(-1).cpu().numpy()
-        # aggregate edge scores
+        from inference_memory import topology_scores
         from topology_aggregation import aggregate_votes
-        aggregate_votes(topo_scores, collated['pairs'], collated['valid'], idx_maps,
-                        edge_scores, edge_counts)
+        for batch_slice,query_slice,scores in topology_scores(net,batch_features,
+                collated['points'],collated['pairs'],collated['valid'],batch_mask):
+            aggregate_votes(scores,collated['pairs'][batch_slice,query_slice],
+                collated['valid'][batch_slice,query_slice],idx_maps[batch_slice],edge_scores,edge_counts)
+        del batch_features,batch_mask
     # avg edge scores and filter
     pred_edges = []
     pred_edge_scores = []
