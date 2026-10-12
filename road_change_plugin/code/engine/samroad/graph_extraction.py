@@ -6826,18 +6826,23 @@ def estimate_skeleton_tangents(points, tangent_radius=5.0):
         return np.empty((0, 2), dtype=np.float32)
     tree = KDTree(points)
     tangents = np.zeros((points.shape[0], 2), dtype=np.float32)
-    for point_idx, point in enumerate(points):
-        neighbor_indices = tree.query_radius(point[np.newaxis, :], r=tangent_radius)[0]
-        neighborhood = points[neighbor_indices].astype(np.float32)
-        if neighborhood.shape[0] < 2:
-            tangents[point_idx] = (1.0, 0.0)
-            continue
-        centered = neighborhood - np.mean(neighborhood, axis=0, keepdims=True)
-        covariance = centered.T @ centered
-        _, eigenvectors = np.linalg.eigh(covariance)
-        tangent = eigenvectors[:, -1]
-        norm = float(np.linalg.norm(tangent))
-        tangents[point_idx] = tangent / max(norm, 1e-6)
+    # Bound temporary neighbor storage while avoiding one sklearn validation
+    # and tree-query dispatch for every skeleton pixel. Neighborhood order and
+    # the per-point float32 covariance calculation are unchanged.
+    for start in range(0, len(points), 1024):
+        neighborhoods = tree.query_radius(points[start:start + 1024], r=tangent_radius)
+        for offset, neighbor_indices in enumerate(neighborhoods):
+            point_idx = start + offset
+            neighborhood = points[neighbor_indices].astype(np.float32)
+            if neighborhood.shape[0] < 2:
+                tangents[point_idx] = (1.0, 0.0)
+                continue
+            centered = neighborhood - np.mean(neighborhood, axis=0, keepdims=True)
+            covariance = centered.T @ centered
+            _, eigenvectors = np.linalg.eigh(covariance)
+            tangent = eigenvectors[:, -1]
+            norm = float(np.linalg.norm(tangent))
+            tangents[point_idx] = tangent / max(norm, 1e-6)
     return tangents
 
 

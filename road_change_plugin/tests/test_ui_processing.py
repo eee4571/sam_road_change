@@ -266,12 +266,12 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(page.truths.item(0, 1).text(), '未提供')
         self.assertTrue(any(r[0] == '南区' for r in page.inputs()['truths']))
 
-    def test_missing_reference_locates_area_and_blocks_processing(self):
+    def test_auto_reference_failure_locates_area_and_manual_override(self):
         (self.root / 'project_config.json').write_text('{}')
         self.widget.scan()
         self.wait_ready()
         self.assertEqual(self.widget.run_button.text(), '修正数据')
-        self.assertEqual(self.widget.check_note.text(), '北区：请选择 IR-MAD 参考期')
+        self.assertEqual(self.widget.check_note.text(), '北区：未能自动确定参考期，请手动选择参考期')
         self.widget.run_button.click()
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.configuration)
         self.assertEqual(self.widget.configuration.area.currentText(), '北区')
@@ -283,6 +283,42 @@ class ProcessingUiTests(unittest.TestCase):
         self.wait_ready()
         self.assertTrue(self.widget.checked)
         self.assertEqual(self.widget.pages.currentWidget(), self.widget.main_page)
+
+    def test_automatic_references_are_saved_and_manual_selection_is_retained(self):
+        config = self.root / 'project_config.json'
+        saved = json.loads(config.read_text(encoding='utf8'))
+        saved['area_irmad_references'] = {'南区': '2022'}
+        config.write_text(json.dumps(saved), encoding='utf8')
+        result = dict(issues=[], area_irmad_references={'北区': '2020', '南区': '2022'},
+                      reference_selections={'北区': {'period': '2020', 'sampled_locations': 25, 'close_candidates': True}})
+        with patch.object(self.widget.controller, 'inspect_data', return_value=result):
+            self.widget.scan()
+            self.wait_ready()
+        self.assertTrue(self.widget.checked)
+        self.assertEqual(json.loads(config.read_text(encoding='utf8'))['area_irmad_references'], result['area_irmad_references'])
+        self.widget.configuration.area.setCurrentText('北区')
+        self.assertIn('已自动选择：2020', self.widget.configuration.reference_note.text())
+        self.assertIn('候选差距较小', self.widget.configuration.reference_note.text())
+        self.widget._load_project(self.root)
+        self.wait_ready()
+        self.assertEqual(self.widget.model['area_irmad_references'], result['area_irmad_references'])
+        self.widget.configuration.reference.setCurrentText('20250118')
+        self.widget._save_and_check()
+        self.wait_ready()
+        self.assertEqual(self.widget.model['area_irmad_references']['北区'], '20250118')
+        self.assertTrue(self.widget.configuration.reference_note.isHidden())
+
+    def test_failed_reference_persistence_does_not_enable_processing(self):
+        self.widget.model['area_irmad_references']['北区'] = ''
+        old = (self.root / 'project_config.json').read_bytes()
+        result = dict(issues=[], area_irmad_references={'北区': '2020', '南区': '2022'},
+                      reference_selections={'北区': {'period': '2020'}})
+        with patch('plugin.widget.save_configuration', side_effect=OSError('文件被占用')):
+            self.widget._checked(result)
+        self.assertFalse(self.widget.checked)
+        self.assertIn('参考期保存失败', self.widget.check_note.text())
+        self.assertEqual(self.widget.model['area_irmad_references']['北区'], '')
+        self.assertEqual((self.root / 'project_config.json').read_bytes(), old)
 
     def test_missing_image_targets_specific_period(self):
         self.widget._show_configuration()

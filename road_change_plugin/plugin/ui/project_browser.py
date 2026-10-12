@@ -123,8 +123,8 @@ def check_files(model):
     for name in names:
         rows = [r for r in model["periods"] if r[0] == name]
         reference = model.get("area_irmad_references", {}).get(name)
-        if reference not in {r[1] for r in rows}:
-            issues.append(f"{name}：请选择 IR-MAD 参考期")
+        if reference and reference not in {r[1] for r in rows}:
+            issues.append(f"{name}：参考期不存在，请重新选择参考期")
         if len(rows) < 2 or len({r[1] for r in rows}) != len(rows):
             issues.append(f"{name} 需要至少两个不同期次")
     for kind, rows in (("验证区", model["areas"]), ("影像清单", model["periods"]), ("真值数据", model["truths"])):
@@ -180,6 +180,13 @@ def save_configuration(model, settings):
                   area_truths=[[a, b, c, portable(p)] for a, b, c, p in model["truths"]],
                   area_irmad_references=model["area_irmad_references"],
                   plugin_processing_parameters=settings)
+    if 'automatic_reference_selections' in model:
+        config['automatic_reference_selections'] = model['automatic_reference_selections']
+    if 'automatic_reference_selections' in config:
+        config['automatic_reference_selections'] = {
+            area: selection for area, selection in config['automatic_reference_selections'].items()
+            if area in {name for name, _ in model['areas']} and
+            selection.get('period') == model['area_irmad_references'].get(area)}
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, suffix=".tmp", delete=False) as stream:

@@ -121,7 +121,7 @@ class Controller(TaskSignals):
         references=data.get('area_irmad_references',{})
         for name in names:
             if references.get(name) not in [r[1] for r in periods if r[0]==name]:
-                raise ValueError(f'{name} 请选择已有期次作为 IR-MAD 参考期')
+                raise ValueError(f'{name} 请先检查数据以自动选择参考期，或手动指定已有期次')
         args += ['--irmad-reference',json.dumps(references,ensure_ascii=False)]
         return task_arguments(args)
 
@@ -256,6 +256,12 @@ class Controller(TaskSignals):
     def inspect_data(self, data):
         """Read-only GIS inspection in the independent backend interpreter."""
         import subprocess
+        selection = {}
+        if any(not data.get('area_irmad_references', {}).get(area) for area, _ in data.get('areas', [])):
+            selection = self.recommend_references(data)
+            if selection.get('issues'):
+                return selection
+            data = {**data, 'area_irmad_references': selection['area_irmad_references']}
         args=self.build_command('all',data)+['--data-check-only']
         executable,command=self.runner.command(args)
         environment=self.runner.environment()
@@ -270,5 +276,22 @@ class Controller(TaskSignals):
         for line in process.stdout.splitlines():
             if line.startswith('__SAMROAD_USER__'):
                 value=json.loads(line[len('__SAMROAD_USER__'):])
-                if value.get('stage')=='data-check':return value
+                if value.get('stage')=='data-check':
+                    return {**value, 'area_irmad_references': data.get('area_irmad_references', {}),
+                            'reference_selections': selection.get('reference_selections', {})}
         raise ValueError('数据检查未返回报告')
+
+    def recommend_references(self, data, *, force=False, use_cache=True):
+        """Only bounded samples are read by the separate GIS interpreter."""
+        import subprocess
+        environment = self.runner.environment()
+        if data.get('project_root'):
+            environment.insert('SAMROAD_PROJECT_ROOT', str(self.path(data['project_root'])))
+        process = subprocess.run([str(self.runner.python_path()), '-u', '-m', 'app.reference_selection'],
+            input=json.dumps(dict(data=data, force=force, use_cache=use_cache), ensure_ascii=False),
+            cwd=self.runner.root/'code', env={k: environment.value(k) for k in environment.keys()},
+            capture_output=True, text=True, encoding='utf8', errors='replace', timeout=900,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if process.returncode:
+            raise ValueError((process.stderr or process.stdout)[-2500:])
+        return json.loads(process.stdout)
