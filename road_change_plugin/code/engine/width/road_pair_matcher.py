@@ -280,14 +280,13 @@ def build_width_segments(
 
 
 def build_corridors(segments: gpd.GeoDataFrame, period: str = "") -> gpd.GeoDataFrame:
-    from engine.width.width_reliability import ROAD_ERRORS, issue
+    from engine.width.width_reliability import issue, positive, project_default_width
     rows = []
     diagnostics=[]
     for _, row in segments.iterrows():
-        width = _number(row, ("width_m",))
-        if width <= 0:
-            continue
         try:
+            width = _number(row, ("width_m",))
+            if not positive(width):raise ValueError('Missing corridor width')
             if row.get('width_backend')=='raw_image':
                 from shapely import from_wkb
                 encoded=row.get('raw_corridor_wkb','')
@@ -297,13 +296,20 @@ def build_corridors(segments: gpd.GeoDataFrame, period: str = "") -> gpd.GeoData
             else:
                 geometry = row.geometry.buffer(width * 0.5, cap_style="flat", join_style="round")
             if geometry.is_empty:raise ValueError('Empty corridor geometry')
-        except ROAD_ERRORS as exc:
+        except Exception as exc:
             diagnostics.append(issue(row.get('parent_id',row.get('segment_id','')),row.get('tile_id',''),
                                      'corridor',exc,geometry=row.geometry,fallback='symmetric_buffer'))
-            geometry=row.geometry.buffer(width*.5)
+            width=float(row.get('width_m')) if positive(row.get('width_m')) else project_default_width()
+            try:
+                geometry=row.geometry.buffer(width*.5)
+            except Exception as buffer_error:
+                diagnostics.append(issue(row.get('parent_id',row.get('segment_id','')),row.get('tile_id',''),
+                    'corridor_fallback',buffer_error,geometry=row.geometry,fallback='axis_retained_without_corridor'))
+                continue
             row=row.copy()
             row['quality_grade']=row['width_quality']='C'
-            row['qa_state']='review';row['qa_reason']='corridor_geometry_fallback'
+            row['width_m']=width
+            row['qa_state']='review';row['qa_reason']=str(exc)
         rows.append({
             **{key: row.get(key) for key in segments.columns if key != "geometry"},
             "period": period,

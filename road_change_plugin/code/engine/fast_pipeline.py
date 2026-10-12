@@ -7,7 +7,7 @@ import hashlib
 import json
 from .fast_timing import timed_stage
 from .width.width_reliability import (ROAD_ERRORS, InputContractError, atomic_json, clean_line,
-    clean_frame, issue, positive, project_default_width, validate_graph, validate_mask)
+    clean_frame, issue, positive, project_default_width, validate_graph, validate_mask, require_road_local)
 import sys
 import time
 import warnings
@@ -2460,6 +2460,44 @@ def _write_fast_molra_surface(cache_path: Path, mask: np.ndarray) -> None:
         raise OSError(f"Could not cache Fast MLoRA surface: {cache_path}")
 
 
+def _fast_road_export(path,width_row,transform,pixel_size,map_pixel_size,tile_id,road_id,diagnostics):
+    try:
+        pixels=np.asarray(path.pixels,dtype=float)
+        clean_line(LineString(pixels))
+    except Exception as exc:
+        diagnostics.append(issue(road_id,tile_id,'export_input_geometry',exc,fallback='invalid_geometry_excluded'))
+        return None
+    try:
+        line=clean_line(_world_path(transform,_simplify_path_pixels(path)))
+        width=float(width_row['width_units'])
+        if not positive(width):raise ValueError('Invalid road width attribute')
+        source=str(width_row['width_source']);grade=width_row.get('quality_grade','C')
+        reason=width_row.get('fallback_reason','')
+        corridor=line.buffer(width/max(pixel_size,1e-9)*map_pixel_size/2.)
+    except Exception as exc:
+        require_road_local(exc)
+        # Only materialize the dense original axis on failure. If its transform
+        # is invalid too, propagate the input contract failure to the tile owner.
+        original=clean_line(_world_path(transform,pixels))
+        diagnostics.append(issue(road_id,tile_id,'road_export',exc,geometry=original,fallback='original_axis_width'))
+        line=original
+        value=width_row.get('width_units') if isinstance(width_row,dict) else None
+        width=float(value) if positive(value) else project_default_width()
+        source='same_road_median' if positive(value) else 'project_default'
+        grade='C';reason=str(exc)
+        width_row=dict(width_units=width,width_source=source,quality_grade=grade,fallback_reason=reason)
+        try:
+            corridor=line.buffer(width/max(pixel_size,1e-9)*map_pixel_size/2.)
+        except Exception as buffer_error:
+            diagnostics.append(issue(road_id,tile_id,'road_export_buffer',buffer_error,
+                geometry=original,fallback='axis_retained_without_corridor'))
+            corridor=None
+    common=dict(tile=tile_id,edge_id=int(road_id),width_m=width,width_src=source,
+        quality_gr=grade,width_qual=grade,width_unit='m',qa_reason=reason,
+        qa_state='review' if grade=='C' else 'auto',exec_prof='fast',geometry=line)
+    return common,corridor,width_row
+
+
 def measure_fast_widths(
     image_dir: Path,
     surface_dir: Path,
@@ -2660,31 +2698,15 @@ def measure_fast_widths(
                                   molra_binary=molra_binary,sample_function=sample_widths_by_normal,
                                   diagnostics=diagnostics,tile_id=image_path.stem))
                 for path_id, path in enumerate(final_paths):
-                    try:
-                        line = clean_line(_world_path(transform, _simplify_path_pixels(path)))
-                    except ROAD_ERRORS as exc:
-                        diagnostics.append(issue(path_id,image_path.stem,'export_geometry',exc,fallback='invalid_geometry_excluded'))
-                        continue
-                    width = float(width_rows[path_id]["width_units"])
-                    width_px = float(width / max(pixel_size, 1e-9)) if width > 0 else 0.0
-                    width_source = str(width_rows[path_id]["width_source"])
-                    if not positive(width):
-                        raise InputContractError('Width resolver returned a nonpositive/nonfinite width')
-                    common = {
-                        "tile": image_path.stem, "edge_id": int(path_id),
-                        "width_m": float(width), "width_src": width_source,
-                        "quality_gr":width_rows[path_id].get('quality_grade','C'),
-                        "width_qual":width_rows[path_id].get('quality_grade','C'),
-                        "width_unit":"m", "qa_reason":width_rows[path_id].get('fallback_reason',''),
-                        "qa_state":"review" if width_rows[path_id].get('quality_grade','C')=='C' else 'auto',
-                        "exec_prof": "fast", "geometry": line,
-                    }
-                    layer_records["centerlines"].append({**common, "source": "final_centerline"})
+                    product=_fast_road_export(path,width_rows[path_id],transform,pixel_size,map_pixel_size,
+                                              image_path.stem,path_id,diagnostics)
+                    if product is None:continue
+                    common,corridor,width_rows[path_id]=product
+                    # Publish one complete road only after its local calculation.
+                    layer_records["centerlines"].append({**common,"source":"final_centerline"})
                     layer_records["width_segments"].append(common)
-                    layer_records["corridors"].append({
-                        **common,
-                        "geometry": line.buffer(width_px * map_pixel_size / 2.0),
-                    })
+                    if corridor is not None:
+                        layer_records["corridors"].append({**common,"geometry":corridor})
                 for mapping, value in shapes(
                     cleaned_surface,
                     mask=(cleaned_surface > 0) & valid,
@@ -3115,7 +3137,7 @@ def prepare_regional_products(
                         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
                         Path(__file__).with_name('road_network_products.py'),
                         Path(__file__).with_name('road_network_connection.py'),
-                        Path(__file__).with_name('road_axis_cleanup.py'), Path(__file__).with_name('road_axis_quality.py'), WIDTH_ROOT/'raw_feature_cache.py',
+                        Path(__file__).with_name('road_axis_cleanup.py'), Path(__file__).with_name('road_axis_quality.py'), WIDTH_ROOT/'raw_feature_cache.py', WIDTH_ROOT/'raw_memory.py',
                         Path(__file__).with_name('road_connection_evidence.py'),
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),
@@ -3201,14 +3223,16 @@ def prepare_regional_products(
     if width_method=='raw_image':
         from .width.raw_road_surfaces import build_road_surfaces
         frames['surfaces']=build_road_surfaces(frames['width_segments'],image_path=raw_inputs[0],diagnostics=geometry_diagnostics)
+        if geometry_diagnostics:
+            affected=frames['width_segments'].parent_id.astype(str).isin({r['road_id'] for r in geometry_diagnostics})
+            frames['width_segments'].loc[affected,['quality_grade','width_quality']]='C'
+            frames['width_segments'].loc[affected,'qa_state']='review'
         summary_path=output_dir/'raw_width/summary.json'
         quality=json.loads(summary_path.read_text(encoding='utf8'))
         if geometry_diagnostics:
-            quality['exceptions'].extend(geometry_diagnostics)
-            quality['exception_count']=len(quality['exceptions'])
-            quality['status']='completed_with_warnings'
-            from collections import Counter
-            quality['exception_counts']=dict(Counter(r['exception_type'] for r in quality['exceptions']))
+            from .width.width_reliability import quality_summary
+            quality.update(quality_summary(frames['width_segments'],[*quality['exceptions'],*geometry_diagnostics],
+                                           total_input=quality.get('total_input')))
         atomic_json(output_dir/'width_quality_summary.json',quality)
         outputs.update(status=quality['status'],warning_count=quality['exception_count'],
             low_confidence_road_count=quality['low_confidence_road_count'],
@@ -3262,9 +3286,9 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     for name,default in [('quality_grade','C'),('width_source','axis_width_estimate'),('outlier_reason','')]:
         if name not in quality_frame:quality_frame[name]=default
         else:quality_frame[name]=quality_frame[name].fillna(default)
-    formal_errors=[dict(road_id=','.join(map(str,r.get('source_ids',[]))),tile_id='',bounds=None,
+    formal_errors=[dict(road_id=','.join(map(str,r.get('source_ids',[]))),tile_id=r.get('tile_id',''),bounds=None,
         stage=r['stage'],exception_type=r['exception_type'],reason=r['reason'],
-        traceback=r.get('traceback',''),fallback=r.get('final_action','')) for r in surface_audit.get('failures',[])]
+        traceback=r.get('traceback',''),fallback=r.get('final_action',''),fallback_reason=r['reason']) for r in surface_audit.get('failures',[])]
     report=quality_summary(quality_frame,formal_errors)
     report_path=output_dir/'width_export_summary.json'
     atomic_json(report_path,report)

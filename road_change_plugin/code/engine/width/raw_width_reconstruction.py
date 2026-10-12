@@ -105,7 +105,7 @@ def smooth_side(s, y, confidence, anchor, junction, config):
     if not len(indices):
         return np.full(n, np.nan), np.full(n, 'unresolved', object), np.zeros(n), True
     source = np.full(n, 'smoothed', object)
-    nearest = np.abs(s[:, None]-s[indices][None, :]).argmin(axis=1)
+    nearest = nearest_anchor(s,s[indices])
     distance = np.abs(s-s[indices][nearest])
     certainty = confidence[indices][nearest].copy()
     seed = np.interp(s, s[indices], y[indices])
@@ -174,6 +174,17 @@ def smooth_side(s, y, confidence, anchor, junction, config):
                       options={'maxiter': config.max_iterations, 'ftol': 1e-9, 'gtol': 1e-5})
     certainty[anchor] *= np.exp(-np.abs(result.x[anchor]-y[anchor])/4)
     return result.x, source, certainty, bool(result.success)
+
+
+def nearest_anchor(stations, anchors):
+    """Sorted nearest neighbour in O(n) memory, with the old left-tie rule.
+
+    Avoid the n-by-anchor-count distance matrix (two float64 temporaries).
+    Both arrays are ordered by the reconstruction's station contract.
+    """
+    right=np.minimum(np.searchsorted(anchors,stations),len(anchors)-1)
+    left=np.maximum(right-1,0)
+    return np.where(np.abs(stations-anchors[left])<=np.abs(stations-anchors[right]),left,right)
 
 
 def reconstruct_chain(group, config):

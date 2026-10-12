@@ -18,6 +18,37 @@ class InputContractError(RuntimeError):
     """The coordinate system or raster contract cannot be interpreted safely."""
 
 
+class SharedWidthStateError(RuntimeError):
+    """An error crossed a shared reader/cache boundary; local recovery is unsafe."""
+
+
+def require_road_local(error):
+    """Only call inside an audited, rollbackable single-road computation.
+
+    Scope establishes locality, not the exception name. Runtime/invariant errors
+    remain ambiguous and fatal. Check chained causes so wrappers cannot disguise
+    resource, dependency, I/O or cancellation failures as a local ValueError.
+    """
+    from concurrent.futures import CancelledError
+    pending=[error];seen=set()
+    fatal=(MemoryError,OSError,ImportError,RuntimeError,SystemError,AssertionError,CancelledError)
+    resource_messages=('out of memory','failed to allocate','cannot allocate','unable to allocate','allocation failed','bad_alloc',
+        'insufficient memory','resource exhausted','resource temporarily unavailable',
+        'no space left','disk full','too many open files','cannot start new thread',
+        'permission denied','paging file is too small','cuda error','cuda out of memory')
+    while pending:
+        current=pending.pop()
+        if id(current) in seen:continue
+        seen.add(id(current))
+        if (not isinstance(current,Exception) or isinstance(current,fatal)
+                or getattr(current,'code',None)==-4
+                or any(token in str(current).lower() for token in resource_messages)):
+            raise error
+        cause=current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        if cause is not None:pending.append(cause)
+        pending.extend(getattr(current,'exceptions',()))
+
+
 def project_default_width():
     import os
     root = os.environ.get('SAMROAD_PROJECT_ROOT')
@@ -33,7 +64,7 @@ def implementation_identity():
     root=Path(__file__).parent
     paths=[root/name for name in ('width_reliability.py','chain_width_calculator.py','molra_centerline_width.py',
         'raw_image_backend.py','raw_boundary_core.py','raw_width_reconstruction.py','raw_width_records.py',
-        'raw_feature_cache.py','raw_road_surfaces.py')]
+        'raw_feature_cache.py','raw_memory.py','raw_road_surfaces.py')]
     paths += [root.parent/'fast_pipeline.py']
     digest=hashlib.sha256()
     for path in paths:digest.update(path.read_bytes())
@@ -55,15 +86,13 @@ def atomic_json(path, value):
 
 
 def issue(road_id, tile_id, stage, error, *, geometry=None, fallback='pending'):
-    # Native numerical libraries sometimes report allocation failure as ValueError/cv2.error.
-    if getattr(error,'code',None)==-4 or any(token in str(error).lower() for token in
-        ('out of memory','failed to allocate','bad_alloc','insufficient memory')):
-        raise error
+    require_road_local(error)
     bounds = list(geometry.bounds) if geometry is not None and not geometry.is_empty else None
     row = dict(road_id=str(road_id), tile_id=str(tile_id), stage=stage,
                exception_type=type(error).__name__, reason=str(error),
                traceback=''.join(traceback.format_exception(type(error), error, error.__traceback__)),
-               fallback=fallback, bounds=bounds if bounds is None or np.isfinite(bounds).all() else None)
+               fallback=fallback, fallback_reason=str(error),
+               bounds=bounds if bounds is None or np.isfinite(bounds).all() else None)
     print('[Width warning] ' + json.dumps(row, ensure_ascii=False), flush=True)
     return row
 
@@ -134,19 +163,25 @@ def validate_graph(nodes, edges, diagnostics, tile_id=''):
     return np.asarray(kept,dtype=np.int64).reshape(-1,2),ids
 
 
-def surface_width_estimates(lines, surfaces):
+def surface_width_estimates(lines, surfaces, diagnostics=None, tile_ids=None):
     """Metre distance-to-boundary evidence at actual, covered centerline stations."""
     from shapely import STRtree
     polygons=[g for g in surfaces.geometry if g is not None and not g.is_empty and g.geom_type in ('Polygon','MultiPolygon')]
     tree=STRtree(polygons)
+    diagnostics=[] if diagnostics is None else diagnostics
     values={}
     for key,line in lines.items():
         estimates=[]
-        for station in np.linspace(0,line.length,9)[1:-1]:
-            point=line.interpolate(station)
-            for index in tree.query(point,predicate='within'):
-                width=2*point.distance(polygons[int(index)].boundary)
-                if positive(width):estimates.append(width)
+        try:
+            for station in np.linspace(0,line.length,9)[1:-1]:
+                point=line.interpolate(station)
+                for index in tree.query(point,predicate='within'):
+                    width=2*point.distance(polygons[int(index)].boundary)
+                    if positive(width):estimates.append(width)
+        except Exception as exc:
+            diagnostics.append(issue(key,(tile_ids or {}).get(key,''),'local_mask_estimate',exc,
+                                     geometry=line,fallback='next_width_evidence'))
+            continue
         if estimates:values[key]=estimates
     return values
 

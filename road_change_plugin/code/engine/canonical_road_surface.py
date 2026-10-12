@@ -1108,8 +1108,13 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
     for i,c in enumerate(chains):
         report=dict(sections=0,chain_id=i,source_features=list(c.sources),graph_edges=list(c.edges),
                     length_m=float(c.axis.length),axis_wkt=c.axis.wkt)
-        with geometry_item('stable_width',c.sources,on_error=lambda:blocked.add(i)):
-            c.widths,detail=stable_width(c.stations,c.widths,c.quality>=.99)
+        original=c.widths.copy()
+        def retain_width():
+            c.widths=original
+            c.quality=np.zeros_like(c.quality)
+            c.width_fallback_reason='stable_width_failed'
+        with geometry_item('stable_width',c.sources,on_error=retain_width,status='fallback',road_local=True):
+            c.widths,detail=stable_width(c.stations.copy(),c.widths.copy(),c.quality>=.99)
             report.update(detail)
         chain_audit.append(report)
     ends=defaultdict(list)
@@ -1131,6 +1136,7 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
             ends=(_node(c.ends[0][0],part.coords[0]),_node(c.ends[1][0],part.coords[-1]))
             surviving.append(Chain(part,ss,np.interp(locations,c.stations,c.widths),
                 np.interp(locations,c.stations,c.quality),c.sources,ends,c.edges))
+            if hasattr(c,'width_fallback_reason'):surviving[-1].width_fallback_reason=c.width_fallback_reason
             reports.append(dict(report,axis_quality='low',repair_status='fallback'))
     chains=surviving;chain_audit=reports;blocked=set()
     ends=defaultdict(list)
@@ -1147,7 +1153,10 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
         if len(arms)==2 and arms[0][0]==arms[1][0] and not internal.get(node):continue
         for i,e in arms:
             c=chains[i];width=c.widths[0 if e==0 else -1]
-            with geometry_item("junction_portal",c.sources,on_error=lambda:blocked.add(i)):
+            def retain_untrimmed():
+                trim[i,e]=0.;portals.pop((i,e),None)
+                c.quality=np.zeros_like(c.quality);c.width_fallback_reason='junction_portal_failed'
+            with geometry_item("junction_portal",c.sources,on_error=retain_untrimmed,status='fallback',road_local=True):
                 center=np.mean([n[1:] for n in members.get(node,{node})],axis=0)
                 offset=np.linalg.norm(np.asarray(c.axis.coords[0 if e==0 else -1])-center)
                 trim[i,e]=min(max(1.,float(width)*.5)+offset,c.axis.length*.35)
@@ -1160,7 +1169,16 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
             print(f'[正式道路] 道路面生成：{i}/{len(chains)} 条链',flush=True)
             last_progress=perf_counter()
         if i in blocked:continue
-        with geometry_item("chain_surface",c.sources,on_error=lambda:blocked.add(i)):
+        body_mark=len(bodies)
+        def retain_surface_axis():
+            del bodies[body_mark:]
+            c.quality=np.zeros_like(c.quality);c.width_fallback_reason='chain_surface_failed'
+            with geometry_item('chain_surface_buffer',c.sources,status='fallback',road_local=True):
+                body=c.axis.buffer(float(np.median(c.widths))/2)
+                if body.is_empty or not body.is_valid:raise ValueError('Invalid fallback road buffer')
+                bodies.append(body)
+            published.add(i)
+        with geometry_item("chain_surface",c.sources,on_error=retain_surface_axis,status='fallback',road_local=True):
             from .road_axis_quality import require_safe_axis
             require_safe_axis(c.axis,float(np.max(c.widths)))
             a,b=trim[i,0],c.axis.length-trim[i,1]
@@ -1240,8 +1258,11 @@ def build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obse
                                                  evidence=evidence,observations=observations)
     if metadata is not None:
         for row in recovery.failures[first:]:
+            row['tile_id']=','.join(sorted({str(metadata[i].get('tile_id','')) for i in row['source_ids']
+                                           if isinstance(i,int) and 0<=i<len(metadata)}))
             row['source_ids']=[metadata[i].get('source_feature',i) if isinstance(i,int) and 0<=i<len(metadata) else i
                                for i in row['source_ids']]
+            row['road_id']=','.join(map(str,row['source_ids']))
     audit['summary'].update(recovery.summary(audit['summary']['surface_axis_repair_count']))
     audit['failures']=list(recovery.failures[first:])
     return surface,chains,audit

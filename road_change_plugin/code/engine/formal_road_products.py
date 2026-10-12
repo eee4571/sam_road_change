@@ -99,7 +99,7 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     from .road_axis_quality import repair_network_axes
     from .canonical_road_surface import build_road_geometry
     from .product_cache import read_completed, write_completed, signature
-    from .width.width_reliability import ROAD_ERRORS, InputContractError, project_default_width
+    from .width.width_reliability import InputContractError, project_default_width
 
     crs = centers.crs
     if crs is None or not crs.is_projected or any(abs(a.unit_conversion_factor-1)>1e-9 for a in crs.axis_info):
@@ -122,10 +122,16 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     default_width=project_default_width()
     fallback = []
     for row in rows:
-        value = row.get('width_m', row.get('width_map', default_width))
-        try: value = float(value)
-        except (ValueError, TypeError): value = default_width
-        fallback.append(value if np.isfinite(value) and value > 0 else default_width)
+        value=default_width
+        def mark_attribute_fallback():
+            row['_width_fallback']=True
+            row['_width_fallback_reason']='width_attribute_failed'
+        with geometry_item('width_attribute',[row['source_feature']],on_error=mark_attribute_fallback,
+                           status='fallback',road_local=True,tile_id=str(row.get('tile_id',''))):
+            candidate=float(row.get('width_m',row.get('width_map',default_width)))
+            if not np.isfinite(candidate) or candidate<=0:raise ValueError('Invalid road width attribute')
+            value=candidate
+        fallback.append(value)
     first_issue=len(current_recovery().failures)
     print(f'[正式道路] 轴线质量检查：{len(axes)} 条',flush=True)
     repaired, axis_audit = repair_network_axes(axes, fallback, evidence)
@@ -156,7 +162,7 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                 kept_rows.append(dict(row,geometry=part,_width_fallback=True))
                 kept_axes.append(part)
         with geometry_item("width_profile",[row["source_feature"]],on_error=retain_width_axis,
-                           status='fallback',error_types=ROAD_ERRORS):
+                           status='fallback',road_local=True,tile_id=str(row.get('tile_id',''))):
             if axis is None:continue
             if row.get('track_id'):
                 ss, vv = road_profile(row, old, width)
@@ -169,6 +175,7 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                 key = hashlib.sha256(json.dumps([old.wkb_hex,width,dependencies]).encode()).hexdigest()
                 ss, vv, qq = (map(np.asarray, saved[key]) if key in saved else sampler.profile_quality(old, width))
                 current[key] = [ss.tolist(), vv.tolist(), qq.tolist()]
+            if row.get('_width_fallback'):qq=np.zeros(len(ss))
             if i in repairs and repairs[i].get('piece_maps'):
                 parts=[axis] if axis.geom_type=='LineString' else list(axis.geoms)
                 for part,mapping in zip(parts,repairs[i]['piece_maps']):
@@ -209,15 +216,17 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                      qa_reason='formal_width_segment_mapping_failed')
             center_rows.append(row);width_rows.append(row.copy())
         with geometry_item('formal_chain',chain.sources,on_error=retain_chain,
-                           status='fallback',error_types=ROAD_ERRORS):
+                           status='fallback',road_local=True,
+                           tile_id=','.join(sorted({str(rows[i].get('tile_id','')) for i in chain.sources}))):
             sources = sorted(chain.sources)
             owner = next((i for i in sources if rows[i].get('track_id')), sources[0])
             row = {k:v for k,v in rows[owner].items() if k not in ('geometry','_original_row','gt_width_profile',
-                                                                'source_feature','axis_quality','repair_status','_width_fallback')}
+                                                                'source_feature','axis_quality','repair_status','_width_fallback','_width_fallback_reason')}
             row.update(segment_id=chain_id, width_m=float(np.median(chain.widths)),
                        length_m=chain.axis.length, geometry=chain.axis,
                        source_ids=','.join(map(str,sources)))
-            reliable_fraction=min(float(np.mean(np.asarray(quality[i])>0)) for i in sources)
+            reliable_fraction=min(float(np.mean(chain.quality>0)),
+                                  min(float(np.mean(np.asarray(quality[i])>0)) for i in sources))
             row.update(width_qual='A' if reliable_fraction>=1 else 'C',
                        qa_state='auto' if reliable_fraction>=1 else 'review')
             if row.get('track_id'):
@@ -242,9 +251,10 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                     cosine = abs(float(_direction(old,station) @ _direction(line,line.project(probe))))
                     if cosine >= .95: candidates.append((line.distance(probe),-cosine,int(k)))
                 evidence_row = sampler.frame.iloc[min(candidates)[2]].to_dict() if candidates else {}
-                if rows[source].get('_width_fallback'):
+                if rows[source].get('_width_fallback') or getattr(chain,'width_fallback_reason',''):
                     evidence_row.update(quality_grade='C',width_quality='C',valid_ratio=0.,
-                        width_source='axis_width_estimate',qa_state='review',qa_reason='width_profile_mapping_failed')
+                        width_source='axis_width_estimate',qa_state='review',
+                        qa_reason=getattr(chain,'width_fallback_reason',rows[source].get('_width_fallback_reason','width_profile_mapping_failed')))
                 local = substring(chain.axis,a,b)
                 # A missing observation stays missing. A chain owner's grade must
                 # never leak into an unsupported station of the merged chain.

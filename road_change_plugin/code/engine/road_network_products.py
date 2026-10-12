@@ -202,6 +202,12 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
     print(f'[Fast timing] width_rebuild_inferred={time.perf_counter()-stage_started:.6f}s',flush=True)
     stage_started=time.perf_counter()
     corridors = build_corridors(segments)
+    diagnostics=[*segments.attrs.get('width_diagnostics',[]),*corridors.attrs.get('width_diagnostics',[])]
+    if diagnostics and 'parent_id' in segments:
+        affected=segments.parent_id.astype(str).isin({r['road_id'] for r in diagnostics})
+        segments.loc[affected,['quality_grade','width_quality']]='C'
+        segments.loc[affected,'qa_state']='review'
+    corridors.attrs['width_diagnostics']=diagnostics
     if raw_observations:
         segments=segments.drop(columns=['raw_corridor_wkb'],errors='ignore')
         corridors=corridors.drop(columns=['raw_corridor_wkb'],errors='ignore')

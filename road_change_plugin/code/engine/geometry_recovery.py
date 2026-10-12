@@ -54,17 +54,23 @@ def recovery_scope(recovery):
 
 
 @contextmanager
-def geometry_item(stage, sources, on_error=None, status='skipped', error_types=GEOMETRY_ERRORS):
+def geometry_item(stage, sources, on_error=None, status='skipped', error_types=GEOMETRY_ERRORS,
+                  road_local=False, tile_id=''):
     """A transaction boundary around a single geometry, never around file I/O."""
     try:yield
-    except error_types as error:
+    except (Exception if road_local else error_types) as error:
+        if road_local:
+            from .width.width_reliability import require_road_local
+            require_road_local(error)
         if getattr(error,'code',None)==-4 or any(token in str(error).lower() for token in
             ('out of memory','failed to allocate','bad_alloc','insufficient memory')):
             raise
         recovery = _current.get()
         if recovery is None:raise
         if on_error is not None:on_error()
-        recovery.record(stage,sources,error,status,final_action='retain_valid_geometry' if status=='fallback' else None)
+        record=recovery.record(stage,sources,error,status,final_action='retain_valid_geometry' if status=='fallback' else None)
+        if road_local:
+            record.update(road_id=','.join(map(str,sources)),tile_id=tile_id,fallback_reason=str(error))
 
 
 def current_recovery():

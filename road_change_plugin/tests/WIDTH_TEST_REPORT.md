@@ -2,6 +2,8 @@
 
 日期：2026-10-12。平台：Windows，Python 3.10.20；NumPy 2.2.6、GeoPandas 1.1.4、Shapely 2.1.2、Rasterio 1.4.4、SciPy 1.15.3。
 
+最新“道路局部异常 + RGB 内存安全”改造共 179 项测试通过，见 [RGB_MEMORY_SAFETY.md](RGB_MEMORY_SAFETY.md)；异常分类边界见 [WIDTH_EXCEPTION_BOUNDARIES.md](WIDTH_EXCEPTION_BOUNDARIES.md)。以下为第一轮记录。
+
 ## 验证结果
 
 | 测试 | 用例数 | 结果 | 重点 |

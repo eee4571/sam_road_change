@@ -177,7 +177,7 @@ def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None, dia
     data used by Fast2 is not mutated; smoothing is exclusive to this product.
     """
     started = time.perf_counter()
-    from .width_reliability import ROAD_ERRORS, issue
+    from .width_reliability import issue
     diagnostics=[] if diagnostics is None else diagnostics
     if width_segments.empty:
         return gpd.GeoDataFrame({'surface_id': [], 'area_m2': []}, geometry=[], crs=width_segments.crs)
@@ -192,21 +192,37 @@ def build_road_surfaces(width_segments, *, pixel_size=None, image_path=None, dia
         raise ValueError('Invalid road surface pixel size')
     chains, ends, axes, road_widths = [], [], [], []
     fallback_axes=[]
-    for axis, ss, left, right in _profile_runs(frame):
+    for parent,group in frame.groupby('parent_id',sort=False):
+        first=group.iloc[0];tile_id=str(first.get('tile_id',''))
         try:
-            polygon, terminals = _display_boundaries(axis, ss, left, right, pixel_size)
-            if polygon.is_empty:raise ValueError('Empty offset surface')
-        except ROAD_ERRORS as exc:
-            related=frame.iloc[int(frame.sindex.nearest(axis)[1][0])]
-            diagnostics.append(issue(related.get('parent_id',''),related.get('tile_id',''),'surface',exc,
-                geometry=axis,fallback='symmetric_buffer'))
-            polygon=axis.buffer(float(np.median(left+right))/2)
-            terminals=[]
-            fallback_axes.append(axis)
-        chains.append(polygon)
-        axes.append(axis)
-        road_widths.append(float(np.median(left + right)))
-        ends.extend(terminals)
+            runs=list(_profile_runs(group))
+        except Exception as exc:
+            diagnostics.append(issue(parent,tile_id,'surface_profile',exc,
+                                     geometry=first.geometry,fallback='segment_profiles'))
+            from .raw_image_backend import _profile_width
+            width=_profile_width(group)
+            runs=[(line,np.array([line.length/2]),np.array([width/2]),np.array([width/2]))
+                  for line in group.geometry]
+            fallback_axes.extend(group.geometry)
+        for axis, ss, left, right in runs:
+            try:
+                polygon, terminals = _display_boundaries(axis, ss, left, right, pixel_size)
+                if polygon.is_empty:raise ValueError('Empty offset surface')
+            except Exception as exc:
+                diagnostics.append(issue(parent,tile_id,'surface',exc,
+                    geometry=axis,fallback='symmetric_buffer'))
+                fallback_axes.append(axis)
+                try:
+                    polygon=axis.buffer(float(np.median(left+right))/2)
+                except Exception as buffer_error:
+                    diagnostics.append(issue(parent,tile_id,'surface_fallback',buffer_error,
+                        geometry=axis,fallback='axis_retained_without_surface'))
+                    continue
+                terminals=[]
+            chains.append(polygon)
+            axes.append(axis)
+            road_widths.append(float(np.median(left + right)))
+            ends.extend(terminals)
     boundary_seconds = time.perf_counter() - started
     merged = make_valid(union_all(chains))
     print(f'[Raw width] boundary union components={len(list(_polygons(merged)))}', flush=True)

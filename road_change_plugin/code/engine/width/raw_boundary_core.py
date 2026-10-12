@@ -15,6 +15,7 @@ from scipy.signal import find_peaks
 from scipy.spatial import cKDTree
 import shapely
 from shapely.geometry import LineString
+from .raw_memory import MemoryPolicy, RoadMemoryLimit, WORKSPACES
 
 
 @dataclass
@@ -85,6 +86,8 @@ def load_roads(path, layer, config):
 
 
 def sample_line(line, c):
+    # Check before the dense one-metre interpolation (including standalone use).
+    MemoryPolicy().road_bytes(line.length,c)
     # Smooth at 1 m resolution, preserve the two network endpoints, then resample by arc length.
     s = np.linspace(0, line.length, max(3, int(np.ceil(line.length)) + 1))
     xy = shapely.get_coordinates(shapely.line_interpolate_point(line, s))
@@ -107,11 +110,14 @@ class NoImageCoverage(ValueError):
 
 
 class ImageReader:
-    def __init__(self, path, metric_crs):
+    def __init__(self, path, metric_crs, *, memory_policy=None):
         from .raw_feature_cache import TileMosaic,FeatureCache
+        from threading import local
+        self.policy=memory_policy or MemoryPolicy()
+        self.thread=local()
         self.ds = TileMosaic(path if isinstance(path,(list,tuple)) else [path])
         try:
-            self.feature_cache=FeatureCache(self.ds)
+            self.feature_cache=FeatureCache(self.ds,policy=self.policy)
             self.to_image = Transformer.from_crs(metric_crs, self.ds.crs, always_xy=True)
         except BaseException:
             self.ds.close()
@@ -126,23 +132,60 @@ class ImageReader:
 
     def crop(self, xy, pad=5):
         pix = self.pixels(xy)
-        lo = np.maximum(np.floor(pix.reshape(-1, 2).min(0)-pad), 0).astype(int)
-        hi = np.minimum(np.ceil(pix.reshape(-1, 2).max(0)+pad+1), [self.ds.width, self.ds.height]).astype(int)
+        lo,hi=self.window_bounds(pix,pad)
         if np.any(hi <= lo):
             raise ValueError('Centerline does not overlap image')
         window = Window(*lo, *(hi-lo))
-        with self.feature_cache.read_lock:
-            rgb,valid=self.ds.read_window(window)
+        self.policy.check_window(*(hi-lo))
+        with WORKSPACES.reserve(self.policy.window_bytes(int(hi[0]-lo[0])*int(hi[1]-lo[1]))):
+            with self.feature_cache.read_lock:
+                rgb,valid=self.ds.read_window(window)
         return rgb, valid, pix-lo, lo
 
     def close(self):
+        self.feature_cache.clear()
         self.ds.close()
+
+    def window_bounds(self,pix,pad=5):
+        if not np.isfinite(pix).all():
+            from .width_reliability import InputContractError
+            raise InputContractError('Nonfinite RGB pixel coordinates; check image and road CRS')
+        limit=[self.ds.width,self.ds.height]
+        # Clip in floating point before integer conversion, never wrap huge
+        # out-of-coverage coordinates or move them onto valid image evidence.
+        lo=np.clip(np.floor(pix.reshape(-1,2).min(0)-pad),0,limit).astype(np.int64)
+        hi=np.clip(np.ceil(pix.reshape(-1,2).max(0)+pad+1),0,limit).astype(np.int64)
+        return lo,hi
+
+    def profile_windows(self,xy,normal,c):
+        # Endpoint bounds suffice for a linear cross-section on the projected
+        # grid only after transformation. Transform every cross-section point
+        # in small planning batches, also supporting nonlinear CRS transforms.
+        offsets=np.arange(-c.search_radius-2,c.search_radius+2+c.cross_step/2,c.cross_step)
+        lows=[];highs=[]
+        for start in range(0,len(xy),128):
+            points=xy[start:start+128,None,:]+normal[start:start+128,None,:]*offsets[None,:,None]
+            pixels=self.pixels(points)
+            for row in pixels:
+                lo,hi=self.window_bounds(row)
+                lows.append(lo);highs.append(hi)
+        lows=np.asarray(lows);highs=np.asarray(highs)
+        pending=[(0,len(xy))];result=[]
+        while pending:
+            a,b=pending.pop()
+            lo=lows[a:b].min(0);hi=highs[a:b].max(0)
+            try:
+                if np.all(hi>lo):self.policy.check_window(*(hi-lo))
+            except RoadMemoryLimit:
+                if b-a==1:raise
+                mid=(a+b)//2
+                pending.extend([(mid,b),(a,mid)])
+            else:result.append((a,b))
+        return result
 
     def features(self,xy,pad=5):
         pix=self.pixels(xy)
-        if not np.isfinite(pix).all():raise ValueError('Nonfinite RGB pixel coordinates; check image and road CRS')
-        lo=np.maximum(np.floor(pix.reshape(-1,2).min(0)-pad),0).astype(int)
-        hi=np.minimum(np.ceil(pix.reshape(-1,2).max(0)+pad+1),[self.ds.width,self.ds.height]).astype(int)
+        lo,hi=self.window_bounds(pix,pad)
         if np.any(hi<=lo):raise NoImageCoverage('Centerline does not overlap image')
         return (*self.feature_cache.features(lo,hi),pix-lo)
 
@@ -152,6 +195,31 @@ def normalize_feature(a, scale):
 
 
 def extract_profiles(reader, xy, normal, c):
+    try:
+        windows=reader.profile_windows(xy,normal,c)
+    except RoadMemoryLimit:
+        raise
+    except Exception as error:
+        from .width_reliability import SharedWidthStateError, require_road_local
+        require_road_local(error)
+        raise SharedWidthStateError('Shared RGB projection/window planner failed') from error
+    reader.thread.windowed=len(windows)>1
+    if len(windows)==1:
+        return _extract_window_profiles(reader,xy,normal,c)
+    # Only the cross-section outputs span the road; image feature arrays never
+    # span its complete bounding rectangle. No optimizer state is split here.
+    outputs=None
+    for a,b in windows:
+        parts=_extract_window_profiles(reader,xy[a:b],normal[a:b],c)
+        if outputs is None:
+            outputs=[np.empty((len(xy),*part.shape[1:]),dtype=part.dtype) for part in parts[1:]]
+            offsets=parts[0]
+        for target,part in zip(outputs,parts[1:]):target[a:b]=part
+        del parts,part
+    return (offsets,*outputs)
+
+
+def _extract_window_profiles(reader, xy, normal, c):
     # Read an evidence halo so a boundary at the search limit still has both color bands.
     radius = c.search_radius + 2.0
     offsets = np.arange(-radius, radius+c.cross_step/2, c.cross_step)
@@ -162,6 +230,14 @@ def extract_profiles(reader, xy, normal, c):
         shape=(len(xy),len(offsets))
         return (offsets,np.full(shape,-1.),np.zeros(shape+(4,)),np.zeros(shape,bool),
                 np.full(shape+(3,),np.nan),np.zeros(shape+(3,)))
+    except RoadMemoryLimit:
+        raise
+    except Exception as error:
+        # Reader/cache/projection state is shared by workers. Its failure is not
+        # evidence of a bad road, even when the native exception is KeyError.
+        from .width_reliability import SharedWidthStateError, require_road_local
+        require_road_local(error)
+        raise SharedWidthStateError('Shared RGB reader/cache failed') from error
     coordinates = [pix[..., 1], pix[..., 0]]
     def sample(a, order=1, fill=np.nan):
         return map_coordinates(a, coordinates, order=order, mode='constant', cval=fill)
@@ -259,6 +335,11 @@ def confidence_for_choice(ids, score, offsets):
 
 
 def measure_road(reader, line, junction_tree, c):
+    with WORKSPACES.reserve(reader.policy.road_bytes(line.length,c)):
+        return _measure_road(reader,line,junction_tree,c)
+
+
+def _measure_road(reader, line, junction_tree, c):
     distance, xy, normal = sample_line(line, c)
     offsets, scores, features, valid, rgb_profile, lab_profile = extract_profiles(reader, xy, normal, c)
     states = [states_for_row(offsets, score, c) for score in scores]
@@ -302,6 +383,7 @@ def measure_road(reader, line, junction_tree, c):
                 flags[i].add('insufficient_continuous_support')
                 chosen[i] = baseline[i]
     data = dict(s=distance, xy=xy, normal=normal, offsets=offsets, scores=scores,
+                memory_windowed=reader.thread.windowed,
                 features=features, rgb=rgb_profile, lab=lab_profile)
     data['flags'] = [';'.join(sorted(f)) for f in flags]
     for name, selection in [('baseline', baseline), ('optimized', chosen)]:

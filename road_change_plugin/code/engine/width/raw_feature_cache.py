@@ -7,11 +7,14 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 from scipy.ndimage import map_coordinates
+from .raw_memory import MemoryPolicy, WORKSPACES, CACHE_LOCK, CACHES, admit_cache, bounded_gdal_cache
 
 
 class TileMosaic:
     def __init__(self, paths):
         self.sources=[]
+        self._cache_context=bounded_gdal_cache()
+        self._cache_context.__enter__()
         try:
             for path in paths:self.sources.append(rasterio.open(path))
             self._initialize_grid()
@@ -44,6 +47,7 @@ class TileMosaic:
 
     def read_window(self,window):
         x,y,w,h=map(int,(window.col_off,window.row_off,window.width,window.height))
+        MemoryPolicy().check_window(w,h)
         rgb=np.zeros((h,w,3),np.uint8);valid=np.zeros((h,w),bool)
         for ds,(dx,dy) in zip(self.sources,self.offsets):
             x0,y0=max(x,dx),max(y,dy);x1,y1=min(x+w,dx+ds.width),min(y+h,dy+ds.height)
@@ -56,7 +60,12 @@ class TileMosaic:
         return rgb,valid
 
     def close(self):
-        for ds in self.sources:ds.close()
+        try:
+            for ds in self.sources:ds.close()
+        finally:
+            if self._cache_context is not None:
+                self._cache_context.__exit__(None,None,None)
+                self._cache_context=None
 
 
 class FeatureCache:
@@ -67,11 +76,23 @@ class FeatureCache:
     Exact crop-dependent filters are cached by their complete window instead.
     Both caches share one byte budget and LRU, including all derived arrays.
     """
-    def __init__(self,ds,max_bytes=128*1024*1024,block_size=512):
+    def __init__(self,ds,max_bytes=128*1024*1024,block_size=512,policy=None):
         self.ds=ds;self.max_bytes=max_bytes;self.block_size=block_size
-        self.items=OrderedDict();self.bytes=0;self.lock=RLock()
+        if not 1<=block_size<=512:raise ValueError('RGB feature blocks must be at most 512 pixels')
+        self.policy=policy or MemoryPolicy()
+        self.items=OrderedDict();self.bytes=0;self.lock=CACHE_LOCK
         self.read_lock=RLock();self.pending={}
         self.hits=0;self.misses=0;self.evictions=0
+        self.max_window_pixels=0;self.window_builds=0
+        with self.lock:CACHES.add(self)
+
+    def evict(self):
+        _,old=self.items.popitem(last=False)
+        self.bytes-=sum(a.nbytes for a in old);self.evictions+=1
+
+    def clear(self):
+        with self.lock:
+            self.items.clear();self.bytes=0
 
     def _get(self,key,build):
         with self.lock:
@@ -86,9 +107,7 @@ class FeatureCache:
         try:
             value=build();size=sum(a.nbytes for a in value)
             with self.lock:
-                while self.items and self.bytes+size>self.max_bytes:
-                    _,old=self.items.popitem(last=False);self.bytes-=sum(a.nbytes for a in old);self.evictions+=1
-                if size<=self.max_bytes:self.items[key]=value;self.bytes+=size
+                if admit_cache(self,size):self.items[key]=value;self.bytes+=size
                 # Wake same-key readers only after publication; no computations
                 # or dataset I/O run while holding the cache-state lock.
                 future.set_result(value);self.pending.pop(key)
@@ -100,7 +119,16 @@ class FeatureCache:
 
     def features(self,lo,hi):
         x,y=map(int,lo);w,h=map(int,hi-lo)
+        self.policy.check_window(w,h)
+        if x<0 or y<0 or x+w>self.ds.width or y+h>self.ds.height:
+            raise ValueError('RGB feature window lies outside the image grid')
+        with WORKSPACES.reserve(self.policy.window_bytes(w*h)):
+            return self._features(x,y,w,h)
+
+    def _features(self,x,y,w,h):
         def build():
+            with self.lock:
+                self.max_window_pixels=max(self.max_window_pixels,w*h);self.window_builds+=1
             rgbf=np.empty((h,w,3),np.float32);lab=np.empty_like(rgbf)
             gray=np.empty((h,w),np.float32);mask=np.empty((h,w),np.uint8)
             b=self.block_size
