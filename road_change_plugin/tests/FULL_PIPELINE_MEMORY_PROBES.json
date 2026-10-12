@@ -1,0 +1,94 @@
+{
+  "scope": "Full production Fast + raw_image + IR-MAD pipeline",
+  "meaning": "Diagnostic findings, not a memory-safety certification",
+  "model_inference_executed": false,
+  "large_allocations_executed": false,
+  "findings": {
+    "regional_axis_before_rgb": {
+      "reached_allocation": true,
+      "requests": [
+        {
+          "elements": 1000000000,
+          "float64_bytes": 8000000000
+        }
+      ]
+    },
+    "formal_change_stations": {
+      "reached_allocation": true,
+      "requests": [
+        {
+          "elements": 250000001,
+          "float64_bytes": 2000000008
+        }
+      ]
+    },
+    "irmad_wide_input_strip": {
+      "shape": [
+        128,
+        1000000
+      ],
+      "pixels": 128000000,
+      "paired_rgb_uint8_bytes": 768000000,
+      "exposure": "custom/bypassed normalization; normal plugin tiles are 4096 or smaller"
+    },
+    "inference_array_lower_bounds": {
+      "infer_batch_size": 16,
+      "patch_size": 512,
+      "sample_margin": 64,
+      "cases": [
+        {
+          "size": 4096,
+          "patches": 121,
+          "fusion_float32_bytes": 201326592,
+          "retained_two_channel_float32_masks_bytes": 253755392,
+          "note": "Excludes retained embeddings, model weights, batch activations and CPU arrays."
+        },
+        {
+          "size": 8192,
+          "patches": 441,
+          "fusion_float32_bytes": 805306368,
+          "retained_two_channel_float32_masks_bytes": 924844032,
+          "note": "Excludes retained embeddings, model weights, batch activations and CPU arrays."
+        }
+      ]
+    },
+    "rescale_before_target_size_check": {
+      "reached_allocation": true,
+      "requests": [
+        {
+          "shape": [
+            81920,
+            81920
+          ],
+          "rgb_uint8_bytes": 20132659200
+        }
+      ],
+      "enabled_in_current_config": false
+    },
+    "evaluation_area_cap_bypass": {
+      "reached_allocation": true,
+      "requests": [
+        {
+          "shape": [
+            5,
+            730296748
+          ],
+          "cells": 3651483740,
+          "intended_cap": 8000000
+        }
+      ]
+    },
+    "assisted_evaluation_bbox": {
+      "reached_allocation": true,
+      "requests": [
+        {
+          "shape": [
+            80003,
+            80003
+          ],
+          "single_uint8_mask_bytes": 6400480009
+        }
+      ]
+    }
+  }
+}

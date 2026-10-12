@@ -1,5 +1,7 @@
 # 测宽之外的内存风险检查
 
+完整道路提取、IR-MAD、模型、长时序、评价及应用并发的补充审计见 [FULL_PIPELINE_MEMORY_AUDIT.md](FULL_PIPELINE_MEMORY_AUDIT.md)。本报告仅记录此前测宽周边的修复与验证。
+
 2026-10-12；基于 `main` 的 `3ba255b`。沿实际插件 `fast + raw_image` 路径检查区域恢复、正式产品发布、概率图输出、Fast2 Auto、预览和模型预取。未运行模型；未递归扫描项目成果或环境。
 
 ## 结论
