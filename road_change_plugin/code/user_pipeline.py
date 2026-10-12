@@ -1044,8 +1044,11 @@ def map_scene(args: argparse.Namespace) -> dict:
     rgb = np.zeros((3, height, width), dtype=np.uint8)
     covered = np.zeros((height, width), dtype=bool)
     source_count = 0
+    from engine.width.raw_memory import bounded_gdal_cache
+    from engine.raster_memory import check_native_blocks
     for raster_path in rasters:
-        with rasterio.open(raster_path) as source:
+        with bounded_gdal_cache(),rasterio.open(raster_path) as source:
+            check_native_blocks(source)
             if source.crs is None:
                 continue
             source_bounds = transform_bounds(source.crs, target_crs, *source.bounds, densify_pts=8)
@@ -1057,7 +1060,9 @@ def map_scene(args: argparse.Namespace) -> dict:
                 mask = np.zeros((height, width), dtype=np.uint8)
                 for band, source_index in enumerate(indexes):
                     reproject(rasterio.band(warped, source_index), tile[band], src_transform=warped.transform, src_crs=warped.crs, dst_transform=transform, dst_crs=target_crs, dst_nodata=np.nan, resampling=Resampling.bilinear)
-                reproject(warped.dataset_mask(), mask, src_transform=warped.transform, src_crs=warped.crs, dst_transform=transform, dst_crs=target_crs, dst_nodata=0, resampling=Resampling.nearest)
+                with WarpedVRT(warped,crs=target_crs,transform=transform,width=width,height=height,
+                               resampling=Resampling.nearest) as preview_mask:
+                    mask=preview_mask.dataset_mask()
                 valid = (mask > 0) & np.isfinite(tile).any(axis=0)
                 if not valid.any():
                     continue
@@ -2434,87 +2439,10 @@ def _write_probability_mosaic(
     *,
     allow_direct_placement: bool = True,
 ) -> str | None:
-    """Georeference already-produced SAMRoad probability PNGs without inference."""
-    import numpy as np
-    import rasterio
-    from PIL import Image
-    from rasterio.transform import from_origin
-    from rasterio.warp import Resampling, reproject
-
-    sources = []
-    for image_path in listed_rasters(image_dir):
-        probability_path = probability_dir / f"{image_path.stem}{suffix}"
-        if not probability_path.is_file():
-            continue
-        try:
-            with rasterio.open(image_path) as dataset:
-                probability = np.asarray(Image.open(probability_path).convert("L"), dtype=np.uint8)
-                if probability.shape != dataset.shape or dataset.crs is None:
-                    continue
-                sources.append({
-                    "probability": probability,
-                    "valid": dataset.dataset_mask() > 0,
-                    "transform": dataset.transform,
-                    "crs": dataset.crs,
-                    "bounds": dataset.bounds,
-                    "xres": abs(float(dataset.transform.a)),
-                    "yres": abs(float(dataset.transform.e)),
-                })
-        except (OSError, ValueError, rasterio.errors.RasterioError):
-            continue
-    if not sources:
-        return None
-    target_crs = sources[0]["crs"]
-    compatible = [source for source in sources if source["crs"] == target_crs]
-    if not compatible:
-        return None
-    xres = float(np.median([source["xres"] for source in compatible]))
-    yres = float(np.median([source["yres"] for source in compatible]))
-    left = min(source["bounds"].left for source in compatible)
-    bottom = min(source["bounds"].bottom for source in compatible)
-    right = max(source["bounds"].right for source in compatible)
-    top = max(source["bounds"].top for source in compatible)
-    width = max(1, int(np.ceil((right - left) / xres)))
-    height = max(1, int(np.ceil((top - bottom) / yres)))
-    transform = from_origin(left, top, xres, yres)
-    mosaic = np.zeros((height, width), dtype=np.uint8)
-    valid = np.zeros((height, width), dtype=np.uint8)
-    for source in compatible:
-        placement = (
-            _strict_grid_window(
-                source["transform"], source["probability"].shape,
-                transform, mosaic.shape,
-            )
-            if allow_direct_placement and source["crs"] == target_crs else None
-        )
-        if placement is not None:
-            mosaic[placement] = source["probability"]
-            valid[placement] = source["valid"].astype(np.uint8) * 255
-        else:
-            reproject(
-                source["probability"], mosaic,
-                src_transform=source["transform"], src_crs=source["crs"],
-                dst_transform=transform, dst_crs=target_crs,
-                resampling=Resampling.bilinear, init_dest_nodata=False,
-            )
-            reproject(
-                source["valid"].astype(np.uint8) * 255, valid,
-                src_transform=source["transform"], src_crs=source["crs"],
-                dst_transform=transform, dst_crs=target_crs,
-                resampling=Resampling.nearest, init_dest_nodata=False,
-            )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(
-        output, "w", driver="GTiff", width=width, height=height, count=1,
-        dtype="uint8", crs=target_crs, transform=transform, compress="deflate",
-    ) as dataset:
-        dataset.write(mosaic, 1)
-        dataset.write_mask(valid)
-        dataset.update_tags(
-            evidence_type="SAMRoad scene-relative road probability",
-            source="existing per-tile probability products; no inference rerun",
-        )
-    return str(output.resolve())
+    """Georeference cached probabilities using bounded disk-backed windows."""
+    from engine.probability_mosaic import write_probability_mosaic
+    return write_probability_mosaic(listed_rasters(image_dir),probability_dir,output,suffix,
+                                   _strict_grid_window if allow_direct_placement else None)
 
 
 def extract(args: argparse.Namespace) -> dict:

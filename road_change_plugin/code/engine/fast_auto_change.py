@@ -50,7 +50,18 @@ class WindowedProbability(RoadProbabilityRaster):
     _STRIP_READ_MAX_BYTES = 1024*1024
 
     def __init__(self, path, metric_crs, *, ram_limit_bytes=128*1024*1024, cache_limit_bytes=64*1024*1024):
+        from .width.raw_memory import bounded_gdal_cache
+        self._cache_context=bounded_gdal_cache()
+        self._cache_context.__enter__()
+        try:
+            self._initialize(path,metric_crs,ram_limit_bytes,cache_limit_bytes)
+        except BaseException:
+            self.close();raise
+
+    def _initialize(self,path,metric_crs,ram_limit_bytes,cache_limit_bytes):
         self.dataset = rasterio.open(path)
+        from .raster_memory import check_native_blocks
+        check_native_blocks(self.dataset)
         self.crs = CRS.from_user_input(self.dataset.crs)
         self.metric_crs = CRS.from_user_input(metric_crs)
         self.to_raster = Transformer.from_crs(metric_crs, self.crs, always_xy=True)
@@ -74,16 +85,24 @@ class WindowedProbability(RoadProbabilityRaster):
         self._blocks = OrderedDict()
         self._cache_bytes = 0
         self._cache_limit = cache_limit_bytes
+        # A native TIFF strip may span a scene millions of columns wide. GDAL
+        # windowing remains exact when logical cache blocks subdivide it.
         self._block_shape = self.dataset.block_shapes[0]
+        if np.prod(self._block_shape)*(np.dtype(self.dataset.dtypes[0]).itemsize+1)>self._STRIP_READ_MAX_BYTES:
+            self._block_shape=tuple(min(512,v) for v in self._block_shape)
         required = self.dataset.width*self.dataset.height*(np.dtype(self.dataset.dtypes[0]).itemsize+1)
         if required <= ram_limit_bytes:
             self._ram = self.dataset.read(1, masked=True)
 
     def close(self):
-        self.dataset.close()
-        self._ram = None
-        self._blocks.clear()
-        self._cache_bytes = 0
+        try:
+            if hasattr(self,'dataset'):self.dataset.close()
+        finally:
+            self._ram=None
+            if hasattr(self,'_blocks'):self._blocks.clear()
+            self._cache_bytes=0
+            if self._cache_context is not None:
+                self._cache_context.__exit__(None,None,None);self._cache_context=None
 
     def _values_at(self, x, y):
         x, y = self.to_raster.transform(np.asarray(x), np.asarray(y))

@@ -121,8 +121,9 @@ def _evidence_route(axis,width,evidence):
     from skimage.graph import route_through_array
     bounds=axis.buffer(width).bounds
     x0,y0,x1,y1=bounds
-    step=max(1.,width/12,np.sqrt((x1-x0)*(y1-y0)/200000.))
-    xx=np.arange(x0,x1+step,step);yy=np.arange(y0,y1+step,step)
+    from .bounded_grid import bounded_grid_shape
+    step,nx,ny=bounded_grid_shape(x1-x0,y1-y0,max(1.,width/12),200000,endpoints=True)
+    xx=x0+np.arange(nx)*step;yy=y0+np.arange(ny)*step
     x,y=np.meshgrid(xx,yy);xy=np.c_[x.ravel(),y.ravel()]
     allowed=covers(axis.buffer(width),points(xy));score=np.zeros(len(xy))
     if evidence.surface is not None:score=covers(evidence.surface.context,points(xy)).astype(float)

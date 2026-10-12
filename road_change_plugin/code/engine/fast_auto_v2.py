@@ -47,11 +47,10 @@ class ChangeEvidence:
         b = np.asarray(bounds)
         left, bottom = b[:, :2].min(axis=0)-70
         right, top = b[:, 2:].max(axis=0)+70
-        self.resolution = max(config.raster_resolution,
-                              np.sqrt((right-left)*(top-bottom)/config.maximum_raster_cells))
+        from .bounded_grid import bounded_grid_shape
+        self.resolution,self.width,self.height=bounded_grid_shape(
+            right-left,top-bottom,config.raster_resolution,config.maximum_raster_cells)
         self.transform = from_origin(left, top, self.resolution, self.resolution)
-        self.height = int(np.ceil((top-bottom)/self.resolution))
-        self.width = int(np.ceil((right-left)/self.resolution))
         self.masks = []
         for scene in (before, after):
             shapes = [(g, 1) for g in scene.surfaces.geometry if not g.is_empty]

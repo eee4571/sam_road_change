@@ -24,6 +24,7 @@ class RoadProbability:
     def values(self, xy):
         import rasterio
         from rasterio.windows import Window
+        from .width.raw_memory import bounded_gdal_cache
         xy=xy/self.unit
         values=np.full(len(xy),np.nan)
         for path,transform,shape,project in self.tiles:
@@ -31,30 +32,33 @@ class RoadProbability:
             row=np.floor(row).astype(int);col=np.floor(col).astype(int)
             selected=np.flatnonzero((row>=0)&(row<shape[0])&(col>=0)&(col<shape[1]))
             if not len(selected):continue
-            r,c=row[selected],col[selected];r0,c0=int(r.min()),int(c.min())
-            window=Window(c0,r0,int(c.max())-c0+1,int(r.max())-r0+1)
-            if path.suffix.lower()=='.png':
-                # PNG window reads repeatedly decode preceding scanlines. Keep a
-                # bounded per-recovery cache; no cache survives input edits.
-                import cv2
-                block=self.png_cache.pop(path,None)
-                if block is None:
-                    block=cv2.imdecode(np.frombuffer(path.read_bytes(),dtype=np.uint8),cv2.IMREAD_GRAYSCALE)
-                    if block is None or block.shape!=shape:raise ValueError(f'Invalid probability mask: {path}')
-                    while self.png_cache and self.cache_bytes+block.nbytes>128*1024*1024:
-                        _,old=self.png_cache.popitem(last=False);self.cache_bytes-=old.nbytes
-                    self.cache_bytes+=block.nbytes
-                self.png_cache[path]=block
-                if self.cache_bytes>128*1024*1024:
-                    self.png_cache.pop(path);self.cache_bytes-=block.nbytes
-                block=np.ma.asarray(block[r0:r0+int(window.height),c0:c0+int(window.width)])
-            else:
-                with rasterio.open(path) as ds:
-                    if ds.shape!=shape:raise ValueError(f'Probability/image grid shape mismatch: {path}')
-                    block=ds.read(1,window=window,masked=True)
-            sampled=block[r-r0,c-c0].astype(float).filled(np.nan)
-            if block.dtype==np.uint8:sampled/=255.
-            values[selected]=np.fmax(values[selected],sampled)
+            r,c=row[selected],col[selected]
+            # Group requested pixels into bounded native-coordinate windows;
+            # never read the bounding rectangle between distant probes.
+            ids=(r//512)*((shape[1]+511)//512)+c//512
+            order=np.argsort(ids,kind='stable')
+            starts=np.r_[0,np.flatnonzero(np.diff(ids[order]))+1,len(order)]
+            with bounded_gdal_cache(),rasterio.open(path) as ds:
+                from .raster_memory import check_native_blocks
+                check_native_blocks(ds)
+                if ds.shape!=shape or ds.count!=1:raise ValueError(f'Probability/image grid mismatch: {path}')
+                for start,stop in zip(starts[:-1],starts[1:]):
+                    take=order[start:stop];rr,cc=r[take],c[take]
+                    r0,c0=int(rr.min()),int(cc.min())
+                    h,w=int(rr.max())-r0+1,int(cc.max())-c0+1
+                    key=(path,r0,c0,h,w)
+                    block=self.png_cache.pop(key,None)
+                    if block is None:
+                        block=ds.read(1,window=Window(c0,r0,w,h),masked=True)
+                        size=block.data.nbytes+np.ma.getmaskarray(block).nbytes
+                        while self.png_cache and self.cache_bytes+size>128*1024*1024:
+                            _,old=self.png_cache.popitem(last=False)
+                            self.cache_bytes-=old.data.nbytes+np.ma.getmaskarray(old).nbytes
+                        self.cache_bytes+=size
+                    self.png_cache[key]=block
+                    sampled=block[rr-r0,cc-c0].astype(float).filled(np.nan)
+                    if block.dtype==np.uint8:sampled/=255.
+                    values[selected[take]]=np.fmax(values[selected[take]],sampled)
         return values
 
 

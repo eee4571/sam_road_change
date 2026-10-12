@@ -3139,6 +3139,7 @@ def prepare_regional_products(
                         Path(__file__).with_name('road_network_connection.py'),
                         Path(__file__).with_name('road_axis_cleanup.py'), Path(__file__).with_name('road_axis_quality.py'), WIDTH_ROOT/'raw_feature_cache.py', WIDTH_ROOT/'raw_memory.py',
                         Path(__file__).with_name('road_connection_evidence.py'),
+                        Path(__file__).with_name('bounded_grid.py'),Path(__file__).with_name('raster_memory.py'),
                         Path(__file__).with_name('road_track_corridors.py'),
                         Path(__file__).with_name('road_geometry.py'),
                         WIDTH_ROOT/'production_workflow.py', WIDTH_ROOT/'road_pair_matcher.py',
@@ -3190,7 +3191,7 @@ def prepare_regional_products(
         *[p for pair in connection_probability_sources+connection_molra_sources for p in pair],
         *[Path(__file__).with_name(name) for name in (
             'road_network_products.py','road_network_connection.py','road_axis_cleanup.py',
-            'road_axis_quality.py','geometry_recovery.py','road_connection_evidence.py',
+            'road_axis_quality.py','geometry_recovery.py','road_connection_evidence.py','bounded_grid.py','raster_memory.py',
             'road_track_corridors.py','road_geometry.py')]])
     # Include the actual clipped input, so clipping/CRS changes invalidate recovery.
     network_inputs += [str(centers.crs),hashlib.sha256(b''.join(centers.geometry.to_wkb())).hexdigest()]
