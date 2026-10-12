@@ -28,6 +28,13 @@ def read_completed(path, inputs):
         return None
     if not isinstance(data, dict) or not {'inputs', 'outputs', 'paths', 'result'} <= data.keys():
         return None
+    if (not isinstance(data['paths'],list) or not all(isinstance(p,str) for p in data['paths'])
+            or not isinstance(data['outputs'],list) or not isinstance(data['result'],dict)):
+        return None
+    if not all(Path(p).is_file() and Path(p).stat().st_size > 0 for p in data['paths']):
+        return None
+    if isinstance(data['result'],dict) and data['result'].get('status') in {'failed','running','cancelled'}:
+        return None
     if data['inputs'] == inputs and data['outputs'] == signature(data['paths']):
         return data['result']
     return None
@@ -35,6 +42,8 @@ def read_completed(path, inputs):
 
 def write_completed(path, inputs, result, paths):
     paths = [str(p) for p in paths]
+    if not all(Path(p).is_file() and Path(p).stat().st_size > 0 for p in paths):
+        raise OSError('Cannot commit incomplete product outputs')
     data = dict(inputs=inputs, result=result, paths=paths, outputs=signature(paths))
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')

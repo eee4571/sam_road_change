@@ -299,6 +299,14 @@ class RoadScene:
         value = self.width_values[index]
         return float(value) if pd.notna(value) and value > 0 else 6.0
 
+    def reliable_width_at(self, point):
+        from .road_surface_quality import reliable_width
+        ids=self.width_tree.query(point,predicate='dwithin',distance=.75)
+        if not len(ids):return False
+        distance=min(self.width_geometries[int(i)].distance(point) for i in ids)
+        nearest=[int(i) for i in ids if self.width_geometries[int(i)].distance(point)<=distance+1e-6]
+        return all(reliable_width(self.widths.iloc[i]) is True for i in nearest)
+
     def widths_at(self, points):
         from shapely import distance
         result = np.full(len(points), 6.)
@@ -664,6 +672,11 @@ def _analyze_scenes(before, after, *, tolerance, absolute, relative, minimum_len
                     valid_width = reverse is not None and reverse["target"] == line_id and reverse["reliable"]
                 before_width = after_width = None
                 reason = "unreliable_match_or_existence_or_junction"
+                if valid_width and not (source.reliable_width_at(point) and target.reliable_width_at(target_point)):
+                    valid_width=False
+                    reason='low_confidence_saved_width_review_required'
+                    row['width_review_required']=True
+                    counts['width_quality_rejected_cells']+=1
                 if valid_width:
                     exact_started = time.perf_counter()
                     normal = paired_normals[index]

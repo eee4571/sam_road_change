@@ -280,34 +280,45 @@ def build_width_segments(
 
 
 def build_corridors(segments: gpd.GeoDataFrame, period: str = "") -> gpd.GeoDataFrame:
+    from engine.width.width_reliability import ROAD_ERRORS, issue
     rows = []
+    diagnostics=[]
     for _, row in segments.iterrows():
         width = _number(row, ("width_m",))
         if width <= 0:
             continue
-        if row.get('width_backend')=='raw_image':
-            from shapely import from_wkb
-            encoded=row.get('raw_corridor_wkb','')
-            geometry=(from_wkb(encoded) if encoded else row.geometry.buffer(
-                float(row.final_left_distance),single_sided=True).union(row.geometry.buffer(
-                -float(row.final_right_distance),single_sided=True)))
-        else:
-            geometry = row.geometry.buffer(width * 0.5, cap_style="flat", join_style="round")
-        if geometry.is_empty:
-            continue
+        try:
+            if row.get('width_backend')=='raw_image':
+                from shapely import from_wkb
+                encoded=row.get('raw_corridor_wkb','')
+                geometry=(from_wkb(encoded) if encoded else row.geometry.buffer(
+                    float(row.final_left_distance),single_sided=True).union(row.geometry.buffer(
+                    -float(row.final_right_distance),single_sided=True)))
+            else:
+                geometry = row.geometry.buffer(width * 0.5, cap_style="flat", join_style="round")
+            if geometry.is_empty:raise ValueError('Empty corridor geometry')
+        except ROAD_ERRORS as exc:
+            diagnostics.append(issue(row.get('parent_id',row.get('segment_id','')),row.get('tile_id',''),
+                                     'corridor',exc,geometry=row.geometry,fallback='symmetric_buffer'))
+            geometry=row.geometry.buffer(width*.5)
+            row=row.copy()
+            row['quality_grade']=row['width_quality']='C'
+            row['qa_state']='review';row['qa_reason']='corridor_geometry_fallback'
         rows.append({
             **{key: row.get(key) for key in segments.columns if key != "geometry"},
             "period": period,
             "area_m2": float(geometry.area),
             "geometry": geometry,
         })
-    return (
+    result = (
         gpd.GeoDataFrame(rows, geometry="geometry", crs=segments.crs)
         if rows else gpd.GeoDataFrame(
             {"segment_id": pd.Series(dtype="object"), "period": pd.Series(dtype="object"), "area_m2": pd.Series(dtype="float64")},
             geometry=[], crs=segments.crs,
         )
     )
+    result.attrs['width_diagnostics']=diagnostics
+    return result
 
 
 def build_network_cover(

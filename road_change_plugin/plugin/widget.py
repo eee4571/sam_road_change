@@ -889,6 +889,10 @@ class RoadChangeWidget(QWidget):
 
     def _progress(self, payload):
         event = payload.get("event", {})
+        if event.get('kind')=='warning' and event.get('status')=='completed_with_warnings':
+            self.progress_note.setText(event.get('message','测宽完成，部分道路使用估计宽度'))
+            self.log_panel.set_error(event.get('message','')+'\n'+event.get('details',''))
+            return
         self.stage_text.setText(payload.get("stage") or "处理中")
         area = event.get("grid") or event.get("area_id")
         if area:
@@ -964,6 +968,9 @@ class RoadChangeWidget(QWidget):
             self.progress.setValue(1000)
         self.progress_note.setText("成果已生成" if finished else "已停止，已完成成果可供续跑")
         self.status.setText("处理完成，当前成果已生成" if finished else "任务已取消")
+        if finished and payload.get('width_warnings'):
+            self.progress_note.setText('测宽完成，部分道路使用估计宽度；请查看日志中的质量详情')
+            self.status.setText('处理完成，存在测宽警告')
         self._log({**payload, "message": self.state_text.text()})
         self._refresh_results(latest=True)
         self._update_controls()

@@ -226,14 +226,21 @@ def _reliable_width_at(scene,points):
     """C display/propagation widths are never temporal width evidence."""
     from shapely import distance
     field=next((f for f in WIDTH_QUALITY_FIELDS if f in scene.widths),None)
-    if field is None:return np.ones(len(points),dtype=bool)
+    if field is None:return np.zeros(len(points),dtype=bool)
     result=np.zeros(len(points),dtype=bool)
     pairs=scene.width_tree.query(points,predicate='dwithin',distance=3.)
     if not pairs.size:return result
     order=np.argsort(distance(points[pairs[0]],scene.width_geometries[pairs[1]]),kind='stable')
     _,first=np.unique(pairs[0,order],return_index=True);chosen=order[first]
     ids=pairs[1,chosen]
-    result[pairs[0,chosen]]=scene.widths.iloc[ids][field].astype(str).str.upper().isin(['A','B']).to_numpy()
+    rows=scene.widths.iloc[ids]
+    usable=rows[field].astype(str).str.upper().isin(['A','B']).to_numpy()
+    for quality_field in WIDTH_QUALITY_FIELDS:
+        if quality_field in rows:usable &= ~rows[quality_field].astype(str).str.upper().eq('C').to_numpy()
+    if 'width_m' in rows:
+        values=rows.width_m.to_numpy(float)
+        usable &= np.isfinite(values)&(values>0)
+    result[pairs[0,chosen]]=usable
     return result
 
 

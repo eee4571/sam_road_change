@@ -39,6 +39,7 @@ class Runner(TaskSignals):
         self._terminal = True
         self._cancelled = False
         self._completion = {}
+        self._width_warnings = {}
         self._failure = ""
         self._diagnostic_hint = ''
         self._output_tail = deque(maxlen=100)
@@ -93,6 +94,7 @@ class Runner(TaskSignals):
         self._terminal = False
         self._cancelled = False
         self._completion = {}
+        self._width_warnings = {}
         self._failure = ""
         self._diagnostic_hint = ''
         self._output_tail.clear()
@@ -148,6 +150,9 @@ class Runner(TaskSignals):
             self.task_log.emit(self._payload(level="INFO", message=line))
             return
         kind = event.get("kind")
+        if kind=='warning' and event.get('status')=='completed_with_warnings':
+            self._width_warnings[event.get('details','')]=event
+            self.task_progress.emit(self._payload(stage=event.get('stage','测宽'),message=event.get('message',''),event=event))
         self.task_log.emit(self._payload(level="INFO", message=json.dumps(event, ensure_ascii=False), event=event))
         if kind in {"pipeline", "stage", "prepare"}:
             done = event.get("completed", event.get("stage_index", event.get("index", 0)))
@@ -196,7 +201,8 @@ class Runner(TaskSignals):
         else:
             self.state = "completed"
         self._terminal = True
-        self.task_finished.emit(self._payload(status=self.state, exit_code=exit_code, event=self._completion))
+        self.task_finished.emit(self._payload(status=self.state, exit_code=exit_code, event=self._completion,
+                                             width_warnings=list(self._width_warnings.values())))
 
     def cancel(self):
         if not self.running:

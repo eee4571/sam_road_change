@@ -4,13 +4,14 @@ from scipy.ndimage import median_filter
 
 
 def reliable_width(row):
-    grade = str(row.get('quality_grade', row.get('width_quality', ''))).upper()
+    grade = str(row.get('quality_grade', row.get('width_quality', row.get('quality_gr',row.get('width_qual',''))))).upper()
     if not grade or grade == 'NAN':
         return None
     width = float(row.get('width_m', 0))
     ratio = float(row.get('valid_ratio', 1))
     scatter = float(row.get('width_std', 0))
-    return grade in ('A', 'B') and ratio >= .15 and scatter <= .6 * width
+    return (grade in ('A', 'B') and np.isfinite([width,ratio,scatter]).all()
+            and width>0 and ratio >= .15 and scatter>=0 and scatter <= .6 * width)
 
 
 def stable_width(stations, values, reliable):

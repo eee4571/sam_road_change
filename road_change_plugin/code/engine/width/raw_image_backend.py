@@ -13,8 +13,11 @@ from shapely.ops import substring
 from .raw_boundary_core import Config, ImageReader, load_roads, measure_road
 from .raw_width_reconstruction import ReconstructionConfig, reconstruct_chain
 from .raw_width_records import rows_for_road, flag_crossings
+from .chain_width_calculator import resolve_chain_fallbacks
+from .width_reliability import (ROAD_ERRORS, InputContractError, atomic_json, clean_frame,
+                                issue, positive, project_default_width, quality_summary)
 
-VERSION=2
+VERSION=3
 FIELDS=('final_left_distance','final_right_distance','final_width','final_confidence','width_source','outlier_reason')
 
 def original_images(image_dir):
@@ -25,13 +28,15 @@ def original_images(image_dir):
 
 
 def quality(row):
+    if row.get('quality_grade') in ('A','B','C'):return row['quality_grade']
     source=row['width_source']
     if source=='measured':return 'A'
     if source=='smoothed' and row['solver_converged'] and row['final_confidence']>=Config().confidence_threshold:return 'A'
     if source=='interpolated':return 'B'
     return 'C'
 
-def observation_segments(samples,roads,crs):
+def _observation_segments(samples,roads,crs,diagnostics=None):
+    diagnostics=[] if diagnostics is None else diagnostics
     records=[]
     for road_id,group in samples.groupby('road_id',sort=False):
         line=roads[road_id];group=group.sort_values('s_m')
@@ -49,61 +54,257 @@ def observation_segments(samples,roads,crs):
         normal=np.column_stack([-tangent[:,1],tangent[:,0]])
         lxy=xy+normal*left[:,None];rxy=xy-normal*right[:,None]
         for i,(_,row) in enumerate(group.iterrows()):
-            if edges[i+1]-edges[i]<=1e-7:continue
+            if edges[i+1]-edges[i]<=0:continue
             grade=quality(row);value=float(row.final_width)
-            polygon=(make_valid(Polygon([lxy[i],lxy[i+1],rxy[i+1],rxy[i]]))
-                     if np.isfinite([*lxy[i],*lxy[i+1],*rxy[i],*rxy[i+1]]).all() else None)
+            try:
+                polygon=(make_valid(Polygon([lxy[i],lxy[i+1],rxy[i+1],rxy[i]]))
+                         if np.isfinite([*lxy[i],*lxy[i+1],*rxy[i],*rxy[i+1]]).all() else None)
+            except ROAD_ERRORS as exc:
+                diagnostics.append(issue(road_id,row.get('tile_id',''),'corridor',exc,
+                                         geometry=line,fallback='symmetric_buffer'))
+                polygon=None
+                grade='C'
             records.append(dict(**{field:row[field] for field in FIELDS},
                 raw_corridor_wkb=polygon.wkb_hex if polygon is not None else '',
                 width_m=value,width_std=0.,width_quality=grade,quality_grade=grade,
                 valid_ratio=1. if grade in ('A','B') else 0.,width_backend='raw_image',
                 parent_id=road_id,segment_id=f'RGB{len(records):09d}',part_id=0,
-                line_source='observed',qa_state='auto',qa_reason=str(row.outlier_reason),
+                tile_id=str(row.get('tile_id','')), width_unit='m',
+                line_source='observed',qa_state='review' if grade=='C' else 'auto',qa_reason=str(row.outlier_reason),
                 length_m=edges[i+1]-edges[i],geometry=substring(line,edges[i],edges[i+1])))
     return gpd.GeoDataFrame(records,geometry='geometry',crs=crs)
 
-def measure_region(centerlines,image_dir,output_dir):
+
+def observation_segments(samples,roads,crs,diagnostics=None):
+    diagnostics=[] if diagnostics is None else diagnostics
+    frames=[]
+    for key,group in samples.groupby('road_id',sort=False):
+        try:
+            frame=_observation_segments(group,{key:roads[key]},crs,diagnostics)
+            if frame.empty:raise ValueError('Empty observation geometry')
+        except ROAD_ERRORS as exc:
+            row=group.iloc[0];line=roads[key]
+            diagnostics.append(issue(key,row.get('tile_id',''),'observation_geometry',exc,
+                                     geometry=line,fallback='whole_axis_buffer'))
+            value=float(np.median(group.final_width))
+            frame=gpd.GeoDataFrame([dict(final_width=value,width_m=value,
+                final_left_distance=value/2,final_right_distance=value/2,final_confidence=0.,
+                width_source=str(row.width_source),outlier_reason=str(exc),raw_corridor_wkb='',
+                width_std=0.,width_quality='C',quality_grade='C',valid_ratio=0.,width_backend='raw_image',
+                parent_id=key,segment_id=key+'_fallback',part_id=0,tile_id=str(row.get('tile_id','')),
+                width_unit='m',line_source='observed',qa_state='review',qa_reason=str(exc),
+                length_m=line.length,geometry=line)],geometry='geometry',crs=crs)
+        frames.append(frame)
+    result=gpd.GeoDataFrame(pd.concat(frames,ignore_index=True),geometry='geometry',crs=crs)
+    result['segment_id']=[f'RGB{i:09d}' for i in range(len(result))]
+    return result
+
+def _unresolved_profile(road_id,line,reason):
+    # A single station represents the whole valid axis; no synthetic geometry.
+    xy=line.interpolate(line.length/2).coords[0]
+    return pd.DataFrame([dict(road_id=road_id,sample_id=0,s_m=line.length/2,
+        center_x=xy[0],center_y=xy[1],normal_x=0.,normal_y=0.,
+        final_left_distance=np.nan,final_right_distance=np.nan,final_width=np.nan,
+        final_confidence=0.,width_source='unresolved',outlier_reason=reason,
+        reconstruction_available=False,solver_converged=False)])
+
+
+def _fill_profiles(frames,roads,default_width_m,local_estimates=None):
+    reliable={}
+    for key,frame in frames.items():
+        grades=frame.apply(quality,axis=1)
+        valid=(np.isfinite(frame.final_width) & frame.final_width.gt(0) & grades.isin(['A','B'])
+               & np.isfinite(frame.final_left_distance) & frame.final_left_distance.gt(0)
+               & np.isfinite(frame.final_right_distance) & frame.final_right_distance.gt(0))
+        reliable[key]=frame.loc[valid,'final_width'].to_numpy()
+    estimates=resolve_chain_fallbacks(roads,reliable,local_estimates=local_estimates,default_width_m=default_width_m)
+    for key,frame in frames.items():
+        frame=frame.copy()
+        frame['quality_grade']=frame.apply(quality,axis=1)
+        invalid=~(np.isfinite(frame.final_width) & frame.final_width.gt(0)
+                  & np.isfinite(frame.final_left_distance) & frame.final_left_distance.gt(0)
+                  & np.isfinite(frame.final_right_distance) & frame.final_right_distance.gt(0))
+        estimate=estimates[key]
+        if invalid.any():
+            good=~invalid & frame.quality_grade.isin(['A','B'])
+            if good.any():
+                # Preserve asymmetric evidence when interpolating this road's own stations.
+                for side in ('left','right'):
+                    frame.loc[invalid,f'final_{side}_distance']=np.interp(
+                        frame.loc[invalid,'s_m'],frame.loc[good,'s_m'],frame.loc[good,f'final_{side}_distance'])
+            else:
+                for side in ('left','right'):frame.loc[invalid,f'final_{side}_distance']=estimate['width_m']/2
+            frame.loc[invalid,'final_width']=frame.loc[invalid,'final_left_distance']+frame.loc[invalid,'final_right_distance']
+            frame.loc[invalid,'width_source']=estimate['width_source']
+            frame.loc[invalid,'quality_grade']=estimate['quality_grade']
+            frame.loc[invalid,'final_confidence']=0.
+            frame.loc[invalid,'reconstruction_available']=True
+            frame.loc[invalid,'outlier_reason']=frame.loc[invalid,'outlier_reason'].fillna('').astype(str).map(
+                lambda reason:';'.join(filter(None,[reason,estimate['fallback_reason']])))
+        frames[key]=frame
+    return frames
+
+
+def measure_region(centerlines,image_dir,output_dir,*,default_width_m=None,surface_evidence=None):
     """One regional chain solve, including chains crossing source image tiles."""
     from ..product_cache import signature,read_completed,write_completed
     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
+    default_width_m=project_default_width() if default_width_m is None else default_width_m
+    if not positive(default_width_m):raise InputContractError('Project default width must be finite and positive (metres)')
     files=original_images(image_dir)
     c=Config(max_roads=0,min_length=0);rc=ReconstructionConfig()
     identities=signature([*files,__file__,Path(__file__).with_name('raw_boundary_core.py'),
-        Path(__file__).with_name('raw_width_reconstruction.py'),Path(__file__).with_name('raw_width_records.py'),Path(__file__).with_name('raw_feature_cache.py')])
+        Path(__file__).with_name('raw_width_reconstruction.py'),Path(__file__).with_name('raw_width_records.py'),Path(__file__).with_name('raw_feature_cache.py'),
+        Path(__file__).with_name('chain_width_calculator.py'),Path(__file__).with_name('width_reliability.py')])
     import hashlib
-    identities += [str(VERSION),str(centerlines.crs),hashlib.sha256(b''.join(centerlines.geometry.to_wkb())).hexdigest(),
-                   json.dumps(asdict(c),sort_keys=True),json.dumps(asdict(rc),sort_keys=True)]
+    identities += [str(VERSION),str(centerlines.crs),hashlib.sha256(json.dumps(centerlines.geometry.to_wkb(hex=True).tolist()).encode()).hexdigest(),
+                   json.dumps(asdict(c),sort_keys=True),json.dumps(asdict(rc),sort_keys=True),float(default_width_m)]
+    if surface_evidence is not None:
+        if surface_evidence.crs is None:raise InputContractError('Surface evidence requires CRS')
+        identities += [str(surface_evidence.crs),hashlib.sha256(json.dumps(surface_evidence.geometry.to_wkb(hex=True).tolist()).encode()).hexdigest()]
     marker=output/'completed.json';cached=read_completed(marker,identities)
     if cached:return gpd.read_file(cached['observations'],layer='width_observations')
+    marker.unlink(missing_ok=True)
+    diagnostics=[]
+    original_count=len(centerlines)
+    centerlines=clean_frame(centerlines,diagnostics)
+    atomic_json(output/'preflight.json',dict(input_roads=original_count,valid_roads=len(centerlines),exceptions=diagnostics))
+    if centerlines.empty:
+        raise InputContractError('No valid centerlines available for RGB width')
     started=time.perf_counter();source=output/'final_centerline_input.gpkg'
     centerlines.to_file(source,layer='centerlines',driver='GPKG')
     roads,junctions,crs,_=load_roads(source,'centerlines',c)
-    from concurrent.futures import ThreadPoolExecutor
+    if not roads:raise ValueError('No nonzero road chains available for RGB width; check extraction and validation area')
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
     import os
-    reader=ImageReader(files,crs);tree=cKDTree(junctions) if len(junctions) else None
+    tree=cKDTree(junctions) if len(junctions) else None
     road_map={f'road_{i:05d}':line for i,line in enumerate(roads)}
+    checkpoint_id=hashlib.sha256(json.dumps(identities,sort_keys=True).encode()).hexdigest()
+    checkpoints=output/'chains'/checkpoint_id
+    checkpoints.mkdir(parents=True,exist_ok=True)
+    # Record exact contributing source tiles, including chains crossing tile seams.
+    import rasterio
+    from shapely.geometry import box
+    tile_boxes=[]
+    for file in files:
+        with rasterio.open(file) as ds:
+            bounds=gpd.GeoSeries([box(*ds.bounds)],crs=ds.crs).to_crs(crs).iloc[0]
+            tile_boxes.append((file.stem,bounds))
+    from shapely import STRtree
+    tile_tree=STRtree([item[1] for item in tile_boxes])
+    tile_ids={key:','.join(tile_boxes[int(i)][0] for i in tile_tree.query(line,predicate='intersects'))
+              for key,line in road_map.items()}
     def solve(item):
         road_id,line=item
-        data=measure_road(reader,line,tree,c);flag_crossings(data)
-        return reconstruct_chain(pd.DataFrame(rows_for_road(road_id,data)),rc)
+        checkpoint=checkpoints/(road_id+'.json')
+        completed=checkpoint.with_suffix('.completed.json')
+        cached=read_completed(completed,[road_id,line.wkb_hex])
+        if cached is not None:
+            try:
+                frame=pd.read_json(checkpoint,orient='table')
+                if frame.empty or not set(FIELDS).issubset(frame):raise ValueError('Invalid profile checkpoint')
+                return frame,True,cached['exceptions']
+            except (ValueError,KeyError) as exc:
+                print(f'[RGB width] Recomputing damaged checkpoint {road_id}: {exc}',flush=True)
+        errors=[]
+        try:
+            if line.length/c.spacing>20000:
+                raise ValueError('road_profile_sample_budget_exceeded')
+            data=measure_road(reader,line,tree,c);flag_crossings(data)
+            observations=pd.DataFrame(rows_for_road(road_id,data))
+            if observations.empty:raise ValueError('No cross sections')
+        except ROAD_ERRORS as exc:
+            errors.append(issue(road_id,tile_ids[road_id],'sampling',exc,geometry=line))
+            frame=_unresolved_profile(road_id,line,str(exc))
+        else:
+            try:
+                frame=reconstruct_chain(observations,rc)
+            except ROAD_ERRORS as exc:
+                errors.append(issue(road_id,tile_ids[road_id],'reconstruction',exc,geometry=line))
+                # Keep accepted measured sections when the smoother fails.
+                frame=observations.copy()
+                good=frame.accepted & np.isfinite(frame.optimized_width) & frame.optimized_width.gt(0)
+                for side in ('left','right'):
+                    frame[f'final_{side}_distance']=frame[f'optimized_{side}_distance'].where(good)
+                frame['final_width']=frame.final_left_distance+frame.final_right_distance
+                frame['final_confidence']=frame.optimized_confidence.where(good,0.)
+                frame['width_source']=np.where(good,'measured','unresolved')
+                frame['outlier_reason']=str(exc)
+                frame['reconstruction_available']=good
+                frame['solver_converged']=False
+        frame['tile_id']=tile_ids[road_id]
+        temporary=checkpoint.with_suffix('.tmp')
+        frame.to_json(temporary,orient='table',double_precision=15,index=False)
+        temporary.replace(checkpoint)
+        write_completed(completed,[road_id,line.wkb_hex],dict(exceptions=errors),[checkpoint])
+        return frame,False,errors
+    print(f'[RGB width] start chains={len(roads)}; checkpoints={checkpoints}',flush=True)
+    frames_by_id={};reused=0;last_report=time.perf_counter()
+    reader=ImageReader(files,crs)
     try:
-        with ThreadPoolExecutor(max_workers=min(4,os.cpu_count() or 1)) as pool:
-            frames=list(pool.map(solve,road_map.items()))
+        workers=min(4,os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            items=iter(road_map.items())
+            futures={}
+            def submit_next():
+                item=next(items,None)
+                if item is not None:futures[pool.submit(solve,item)]=item[0]
+            for _ in range(workers*2):submit_next()
+            while futures:
+                ready,_=wait(futures,return_when=FIRST_COMPLETED)
+                future=next(iter(ready));road_id=futures.pop(future)
+                try:
+                    frame,was_reused,errors=future.result()
+                except Exception as error:
+                    import traceback
+                    for pending in futures:pending.cancel()
+                    failure=dict(road_id=road_id,axis_wkt=road_map[road_id].wkt,
+                        exception_type=type(error).__name__,reason=str(error),traceback=traceback.format_exc())
+                    try:
+                        (output/'failure.json').write_text(json.dumps(failure,ensure_ascii=False,indent=2),encoding='utf8')
+                    except OSError as report_error:
+                        print(f'[RGB width] Could not save failure report: {report_error}',flush=True)
+                    print(f'[RGB width] failed chain={road_id}: {error}; details={output / "failure.json"}',flush=True)
+                    raise
+                frames_by_id[road_id]=frame;reused+=int(was_reused)
+                diagnostics.extend(errors)
+                submit_next()
+                if time.perf_counter()-last_report>=5 or len(frames_by_id)==len(roads):
+                    print(f'[RGB width] {len(frames_by_id)}/{len(roads)} chains; reused={reused}; elapsed={time.perf_counter()-started:.1f}s',flush=True)
+                    last_report=time.perf_counter()
     finally:reader.close()
-    if not frames:raise ValueError('No regional roads available for raw boundary width')
+    local_estimates={}
+    if surface_evidence is not None and not surface_evidence.empty:
+        from .width_reliability import surface_width_estimates
+        unresolved={key:road_map[key] for key,frame in frames_by_id.items()
+                    if not (np.isfinite(frame.final_width)&frame.final_width.gt(0)).all()}
+        local_estimates=surface_width_estimates(unresolved,surface_evidence.to_crs(crs))
+    frames_by_id=_fill_profiles(frames_by_id,road_map,float(default_width_m),local_estimates)
+    frames=[frames_by_id[key] for key in road_map]
     samples=pd.concat(frames,ignore_index=True)
-    observations=observation_segments(samples,road_map,crs).to_crs(centerlines.crs)
-    path=output/'width_observations.gpkg';observations.to_file(path,layer='width_observations',driver='GPKG')
+    observations=observation_segments(samples,road_map,crs,diagnostics)
+    for error in diagnostics:
+        key=error['road_id']
+        if key in frames_by_id:error['fallback']=','.join(sorted(set(frames_by_id[key].width_source)))
+    summary=quality_summary(observations,diagnostics,total_input=original_count)
+    observations=observations.to_crs(centerlines.crs)
+    path=output/'width_observations.gpkg';temporary=output/'width_observations.partial.gpkg'
+    temporary.unlink(missing_ok=True)
+    observations.to_file(temporary,layer='width_observations',driver='GPKG')
     profile=gpd.GeoDataFrame(samples,geometry=gpd.points_from_xy(samples.center_x,samples.center_y),crs=crs)
-    profile.to_file(path,layer='point_profiles',driver='GPKG')
+    profile.to_file(temporary,layer='point_profiles',driver='GPKG')
+    temporary.replace(path)
     (output/'samples.csv').unlink(missing_ok=True)
     manifest=dict(observations=str(path.resolve()),backend='raw_image',version=VERSION,
         config=asdict(c),reconstruction=asdict(rc),images=[str(p) for p in files],
         feature_cache=dict(hits=reader.feature_cache.hits,misses=reader.feature_cache.misses,evictions=reader.feature_cache.evictions,bytes=reader.feature_cache.bytes,max_bytes=reader.feature_cache.max_bytes),
-        chains=len(roads),samples=len(samples),quality=observations.quality_grade.value_counts().to_dict(),
-        seconds=time.perf_counter()-started)
-    (output/'summary.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf8')
+        chains=len(roads),reused_chains=reused,samples=len(samples),
+        unresolved_chains=sum(not f.reconstruction_available.any() for f in frames),
+        quality=observations.quality_grade.value_counts().to_dict(),
+        seconds=time.perf_counter()-started,**summary)
+    atomic_json(output/'summary.json',manifest)
     write_completed(marker,identities,manifest,[path,output/'summary.json'])
+    (output/'failure.json').unlink(missing_ok=True)
     print(f'[RGB width] chains={len(roads)} samples={len(samples)} seconds={manifest["seconds"]:.3f}',flush=True)
     cache=manifest['feature_cache']
     print(f'[RGB feature cache] hit={cache["hits"]} miss={cache["misses"]} eviction={cache["evictions"]} bytes={cache["bytes"]}/{cache["max_bytes"]}',flush=True)
@@ -126,11 +327,13 @@ def rebuild_observations(measured):
         coords=[]
         for line in group.geometry:coords.extend(list(line.coords)[1:] if coords else list(line.coords))
         row=group.iloc[0].to_dict();row.pop('raw_corridor_wkb',None)
-        grade=('A' if (usable.quality_grade=='A').all() else 'B') if len(usable) else 'C'
+        grade=('A' if group.quality_grade.eq('A').all() else 'B') if group.quality_grade.isin(['A','B']).all() else 'C'
         row.update(geometry=LineString(coords),final_left_distance=left,final_right_distance=right,
             final_width=left+right,width_m=left+right,final_confidence=median('final_confidence'),quality_grade=grade,width_quality=grade,
             valid_ratio=float(usable.geometry.length.sum()/max(group.geometry.length.sum(),1e-9)),
-            width_source='representative',width_std=float(usable.final_width.std(ddof=0)) if len(usable) else 0.,
+            width_source=';'.join(sorted(set(group.width_source.astype(str)))),
+            qa_state='review' if grade=='C' else 'auto',
+            width_std=float(usable.final_width.std(ddof=0)) if len(usable) else 0.,
             length_m=float(group.geometry.length.sum()))
         records.append(row)
     return gpd.GeoDataFrame(records,geometry='geometry',crs=measured.crs) if records else measured.iloc[:0].copy()

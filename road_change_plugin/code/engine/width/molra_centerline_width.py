@@ -2848,6 +2848,8 @@ def maybe_snap_to_mask(row: float, col: float, binary: np.ndarray, radius: int) 
 
     y0, y1 = max(0, r - radius), min(binary.shape[0], r + radius + 1)
     x0, x1 = max(0, c - radius), min(binary.shape[1], c + radius + 1)
+    if y0 >= y1 or x0 >= x1:
+        return row, col, False, 0.0
     patch = binary[y0:y1, x0:x1]
     ys, xs = np.nonzero(patch)
     if ys.size == 0:
@@ -2897,96 +2899,106 @@ def sample_widths_by_normal(
     max_snap_distance_px: float = 4.0,
     max_asymmetry_ratio: float = 0.65,
 ) -> list[dict]:
+    from engine.width.width_reliability import ROAD_ERRORS, InputContractError, issue, validate_mask, validate_graph
+    binary = validate_mask(binary)
+    if not all(np.isfinite(v) and v > 0 for v in (pixel_size,sample_step_px,normal_step_px,max_search_px)):
+        raise InputContractError('Sampling steps, pixel size and search extent must be finite positive values')
+    diagnostics=[]
+    edges, original_ids=validate_graph(nodes_rc,edges,diagnostics)
     rows: list[dict] = []
     sample_id = 0
     degrees, _ = graph_degrees(edges.shape[0], nodes_rc.shape[0], edges)
     for edge_id, (src_idx, dst_idx) in enumerate(edges.tolist()):
-        start = nodes_rc[src_idx]
-        end = nodes_rc[dst_idx]
-        vec = end - start
-        length = float(np.linalg.norm(vec))
-        if length < 1.0:
-            continue
-        tangent = vec / length
-        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
-        # Midpoint sampling avoids graph nodes, whose intersection pavement is not a road width.
-        sample_count = max(1, int(np.ceil(length / max(sample_step_px, 1.0))))
-        for sample_index in range(sample_count):
-            t = (sample_index + 0.5) / sample_count
-            row, col = start + vec * t
-            row_used, col_used, snapped, snap_distance = maybe_snap_to_mask(row, col, binary, snap_radius_px)
-            r = int(round(row_used))
-            c = int(round(col_used))
-            inside = bool(0 <= r < binary.shape[0] and 0 <= c < binary.shape[1] and binary[r, c] > 0)
-            distance_to_edge_start = t * length
-            distance_to_edge_end = (1.0 - t) * length
-            near_junction = bool(
-                (degrees[src_idx] >= 3 and distance_to_edge_start < junction_buffer_px)
-                or (degrees[dst_idx] >= 3 and distance_to_edge_end < junction_buffer_px)
-            )
-            near_image_border = bool(
-                r < border_margin_px
-                or c < border_margin_px
-                or r >= binary.shape[0] - border_margin_px
-                or c >= binary.shape[1] - border_margin_px
-            )
-            if inside:
-                left_px, left_stop = scan_one_side(binary, row_used, col_used, normal, -1.0, max_search_px, normal_step_px)
-                right_px, right_stop = scan_one_side(binary, row_used, col_used, normal, 1.0, max_search_px, normal_step_px)
-                raw_width_px = left_px + right_px + normal_step_px
-            else:
-                left_px = right_px = raw_width_px = 0.0
-                left_stop = right_stop = "outside_mask"
-            asymmetry_ratio = abs(left_px - right_px) / max(left_px + right_px, normal_step_px)
-            censored = left_stop != "mask_boundary" or right_stop != "mask_boundary"
-            valid_width = bool(
-                inside
-                and not near_junction
-                and not near_image_border
-                and not censored
-                and snap_distance <= max_snap_distance_px
-            )
-            width_px = raw_width_px if valid_width else 0.0
-            quality_flags = []
-            if not inside:
-                quality_flags.append("outside_mask")
-            if near_junction:
-                quality_flags.append("junction_excluded")
-            if near_image_border or "image_border" in {left_stop, right_stop}:
-                quality_flags.append("image_border_censored")
-            if "max_search" in {left_stop, right_stop}:
-                quality_flags.append("max_search_censored")
-            if snap_distance > max_snap_distance_px:
-                quality_flags.append("large_snap")
-            if asymmetry_ratio > max_asymmetry_ratio:
-                quality_flags.append("asymmetric")
-            rows.append(
-                {
-                    "sample_id": sample_id,
-                    "edge_id": edge_id,
-                    "sample_index": sample_index,
-                    "row": float(row),
-                    "col": float(col),
-                    "row_used": float(row_used),
-                    "col_used": float(col_used),
-                    "snapped": snapped,
-                    "snap_distance_px": snap_distance,
-                    "inside_mask": inside,
-                    "valid_width": valid_width,
-                    "near_junction": near_junction,
-                    "near_image_border": near_image_border,
-                    "left_px": left_px,
-                    "right_px": right_px,
-                    "left_stop": left_stop,
-                    "right_stop": right_stop,
-                    "raw_width_px": raw_width_px,
-                    "asymmetry_ratio": asymmetry_ratio,
-                    "quality_flags": ";".join(quality_flags),
-                    "width_px": width_px,
-                    "width_units": width_px * pixel_size,
-                }
-            )
-            sample_id += 1
+        try:
+            start = nodes_rc[src_idx]
+            end = nodes_rc[dst_idx]
+            vec = end - start
+            length = float(np.linalg.norm(vec))
+            if length < 1.0:
+                continue
+            tangent = vec / length
+            normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+            # Midpoint sampling avoids graph nodes, whose intersection pavement is not a road width.
+            sample_count = max(1, int(np.ceil(length / max(sample_step_px, 1.0))))
+            if sample_count > 20000:raise ValueError('road_profile_sample_budget_exceeded')
+            for sample_index in range(sample_count):
+                t = (sample_index + 0.5) / sample_count
+                row, col = start + vec * t
+                row_used, col_used, snapped, snap_distance = maybe_snap_to_mask(row, col, binary, snap_radius_px)
+                r = int(round(row_used))
+                c = int(round(col_used))
+                inside = bool(0 <= r < binary.shape[0] and 0 <= c < binary.shape[1] and binary[r, c] > 0)
+                distance_to_edge_start = t * length
+                distance_to_edge_end = (1.0 - t) * length
+                near_junction = bool(
+                    (degrees[src_idx] >= 3 and distance_to_edge_start < junction_buffer_px)
+                    or (degrees[dst_idx] >= 3 and distance_to_edge_end < junction_buffer_px)
+                )
+                near_image_border = bool(
+                    r < border_margin_px
+                    or c < border_margin_px
+                    or r >= binary.shape[0] - border_margin_px
+                    or c >= binary.shape[1] - border_margin_px
+                )
+                if inside:
+                    left_px, left_stop = scan_one_side(binary, row_used, col_used, normal, -1.0, max_search_px, normal_step_px)
+                    right_px, right_stop = scan_one_side(binary, row_used, col_used, normal, 1.0, max_search_px, normal_step_px)
+                    raw_width_px = left_px + right_px + normal_step_px
+                else:
+                    left_px = right_px = raw_width_px = 0.0
+                    left_stop = right_stop = "outside_mask"
+                asymmetry_ratio = abs(left_px - right_px) / max(left_px + right_px, normal_step_px)
+                censored = left_stop != "mask_boundary" or right_stop != "mask_boundary"
+                valid_width = bool(
+                    inside
+                    and not near_junction
+                    and not near_image_border
+                    and not censored
+                    and snap_distance <= max_snap_distance_px
+                )
+                width_px = raw_width_px if valid_width else 0.0
+                quality_flags = []
+                if not inside:
+                    quality_flags.append("outside_mask")
+                if near_junction:
+                    quality_flags.append("junction_excluded")
+                if near_image_border or "image_border" in {left_stop, right_stop}:
+                    quality_flags.append("image_border_censored")
+                if "max_search" in {left_stop, right_stop}:
+                    quality_flags.append("max_search_censored")
+                if snap_distance > max_snap_distance_px:
+                    quality_flags.append("large_snap")
+                if asymmetry_ratio > max_asymmetry_ratio:
+                    quality_flags.append("asymmetric")
+                rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "edge_id": original_ids[edge_id],
+                        "sample_index": sample_index,
+                        "row": float(row),
+                        "col": float(col),
+                        "row_used": float(row_used),
+                        "col_used": float(col_used),
+                        "snapped": snapped,
+                        "snap_distance_px": snap_distance,
+                        "inside_mask": inside,
+                        "valid_width": valid_width,
+                        "near_junction": near_junction,
+                        "near_image_border": near_image_border,
+                        "left_px": left_px,
+                        "right_px": right_px,
+                        "left_stop": left_stop,
+                        "right_stop": right_stop,
+                        "raw_width_px": raw_width_px,
+                        "asymmetry_ratio": asymmetry_ratio,
+                        "quality_flags": ";".join(quality_flags),
+                        "width_px": width_px,
+                        "width_units": width_px * pixel_size,
+                    }
+                )
+                sample_id += 1
+        except ROAD_ERRORS as exc:
+            issue(original_ids[edge_id], '', 'normal_sampling', exc, fallback='chain_fallback')
     return rows
 
 

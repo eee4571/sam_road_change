@@ -218,14 +218,14 @@ def _surface_line_coverage(line: BaseGeometry, surface: BaseGeometry, tolerance:
 
 def _width_quality_is_usable(row: pd.Series, config: DetectionConfig) -> bool:
     """Reject explicitly low-confidence widths while keeping legacy inputs usable."""
-    if not config.width_exclude_low_quality:
-        return True
-    for field in ("quality_gr", "quality_grade"):
+    for field in ("quality_gr", "quality_grade", "width_quality", "width_qual"):
         if field not in row.index:
             continue
         value = str(row.get(field, "") or "").strip().upper()
         if value == "C":
             return False
+    if str(row.get('width_source',row.get('width_src',''))) in {'project_default','region_median','chain_neighbor','local_mask_edt'}:
+        return False
     return True
 
 
