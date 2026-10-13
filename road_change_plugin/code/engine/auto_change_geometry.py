@@ -123,24 +123,25 @@ def corridor(axis, stations, widths):
     directions /= np.linalg.norm(directions, axis=1)[:, None]
     normals = np.column_stack([-directions[:, 1], directions[:, 0]])
     radii=np.interp(sample_stations,stations,widths)/2
-    sides=[]
-    for side in (1.,-1.):
-        boundary=[coords[0]+side*normals[0]*radii[0]]
-        for i in range(1,len(coords)-1):
-            turn=np.arctan2(directions[i-1,0]*directions[i,1]-directions[i-1,1]*directions[i,0],directions[i-1]@directions[i])
-            if side*turn < -1e-8:
-                # Follow the exterior offset arc, rather than creating a mitre
-                # triangle. End caps remain straight; these are internal bends.
-                angle=np.arctan2(side*normals[i-1,1],side*normals[i-1,0])
-                angles=angle+np.linspace(0.,turn,max(2,int(np.ceil(abs(turn)/(.5*np.pi/16)))+1))
-                boundary.extend(coords[i]+radii[i]*np.column_stack([np.cos(angles),np.sin(angles)]))
-            else:
-                bisector=normals[i-1]+normals[i]
-                bisector/=max(np.linalg.norm(bisector),1e-12)
-                boundary.append(coords[i]+side*radii[i]*bisector/max(float(bisector@normals[i]),.5))
-        boundary.append(coords[-1]+side*normals[-1]*radii[-1])
-        sides.append(boundary)
-    return _clean_overlay(make_valid(Polygon(np.vstack([sides[0],sides[1][::-1]]))))
+    # Sweep each segment separately. A single offset ring can cross itself at
+    # short bends; make_valid then turns the folded boundary into detached
+    # islands. Every sweep below contains its source axis segment, and every
+    # round join shares the vertex, so union cannot invent an isolated event.
+    left=normals*radii[:-1,None];right=normals*radii[1:,None]
+    pieces=[Polygon([p+n,q+m,q-m,p-n])
+            for p,q,n,m in zip(coords[:-1],coords[1:],left,right)]
+    for i in range(1,len(coords)-1):
+        turn=np.arctan2(directions[i-1,0]*directions[i,1]-directions[i-1,1]*directions[i,0],directions[i-1]@directions[i])
+        if abs(turn)<=1e-8:continue
+        side=-np.sign(turn)
+        angle=np.arctan2(side*normals[i-1,1],side*normals[i-1,0])
+        angles=angle+np.linspace(0.,turn,max(2,int(np.ceil(abs(turn)/(.5*np.pi/16)))+1))
+        arc=coords[i]+radii[i]*np.column_stack([np.cos(angles),np.sin(angles)])
+        pieces.append(Polygon(np.vstack([coords[i],arc])))
+    # Trigonometric arc endpoints and shared segment corners can differ by
+    # UTM floating-point roundoff. Snap only at micrometre precision so a join
+    # cannot become a point-touching island instead of sharing its radial edge.
+    return _clean_overlay(union_all(pieces,grid_size=1e-6))
 
 
 def _paired_profile(row, axis, samples):

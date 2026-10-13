@@ -12,7 +12,7 @@
   "code/app/task_manager.py": "7ed5cd6d0f4b7892d1fd212ad325024e5d75e17d561a0349cd1a6884cb430ca0",
   "code/dependency_identity.py": "83376af2f2ef0f03b5d296b0172763a8e476fbab638f6d427459d1894c971f0b",
   "code/engine/auto_change_assembly.py": "beab68ff0636a94c549b86cc471337b2a9f359e14466f5e599b09b5d7f28ebd7",
-  "code/engine/auto_change_geometry.py": "0e54646cbdc8fb0bd6434350c777ba06a2862c763d32bc3a40540e9cf22510ae",
+  "code/engine/auto_change_geometry.py": "7693ffac300ddf621c7251982b983bbe305c96f4419638750f8a79beade39ef7",
   "code/engine/auto_presence_candidates.py": "520657d7a31d43ee87b02910b2eab5facab2d67a7c1c9d10e5b0fae5e4a1b54f",
   "code/engine/auto_scene_cache.py": "accdd1526e48b58fda6c41c30104c7fa7097ae2c2a037eb80dd65dac3558a1d6",
   "code/engine/auto_station_plan.py": "6664f6f4cff2ba7ef841451a1940d595156dbbaa95ddb157108da40bd486d8b8",
