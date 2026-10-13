@@ -629,13 +629,21 @@ def _write_final_period(original,base,cuts,centers,inserts,directory,metric,outp
     return outputs
 
 
-def _publish_assisted_changes(frame, output, before_period, after_period):
+def _publish_assisted_changes(frame, output, before_period, after_period, *, require_review=False):
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     # Full interval audit retains metric axes and identifiers for temporal
     # matching; the public surface dissolves internal feature boundaries.
-    frame.to_file(output/'gt_assisted_audit.gpkg',layer='changes',driver='GPKG')
+    approved=frame.iloc[:0] if require_review else frame
+    approved.to_file(output/'gt_assisted_audit.gpkg',layer='changes',driver='GPKG')
     from .continuous_road_geometry import change_surfaces
     public=change_surfaces(frame);public['before_per']=before_period;public['after_per']=after_period
+    review={}
+    if require_review:
+        frame.to_file(output/'gt_assisted_audit.gpkg',layer='review_candidates',driver='GPKG')
+        public.to_file(output/'review_candidates.shp',encoding='UTF-8')
+        review=dict(review_candidates=str((output/'review_candidates.shp').resolve()),
+                    review_candidate_count=len(public),review_audit_layer='review_candidates',manual_review_required=True)
+        public=public.iloc[:0]
     public.to_file(output/'road_changes.shp',encoding='UTF-8')
     # The Auto summary/preview helper is intentionally not used: this is a
     # transparent GT-assisted product, never marked ground_truth_used=False.
@@ -645,7 +653,7 @@ def _publish_assisted_changes(frame, output, before_period, after_period):
     from road_change_detection import render_change_preview
     preview=output/'change_preview.png'
     render_change_preview(preview,public,public.iloc[:0],title=f'Final changes {before_period} to {after_period}',empty_message='No changes')
-    return dict(output=str(output.resolve()),road_changes=str((output/'road_changes.shp').resolve()),
+    return dict(**review,output=str(output.resolve()),road_changes=str((output/'road_changes.shp').resolve()),
         event_geometry_audit=str((output/'gt_assisted_audit.gpkg').resolve()),changes_feature_count=len(public),
         layers={'changes':str((output/'road_changes.shp').resolve())},road_change=str(preview.resolve()),previews={'change':str(preview.resolve())})
 
@@ -735,18 +743,20 @@ def build_fast_temporal_outputs(manifest, job_root):
             pairs.append(FramePair(pair_store,len(pairs),frame,before_period=entry['before_period'],after_period=entry['after_period'],
                               original=entry,automatic=automatic))
         target=root/'final_roads'/clean_name(grid)
-        active=[p for p in pairs if not p['frame'].empty]
+        # Unreviewed candidates cannot rewrite roads or create temporal states.
+        active=[p for p in pairs if not p['frame'].empty and not p['automatic'].get('manual_review_required',False)]
         updated=reconcile_periods(local_periods,active,target) if active else local_periods
         for period in updated:period['grid']=grid
         final_periods=[p for p in final_periods if str(p.get('grid','validation'))!=grid]+updated
         for pair in pairs:
             entry=pair['original'];frame=pair['frame']
             directory=root/'final_changes'/clean_name(grid)/f"{pair['before_period']}_to_{pair['after_period']}"
-            published=_publish_assisted_changes(frame,directory,pair['before_period'],pair['after_period'])
-            entry.update(published,product_variant='final',change_interval_count=len(frame),final_period_results=updated,
+            require_review=pair['automatic'].get('manual_review_required',False)
+            published=_publish_assisted_changes(frame,directory,pair['before_period'],pair['after_period'],require_review=require_review)
+            entry.update(published,product_variant='final',change_interval_count=0 if require_review else len(frame),final_period_results=updated,
                          automatic=pair['automatic'])
             entry.pop('manual_review', None)
-            entry.update({f'{kind}_feature_count':int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
+            entry.update({f'{kind}_feature_count':0 if require_review else int(frame.change_typ.eq(kind).sum()) for kind in ('added','removed','widened','narrowed')})
             entry['summary']=str(directory/'change_summary.json');_write_json(entry['summary'],entry)
     from .formal_road_products import is_formal_result
     for period in final_periods:

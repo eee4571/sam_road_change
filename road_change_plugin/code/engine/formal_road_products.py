@@ -10,7 +10,7 @@ from pathlib import Path
 # Bump when the formal geometry contract changes and completed periods truly
 # require rebuilding. Implementation signatures remain provenance, not an
 # automatic invalidation of successful periods on every exception-handling fix.
-FORMAL_ROAD_REVISION = 1
+FORMAL_ROAD_REVISION = 2
 
 
 def export_polygons(frame, audit=None):
@@ -64,6 +64,7 @@ def formal_products_current(directory):
         return (is_formal_result(saved['result']) and
                 saved['inputs'][0] == signature([Path(directory)/'regional_products.gpkg']) and
                 saved['inputs'][3] == signature([v[0] for v in saved['inputs'][3]]) and
+                saved['inputs'][6] == signature([v[0] for v in saved['inputs'][6]]) and
                 read_completed(marker, saved['inputs']) is not None)
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         return False
@@ -256,12 +257,17 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
                         width_source='axis_width_estimate',qa_state='review',
                         qa_reason=getattr(chain,'width_fallback_reason',rows[source].get('_width_fallback_reason','width_profile_mapping_failed')))
                 local = substring(chain.axis,a,b)
+                measured=evidence_row.get('width_m')
+                local_reliable=(evidence_row.get('quality_grade') in ('A','B') and
+                                evidence_row.get('width_quality')!='C' and
+                                measured is not None and np.isfinite(measured) and measured>0)
                 # A missing observation stays missing. A chain owner's grade must
                 # never leak into an unsupported station of the merged chain.
                 width_rows.append({**evidence_row,
                     'segment_id':chain_id, 'source_ids':row['source_ids'], 'track_id':row.get('track_id',''),
                     'state_src':row.get('state_src',''), 'axis_fix':row.get('axis_fix',''),
-                    'measured_w':evidence_row.get('width_m'), 'width_m':float((wa+wb)/2),
+                    'measured_w':evidence_row.get('width_m'),
+                    'width_m':float(measured) if local_reliable else float((wa+wb)/2),
                     'geometry':local, 'length_m':local.length})
     def frame(items):
         return gpd.GeoDataFrame(items,geometry='geometry',crs=crs) if items else gpd.GeoDataFrame(geometry=[],crs=crs)

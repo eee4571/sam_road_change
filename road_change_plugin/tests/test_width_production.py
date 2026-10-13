@@ -40,6 +40,20 @@ class WidthProductionTests(unittest.TestCase):
 
     def summary(self):return json.loads((self.output/'summary.json').read_text(encoding='utf8'))
 
+    def test_network_rebuild_keeps_local_widths_and_grades_on_a_mixed_chain(self):
+        from engine.road_network_products import rebuild_network_width_products
+        observed=backend.measure_region(self.roads,self.images,self.output)
+        chain=observed.index[observed.parent_id.eq('road_00000')]
+        self.assertGreater(len(chain),2)
+        for index,grade,width in zip(chain[:3],['A','C','B'],[6.,.5,10.]):
+            observed.loc[index,['quality_grade','width_quality']]=grade
+            observed.loc[index,['final_width','width_m']]=width
+        segments,corridors=rebuild_network_width_products(self.roads,observed)
+        self.assertEqual(len(segments),len(observed))
+        self.assertEqual(segments.quality_grade.tolist(),observed.quality_grade.tolist())
+        self.assertEqual(segments.width_m.tolist(),observed.width_m.tolist())
+        self.assertFalse(corridors.empty)
+
     def test_single_road_failure_retains_every_axis(self):
         real=backend.measure_road
         def fail(reader,line,*args):

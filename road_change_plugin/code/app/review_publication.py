@@ -154,7 +154,7 @@ def publish_review(session, version, record, progress):
                  'evaluation_metrics', 'evaluation_summary', 'evaluation_error'):
         entry.pop(name, None)
     entry['summary'] = str(version / 'change_summary.json')
-    retained = session.frame.loc[[record['decisions'][str(i)] != 'reject' for i in range(len(session.frame))]]
+    retained = session.frame.loc[[record['decisions'][str(i)] == 'keep' for i in range(len(session.frame))]]
     kinds = retained.get('change_typ')
     for kind in ('added', 'removed', 'widened', 'narrowed', 'width_changed'):
         entry[kind + '_feature_count'] = int(kinds.eq(kind).sum()) if kinds is not None else 0
@@ -194,7 +194,8 @@ def publish_review(session, version, record, progress):
             audit_path = Path(entry.get('output') or '') / 'gt_assisted_audit.gpkg'
             if audit_path.is_file():
                 from engine.reviewed_truth import build_truth_filter
-                review_filter = build_truth_filter(session.frame, record['decisions'], audit_path)
+                review_filter = build_truth_filter(session.frame, record['decisions'], audit_path,
+                    audit_layer=entry.get('review_audit_layer','changes'))
                 entry['manual_review']['truth_filter'] = review_filter
                 record['truth_filter'] = review_filter
             elif entry.get('ground_truth_used'):

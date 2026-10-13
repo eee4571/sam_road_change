@@ -841,7 +841,7 @@ def detect_final_road_changes(before_result, after_result, output_dir, *, before
                    patch_verifier=patch_verifier,compensation=modules.config)
         records, audit, width_audit, counts = analyzer(
             *scenes, tolerance=float(position_tolerance), absolute=float(width_change_absolute),
-            relative=float(width_change_ratio), minimum_length=24. if min_change_length is None else float(min_change_length),
+            relative=float(width_change_ratio), minimum_length=32. if min_change_length is None else float(min_change_length),
             minimum_area=float(min_change_area), presence_audit=presence_audit,**extra)
         if patch_verifier is not None:patch_verifier.write_audit(output_dir)
         result = finalize_auto_candidates(records, audit, width_audit, counts, presence_audit=presence_audit,
@@ -888,7 +888,7 @@ def finalize_auto_candidates(records, audit, width_audit, counts, *, presence_au
     if counts.get('v2_enabled'):
         from .fast_auto_v2 import qualify_candidates
         candidate_audit, width_samples = qualify_candidates(raw_candidates,
-                                minimum_length=24. if min_change_length is None else float(min_change_length),
+                                minimum_length=32. if min_change_length is None else float(min_change_length),
                                 minimum_area=float(min_change_area))
     else:
         seeds, candidate_audit = qualify_presence_candidates(raw_candidates, scenes, observation,
@@ -1038,10 +1038,11 @@ def complete_written_auto_result(output_dir, *, before_period, after_period, min
     render_change_preview(preview, changes, changes.iloc[:0], title=f"Auto {before_period} to {after_period}",
                           empty_message="No Auto change candidates")
     summary = {"execution_profile": "fast", "change_source": "fast_automatic", "change_output_mode": "fast_automatic",
+               "manual_review_required": True,
                "automatic_result": True, "ground_truth_derived": False, "ground_truth_used": False,
                "before_period": before_period, "after_period": after_period,
                "presence_change_source": "final_axis_symmetric_qualified_candidates", "width_change_source": "paired_local_profile",
-               "min_change_length_m": 24. if min_change_length is None else float(min_change_length),
+               "min_change_length_m": 32. if min_change_length is None else float(min_change_length),
                "changes_feature_count": len(changes), **{f"{k}_feature_count": int((changes.change_typ == k).sum()) for k in names},
                "candidate_funnel": str(output_dir/"candidate_funnel.json") if diagnostics else "", "diagnostics": str(gpkg) if diagnostics else "",
                "auto_change_total_seconds": elapsed_seconds+time.perf_counter()-started if elapsed_seconds is not None else None}

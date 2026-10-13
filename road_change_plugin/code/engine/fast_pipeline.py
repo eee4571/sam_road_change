@@ -3238,10 +3238,8 @@ def prepare_regional_products(
     if width_method=='raw_image':
         from .width.raw_road_surfaces import build_road_surfaces
         frames['surfaces']=build_road_surfaces(frames['width_segments'],image_path=raw_inputs[0],diagnostics=geometry_diagnostics)
-        if geometry_diagnostics:
-            affected=frames['width_segments'].parent_id.astype(str).isin({r['road_id'] for r in geometry_diagnostics})
-            frames['width_segments'].loc[affected,['quality_grade','width_quality']]='C'
-            frames['width_segments'].loc[affected,'qa_state']='review'
+        # Corridor rendering failures stay in the warning report. They cannot
+        # downgrade independently measured local RGB width evidence.
         summary_path=output_dir/'raw_width/summary.json'
         quality=json.loads(summary_path.read_text(encoding='utf8'))
         if geometry_diagnostics:
@@ -3273,13 +3271,18 @@ def export_fast_products(width_dir, output_dir, validation_area=None, image_dir=
     from .formal_road_products import reconstruct_frames,formal_metadata,implementation_signature,export_polygons,formal_products_current
     from .road_connection_evidence import ConnectionEvidence,RoadProbability,probability_sources
     sources=probability_sources(image_dir,width_dir)
+    observations=output_dir/'raw_width/width_observations.gpkg' if width_method=='raw_image' else None
+    if observations is not None and not observations.is_file():
+        raise FileNotFoundError(f'Local RGB width observations missing: {observations}')
     identity=[signature([source]),signature([__file__]),implementation_signature(),
-              signature([p for pair in sources for p in pair]),width_method,str(image_dir)]
+              signature([p for pair in sources for p in pair]),width_method,str(image_dir),signature([observations])]
     marker=output_dir/'fast_export_cache.json';cached=read_completed(marker,identity)
     if cached:return cached
     mapping={'centerlines':'road_centerlines.shp','surfaces':'road_surfaces.shp',
              'width_segments':'road_width_segments.gpkg','corridors':'road_corridors.gpkg'}
     frames={key:gpd.read_file(source,layer=key) for key in mapping}
+    if observations is not None:
+        frames['width_segments']=gpd.read_file(observations,layer='width_observations')
     output_crs=frames['centerlines'].crs
     metric=frames['centerlines'].estimate_utm_crs() if output_crs.is_geographic else output_crs
     frames={k:v.to_crs(metric) for k,v in frames.items()}

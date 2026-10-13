@@ -10,9 +10,9 @@ import geopandas as gpd
 from shapely import make_valid
 
 
-def build_truth_filter(original, decisions, audit_path):
+def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes'):
     audit_path = Path(audit_path)
-    audit = gpd.read_file(audit_path, layer='changes')
+    audit = gpd.read_file(audit_path, layer=audit_layer)
     if audit.crs is None:
         raise ValueError('变化来源记录缺少坐标系，无法更新复核评价')
     result = {'audit': str(audit_path), 'crs': audit.crs.to_wkt(), 'objects': []}

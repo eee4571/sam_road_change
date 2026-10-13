@@ -117,6 +117,28 @@ class FormalPeriodTests(unittest.TestCase):
         with patch('engine.formal_road_products.reconstruct_frames',side_effect=AssertionError('duplicate reconstruction')):
             self.assertEqual(export_fast_products(self.width,self.output),result)
 
+    def test_cached_raw_observations_restore_local_grades_and_invalidate_export(self):
+        self.regional([line(0,100)])
+        raw=self.output/'raw_width/width_observations.gpkg'; raw.parent.mkdir()
+        observations=gpd.GeoDataFrame({'width_m':[6.,.5,10.],
+            'quality_grade':['A','C','B'],'width_quality':['A','C','B']},
+            geometry=[line(0,40),line(40,60),line(60,100)],crs=3857)
+        observations.to_file(raw,layer='width_observations',driver='GPKG')
+        with patch('engine.fast_pipeline._write_fast_period_previews',side_effect=self.preview):
+            result=export_fast_products(self.width,self.output,width_method='raw_image')
+        widths=gpd.read_file(result['width_segments'])
+        self.assertEqual(set(widths.quality_grade),{'A','B','C'})
+        self.assertTrue((widths.loc[widths.quality_grade=='A','width_m']==6.).all())
+        self.assertTrue((widths.loc[widths.quality_grade=='B','width_m']==10.).all())
+        self.assertTrue(formal_products_current(self.output))
+        with raw.open('ab') as stream:stream.write(b'input changed')
+        self.assertFalse(formal_products_current(self.output))
+
+    def test_raw_export_does_not_substitute_aggregated_grades_when_observations_missing(self):
+        self.regional()
+        with self.assertRaisesRegex(FileNotFoundError,'Local RGB width observations missing'):
+            export_fast_products(self.width,self.output,width_method='raw_image')
+
     def test_legacy_or_changed_renderer_cannot_reuse_period(self):
         self.regional(); result = self.export()
         result_file = self.root/'period.json'; result_file.write_text(json.dumps(result))
@@ -191,6 +213,34 @@ class FormalPeriodTests(unittest.TestCase):
         self.assertFalse(middle.empty)
         self.assertTrue(middle.width_m.eq(8.).all())
         self.assertTrue(middle.measured_w.eq(.5).all())
+
+    def test_local_good_width_values_survive_neighbor_c_and_formal_export(self):
+        axes=gpd.GeoDataFrame(dict(width_m=[8.]),geometry=[line(0,120)],crs=3857)
+        widths=gpd.GeoDataFrame(dict(width_m=[6.,.5,10.],quality_grade=['A','C','B'],
+            width_quality=['A','C','B'],width_std=[.1,.2,.1]),
+            geometry=[line(0,40),line(40,80),line(80,120)],crs=3857)
+        frames,_,_=reconstruct_frames(axes,widths)
+        local=frames['width_segments']
+        self.assertTrue(local.loc[local.quality_grade.eq('A'),'width_m'].eq(6.).all())
+        self.assertTrue(local.loc[local.quality_grade.eq('B'),'width_m'].eq(10.).all())
+        self.assertTrue(local.quality_grade.eq('C').any())
+
+    def test_review_required_candidates_do_not_rewrite_roads_or_publish_events(self):
+        self.regional([line(0,100)]);period=self.export()
+        event=gpd.GeoDataFrame(dict(change_typ=['added'],width_bef=[0.],width_aft=[8.],
+            confidence=[.99],axis_wkt=[line(0,100).wkt],length_m=[100.]),
+            geometry=[line(0,100).buffer(4)],crs=3857)
+        entry=dict(grid='test',before_period='1',after_period='2',manual_review_required=True)
+        manifest=dict(period_results=[dict(period,grid='test',period=p) for p in ['1','2']],change_results=[entry])
+        with patch('engine.fast_gt_reconciliation._auto_axes',return_value=event), \
+             patch('engine.fast_gt_reconciliation.reconcile_periods',side_effect=AssertionError('unreviewed road edit')), \
+             patch('temporal_road_analysis.build_from_manifest',return_value=[]):
+            build_fast_temporal_outputs(manifest,self.root/'final')
+        actual=manifest['change_results'][0]
+        self.assertEqual(actual['changes_feature_count'],0)
+        self.assertGreater(actual['review_candidate_count'],0)
+        self.assertTrue(gpd.read_file(actual['road_changes']).empty)
+        self.assertTrue(gpd.read_file(actual['event_geometry_audit'],layer='changes').empty)
 
     def test_unobserved_interval_does_not_inherit_chain_owner_grade(self):
         axes = gpd.GeoDataFrame(dict(width_m=[8.],quality_grade=['A']),geometry=[line(0,100)],crs=3857)

@@ -18,8 +18,8 @@ from shapely.geometry import LineString, box
 from shapely.strtree import STRtree
 from engine.fast_candidate_publication import CandidateEvidence, grade_candidate, screen_candidates
 from engine.fast_patch_verification import PatchVerifier
-from engine.fast_auto_v2 import _reliable_width_at
-from test_fast_patch_verification import DecisionTests, RasterTests
+from engine.fast_auto_v2 import _reliable_width_at, merge_presence_intervals, presence_publication, V2Config
+from test_fast_patch_verification import DecisionTests as BaseDecisionTests, RasterTests
 import user_pipeline  # pin the plugin entry before workbench fixtures change sys.path
 import test_fast_auto_v2 as regression
 
@@ -51,6 +51,22 @@ def scene(lines=(), surface=None):
 
 
 class StructuralTests(unittest.TestCase):
+    def test_two_period_junction_and_strong_surface_loss_reach_image_review(self):
+        row=presence();row.update(length_m=40.,end_m=40.,axis_wkt='LINESTRING (0 0, 40 0)',
+            junction=True,v2_temporal_state='temporal_context_unknown',qa_state='probable',before_surface_ratio=.12)
+        self.assertTrue(presence_publication(row,V2Config())[0])
+        counts,_=screen_candidates([row],CandidateEvidence([scene(),scene([LineString([(0,0),(40,0)])])],{},[],2.,.2))
+        self.assertTrue(row['v2_publish'])
+        self.assertEqual(counts['v2_structure_passed_added'],1)
+        self.assertNotIn('presence_junction_context',row['v2_confidence_conditions'])
+
+    def test_merge_only_sub_tolerance_cuts_before_evidence(self):
+        self.assertEqual(merge_presence_intervals([(0,18),(20,40),(48,70)],3),[(0,40),(48,70)])
+        row=presence();row['length_m']=31.9
+        self.assertFalse(presence_publication(row,V2Config())[0])
+        row['length_m']=32.
+        self.assertTrue(presence_publication(row,V2Config())[0])
+
     def test_existing_interval_and_formal_output_contract(self):
         for name in ('test_stable_segments_do_not_run_match',
                      'test_presence_symmetry_and_flat_regular_geometry',
@@ -71,7 +87,7 @@ class StructuralTests(unittest.TestCase):
 
     def test_strong_change_never_bypasses_presence_conditions(self):
         cases={'before_valid_ratio':0.,'after_surface_ratio':.1,'before_surface_ratio':.8,
-               'length_m':20.,'ambiguous':True,'junction':True,
+               'length_m':20.,'ambiguous':True,
                'v2_temporal_state':'transient_extraction_or_gap'}
         for key,value in cases.items():
             row=presence();row[key]=value
@@ -118,8 +134,10 @@ class StructuralTests(unittest.TestCase):
         axis=LineString([(0,0),(150,0)])
         source=scene([axis,LineString([(0,5),(150,5)])])
         target=scene([LineString([(0,6),(150,6)])])
-        counts,audit=screen_candidates([presence()],CandidateEvidence([target,source],{},[],2.,.2))
-        self.assertIn('cross_track_presence_ambiguity',audit[0]['reasons'])
+        row=presence()
+        counts,audit=screen_candidates([row],CandidateEvidence([target,source],{},[],2.,.2))
+        self.assertTrue(row['v2_publish'])
+        self.assertIn('cross_track_presence_ambiguity',row['v2_confidence_conditions'])
 
     def test_rejected_candidates_never_read_patches_or_controls(self):
         verifier=PatchVerifier.__new__(PatchVerifier)
@@ -143,4 +161,25 @@ class StructuralTests(unittest.TestCase):
         verifier.record_decision.assert_called_once()
 
 
+class DecisionTests(BaseDecisionTests):
+    def test_uncertain_without_strong_fast2_evidence_is_candidate(self):
+        p=self.patch();p['valid']=False;v=self.verifier()
+        for original in (True,False):
+            row=dict(change_typ='added',v2_publish=original,v2_precision_reason='original_fast2')
+            v.record_decision(row,p,0)
+            self.assertEqual(row['v2_publish'],original)
+            self.assertEqual(row['v2_publication_level'],'Candidate')
+            self.assertEqual(row['qa_state'],'uncertain')
+
+    def test_curved_or_unresolved_width_is_not_rejected_as_stable(self):
+        p=self.stable();v=self.verifier()
+        for axis,width in [('LINESTRING (0 0, 20 0, 20 20)',10),('LINESTRING (0 0, 40 0)',2)]:
+            row=dict(change_typ='widened',v2_publish=True,v2_precision_reason='original',
+                     width_bef=width,width_aft=width,axis_wkt=axis)
+            v.record_decision(row,p,0)
+            self.assertTrue(row['v2_publish'])
+            self.assertEqual(row['v2_patch_state'],'uncertain')
+
+
+del BaseDecisionTests
 if __name__=='__main__':unittest.main()

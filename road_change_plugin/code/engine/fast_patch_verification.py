@@ -284,8 +284,9 @@ class PatchVerifier:
             self.counts['primary_'+reasons[0]]+=1
             for reason in reasons:self.counts['veto_'+reason]+=1
         else:
-            if level=='Candidate':
-                row.update(v2_publish=False,v2_precision_reason='candidate_confidence:'+(';'.join(conditions)))
+            # Confidence ranks review work; uncertainty cannot silently erase it.
+            row['confidence']={'Confirmed':.9,'Probable':.6,'Candidate':.3}[level]
+            row['qa_state']={'Confirmed':'confirmed','Probable':'probable','Candidate':'uncertain'}[level]
             if row.get('v2_publish',False):self.counts[f'after_{kind}']+=1
             if state=='uncertain':
                 self.counts['qa_unknown']+=1

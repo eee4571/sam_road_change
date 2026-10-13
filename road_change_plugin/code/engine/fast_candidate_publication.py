@@ -6,6 +6,22 @@ import numpy as np
 from shapely import from_wkt
 
 
+PRESENCE_MINIMUM_LENGTH = 32.
+
+
+def presence_eligibility(row, minimum_length=PRESENCE_MINIMUM_LENGTH):
+    """Shared admission to image verification and human review, not approval."""
+    source,target=('after','before') if row['change_typ']=='added' else ('before','after')
+    if row['length_m'] < minimum_length:return False,'short_presence_interval'
+    if min(row.get(source+'_valid_ratio',0.),row.get(target+'_valid_ratio',0.)) < .99:
+        return False,'presence_valid_observation'
+    if row.get(source+'_geometry_ratio',0.) < .99 or row.get(source+'_surface_ratio',0.) < .55:
+        return False,'presence_source_support'
+    loss=row.get(target+'_surface_ratio',1.) <= .15 and not row.get(target+'_probability_ratio',1.)
+    if row.get('qa_state')=='confirmed' or loss:return True,'two_period_presence_evidence'
+    return False,'opposite_absence_not_confirmed'
+
+
 class CandidateEvidence:
     def __init__(self,scenes,profiles,width_audit,absolute,relative):
         self.scenes=scenes;self.profiles=profiles or {};self.absolute=absolute;self.relative=relative
@@ -81,12 +97,21 @@ def screen_candidates(records,evidence):
         facts=evidence.facts(row)
         level,reasons,metrics=grade_candidate(row,'uncertain',facts,
             absolute=evidence.absolute,relative=evidence.relative)
-        if not reasons and row['change_typ'] in ('added','removed'):
+        hard=[]
+        if row['change_typ'] in ('added','removed'):
+            eligible,reason=presence_eligibility(row,row.get('v2_minimum_length',PRESENCE_MINIMUM_LENGTH))
+            if not eligible:hard.append(reason)
+        if not hard and row['change_typ'] in ('added','removed'):
             evidence.track_facts(row,facts)
             level,reasons,metrics=grade_candidate(row,'uncertain',facts,
                 absolute=evidence.absolute,relative=evidence.relative)
-        row['v2_structure_passed']=not reasons
-        if reasons:
+            # Definite same-road support is a negative; ambiguous tracks need eyes.
+            hard.extend(r for r in facts.get('track_reasons',[]) if r in
+                        ('same_road_displacement_rescue','nearby_opposite_surface_support'))
+        row['v2_structure_passed']=not hard
+        row.update(v2_publication_level=level,v2_confidence_conditions=';'.join(reasons))
+        if hard:
+            reasons=hard
             row.update(v2_publish=False,v2_publication_level='Candidate',
                 v2_confidence_conditions=';'.join(reasons),v2_precision_reason='structure:'+(';'.join(reasons)))
             counts['v2_structure_rejected_'+row['change_typ']]+=1
@@ -113,18 +138,15 @@ def grade_candidate(row,image_state,facts,*,absolute=2.,relative=.2):
         if not bool(ok):fail.append(name)
     if kind in ('added','removed'):
         source,target=('after','before') if kind=='added' else ('before','after')
-        width=max(float(row.get('width_bef',0.)),float(row.get('width_aft',0.)))
-        metrics.update(length_m=length,minimum_length=max(64.,8*width),
+        metrics.update(length_m=length,minimum_length=row.get('v2_minimum_length',PRESENCE_MINIMUM_LENGTH),
             source_surface=row.get(source+'_surface_ratio'),opposite_surface=row.get(target+'_surface_ratio'))
-        check('presence_continuous_length',length>=max(64.,8*width))
+        check('presence_continuous_length',length>=metrics['minimum_length'])
         check('presence_valid_observation',row.get(source+'_valid_ratio',0.)>=.99 and row.get(target+'_valid_ratio',0.)>=.99)
         check('presence_source_support',row.get(source+'_geometry_ratio',0.)>=.99 and row.get(source+'_surface_ratio',0.)>=.75)
         check('presence_clear_opposite_absence',row.get('qa_state')=='confirmed' and
               row.get(target+'_surface_ratio',1.)<=.05 and row.get(target+'_probability_ratio',1.)==0.)
-        check('presence_uncovered_segment',facts.get('uncovered_axis_fraction',0.)>=.5)
-        # A long confirmed interval may cross a junction; junction is not a veto.
-        check('presence_junction_context',not row.get('junction',False) or
-              (length>=max(96.,12*width) and row.get('v2_temporal_state')=='persistent_change'))
+        # Missing extra dates are unknown, never negative two-period evidence.
+        # Junction/coverage ambiguity is resolved locally, not by an entire-axis veto.
         # Existence QA is not a correspondence ambiguity flag. Unknown ranking
         # must not be fabricated from a merely probable presence classification.
         check('presence_ambiguous_correspondence',not row.get('ambiguous',False))

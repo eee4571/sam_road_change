@@ -182,7 +182,10 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
     raw_observations=observations is not None and 'final_width' in observations and 'width_backend' in observations
     if raw_observations:
         from .width.raw_image_backend import rebuild_observations
-        segments=rebuild_observations(observations)
+        # Representative geometry serves display corridors only. Detection keeps
+        # the measured local values and A/B/C grades, including gaps and failures.
+        representative=rebuild_observations(observations)
+        segments=observations.copy()
     else:
         segments = build_width_segments(metric,observations,source_tolerance=source_tolerance)
     print(f'[Fast timing] width_rebuild_segments={time.perf_counter()-stage_started:.6f}s',flush=True)
@@ -202,9 +205,11 @@ def rebuild_network_width_products(centerlines, measured=None, source_tolerance=
         segments.loc[inferred, 'qa_reason'] = 'connection_width_inherited'
     print(f'[Fast timing] width_rebuild_inferred={time.perf_counter()-stage_started:.6f}s',flush=True)
     stage_started=time.perf_counter()
-    corridors = build_corridors(segments)
+    corridors = build_corridors(representative if raw_observations else segments)
     diagnostics=[*segments.attrs.get('width_diagnostics',[]),*corridors.attrs.get('width_diagnostics',[])]
-    if diagnostics and 'parent_id' in segments:
+    if raw_observations:
+        diagnostics.extend(representative.attrs.get('width_diagnostics',[]))
+    if diagnostics and 'parent_id' in segments and not raw_observations:
         affected=segments.parent_id.astype(str).isin({r['road_id'] for r in diagnostics})
         segments.loc[affected,['quality_grade','width_quality']]='C'
         segments.loc[affected,'qa_state']='review'

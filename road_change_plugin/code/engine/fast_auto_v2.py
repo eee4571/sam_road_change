@@ -6,7 +6,7 @@ Raster evidence never supplies published geometry. Truth is not an input.
 """
 from collections import Counter
 from .disk_records import DiskMap,record_scope
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 
 import numpy as np
@@ -32,9 +32,6 @@ class V2Config:
     presence_minimum_length: float = 32.
     width_minimum_length: float = 72.
     width_threshold_factor: float = 2.
-    source_surface_minimum: float = .55
-    opposite_surface_maximum: float = .15
-    require_confirmed_absence: bool = True
     width_variability_factor: float = 2.
 
 
@@ -110,16 +107,19 @@ def _event_coordinates(axis,width,tolerance):
 
 def presence_publication(row,config):
     """Explicit absence or strong surface loss; weak ranks alone cannot veto it."""
-    source,target=('before','after') if row['change_typ']=='removed' else ('after','before')
-    surface_loss=(row.get(f'{source}_valid_ratio',0.) and row.get(f'{target}_valid_ratio',0.)
-                  and row.get(f'{source}_surface_ratio',0.)>=config.source_surface_minimum
-                  and row.get(f'{target}_surface_ratio',1.)<=config.opposite_surface_maximum
-                  and not row.get(f'{target}_probability_ratio',1.))
-    if row['length_m']<config.presence_minimum_length:return False,'short_presence_interval'
-    if not config.require_confirmed_absence:return True,'interval_evidence'
-    if row['qa_state']=='confirmed':return True,'confirmed_absence'
-    if surface_loss:return True,'strong_surface_loss_without_opposite_support'
-    return False,'opposite_absence_not_confirmed'
+    from .fast_candidate_publication import presence_eligibility
+    row['v2_minimum_length']=config.presence_minimum_length
+    return presence_eligibility(row,config.presence_minimum_length)
+
+
+def merge_presence_intervals(intervals, tolerance):
+    """Join only sub-tolerance cuts on the same axis; remeasure joint evidence."""
+    merged=[]
+    for a,b in sorted(intervals):
+        if merged and a-merged[-1][1] <= tolerance:
+            merged[-1]=(merged[-1][0],max(b,merged[-1][1]))
+        else:merged.append((a,b))
+    return merged
 
 
 def _presence(axis_id,axis,intervals,source,target,side,evidence,tolerance,counts,config):
@@ -361,7 +361,8 @@ def _strong_runs(indexes, strong):
 
 
 @record_scope
-def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=24.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None,compensation=None):
+def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_length=32.,minimum_area=4.,presence_audit=None,config=V2Config(),temporal_context=None,patch_verifier=None,compensation=None):
+    config=replace(config,presence_minimum_length=minimum_length)
     modules=Fast2Compensation(compensation)
     if patch_verifier is not None and patch_verifier.compensation.config != modules.config:
         raise ValueError("Analyzer and patch verifier compensation configurations must match")
@@ -391,6 +392,9 @@ def analyze_scenes(before,after,*,tolerance=3.,absolute=2.,relative=.2,minimum_l
         coverage=LongitudinalCoverage(target.lines,tolerance*config.stable_position_factor)
         for axis_id,axis in enumerate(source.lines):
             tick=time.perf_counter();intervals=coverage.uncovered(axis)
+            merged=merge_presence_intervals(intervals,tolerance)
+            counts['v2_presence_cuts_merged']+=len(intervals)-len(merged)
+            intervals=merged
             local,observations,details=_presence(axis_id,axis,intervals,source,target,side,evidence,tolerance,counts,config)
             records.extend(local);audit.extend(observations)
             if presence_audit is not None:presence_audit.extend(details)

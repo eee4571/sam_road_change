@@ -52,6 +52,18 @@ class ReviewedTruthTests(unittest.TestCase):
     def exclusions(self, decisions):
         return build_truth_filter(self.original, decisions, self.audit_path)
 
+    def test_pending_candidate_provenance_survives_empty_formal_audit(self):
+        pyogrio.write_dataframe(self.audit.iloc[:0],self.audit_path,layer='changes',driver='GPKG')
+        pyogrio.write_dataframe(self.audit,self.audit_path,layer='review_candidates',driver='GPKG')
+        manifest=read_json(self.fixture.manifest)
+        manifest['change_results'][0]['review_audit_layer']='review_candidates'
+        write_json(self.fixture.manifest,manifest)
+        session=ReviewSession(self.fixture.manifest);session.open_pair(0)
+        session.save({'0':'reject','1':'keep','2':'pending'})
+        result=read_json(self.fixture.manifest)['change_results'][0]
+        self.assertEqual(len(result['manual_review']['truth_filter']['objects']),1)
+        self.assertEqual(result['changes_feature_count'],1)
+
     def test_only_rejected_assisted_objects_are_excluded(self):
         review = self.exclusions({'0': 'reject', '1': 'reject', '2': 'pending'})
         effective, metadata = apply_truth_filter(self.truth, review, 'BHBM')

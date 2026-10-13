@@ -68,16 +68,42 @@ class ReviewTests(unittest.TestCase):
         np.testing.assert_equal(images[0][64, 64], [40, 80, 120, 255])
         np.testing.assert_equal(images[1][64, 64], [100, 150, 200, 255])
 
+    def test_all_candidates_use_existing_tool_but_only_keep_publishes(self):
+        candidates=self.root/'review_candidates.shp'
+        frame=self.frame.copy();frame['confidence']=[.3,.9,.6]
+        pyogrio.write_dataframe(frame,candidates,encoding='UTF-8')
+        pyogrio.write_dataframe(frame.iloc[:0],self.source,geometry_type='LineString',encoding='UTF-8')
+        manifest=read_json(self.manifest)
+        manifest['change_results'][0].update(review_candidates=str(candidates),manual_review_required=True)
+        write_json(self.manifest,manifest)
+        session=ReviewSession(self.manifest);data=session.open_pair(0)
+        self.assertEqual([f['id'] for f in data['features']],['1','2','0'])
+        self.assertTrue(all(f['status']=='pending' for f in data['features']))
+        before=source_signature(self.source,session.inputs)
+        decisions={'0':'keep','1':'pending','2':'reject'}
+        session.record(decisions)
+        self.assertEqual(source_signature(self.source,session.inputs),before)
+        session.save(decisions)
+        self.assertEqual(gpd.read_file(self.source).road_id.tolist(),[101])
+        reopened=ReviewSession(self.manifest);data=reopened.open_pair(0)
+        self.assertEqual(len(data['features']),3)
+        self.assertEqual({f['id']:f['status'] for f in data['features']},decisions)
+        changed=frame.copy();changed.loc[1,'confidence']=.8
+        pyogrio.write_dataframe(changed,candidates,encoding='UTF-8')
+        with self.assertRaisesRegex(ValueError,'已改变'):session.save(decisions)
+        with self.assertRaisesRegex(ValueError,'已改变'):reopened.save(decisions)
+        self.assertTrue(all(f['status']=='pending' for f in ReviewSession(self.manifest).open_pair(0)['features']))
+
     def test_save_resume_preserves_original_and_attributes(self):
         before = source_signature(self.source, self.session.inputs)
         decisions = {"0": "keep", "1": "reject", "2": "pending"}
         saved = self.session.save(decisions)
         output = gpd.read_file(saved["path"])
-        self.assertEqual(list(output.road_id), [101, 309])
+        self.assertEqual(list(output.road_id), [101])
         reviewed = gpd.read_file(self.session.source.parent / 'road_changes_reviewed.shp')
-        self.assertEqual(list(reviewed["name"]), ["甲", "丙"])
+        self.assertEqual(list(reviewed["name"]), ["甲"])
         self.assertTrue(output.crs == self.frame.crs)
-        self.assertEqual(list(output.width_m), [4.25, 6.0])
+        self.assertEqual(list(output.width_m), [4.25])
         self.assertTrue(output.geometry.iloc[0].equals_exact(self.frame.geometry.iloc[0], 0))
         rejected = gpd.read_file(self.session.source.parent / "false_changes.shp")
         self.assertEqual(list(rejected.road_id), [205])
@@ -88,7 +114,7 @@ class ReviewTests(unittest.TestCase):
         restored = ReviewSession(self.manifest)
         restored.open_pair(0)
         restored.save({'0': 'keep', '1': 'keep', '2': 'pending'})
-        self.assertEqual(len(gpd.read_file(self.source)), 3)
+        self.assertEqual(len(gpd.read_file(self.source)), 2)
 
     def test_all_rejected_and_empty_input_export_valid_shapefiles(self):
         saved = self.session.save({str(i): "reject" for i in range(3)})

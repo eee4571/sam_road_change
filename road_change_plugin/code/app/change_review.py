@@ -126,7 +126,10 @@ class ReviewSession:
         signature = source_signature(source, inputs)
         self.published_source, self.published_signature = source, signature
         review = entry.get('manual_review') or {}
-        if review.get('published_signature') == signature:
+        if entry.get('review_candidates'):
+            source=self.resolve(entry['review_candidates'])
+            signature=source_signature(source,inputs)
+        elif review.get('published_signature') == signature:
             source = Path(review['original'])
             signature = source_signature(source, inputs)
             if signature != review['source_signature']:
@@ -196,11 +199,12 @@ class ReviewSession:
                 self.image_warnings.append(f"{period}：{exc}")
             self.rasters.append(tiles)
         self.frame = frame
+        ordered=frame.sort_values('confidence',ascending=False,kind='stable') if 'confidence' in frame else frame
         return {"pair": pair, "features": [
             {"id": str(i), "change_type": str(row.get("change_typ", "未分类")),
              "status": statuses.get(str(i), "pending"),
              "attributes": {str(k): str(v) for k, v in row.items() if k != frame.geometry.name}}
-            for i, row in frame.iterrows()], "warning": warning,
+            for i, row in ordered.iterrows()], "warning": warning,
             "image_warnings": self.image_warnings, "saved_path": saved_path,
             "source_signature": signature, "published_signature": self.published_signature,
             "applied_decisions": applied_decisions}
@@ -298,18 +302,22 @@ class ReviewSession:
         target = self.folder / version
         target.mkdir()
         rejected = np.array([decisions[str(i)] == "reject" for i in range(len(self.frame))], dtype=bool)
-        for filename, selected in (("road_changes_reviewed.shp", ~rejected), ("false_changes.shp", rejected)):
+        kept=np.array([decisions[str(i)] == 'keep' for i in range(len(self.frame))],dtype=bool)
+        for filename, selected in (("road_changes_reviewed.shp", kept), ("false_changes.shp", rejected)):
             pyogrio.write_dataframe(self.frame.loc[selected], target / filename, driver="ESRI Shapefile",
                                     encoding="UTF-8", geometry_type=self.geometry_type)
         counts = {state: sum(s == state for s in decisions.values()) for state in sorted(STATES)}
         record = {"version": 1, "source": str(self.source), "source_signature": self.signature,
                   "pair": self.pair, "decisions": decisions, "counts": counts,
                   "saved_at": datetime.now(timezone.utc).isoformat(),
-                  "retained_pending": True, "evaluation": "not_recomputed"}
+                  "retained_pending": False, "evaluation": "not_recomputed"}
         atomic_json(target / "review.json", record)
         from .review_publication import publish_review
         result = publish_review(self, target, record, progress or (lambda message: None))
-        self.source = Path(result['original'])
+        # Only the published source was overwritten by Apply. A separate
+        # candidate source must remain live for stale-data checks on next Apply.
+        if self.source == self.published_source:
+            self.source = Path(result['original'])
         self.published_source = Path(result['path'])
         self.published_signature = result['published_signature']
         self.pair['path'] = result['path']

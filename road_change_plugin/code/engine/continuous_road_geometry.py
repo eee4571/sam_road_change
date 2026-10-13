@@ -227,6 +227,8 @@ def change_surfaces(frame):
             local=group.loc[group.geometry.intersects(part)]
             if local.empty:local=group
             rows.append(dict(change_id=f'CH{len(rows)+1:06d}',change_typ=kind,
+                confidence=float(local.confidence.min()) if 'confidence' in local else 0.,
+                qa_state='pending',
                 width_bef=float(local.width_bef.median()),width_aft=float(local.width_aft.median()),
                 width_diff=float((local.width_aft-local.width_bef).median()),geometry=part))
     return gpd.GeoDataFrame(rows,geometry='geometry',crs=frame.crs) if rows else frame.iloc[:0].copy()
