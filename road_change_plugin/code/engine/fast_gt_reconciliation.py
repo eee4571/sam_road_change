@@ -721,7 +721,14 @@ def build_fast_temporal_outputs(manifest, job_root):
         payload=_load_fast_period_result(Path(entry['result'])) if entry.get('result') and Path(entry['result']).is_file() else {}
         periods.append({**payload,**entry})
     manifest['auto_period_results']=periods
-    final_periods=list(periods)
+    from .formal_road_products import is_formal_result
+    existing={(str(p.get('grid')),str(p.get('period'))):p for p in manifest.get('final_period_results',[])}
+    final_periods=[]
+    for period in periods:
+        previous=existing.get((str(period.get('grid')),str(period.get('period'))),{})
+        # Keep unchanged, current final roads during a pair-only update. A
+        # rerun period has a new rerun_at and must supply its new observations.
+        final_periods.append(previous if is_formal_result(previous) and previous.get('rerun_at')==period.get('rerun_at') else period)
     entries=[e for e in manifest.get('change_results',[]) if e.get('status') not in ('failed','stale')]
     for grid in sorted({str(e.get('grid','validation')) for e in entries}):
         local_periods=[p for p in periods if str(p.get('grid','validation'))==grid]
@@ -737,6 +744,8 @@ def build_fast_temporal_outputs(manifest, job_root):
         metric=first.estimate_utm_crs() if first.crs.is_geographic else first.crs
         pairs=[];pair_store=FrameSpool()
         for entry in local_changes:
+            # Preserve unselected final changes and their human decisions.
+            if entry.get('fast_finalization_state')=='completed':continue
             automatic=entry.get('automatic',entry.copy())
             frame=(gpd.read_file(entry['correction_audit'],layer='corrected_intervals').to_crs(metric)
                    if entry.get('correction_audit') else _auto_axes(automatic,metric))
@@ -745,7 +754,8 @@ def build_fast_temporal_outputs(manifest, job_root):
         target=root/'final_roads'/clean_name(grid)
         # Unreviewed candidates cannot rewrite roads or create temporal states.
         active=[p for p in pairs if not p['frame'].empty and not p['automatic'].get('manual_review_required',False)]
-        updated=reconcile_periods(local_periods,active,target) if active else local_periods
+        updated=(reconcile_periods(local_periods,active,target) if active else
+                 [p for p in final_periods if str(p.get('grid','validation'))==grid])
         for period in updated:period['grid']=grid
         final_periods=[p for p in final_periods if str(p.get('grid','validation'))!=grid]+updated
         for pair in pairs:

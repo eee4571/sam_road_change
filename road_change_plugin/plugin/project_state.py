@@ -287,7 +287,10 @@ class ProjectState:
         removed = [p for p in products if self.in_scope(p, scope)]
         targets = [path for p in removed for path in self.dataset_files(p['path'])]
         job = Path(manifest.get('job_root') or Path(descriptor['path']).parent).resolve()
-        targets += [job / 'grids' / safe_name(grid) / 'periods' / safe_name(p) for p in scope['periods']]
+        # Local updates replace publications, not the period inference/width
+        # workspace. The backend validates and resumes individual stages there.
+        period_cache = job / 'grids' / safe_name(grid) / 'periods'
+        targets = [p for p in targets if not Path(p).resolve().is_relative_to(period_cache.resolve())]
         targets.append(Path(descriptor['path']).parent / 'local_rerun.json')
         targets += [job / 'grids' / safe_name(grid) / 'changes' / safe_name(pair) for pair in changes]
         # Exact published category directories include auxiliary files and previews.

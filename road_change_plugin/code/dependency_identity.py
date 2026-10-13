@@ -14,6 +14,32 @@ _RESOURCE_KEY_SUFFIXES = ("_PATH", "_ROOT", "_DIR")
 _MODEL_RESOURCE_SUFFIXES = {".ckpt", ".pth", ".pt", ".onnx", ".safetensors"}
 
 
+def local_code_identity(path: Path, roots: tuple[str, ...]) -> str:
+    """Hash selected functions and their same-module dependencies, not unrelated stages."""
+    tree=ast.parse(path.read_text(encoding='utf-8-sig'))
+    definitions={}
+    imports=[]
+    for node in tree.body:
+        if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+            definitions[node.name]=node
+        elif isinstance(node,(ast.Assign,ast.AnnAssign)):
+            targets=node.targets if isinstance(node,ast.Assign) else [node.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name,ast.Name):definitions[name.id]=node
+        elif isinstance(node,(ast.Import,ast.ImportFrom)):imports.append(node)
+    missing=set(roots)-definitions.keys()
+    if missing:raise ValueError(f'Missing code identity roots: {sorted(missing)}')
+    pending=list(roots);selected=set()
+    while pending:
+        name=pending.pop()
+        if name in selected or name not in definitions:continue
+        selected.add(name)
+        pending.extend(n.id for n in ast.walk(definitions[name]) if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load))
+    nodes=imports+[definitions[name] for name in sorted(selected)]
+    return hashlib.sha256('\n'.join(ast.dump(n,include_attributes=False) for n in nodes).encode()).hexdigest()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:

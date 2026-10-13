@@ -65,9 +65,10 @@ def implementation_identity():
     paths=[root/name for name in ('width_reliability.py','chain_width_calculator.py','molra_centerline_width.py',
         'raw_image_backend.py','raw_boundary_core.py','raw_width_reconstruction.py','raw_width_records.py',
         'raw_feature_cache.py','raw_memory.py','raw_road_surfaces.py')]
-    paths += [root.parent/'fast_pipeline.py']
     digest=hashlib.sha256()
     for path in paths:digest.update(path.read_bytes())
+    from dependency_identity import local_code_identity
+    digest.update(local_code_identity(root.parent/'fast_pipeline.py',('measure_fast_widths',)).encode())
     return [VERSION,digest.hexdigest(),project_default_width()]
 
 

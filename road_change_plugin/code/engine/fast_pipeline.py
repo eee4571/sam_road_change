@@ -2529,13 +2529,15 @@ def measure_fast_widths(
     default_width=project_default_width()
     tile_cache=output_dir/'tile_checkpoints'
     tile_cache.mkdir(parents=True,exist_ok=True)
+    from dependency_identity import local_code_identity
+    width_code=local_code_identity(Path(__file__),('measure_fast_widths',))
     def tile_inputs(image_path):
         return signature([image_path,surface_dir/f'{image_path.stem}_mask.png',
             probability_dir/f'{image_path.stem}_road.png',
             probability_dir.parent/'graph'/f'{image_path.stem}_fast_topology.npz',
-            __file__,WIDTH_ROOT/'molra_centerline_width.py',WIDTH_ROOT/'chain_width_calculator.py',
+            WIDTH_ROOT/'molra_centerline_width.py',WIDTH_ROOT/'chain_width_calculator.py',
             WIDTH_ROOT/'width_reliability.py',sam_pretrained_path,molra_weight_path]) + [
-            width_method,requested_pixel_size,molra_tile,molra_overlap,molra_threshold,default_width]
+            width_method,requested_pixel_size,molra_tile,molra_overlap,molra_threshold,default_width,width_code]
     batch_started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     from .disk_records import DiskRows, write_gpkg_rows

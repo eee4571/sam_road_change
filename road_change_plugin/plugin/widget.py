@@ -413,6 +413,7 @@ class RoadChangeWidget(QWidget):
             scope = self.update_page.scope or {}
             confirmation = (f"区域：{scope.get('grid', '')}\n重新处理 {len(scope.get('periods', []))} 个道路期次，"
                             f"更新 {len(scope.get('changes', []))} 个变化对、长时序及可用的精度评价。\n\n"
+                            '程序会复用有效缓存，按需更新过期的单期正式成果。\n\n'
                             '完整范围已列于当前页面。对应正式成果将被替换，是否开始？')
             if QMessageBox.question(self, '确认局部重跑', confirmation,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

@@ -195,7 +195,7 @@ class ProjectLifecycleTests(unittest.TestCase):
         for p in original:
             self.assertEqual(Path(p['path']).exists(), not self.store.in_scope(p, scope), p['path'])
         self.assertTrue((self.store.current / 'grids/南区/periods/2021/intermediate.dat').exists())
-        self.assertFalse((self.store.current / 'grids/南区/periods/2020').exists())
+        self.assertTrue((self.store.current / 'grids/南区/periods/2020/intermediate.dat').exists())
         self.assertTrue((self.store.current / 'grids/南区/changes/2022_to_2023/intermediate.dat').exists())
         self.assert_cache()
 

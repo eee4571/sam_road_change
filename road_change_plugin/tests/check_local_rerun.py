@@ -64,6 +64,35 @@ class SelectionTests(unittest.TestCase):
         run_selection(self.args(pairs=[['2021','2022'],['2023','2024']]),pipeline)
         self.assertEqual(self.calls,[('change','2021','2022'),('change','2023','2024'),('downstream',)])
 
+    def test_single_commands_preserve_other_area(self):
+        for kind in ('period','change'):
+            with self.subTest(kind=kind):
+                pipeline.write_json(self.path,self.manifest)
+                args=self.args()
+                if kind=='period':
+                    args.period='2021'
+                    with patch.object(pipeline,'_rerun_period_entry',return_value={'result':'new'}):
+                        pipeline.rerun_pipeline_period(args)
+                else:
+                    args.before_period='2021';args.after_period='2022'
+                    with patch.object(pipeline,'_rerun_change_entry',return_value={'output':'new'}):
+                        pipeline.rerun_pipeline_change(args)
+                saved=pipeline.read_json(self.path)
+                for key in ('period_results','auto_period_results','change_results','temporal_results'):
+                    self.assertEqual([r for r in saved[key] if r['grid']=='south'],
+                                     [r for r in self.manifest[key] if r['grid']=='south'])
+
+    def test_unselected_review_and_evaluation_are_not_invalidated(self):
+        for entry in self.manifest['change_results']:
+            entry.update(fast_finalization_state='completed',manual_review={'counts':{'keep':2}},
+                published={'changes':'retained.shp'},evaluation_metrics={'precision':1.})
+        pipeline.write_json(self.path,self.manifest)
+        run_selection(self.args(pairs=[['2021','2022']]),pipeline)
+        result=pipeline.read_json(self.path)
+        for old,new in zip(self.manifest['change_results'],sorted(result['change_results'],key=lambda e:(e['grid'],e['before_period']))):
+            if old['grid']=='north' and old['before_period']=='2021':continue
+            self.assertEqual(new,old)
+
     def test_resume_road_failure_does_not_repeat_finished_period(self):
         args=self.args(['2021','2022']);self.fail=('period','2022')
         with self.assertRaisesRegex(RuntimeError,'interrupt'):run_selection(args,pipeline)
@@ -102,6 +131,21 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(args.command,'rerun-selection')
         self.assertEqual(pipeline.parser().parse_args(['rerun-period','--pipeline-manifest',str(self.path),
             '--grid','north','--period','2021','--update-related']).period,'2021')
+
+    def test_retry_evaluation_does_not_invalidate_completed_geometry(self):
+        selected=dict(grid='north',before_period='2020',after_period='2021',
+            fast_finalization_state='completed',evaluation_state='failed',output=self.tmp.name)
+        retained=dict(grid='north',before_period='2021',after_period='2022',
+            fast_finalization_state='completed',evaluation_state='completed',manual_review={'counts':{'keep':2}})
+        original=copy.deepcopy(retained)
+        manifest=dict(fast_finalization_state='completed',change_results=[selected,retained])
+        with patch.object(pipeline,'build_temporal_outputs',return_value=[]), \
+             patch.object(pipeline,'_invalidate_fast_finalization',side_effect=AssertionError('unrelated invalidation')), \
+             patch.object(pipeline,'_manifest_change_context',return_value=('truth','area','type')), \
+             patch.object(pipeline,'_evaluate_existing_changes_impl') as evaluate:
+            pipeline._finalize_fast_manifest(manifest,Path(self.tmp.name))
+        self.assertEqual(evaluate.call_count,1)
+        self.assertEqual(retained,original)
 
 
 if __name__=='__main__':unittest.main()

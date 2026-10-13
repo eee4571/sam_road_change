@@ -4,7 +4,7 @@ import copy
 from pathlib import Path
 
 
-def scoped_downstream(manifest, grid, pipeline, *, invalidate=False):
+def scoped_downstream(manifest, grid, pipeline, *, invalidate=False, pairs=None):
     """Use the existing finalization barrier for the affected area only."""
     scoped = copy.deepcopy(manifest)
     keys = ('period_results', 'auto_period_results', 'change_results', 'final_period_results', 'temporal_results')
@@ -15,7 +15,7 @@ def scoped_downstream(manifest, grid, pipeline, *, invalidate=False):
     if 'grids' in scoped.get('input_spec', {}):
         scoped['input_spec']['grids'] = {k:v for k,v in scoped['input_spec']['grids'].items() if k == grid}
     if invalidate:
-        pipeline._invalidate_fast_finalization(scoped)
+        pipeline._invalidate_fast_finalization(scoped,pairs=pairs)
     else:
         pipeline._refresh_manifest_downstream(scoped)
     for key in keys:
@@ -58,7 +58,7 @@ def run_selection(args, pipeline):
     completed = int(saved.get('completed', 0))
     if not 0 <= completed <= len(steps):raise ValueError('局部重跑断点无效')
     if not saved:
-        scoped_downstream(manifest, plan['grid'], pipeline, invalidate=True)
+        scoped_downstream(manifest, plan['grid'], pipeline, invalidate=True,pairs=plan['pairs'])
         manifest['status'] = 'running'
         pipeline._persist_existing_pipeline(manifest, path)
         pipeline.write_json(checkpoint, dict(plan=plan, completed=0))

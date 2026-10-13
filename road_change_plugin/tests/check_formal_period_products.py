@@ -242,6 +242,36 @@ class FormalPeriodTests(unittest.TestCase):
         self.assertTrue(gpd.read_file(actual['road_changes']).empty)
         self.assertTrue(gpd.read_file(actual['event_geometry_audit'],layer='changes').empty)
 
+    def test_completed_review_is_not_rebuilt_when_another_pair_changes(self):
+        self.regional([line(0,100)]);period=self.export()
+        event=gpd.GeoDataFrame(dict(change_typ=['added'],width_bef=[0.],width_aft=[8.],
+            axis_wkt=[line(0,100).wkt]),geometry=[line(0,100).buffer(4)],crs=3857)
+        retained=dict(grid='test',before_period='2',after_period='3',fast_finalization_state='completed',
+            manual_review={'counts':{'keep':1}},published={'changes':'human-reviewed.shp'},evaluation_metrics={'precision':1.})
+        original=dict(retained)
+        manifest=dict(period_results=[dict(period,grid='test',period=p) for p in ['1','2','3']],
+            change_results=[dict(grid='test',before_period='1',after_period='2',manual_review_required=True),retained])
+        with patch('engine.fast_gt_reconciliation._auto_axes',return_value=event) as axes, \
+             patch('temporal_road_analysis.build_from_manifest',return_value=[]):
+            build_fast_temporal_outputs(manifest,self.root/'final')
+        self.assertEqual(axes.call_count,1)
+        self.assertEqual(manifest['change_results'][1],original)
+
+    def test_pair_only_refresh_keeps_current_final_periods_but_uses_rerun_period(self):
+        self.regional([line(0,100)]);period=self.export()
+        before=dict(period,grid='test',period='1')
+        after=dict(period,grid='test',period='2',rerun_at='new')
+        final_before=dict(before,final_marker='keep')
+        final_after=dict(after,rerun_at='old',final_marker='replace')
+        manifest=dict(auto_period_results=[before,after],period_results=[final_before,final_after],
+            final_period_results=[final_before,final_after],
+            change_results=[dict(grid='test',before_period='1',after_period='2',fast_finalization_state='completed')])
+        with patch('engine.fast_gt_reconciliation._auto_axes',side_effect=AssertionError('unselected pair rebuilt')), \
+             patch('temporal_road_analysis.build_from_manifest',return_value=[]):
+            build_fast_temporal_outputs(manifest,self.root/'final')
+        self.assertEqual(manifest['final_period_results'][0]['final_marker'],'keep')
+        self.assertNotIn('final_marker',manifest['final_period_results'][1])
+
     def test_unobserved_interval_does_not_inherit_chain_owner_grade(self):
         axes = gpd.GeoDataFrame(dict(width_m=[8.],quality_grade=['A']),geometry=[line(0,100)],crs=3857)
         widths = gpd.GeoDataFrame(dict(width_m=[8.],quality_grade=['A']),geometry=[line(0,40)],crs=3857)

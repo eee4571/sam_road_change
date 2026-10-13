@@ -2495,9 +2495,19 @@ def extract(args: argparse.Namespace) -> dict:
     resume = bool(getattr(args, "resume", False))
     period_state_path = workspace / "period_state.json"
     period_state = _load_period_state(period_state_path, grid, period, resume, execution_profile)
+    from engine.product_cache import signature
+    extraction_inputs=[signature([ckpt,config,*listed_rasters(images)]),
+        execution_profile,str(args.rescale),str(getattr(args,'junction_node_mode','sparse'))]
+    if period_state.get('extraction_inputs') != extraction_inputs:
+        for stage in period_state['stages']:
+            if stage!='prepare':period_state['stages'][stage]='pending'
+    period_state['extraction_inputs']=extraction_inputs
+    if period_state.get('pixel_size') != str(args.pixel_size):
+        for stage in ('width','regional','export'):period_state['stages'][stage]='pending'
+    period_state['pixel_size']=str(args.pixel_size)
     width_method=getattr(args,'width_method',None) or period_state.get('width_method','sam_molra')
     if period_state.get('width_method','sam_molra')!=width_method:
-        period_state['stages']['export']='pending'
+        for stage in ('width','regional','export'):period_state['stages'][stage]='pending'
     period_state['width_method']=width_method
     from engine.width.width_reliability import implementation_identity
     width_identity=implementation_identity()
@@ -2617,6 +2627,7 @@ def extract(args: argparse.Namespace) -> dict:
             stage_commands["centerline"][0].extend(("--pipeline-state", str(pipeline_state_path.resolve())))
     try:
         upstream_reexecuted = False
+        executed_stages = set()
         for stage_index, (stage_key, stage_label) in enumerate(stage_definitions, start=1):
             event_context = {
                 "grid": grid, "period": period,
@@ -2636,6 +2647,11 @@ def extract(args: argparse.Namespace) -> dict:
                          message=f"复用已完成测宽成果，部分道路使用估计宽度；异常 {warning.get('exception_count',0)}。详情：{warning.get('details','')}")
                 continue
             upstream_reexecuted = True
+            executed_stages.add(stage_key)
+            # Persist downstream invalidation before starting this stage, so a
+            # stop between two stages cannot leave old outputs marked complete.
+            for dependent,_ in stage_definitions[stage_index:]:
+                period_state['stages'][dependent]='pending'
             period_state.update({
                 "status": "running", "current_stage": stage_key,
                 "current_stage_label": stage_label, "updated_at": now_text(),
@@ -2709,12 +2725,14 @@ def extract(args: argparse.Namespace) -> dict:
         normalized_source / "valid_observation.shp"
         if normalized_source.is_dir() else None
     )
-    valid_observation = _write_valid_observation_area(
+    reuse_observation=resume and 'centerline' not in executed_stages and _shapefile_complete(products/'valid_observation.shp')
+    valid_observation = str(products/'valid_observation.shp') if reuse_observation else _write_valid_observation_area(
         images,
         products / "valid_observation.shp",
         cached_observation=cached_observation,
     )
-    road_probability = _write_probability_mosaic(
+    reuse_probability=resume and not {'centerline','width'}.intersection(executed_stages) and (products/'road_probability.tif').is_file()
+    road_probability = str(products/'road_probability.tif') if reuse_probability else _write_probability_mosaic(
         images, width_dir, products / "road_probability.tif",
     )
     result = _ensure_extract_manifest_fields({
@@ -4551,7 +4569,8 @@ def _rerun_period_entry(manifest: dict, grid: str, period: str) -> dict:
         device=str(input_spec.get("device") or "auto"),
         pixel_size=str(input_spec.get("pixel_size") or "0.0"),
         rescale=str(input_spec.get("rescale") or "off"),
-        run_id=f"roads_rerun_{int(time.time())}",
+        run_id=str(old.get('run_id') or 'roads') if str(workspace)==str(Path(old.get('result',workspace/'latest_result.json')).parent) else 'roads',
+        resume=True, grid=grid, period=period,
         junction_node_mode=str(input_spec.get("junction_node_mode") or "sparse"),
         execution_profile=str(manifest.get("execution_profile") or input_spec.get("execution_profile") or "full"),
         width_method=input_spec.get("width_method","sam_molra"),
@@ -4642,7 +4661,52 @@ def _mark_change_rerun_failed(
         entry["failed_at"] = now_text()
 
 
+def _refresh_fast_period_entries(manifest: dict, grid: str, names=None) -> None:
+    """Refresh only stale formal exports, without extraction or width inference."""
+    if manifest.get('execution_profile')!='fast':return
+    from engine.fast_pipeline import export_fast_products
+    entries=manifest.get('auto_period_results',manifest.get('period_results',[]))
+    for entry in entries:
+        period=str(entry.get('period'))
+        if str(entry.get('grid'))!=grid or (names is not None and period not in names):continue
+        if entry.get('status') in ('failed','stale'):
+            if names is None:continue
+            raise ValueError(f'{grid}/{period} 道路期次尚未完成，请先重跑该道路期次')
+        result_path=Path(entry['result'])
+        payload=read_json(result_path)
+        products=Path(payload['centerlines']).parent
+        if is_formal_result(payload) and formal_products_current(products):
+            # Export may have completed before the project manifest was saved.
+            updated=payload
+        else:
+            workspace=Path(payload.get('workspace') or result_path.parent)
+            input_path=workspace/'input_manifest.json'
+            if not input_path.is_file():
+                raise FileNotFoundError(f'{grid}/{period} 缺少单期输入索引，请重跑该道路期次：{input_path}')
+            inputs=read_json(input_path)
+            images=Path(inputs['images'])
+            width_dir=Path(payload['width_review'])
+            method=payload.get('width_method','sam_molra')
+            required=[products/'regional_products.gpkg',Path(payload['road_probability']),Path(payload['valid_observation'])]
+            if method=='raw_image':required.append(products/'raw_width/width_observations.gpkg')
+            missing=[str(p) for p in required if not p.is_file()]
+            if missing or not images.is_dir() or not width_dir.is_dir():
+                raise FileNotFoundError(f'{grid}/{period} 缺少可复用缓存，请重跑该道路期次：{missing or [str(images),str(width_dir)]}')
+            emit('stage',stage='复用缓存更新单期正式成果',status='running',grid=grid,period=period)
+            exported=export_fast_products(width_dir,products,image_dir=images,width_method=method)
+            updated={**payload,**exported,'surface_source':'canonical_road_graph'}
+            write_json(result_path,updated)
+            emit('stage',stage='复用缓存更新单期正式成果',status='complete',grid=grid,period=period)
+        for key in ('auto_period_results','period_results'):
+            for item in manifest.get(key,[]):
+                if str(item.get('grid'))==grid and str(item.get('period'))==period:
+                    if key=='period_results' and Path(item.get('result',''))!=result_path:continue
+                    item.update(updated)
+
+
 def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
+    from engine.fast_multitemporal import dependency_periods
+    _refresh_fast_period_entries(manifest,grid,dependency_periods(_manifest_period_plan(manifest).get(grid,[]),before,after))
     periods = {
         (str(entry.get("grid")), str(entry.get("period"))): entry
         for entry in (manifest.get('auto_period_results',manifest.get("period_results", [])) or []) if isinstance(entry, dict)
@@ -4739,6 +4803,7 @@ def _affected_manifest_pairs(manifest: dict, grid: str, period: str) -> list[tup
 def _refresh_manifest_downstream(manifest: dict) -> None:
     job_root = Path(str(manifest.get("job_root") or ".")).expanduser().resolve()
     if manifest.get('execution_profile') == 'fast':
+        for grid in _manifest_period_plan(manifest):_refresh_fast_period_entries(manifest,grid)
         _finalize_fast_manifest(manifest, job_root)
         return
     manifest["temporal_results"] = build_temporal_outputs(manifest, job_root)
@@ -4747,14 +4812,15 @@ def _refresh_manifest_downstream(manifest: dict) -> None:
     manifest["downstream_updated_at"] = now_text()
 
 
-def _invalidate_fast_finalization(manifest: dict) -> None:
+def _invalidate_fast_finalization(manifest: dict, *, pairs=None) -> None:
     """Keep resumable Auto inputs, invalidate every derived final product."""
     if manifest.get('execution_profile') != 'fast':return
     manifest['fast_finalization_state']='pending'
-    for key in ('final_period_results','temporal_results','evaluation_summary'):
+    for key in (('final_period_results','temporal_results','evaluation_summary') if pairs is None else ('temporal_results','evaluation_summary')):
         manifest.pop(key,None)
     manifest['temporal_status']='stale'
     for entry in manifest.get('change_results',[]):
+        if pairs is not None and [str(entry['before_period']),str(entry['after_period'])] not in pairs:continue
         for key in ('evaluation_metrics','evaluation_summary','evaluation_error','evaluation_failed_at',
                     'evaluated_at','published','final_period_results','final_temporal'):
             entry.pop(key,None)
@@ -4767,9 +4833,15 @@ def _invalidate_fast_finalization(manifest: dict) -> None:
 @timed_stage("finalization_total")
 def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     """Production Fast barrier: final roads/changes/temporal, evaluation, publish later."""
-    _invalidate_fast_finalization(manifest)
+    # Callers mark the selected changes stale. Retrying finalization must not
+    # invalidate unrelated completed geometry or human review decisions.
+    manifest['fast_finalization_state']='pending'
+    pending={id(e) for e in manifest.get('change_results',[]) if e.get('fast_finalization_state')!='completed'}
+    evaluation_pending=pending|{id(e) for e in manifest.get('change_results',[])
+        if e.get('evaluation_state') in ('stale','failed','running')}
     manifest['temporal_results']=build_temporal_outputs(manifest,job_root)
     for entry in manifest.get('change_results',[]):
+        if id(entry) not in pending:continue
         entry['fast_finalization_state']='completed'
         entry['execution_profile']='fast'
         # A final summary belongs beside the final layer, never in the Auto cache.
@@ -4778,6 +4850,7 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     # All final products exist before any evaluation can fail.
     manifest['fast_finalization_state']='completed'
     for entry in manifest.get('change_results',[]):
+        if id(entry) not in evaluation_pending:continue
         truth,area,field=_manifest_change_context(manifest,str(entry.get('grid','pair')),
             str(entry['before_period']),str(entry['after_period']),entry)
         if not truth:
@@ -4820,11 +4893,12 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
     manifest = read_json(manifest_path)
     _apply_fast2_task_settings(manifest, args)
     if manifest.get('execution_profile') == 'fast':args.update_related=True
-    _invalidate_fast_finalization(manifest)
-    if manifest.get('execution_profile') == 'fast':
-        _persist_existing_pipeline(manifest,manifest_path)
+    from app.local_rerun import scoped_downstream
     grid, period = str(args.grid), str(args.period)
     pairs = _affected_manifest_pairs(manifest, grid, period)
+    scoped_downstream(manifest,grid,sys.modules[__name__],invalidate=True,pairs=[list(p) for p in pairs])
+    if manifest.get('execution_profile') == 'fast':
+        _persist_existing_pipeline(manifest,manifest_path)
     emit("pipeline", stage="道路提取局部重跑", status="running", completed=0, total=1 + (len(pairs) if args.update_related else 0))
     updated = _rerun_period_entry(manifest, grid, period)
     if args.update_related:
@@ -4850,7 +4924,7 @@ def rerun_pipeline_period(args: argparse.Namespace) -> dict:
                 before_period=before, after_period=after,
                 area_completed=index, area_total=len(pairs),
             )
-        _refresh_manifest_downstream(manifest)
+        scoped_downstream(manifest,grid,sys.modules[__name__])
     else:
         for before, after in pairs:
             entry = _invalidate_change_evaluation(
@@ -4872,8 +4946,9 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
     manifest = read_json(manifest_path)
     _apply_fast2_task_settings(manifest, args)
     if manifest.get('execution_profile') == 'fast':args.update_temporal=True
-    _invalidate_fast_finalization(manifest)
     grid, before, after = str(args.grid), str(args.before_period), str(args.after_period)
+    from app.local_rerun import scoped_downstream
+    scoped_downstream(manifest,grid,sys.modules[__name__],invalidate=True,pairs=[[before,after]])
     _invalidate_change_evaluation(manifest, grid, before, after)
     _persist_existing_pipeline(manifest, manifest_path)
     emit(
@@ -4893,7 +4968,7 @@ def rerun_pipeline_change(args: argparse.Namespace) -> dict:
         )
         raise
     if args.update_temporal:
-        _refresh_manifest_downstream(manifest)
+        scoped_downstream(manifest,grid,sys.modules[__name__])
     else:
         manifest["temporal_status"] = "stale"
     manifest["status"] = "completed"
