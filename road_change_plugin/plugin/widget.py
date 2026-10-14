@@ -783,8 +783,7 @@ class RoadChangeWidget(QWidget):
         self.restart_action.setEnabled(available and opened and self.checked)
         compatible = bool(self._current) and self._current['data'].get('execution_profile') == 'fast'
         self.update_button.setVisible(bool(self._current))
-        local_pending = self._resume_task and self._resume_task.get('action', 'all') not in {'all', 'rerun-temporal'}
-        self.update_button.setEnabled(available and self.checked and compatible and not local_pending)
+        self.update_button.setEnabled(available and self.checked and compatible)
         self.review_button.setEnabled(available and not self._resume_task and
                                       any(p['result_type'] == 'road_change' for p in self._result_payloads))
         self.update_page.body.setEnabled(available)
@@ -812,6 +811,7 @@ class RoadChangeWidget(QWidget):
                 scope = self._resume_task.get('scope') or {}
                 target = (scope.get('periods') or scope.get('changes') or [])
                 description += '，继续完成上次选定范围\n' + scope.get('grid', '') + ' / ' + '、'.join(target).replace('_to_', ' → ')
+            description += '\n也可选择“局部重跑”重新指定处理范围'
         elif not self.model['areas']:
             state, title, description = 'unconfigured', '配置数据', '项目尚未配置数据'
         elif not self.checked:

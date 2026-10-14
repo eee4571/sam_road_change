@@ -38,7 +38,7 @@ plugtest 包含 2 条真正多部件的观测，另有 105 个单部件 MultiLin
 | --- | --- |
 | test_temporal_multipart.py | 8 通过 |
 | test_temporal_recovery.py | 5 通过 |
-| test_project_state.py | 21 通过 |
+| test_project_state.py | 24 通过（含中断后重选范围） |
 | test_ui_processing.py | 36 通过 |
 | test_workbench.py | 17 通过 |
 | test_plugin.py | 16 通过 |
@@ -52,7 +52,7 @@ plugtest 包含 2 条真正多部件的观测，另有 105 个单部件 MultiLin
 ## 恢复行为
 
 - 新增 `rerun-temporal --pipeline-manifest PATH [--grid AREA]`，界面对应“局部重跑 → 仅重建长时序”。
-- 完整任务失败不再一律禁用局部重跑。尚未完成的局部道路/变化重跑继续保留原范围锁定。
+- 完整任务或局部重跑中断后，均可重新选择局部范围；“继续”恢复上次范围和断点，重新选择并启动则使用新范围。
 - 仅长时序恢复不清理已有发布目录，不重新发布道路/测宽/变化成果；只完成长时序和必要评价、发布。
 - 完整任务续跑先检查已固化的最终道路和相邻期变化成果，不依据新算法版本废弃这些完成记录。
 - 缺失 SHP 配套文件或道路状态时明确报错；已经进入最终成果阶段的任务不会因此自动转回推理。

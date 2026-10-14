@@ -206,6 +206,18 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertFalse(self.store.resumable())
         self.assert_cache()
 
+    def test_cancelled_first_run_allows_local_selection_before_any_publication(self):
+        self.controller.run('all', self.data)
+        self.checkpoint(completed=False)
+        marker = Path(file(self.store.current / 'grids/南区/periods/2020/intermediate.dat', 'partial-cache'))
+        self.controller.cancel()
+        self.controller.run('rerun-selection', {**self.data, 'selected_periods': ['2020'], 'selected_pairs': []})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.controller.runner.commands[-1][0], 'rerun-selection')
+        self.assertEqual(self.store.state()['scope']['periods'], ['2020'])
+        self.assertEqual(marker.read_text(), 'partial-cache')
+        self.assert_cache()
+
     def test_complete_then_full_run_replaces_existing_formal_results(self):
         self.existing()
         old = [Path(p['path']) for p in self.store.results()]
@@ -266,6 +278,49 @@ class ProjectLifecycleTests(unittest.TestCase):
         for year in range(2020,2025):
             self.assertTrue((self.store.current / f'grids/南区/periods/{year}/intermediate.dat').is_file())
         self.assertTrue((self.store.current / 'grids/南区/changes/2021_to_2022/intermediate.dat').is_file())
+        self.assert_cache()
+
+    def test_cancelled_local_rerun_can_start_new_selection_then_continue_it(self):
+        self.existing()
+        initial = {**self.data, 'selected_periods': [], 'selected_pairs': [['2020', '2021']]}
+        self.controller.run('rerun-selection', initial)
+        old_marker = Path(file(self.store.current / 'local_rerun.json', 'old-step'))
+        self.controller.cancel()
+        remaining = self.store.results()
+        new = {**self.data, 'grid': '北区', 'selected_periods': ['2024'], 'selected_pairs': []}
+        scope = self.store.local_scope('rerun-selection', new)
+        preserved = {p['path']: Path(p['path']).read_bytes() for p in remaining
+                     if not self.store.in_scope(p, scope)}
+        self.controller.run('rerun-selection', new)
+        self.assertFalse(self.errors)
+        self.assertEqual(self.store.state()['scope'], scope)
+        self.assertFalse(old_marker.exists())
+        self.assertEqual(preserved, {p: Path(p).read_bytes() for p in preserved})
+        self.assertTrue((self.store.current / 'grids/南区/periods/2020/intermediate.dat').is_file())
+        self.assertTrue((self.store.current / 'grids/北区/periods/2024/intermediate.dat').is_file())
+        command = self.controller.runner.commands[-1]
+        new_marker = Path(file(self.store.current / 'local_rerun.json', 'new-step'))
+        self.controller.cancel()
+        self.controller.run('all', {**initial, 'resume': True})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.controller.runner.commands[-1], command)
+        self.assertEqual(new_marker.read_text(), 'new-step')
+        self.assertEqual(self.store.state()['scope'], scope)
+        self.assert_cache()
+
+    def test_invalid_new_selection_keeps_interrupted_local_checkpoint(self):
+        self.existing()
+        selected = {**self.data, 'selected_periods': ['2020'], 'selected_pairs': []}
+        self.controller.run('rerun-selection', selected)
+        marker = Path(file(self.store.current / 'local_rerun.json', 'original-step'))
+        self.controller.cancel()
+        previous = self.store.state()
+        self.controller.run('rerun-selection', {**selected, 'selected_periods': ['2099']})
+        self.assertTrue(self.errors)
+        self.assertEqual(marker.read_text(), 'original-step')
+        self.assertEqual(self.store.state()['scope'], previous['scope'])
+        self.assertEqual(self.store.state()['parameters'], previous['parameters'])
+        self.assertTrue(self.store.resumable())
         self.assert_cache()
 
     def test_empty_selection_is_rejected_before_cleanup(self):

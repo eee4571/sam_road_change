@@ -408,11 +408,25 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertEqual(self.widget.run_button.text(), '继续重跑')
         self.assertIn('上次重跑尚未完成', self.widget.processing_hint.text())
         self.assertIn('北区 / 2022', self.widget.processing_hint.text())
-        self.assertFalse(self.widget.update_button.isEnabled())
+        self.assertTrue(self.widget.update_button.isEnabled())
         with patch.object(self.widget.controller, 'run') as run:
             self.widget.run_button.click()
             self.assertEqual(run.call_args.args[0], 'rerun-period')
             self.assertTrue(run.call_args.args[1]['resume'])
+        # The mocked runner emits no stop signal; restore the idle UI before
+        # exercising the alternative action against the same saved checkpoint.
+        self.widget.busy = False
+        self.widget._update_controls()
+        self.widget.update_button.click()
+        page = self.widget.update_page
+        page.area.setCurrentText('北区')
+        next(b for b in page.buttons.buttons() if b.selection.get('period') == '2020').click()
+        with patch.object(self.widget.controller, 'run') as run, patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            page.save_button.click()
+            action, data = run.call_args.args
+            self.assertEqual(action, 'rerun-selection')
+            self.assertEqual(data['selected_periods'], ['2020'])
+            self.assertFalse(data['resume'])
 
     def test_failed_full_task_exposes_temporal_only_update(self):
         from plugin.project_state import ProjectState, write_json

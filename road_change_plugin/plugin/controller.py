@@ -160,8 +160,6 @@ class Controller(TaskSignals):
                 if action != 'rerun-temporal':
                     check_existing_task(store.manifest())
             elif action != "all":
-                if store.resumable() and store.state().get('action', 'all') != 'all' and action != 'rerun-temporal':
-                    raise ValueError("请先继续未完成处理，或重新运行完整流程")
                 previous_output = store.state().get('output')
                 if not previous_output and store.descriptor():
                     previous_output = store.descriptor()['data'].get('output_root')
