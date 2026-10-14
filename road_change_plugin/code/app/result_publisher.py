@@ -562,12 +562,12 @@ class ResultPublisher:
             self._save()
 
     def publish_manifest(
-        self, manifest: dict, *, source_manifest: Path | str | None = None,
+        self, manifest: dict, *, source_manifest: Path | str | None = None, temporal_only: bool = False,
     ) -> dict:
         if manifest.get('fast_finalization_state') == 'pending':
             return self.index
         run_id = manifest.get("run_id", "")
-        for entry in (manifest.get('final_period_results',manifest.get('period_results',[])) or []):
+        for entry in ([] if temporal_only else manifest.get('final_period_results',manifest.get('period_results',[])) or []):
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_period(
                     entry.get("grid"), entry.get("period"), entry,
@@ -575,7 +575,7 @@ class ResultPublisher:
                 )
                 if published:
                     entry["published"] = published
-        for entry in (manifest.get('change_results',[]) or []):
+        for entry in ([] if temporal_only else manifest.get('change_results',[]) or []):
             if isinstance(entry, dict) and entry.get("status") not in {"failed", "stale"}:
                 published = self.publish_change(
                     entry.get("grid"), entry.get("before_period"), entry.get("after_period"),

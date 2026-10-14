@@ -92,6 +92,24 @@ plugin.shutdown()
 
 ## 当前项目、继续处理与更新
 
+长时序汇总失败而单期道路、变化成果已齐全时，选择“局部重跑 → 区域 → 仅重建长时序”。
+即使原完整任务处于失败状态，该入口仍可用；它直接读取原成果，更新长时序及必要的评价、发布，
+不重新运行道路提取、测宽、变化检测，也不清理或重新发布已有单期道路和变化图层。
+完整任务“继续处理”也会优先检查这些已固化成果，避免因程序版本变化重新推理。
+缺失 SHP 配套文件或道路状态文件时会报出具体期次，需先恢复文件或局部重跑对应项。
+
+命令行恢复（省略 `--grid` 则重建所有区域）：
+
+```powershell
+.\runtime\env\samroad_env\python.exe .\code\user_pipeline.py rerun-temporal --pipeline-manifest "D:\项目\_work\current\pipeline_result.json" --grid "区域名"
+```
+
+多部件道路保留所有线性部件及原跨期道路身份；不取最长线、不跨空隙拼接。
+仅有可确定起终点的连续道路填写 `from_node`、`to_node`；分叉、断开或闭环道路留空。
+GeometryCollection 中的线性部件递归保留，点、面不作为中心线写入 SHP。
+合成及真实几何回归见 `tests/test_temporal_multipart.py`，缓存恢复回归见
+`tests/test_temporal_recovery.py` 和 `tests/check_cached_temporal.py`。
+
 每个项目只管理一套当前正式成果，以及最多一个未完成处理状态。用户不需要选择任务编号；运行记录只展示当前日志和最近错误。
 
 ```

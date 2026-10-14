@@ -21,8 +21,8 @@ import numpy as np
 import pandas as pd
 import pyogrio
 from engine.disk_records import DiskRows, LazyFrames, observation_index, record_scope, batches
-from shapely import STRtree, make_valid
-from shapely.geometry import LineString, Point
+from shapely import STRtree, make_valid, line_merge
+from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
 
 
@@ -72,6 +72,27 @@ def _polygon_parts(geometry: BaseGeometry) -> Iterable[BaseGeometry]:
             yield from _polygon_parts(part)
 
 
+def _road_geometry(geometry):
+    """Keep every linear component as one road, without bridging gaps.
+
+    SHP cannot store GeometryCollection. Points/polygons in a collection are
+    not road axes; recursively retain its complete linear geometry instead.
+    """
+    parts = list(_line_parts(geometry))
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else MultiLineString(parts)
+
+
+def _road_nodes(geometry, tolerance):
+    # Merge only exactly connected, non-branching components for the purpose
+    # of finding endpoints. Never replace the stored geometry with this view.
+    line = line_merge(geometry)
+    if line.geom_type != 'LineString' or not line.is_simple or line.is_ring:
+        return '', ''
+    return _node_id(line.coords[0], tolerance), _node_id(line.coords[-1], tolerance)
+
+
 def _metric_crs(frame: gpd.GeoDataFrame):
     crs = frame.crs
     if crs is None:
@@ -107,10 +128,11 @@ def _read_period(path: Path, target_crs=None) -> gpd.GeoDataFrame:
         frame = frame.to_crs(target_crs)
     rows = []
     for source_index, row in frame.iterrows():
-        for part_index, geometry in enumerate(_line_parts(row.geometry)):
+        geometry = _road_geometry(row.geometry)
+        if geometry is not None:
             rows.append({
                 "source_fid": str(row.get("global_id", source_index)),
-                "part_idx": int(part_index),
+                "part_idx": 0,
                 "width_m": _numeric(row, WIDTH_FIELDS, 0.0),
                 "width_reliable": (True if (quality := reliable_width(row)) is None else bool(quality)),
                 "extract_cf": _numeric(row, CONF_FIELDS, 0.0),
@@ -136,7 +158,7 @@ from functools import lru_cache, wraps
 
 @lru_cache(maxsize=16384)
 def _geometry_facts(geometry):
-    ends = tuple(Point(geometry.coords[i]) for i in (0,-1)) if geometry.geom_type == 'LineString' else ()
+    ends = tuple(Point(part.coords[i]) for part in _line_parts(geometry) for i in (0, -1))
     return geometry.length, geometry.bounds, ends
 
 
@@ -175,12 +197,17 @@ def _direction_vector(geometry: BaseGeometry) -> np.ndarray | None:
     """Return an orientation vector (sign-free) using sampled-point PCA."""
     if geometry is None or geometry.is_empty or geometry.length <= 0:
         return None
-    distances = np.linspace(0.0, float(geometry.length), 9)
-    coordinates = np.asarray([
-        geometry.interpolate(float(distance)).coords[0][:2] for distance in distances
-    ], dtype="float64")
-    centered = coordinates - coordinates.mean(axis=0)
-    covariance = centered.T @ centered
+    # Sum length-weighted, locally centered covariance. Empty space between
+    # disconnected pieces must not invent an orientation across that gap.
+    covariance = np.zeros((2, 2), dtype='float64')
+    for part in _line_parts(geometry):
+        coordinates = np.asarray([part.interpolate(float(d)).coords[0][:2]
+                                  for d in np.linspace(0., part.length, 9)])
+        centered = coordinates - coordinates.mean(axis=0)
+        local = centered.T @ centered
+        trace = np.trace(local)
+        if trace > 0:
+            covariance += local / trace * part.length
     values, vectors = np.linalg.eigh(covariance)
     if float(values[-1]) <= 1e-12:
         return None
@@ -217,7 +244,7 @@ def _best_match(
         # A continuous counterpart must explain the longitudinal axis, including
         # its endpoints. Direction alone cannot select an adjacent branch.
         ends = [point.distance(targets[index]) for point in _geometry_facts(geometry)[2]]
-        continuity = float(np.mean(np.exp(-np.asarray(ends)/max(tolerance, .1))))
+        continuity = float(np.mean(np.exp(-np.asarray(ends)/max(tolerance, .1)))) if ends else 0.
         total = .85*score + .15*continuity
         ranked.append((total, overlap, -distance, index))
     if not ranked:
@@ -455,8 +482,10 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
     A state table cannot invent presence or disappearance: matching track IDs
     must physically exist (or be absent) in that period's centerline product.
     """
-    if not all(entry.get('road_state') for entry in period_entries):
+    if not any(entry.get('road_state') for entry in period_entries):
         return [], []
+    if not all(entry.get('road_state') for entry in period_entries):
+        raise ValueError('部分期次缺少道路状态表，无法保留跨期道路身份')
     references={};observations=DiskRows();expected=None
     for entry in period_entries:
         period=str(entry['period'])
@@ -469,7 +498,10 @@ def _reconciled_tracks(period_entries, period_frames, analysis_crs):
         for track_id in sorted(expected):
             rows=state_groups[track_id]
             if len(rows)!=1:raise ValueError(f'Reconciled road state incomplete: {track_id}/{period}')
-            row=rows.iloc[0]
+            row=rows.iloc[0].copy()
+            row.geometry = _road_geometry(row.geometry)
+            if row.geometry is None:
+                raise ValueError(f'Reconciled road state has no line geometry: {track_id}/{period}')
             references.setdefault(track_id,dict(road_id=track_id,born_period=str(period_entries[0]['period']),geometry=row.geometry))
             actual=road_groups.get(track_id,roads.iloc[:0])
             present=row.status=='present'
@@ -531,9 +563,11 @@ def _life_rows(references: list[dict], observations: list[dict], events: list[di
         present_periods = [row["period"] for row in road_observations if row["status"] == "present"]
         confidences = [float(row["match_sc"]) for row in road_observations]
         last_status = road_observations[-1]["status"]
+        geometry = _road_geometry(reference['geometry'])
+        from_node, to_node = _road_nodes(geometry, tolerance)
         row = {
-            "road_id": road_id, "grid_id": "", "from_node": _node_id(reference["geometry"].coords[0], tolerance),
-            "to_node": _node_id(reference["geometry"].coords[-1], tolerance),
+            "road_id": road_id, "grid_id": "", "from_node": from_node,
+            "to_node": to_node,
             "first_obs": present_periods[0] if present_periods else "",
             "last_obs": present_periods[-1] if present_periods else "",
             "life_state": "active" if last_status == "present" else ("removed" if last_status == "absent" else "uncertain"),
@@ -544,7 +578,7 @@ def _life_rows(references: list[dict], observations: list[dict], events: list[di
                 any(item["status"] == "uncertain" for item in road_observations)
                 or road_id in event_reviews
             ) else "auto",
-            "geometry": reference["geometry"],
+            "geometry": geometry,
         }
         for period in periods:
             observation = by_road_period[(road_id, period)]
@@ -593,7 +627,9 @@ def _event_parts(
             geometry = source.geometry
             if geometry is None or geometry.is_empty:
                 continue
-            probe = geometry.boundary if hasattr(geometry, "boundary") else geometry
+            probe = geometry.boundary
+            if probe is None or probe.is_empty:
+                probe = geometry
             buffered = geometry.buffer(tolerance)
             indices = tree.query(buffered, predicate="intersects") if tree is not None else []
             ranked = []
@@ -698,6 +734,10 @@ def _write_shp_batch(path, rows, columns, crs, geometry_type, output_crs=None, *
     path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
         frame = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+        if geometry_type == 'LineString':
+            frame.geometry = frame.geometry.map(_road_geometry)
+            if frame.geometry.isna().any():
+                raise ValueError(f'道路成果包含无有效线性部件的几何：{path}')
         for name, dtype in columns.items():
             if name not in frame.columns:
                 frame[name] = "" if dtype == "str" else np.nan
@@ -768,7 +808,8 @@ def build_temporal_grid(
         if not references:
             raise ValueError(f'{grid_name} 的所有期次均没有有效道路中心线')
         _assign_road_ids(references, output_dir / 'road_life.shp', analysis_crs, tolerance)
-        observations = _observations([r for r in references if not str(r['road_id']).startswith('RC')],
+        reconciled_ids = {r['road_id'] for r in reconciled_refs}
+        observations = _observations([r for r in references if r['road_id'] not in reconciled_ids],
                                      untracked_frames, tolerance)
         observations.extend(reconciled_obs)
     report('正在更新变化事件…')

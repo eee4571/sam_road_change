@@ -415,6 +415,9 @@ class RoadChangeWidget(QWidget):
                             f"更新 {len(scope.get('changes', []))} 个变化对、长时序及可用的精度评价。\n\n"
                             '程序会复用有效缓存，按需更新过期的单期正式成果。\n\n'
                             '完整范围已列于当前页面。对应正式成果将被替换，是否开始？')
+            if scope.get('temporal_only'):
+                confirmation = (f"区域：{scope.get('grid', '')}\n复用已有道路和变化成果，"
+                                '重建长时序并完成必要的评价与发布。是否开始？')
             if QMessageBox.question(self, '确认局部重跑', confirmation,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
@@ -779,8 +782,9 @@ class RoadChangeWidget(QWidget):
         self.rescan_action.setEnabled(available and opened)
         self.restart_action.setEnabled(available and opened and self.checked)
         compatible = bool(self._current) and self._current['data'].get('execution_profile') == 'fast'
-        self.update_button.setVisible(bool(self._result_keys))
-        self.update_button.setEnabled(available and self.checked and compatible and bool(self._result_keys) and not self._resume_task)
+        self.update_button.setVisible(bool(self._current))
+        local_pending = self._resume_task and self._resume_task.get('action', 'all') not in {'all', 'rerun-temporal'}
+        self.update_button.setEnabled(available and self.checked and compatible and not local_pending)
         self.review_button.setEnabled(available and not self._resume_task and
                                       any(p['result_type'] == 'road_change' for p in self._result_payloads))
         self.update_page.body.setEnabled(available)

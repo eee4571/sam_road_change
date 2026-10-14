@@ -414,6 +414,21 @@ class ProcessingUiTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0], 'rerun-period')
             self.assertTrue(run.call_args.args[1]['resume'])
 
+    def test_failed_full_task_exposes_temporal_only_update(self):
+        from plugin.project_state import ProjectState, write_json
+        store = ProjectState(self.root)
+        state = store.state()
+        state.update(status='failed', action='all')
+        write_json(store.path, state)
+        self.widget._refresh_results()
+        self.assertTrue(self.widget.update_button.isEnabled())
+        self.widget.update_button.click()
+        page = self.widget.update_page
+        page.temporal_button.click()
+        self.assertEqual(page.selection['action'], 'rerun-temporal')
+        self.assertTrue(page.scope['temporal_only'])
+        self.assertTrue(page.save_button.isEnabled())
+
     def test_update_preview_uses_exact_shared_scope_and_starts_single_command(self):
         from plugin.project_state import ProjectState
         self.widget.update_button.click()

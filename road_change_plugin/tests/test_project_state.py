@@ -34,6 +34,9 @@ class SyntheticRunner(TaskSignals):
     def missing_runtime(self, profile):
         return self.missing
 
+    def python_path(self):
+        return Path(sys.executable)
+
     def start(self, args, profile):
         self.commands.append(list(args))
         self.running = True
@@ -142,6 +145,38 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.store.results()), 20)
         self.assertEqual(len(self.finished), 1)
         self.assertFalse((self.root / '_work/tasks/runs').exists())
+        self.assert_cache()
+
+    def test_temporal_failure_allows_local_update(self):
+        self.existing()
+        state = self.store.state()
+        state.update(status='failed', action='all')
+        write_json(self.store.path, state)
+        self.controller.run('rerun-selection', {**self.data, 'selected_periods': [],
+                                               'selected_pairs': [['2020', '2021']]})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.controller.runner.commands[-1][0], 'rerun-selection')
+        self.assert_cache()
+
+    def test_temporal_rebuild_preserves_publications_and_resumes_without_policy_upgrade(self):
+        self.existing()
+        products = {p['path']: Path(p['path']).read_bytes() for p in self.store.results()}
+        manifest = read_json(self.store.manifest())
+        manifest['input_spec']['width_method'] = 'sam_molra'
+        write_json(self.store.manifest(), manifest)
+        state = self.store.state()
+        state.update(status='failed', action='all')
+        write_json(self.store.path, state)
+        self.controller.run('rerun-temporal', self.data)
+        self.assertFalse(self.errors)
+        command = self.controller.runner.commands[-1]
+        self.assertEqual(command[0], 'rerun-temporal')
+        self.assertNotIn('--width-method', command)
+        self.assertEqual(products, {p: Path(p).read_bytes() for p in products})
+        self.controller.cancel()
+        self.controller.run('all', {**self.data, 'resume': True})
+        self.assertFalse(self.errors)
+        self.assertEqual(command, self.controller.runner.commands[-1])
         self.assert_cache()
 
     def test_cancel_then_continue_same_checkpoint_and_internal_id(self):

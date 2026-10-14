@@ -101,7 +101,7 @@ class Runner(TaskSignals):
         self._buffer = ""
         self._decoder.reset()
         self.state = "queued"
-        if args and args[0].startswith('rerun-'):
+        if args and args[0].startswith('rerun-') and args[0] != 'rerun-temporal':
             try:
                 check_existing_task(args[args.index('--pipeline-manifest')+1],self.root)
             except (ValueError, OSError, IndexError) as exc:

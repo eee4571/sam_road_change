@@ -14,7 +14,7 @@ def task_arguments(args, root=ROOT):
         return []
     settings=configuration(root)
     action=args[0]
-    if action.startswith('evaluate-'):
+    if action.startswith('evaluate-') or action == 'rerun-temporal':
         return list(args)
     if action not in {'all','rerun-period','rerun-change','rerun-selection','rerun-all-periods','rerun-all-changes'}:
         raise ValueError('插件只支持当前正式流程任务')

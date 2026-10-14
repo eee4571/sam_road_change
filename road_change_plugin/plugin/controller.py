@@ -46,6 +46,10 @@ class Controller(TaskSignals):
     def build_command(self, action, data):
         if action != "all":
             manifest = self.input_file(data.get("manifest", ""), ".json")
+            if action == 'rerun-temporal':
+                store = ProjectState(data['project_root'], data['output'])
+                scope = store.local_scope(action, data)
+                return [action, '--pipeline-manifest', manifest, '--grid', scope['grid']]
             if action == 'rerun-selection':
                 store = ProjectState(data['project_root'], data['output'])
                 scope = store.local_scope(action, data)
@@ -153,9 +157,10 @@ class Controller(TaskSignals):
                     data.update({k: v for k, v in state.get("parameters", {}).items()
                                  if k in {"grid", "period", "before_period", "after_period"}})
                 data.update(manifest=str(store.manifest()), run_id=state.get("run_id", ""))
-                check_existing_task(store.manifest())
+                if action != 'rerun-temporal':
+                    check_existing_task(store.manifest())
             elif action != "all":
-                if store.resumable():
+                if store.resumable() and store.state().get('action', 'all') != 'all' and action != 'rerun-temporal':
                     raise ValueError("请先继续未完成处理，或重新运行完整流程")
                 previous_output = store.state().get('output')
                 if not previous_output and store.descriptor():
@@ -168,7 +173,8 @@ class Controller(TaskSignals):
                 data.update(run_id="current", resume=False)
             # Validate all inputs and runtime before any destructive preparation.
             self.build_command(action, data)
-            missing = self.runner.missing_runtime("fast")
+            missing = ([] if action == 'rerun-temporal' and self.runner.python_path().is_file()
+                       else self.runner.missing_runtime("fast"))
             if missing:
                 raise ValueError("缺少运行资源：" + "、".join(missing))
             configuration()

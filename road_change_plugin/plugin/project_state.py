@@ -251,6 +251,13 @@ class ProjectState:
         descriptor = self.descriptor()
         if not descriptor:
             raise ValueError('当前项目没有可更新的成果')
+        if action == 'rerun-temporal':
+            grid = data.get('grid', '')
+            if descriptor['data'].get('execution_profile') != 'fast':
+                raise ValueError('当前任务不支持长时序更新')
+            if len(self.period_order(descriptor['data'], grid)) < 2:
+                raise ValueError('该区域至少需要两个已处理期次')
+            return dict(grid=grid, periods=[], changes=[], temporal_only=True)
         if action == 'rerun-selection':
             scopes = [self.local_scope('rerun-period', dict(grid=data['grid'], period=p))
                       for p in data.get('selected_periods', [])]
@@ -282,6 +289,13 @@ class ProjectState:
         scope = self.local_scope(action, data)
         descriptor = self.descriptor()
         manifest = descriptor['data']
+        if action == 'rerun-temporal':
+            # A failed rebuild must leave the last published products usable.
+            state = dict(status='running', action=action, manifest=descriptor['path'], run_id=descriptor['id'],
+                         scope=scope, parameters=copy.deepcopy(data), output=str(self.output), last_error='',
+                         configuration_signature=self.state().get('configuration_signature'))
+            write_json(self.path, state)
+            return state
         grid, period, changes = scope['grid'], data.get('period', ''), scope['changes']
         products = self.results()
         removed = [p for p in products if self.in_scope(p, scope)]

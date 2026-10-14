@@ -4413,7 +4413,7 @@ def _persist_pipeline(manifest: dict, job_root: Path, output_root: Path) -> None
     write_json(layout.latest_pipeline_path, manifest)
 
 
-def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
+def _persist_existing_pipeline(manifest: dict, manifest_path: Path, *, temporal_only=False) -> None:
     job_value = str(manifest.get("job_root") or "").strip()
     job_root = Path(job_value or manifest_path.parent).expanduser().resolve()
     output_value = str(manifest.get("output_root") or "").strip()
@@ -4432,7 +4432,7 @@ def _persist_existing_pipeline(manifest: dict, manifest_path: Path) -> None:
     publisher = ResultPublisher(output_root, project_root=project_value)
     ready=manifest.get('fast_finalization_state') != 'pending'
     if ready:
-        publisher.publish_manifest(manifest, source_manifest=manifest_path)
+        publisher.publish_manifest(manifest, source_manifest=manifest_path, temporal_only=temporal_only)
     _write_task_report(manifest, job_root)
     if ready:
         publisher.publish_reports(job_root)
@@ -4831,7 +4831,7 @@ def _invalidate_fast_finalization(manifest: dict, *, pairs=None) -> None:
 
 
 @timed_stage("finalization_total")
-def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
+def _finalize_fast_manifest(manifest: dict, job_root: Path, *, cached_roads=False) -> None:
     """Production Fast barrier: final roads/changes/temporal, evaluation, publish later."""
     # Callers mark the selected changes stale. Retrying finalization must not
     # invalidate unrelated completed geometry or human review decisions.
@@ -4839,7 +4839,13 @@ def _finalize_fast_manifest(manifest: dict, job_root: Path) -> None:
     pending={id(e) for e in manifest.get('change_results',[]) if e.get('fast_finalization_state')!='completed'}
     evaluation_pending=pending|{id(e) for e in manifest.get('change_results',[])
         if e.get('evaluation_state') in ('stale','failed','running')}
-    manifest['temporal_results']=build_temporal_outputs(manifest,job_root)
+    if cached_roads:
+        from temporal_road_analysis import build_from_manifest
+        manifest['temporal_results'] = build_from_manifest(manifest, job_root / 'final_temporal')
+        for result in manifest['temporal_results']:
+            result['execution_profile'] = 'fast'
+    else:
+        manifest['temporal_results']=build_temporal_outputs(manifest,job_root)
     for entry in manifest.get('change_results',[]):
         if id(entry) not in pending:continue
         entry['fast_finalization_state']='completed'
@@ -5284,6 +5290,26 @@ def run_all(args: argparse.Namespace) -> dict:
     specification and skips only outputs that still pass completeness checks.
     """
     current_started = time.monotonic()
+    if getattr(args, 'resume', False) and not any(getattr(args, k, False) for k in ('preflight_only', 'data_check_only')):
+        # Continuing a saved task means finishing its frozen products, not
+        # upgrading completed inference because this program has changed.
+        from app.temporal_recovery import validate_cached_inputs, run_temporal
+        output = Path(args.output_root).expanduser().resolve()
+        layout = project_layout(output)
+        root = _resolve_full_run_job_root(layout, clean_name(args.run_id), resume=True)
+        saved_path = root / 'job_state.json'
+        if saved_path.is_file():
+            saved = read_json(saved_path)
+            try:
+                validate_cached_inputs(saved)
+            except ValueError:
+                # Once final roads were committed, missing source products
+                # require an explicit repair; never turn temporal recovery
+                # into a silent full inference run.
+                if saved.get('final_period_results'):
+                    raise
+            else:
+                return run_temporal(argparse.Namespace(pipeline_manifest=str(saved_path), grid=None), sys.modules[__name__])
     mode = str(getattr(args, "mode", "grid") or "grid").strip().casefold()
     if mode not in {"validation", "grid"}:
         raise ValueError("--mode 必须是 validation 或 grid")
@@ -5968,6 +5994,9 @@ def run_all(args: argparse.Namespace) -> dict:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SAMRoad 面向用户批处理后端")
     sub = p.add_subparsers(dest="command", required=True)
+    a = sub.add_parser('rerun-temporal', help='复用已有道路和变化成果，仅重建长时序及必要下游')
+    a.add_argument('--pipeline-manifest', required=True)
+    a.add_argument('--grid', default=None)
     sub.add_parser("doctor", help="检查独立运行环境、模型和算法核心")
     a = sub.add_parser("preflight-project", help="发现规范项目文件夹并仅执行输入预检")
     a.add_argument("--project-root", required=True)
@@ -6110,6 +6139,9 @@ def main() -> int:
     elif args.command == "apply-edits": apply_centerline_edits(args)
     elif args.command == "rerun-period": rerun_pipeline_period(args)
     elif args.command == 'rerun-selection': rerun_pipeline_selection(args)
+    elif args.command == 'rerun-temporal':
+        from app.temporal_recovery import run_temporal
+        run_temporal(args, sys.modules[__name__])
     elif args.command == "rerun-change": rerun_pipeline_change(args)
     elif args.command == "rerun-all-periods": rerun_all_pipeline_periods(args)
     elif args.command == "rerun-all-changes": rerun_all_pipeline_changes(args)

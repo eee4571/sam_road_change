@@ -77,7 +77,25 @@ class UpdatePage(ProjectPage):
         self.buttons.setExclusive(False)
         self.buttons.buttonToggled.connect(self._selected)
         self.area.currentIndexChanged.connect(self._area_changed)
+        self.temporal_button = QPushButton('仅重建长时序')
+        self.temporal_button.clicked.connect(self._temporal_selected)
+        self.form.addRow(self.temporal_button)
         self.save_button.setEnabled(False)
+
+    def _temporal_selected(self):
+        self.buttons.blockSignals(True)
+        for button in self.buttons.buttons():
+            button.setChecked(False)
+        self.buttons.blockSignals(False)
+        self.selection = dict(action='rerun-temporal', grid=self.area.currentText())
+        try:
+            self.scope = self.store.local_scope('rerun-temporal', self.selection)
+            self.impact.setText('复用已有单期道路和变化成果，仅重建本区域的长时序统计，并完成必要的评价与发布。')
+            self.save_button.setEnabled(True)
+        except ValueError as exc:
+            self.scope = None
+            self.impact.setText(str(exc))
+            self.save_button.setEnabled(False)
 
     def load(self, store):
         self.store = store
