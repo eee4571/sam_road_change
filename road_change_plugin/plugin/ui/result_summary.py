@@ -86,6 +86,7 @@ class MetricSummary(QWidget):
             value = data.get(key, '—')
             number, unit = ('未评价', '') if value == '—' else (value[:-1], '%') if value.endswith('%') else value.split(' ', 1)
             label.setText(number)
+            label.setToolTip(data.get('centerline_note', '') if key in ('offset', 'completeness') else '')
             self.units[key].setText(unit)
             self.units[key].setVisible(bool(unit))
             label.setAccessibleName(value if value != '—' else '未评价')

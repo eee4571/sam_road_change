@@ -2932,18 +2932,27 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             "road_centerline_completeness" in source for source in source_rows
         )
         if has_fast_truth_metrics:
+            pixel_keys = ('truth_centerline_length_px', 'covered_truth_centerline_length_px',
+                          'predicted_centerline_length_px', 'centerline_offset_integral_px2')
+            pixel_totals_valid = all(
+                isinstance(source.get(key), (int, float)) and not isinstance(source.get(key), bool)
+                and math.isfinite(source[key]) and source[key] >= 0
+                for source in source_rows for key in pixel_keys)
+            tolerances = {source.get("centerline_match_tolerance_px", 4.0) for source in source_rows}
+            comparable_completeness = pixel_totals_valid and len(tolerances) == 1
             row.update({
+                "centerline_match_tolerance_px": next(iter(tolerances)) if len(tolerances) == 1 else None,
                 "change_precision": precision,
                 "change_recall": recall,
                 "road_centerline_completeness": (
                     sums["covered_truth_centerline_length_px"]
                     / sums["truth_centerline_length_px"]
-                    if sums["truth_centerline_length_px"] else None
+                    if comparable_completeness and sums["truth_centerline_length_px"] else None
                 ),
                 "centerline_mean_offset_px": (
                     sums["centerline_offset_integral_px2"]
                     / sums["predicted_centerline_length_px"]
-                    if sums["predicted_centerline_length_px"] else None
+                    if pixel_totals_valid and sums["predicted_centerline_length_px"] else None
                 ),
                 "change_type_accuracy": (
                     sums["type_correct_tp_count"] / sums["type_matched_tp_count"]
@@ -2971,6 +2980,18 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 "centerline_offset_status": "excluded",
                 "centerline_offset_reason": "宽度变化真值面不唯一确定道路中心线，未计算中心线偏移",
             })
+        if has_fast_truth_metrics:
+            row['centerline_offset_status'] = ('computed' if row['centerline_mean_offset_px'] is not None
+                                              else 'unavailable')
+            row['centerline_offset_reason'] = (
+                '原始影像像素坐标；新增与灭失；按预测骨架像素数量加权'
+                if pixel_totals_valid else '部分变化对缺少像素评价统计，未以零值或米制结果替代')
+            if not pixel_totals_valid:
+                reasons = dict.fromkeys(str(source.get('centerline_offset_reason') or '') for source in source_rows
+                                        if source.get('centerline_mean_offset_px') is None)
+                row['centerline_offset_reason'] += ': ' + '; '.join(reason for reason in reasons if reason)
+            if pixel_totals_valid and not comparable_completeness:
+                row["centerline_offset_reason"] += "；完整度匹配容差不一致，请重新评价相关变化对"
         aggregate_rows.append(row)
 
     job_root.mkdir(parents=True, exist_ok=True)
@@ -3052,17 +3073,6 @@ def _fast_assisted_evaluation_grid(
     stored_crs = summary.get("gt_assisted_grid_crs")
     stored_transform = summary.get("gt_assisted_grid_transform")
     stored_shape = summary.get("gt_assisted_grid_shape")
-    if (
-        stored_crs
-        and isinstance(stored_transform, list)
-        and len(stored_transform) >= 6
-        and isinstance(stored_shape, list)
-        and len(stored_shape) >= 2
-    ):
-        return stored_crs, stored_transform[:6], (
-            int(stored_shape[0]), int(stored_shape[1]),
-        )
-
     grid = str(change_entry.get("grid") or "")
     before_period = str(change_entry.get("before_period") or "")
     entries = [row for key in ('period_results', 'auto_period_results')
@@ -3085,6 +3095,17 @@ def _fast_assisted_evaluation_grid(
                 candidates.append(Path(record['run_root']).expanduser() / 'products' / 'road_probability.tif')
     probability_path = next((path for path in candidates if path.is_file()), None)
     if probability_path is None:
+        if (
+            stored_crs
+            and isinstance(stored_transform, list)
+            and len(stored_transform) >= 6
+            and isinstance(stored_shape, list)
+            and len(stored_shape) >= 2
+        ):
+            return stored_crs, stored_transform[:6], (
+                int(stored_shape[0]), int(stored_shape[1]),
+            )
+
         attempted = '; '.join(dict.fromkeys(str(path) for path in candidates)) or 'no raster reference in final or Auto period records'
         raise FileNotFoundError(
             f"Fast evaluation probability raster missing: {grid} / {before_period}; {attempted}"
@@ -3287,23 +3308,38 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         metadata['geometry_source']='regular_axis_width_corridors'
         metadata['centerline_offset_unit']='m'
 
-    if is_current_gt_assisted or (is_fast_gt_assisted and
-            str(entry.get('product_variant') or summary.get('product_variant') or '') != 'gt_assisted'):
-        image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
-        centerline_predicted=predicted
-        final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
-        if is_current_gt_assisted and final_audit.is_file():
-            from engine.gt_road_geometry import matched_final_roads
-            centerline_predicted=matched_final_roads(predicted,final_audit)
-            metadata['centerline_association']='final_road_intervals_from_correction_identity'
-            metadata['centerline_matched_object_count']=len(centerline_predicted)
-        rows[0].update(evaluate_fast_assisted_centerline_metrics(
-            centerline_predicted, truth, truth_type_field=evaluation_truth_type_field,
-            image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
-            validation_area=validation,
-        ))
-        metadata['fast_assisted_centerline_metrics']=True
-        metadata['centerline_offset_unit']='px'
+    # Pixel metrics depend on the image grid, not optional GT provenance flags.
+    if str(entry.get('execution_profile') or manifest.get('execution_profile')
+           or summary.get('execution_profile') or '') == 'fast':
+        from rasterio.errors import RasterioIOError
+        try:
+            image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        except (FileNotFoundError, RasterioIOError) as error:
+            rows[0].update(dict.fromkeys(('road_centerline_completeness', 'centerline_mean_offset_px',
+                'truth_centerline_length_px', 'covered_truth_centerline_length_px',
+                'predicted_centerline_length_px', 'centerline_offset_integral_px2')))
+            rows[0].update(centerline_offset_status='unavailable_image_grid',
+                centerline_offset_reason=str(error), centerline_offset_unit='px')
+            metadata['centerline_offset_unit']='px'
+        else:
+            centerline_predicted=predicted
+            final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
+            if final_audit.is_file():
+                from engine.gt_road_geometry import matched_final_roads
+                centerline_predicted=matched_final_roads(predicted,final_audit)
+                metadata['centerline_association']='final_road_intervals_from_correction_identity'
+                metadata['centerline_matched_object_count']=len(centerline_predicted)
+            rows[0].update(evaluate_fast_assisted_centerline_metrics(
+                predicted, truth, truth_type_field=evaluation_truth_type_field,
+                offset_predicted=centerline_predicted,
+                image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
+                validation_area=validation,
+            ))
+            rows[0]['centerline_offset_unit']='px'
+            metadata['fast_assisted_centerline_metrics']=True
+            if is_current_gt_assisted:
+                metadata['evaluation_source']='gt_assisted_final_vs_ground_truth'
+            metadata['centerline_offset_unit']='px'
 
     for row in rows:
         if row.get("class") == "all":

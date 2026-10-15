@@ -46,8 +46,10 @@ def compact_road_fit(geometry):
     centers[-1]+=direction*(hi-(centers[-1]-origin)@direction)
     widths=gaussian_filter1d(widths,1.,mode='nearest')
     axis=LineString(centers)
+    # Cross sections are evenly spaced on the major axis, not along a curved road.
+    distances=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(centers,axis=0),axis=1))]
     return dict(axis=axis,start_external=True,end_external=True,
-                fitted_widths=widths.tolist(),fitted_stations=np.linspace(0,1,len(widths)).tolist())
+                fitted_widths=widths.tolist(),fitted_stations=(distances/axis.length).tolist())
 
 
 def road_profile(row, axis, width):
@@ -86,8 +88,14 @@ def matched_final_roads(predicted, audit_path):
     output_crs=predicted.crs
     predicted=predicted.to_crs(audit.crs)
     rows=[]
-    if 'truth_id' not in audit:return predicted.iloc[:0].copy()
+    if 'truth_id' not in audit:return predicted.to_crs(output_crs)
     selected=audit.loc[audit.truth_id.notna() & audit.truth_id.ne('') & audit.change_typ.isin(['added','removed'])]
+    # Older and purely automatic products may have no correction identities.
+    # An absent association is not evidence that the published roads are absent.
+    if selected.empty:return predicted.to_crs(output_crs)
+    for kind in ('added', 'removed'):
+        if not selected.change_typ.eq(kind).any():
+            rows.extend(predicted.loc[predicted.change_typ.eq(kind), ['change_typ', 'geometry']].to_dict('records'))
     for (truth_id,kind),group in selected.groupby(['truth_id','change_typ']):
         final=predicted.loc[predicted.change_typ.eq(kind)].geometry.union_all()
         # Keep each associated road footprint, excluding attached Auto branches.

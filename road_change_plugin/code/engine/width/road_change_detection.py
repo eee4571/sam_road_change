@@ -1673,6 +1673,7 @@ def evaluate_fast_assisted_centerline_metrics(
     image_transform,
     image_shape: tuple[int, int],
     validation_area: gpd.GeoDataFrame | None = None,
+    offset_predicted: gpd.GeoDataFrame | None = None,
     centerline_match_tolerance_px: float = 4.0,
 ) -> dict:
     """Measure Final added/removed axes directly on the source image grid."""
@@ -1688,6 +1689,7 @@ def evaluate_fast_assisted_centerline_metrics(
         raise ValueError("Fast assisted prediction and truth must define a CRS.")
     predicted = predicted.to_crs(image_crs)
     truth = truth.to_crs(image_crs)
+    validation = None
     if validation_area is not None and not validation_area.empty:
         validation = _polygon_union(
             _clean_geometries(validation_area).to_crs(image_crs)
@@ -1730,8 +1732,28 @@ def evaluate_fast_assisted_centerline_metrics(
     predicted.geometry = predicted.geometry.map(
         lambda geometry: make_valid(to_pixel_geometry(geometry).intersection(image_extent))
     )
-    truth = truth.loc[~truth.geometry.is_empty].copy()
-    predicted = predicted.loc[~predicted.geometry.is_empty].copy()
+    def components(frame):
+        # Disconnected parts must not allocate a raster spanning the empty space
+        # between them. Keep every part and the same class/denominators.
+        records = [dict(_fast_type=row._fast_type, geometry=part)
+                   for _, row in frame.iterrows() for family in ('polygon', 'line')
+                   for part in _iter_family_parts(row.geometry, family)]
+        return gpd.GeoDataFrame(records, columns=['_fast_type', 'geometry'],
+                                geometry='geometry', crs=frame.crs)
+
+    truth = components(truth)
+    predicted = components(predicted)
+    # Coverage uses all published roads. Optional correction identities only
+    # select the roads used for displacement; they must never erase coverage.
+    offset_roads = predicted
+    if offset_predicted is not None:
+        offset_roads = _clean_geometries(offset_predicted).to_crs(image_crs)
+        if validation is not None:
+            offset_roads = _clip_frame(offset_roads, validation)
+        offset_roads['_fast_type'] = normalized_change_series(offset_roads, 'change_typ', 'three')
+        offset_roads.geometry = offset_roads.geometry.map(
+            lambda geometry: make_valid(to_pixel_geometry(geometry).intersection(image_extent)))
+        offset_roads = components(offset_roads)
 
     tolerance = float(centerline_match_tolerance_px)
     search_radius = max(32.0, 8.0 * tolerance)
@@ -1806,7 +1828,7 @@ def evaluate_fast_assisted_centerline_metrics(
                     distance_to_predicted[truth_axis] <= tolerance
                 ))
 
-        for predicted_geometry in predicted_part.geometry:
+        for predicted_geometry in offset_roads.loc[offset_roads['_fast_type'] == change_type].geometry:
             candidate_geometries = []
             if truth_index is not None:
                 positions = np.asarray(
@@ -1841,6 +1863,11 @@ def evaluate_fast_assisted_centerline_metrics(
             offset_integral_px2 / predicted_length_px
             if predicted_length_px > 0 else None
         ),
+        "centerline_offset_status": "computed" if predicted_length_px > 0 else "unavailable",
+        "centerline_offset_reason": (
+            "原始影像像素坐标；新增与灭失；预测骨架到同类真值骨架的平均距离"
+            if predicted_length_px > 0 else "没有可比较的预测与真值骨架，未使用米制结果替代"),
+        "centerline_match_tolerance_px": tolerance,
         "truth_centerline_length_px": float(truth_length_px),
         "covered_truth_centerline_length_px": float(covered_truth_length_px),
         "predicted_centerline_length_px": float(predicted_length_px),

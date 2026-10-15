@@ -27,13 +27,14 @@ from .formal_road_products import export_polygons as _export_polygons
 
 @dataclass(frozen=True)
 class GTProfile:
+    """Production corrections preserve evidence; nonzero noise is opt-in for tests."""
     seed: int = 4571
-    omission_probability: float = .02
-    end_loss_fraction: float = .01
+    omission_probability: float = 0.
+    end_loss_fraction: float = 0.
     maximum_end_loss_m: float = 2.
-    offset_m: float = .4
-    width_fraction: float = .03
-    type_error_probability: float = .003
+    offset_m: float = 0.
+    width_fraction: float = 0.
+    type_error_probability: float = 0.
 
     def __post_init__(self):
         for value in (self.omission_probability,self.type_error_probability):
@@ -267,14 +268,8 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
                 endpoint_loss_m=max(start_loss,end_loss),start_external=description['start_external'],end_external=description['end_external'],
                 max_offset_m=float(np.max(abs(displacement))),width_factor=factor,
                 type_error=bool(type_error),width_relation='presence' if kind in ('added','removed') else 'gt_class_with_period_width_relation'))
-    from .road_network_products import rebuild_corrected_road_axes
-    for kind in sorted({r['change_typ'] for r in records}):
-        selected=[r for r in records if r['change_typ']==kind]
-        fitted=rebuild_corrected_road_axes([from_wkt(r['axis_wkt']) for r in selected],
-            [max(r['width_bef'],r['width_aft']) for r in selected],truth.geometry.union_all())
-        for row,axis in zip(selected,fitted):
-            row.update(axis_wkt=axis.wkt,length_m=axis.length,
-                       geometry=record_polygon(row,axis))
+    # These axes already follow the supplied evidence. Refitting them a second
+    # time displaces bends while retaining the old width stations.
     return _changes(records,truth.crs),audit
 
 
@@ -319,7 +314,7 @@ def correct_changes(auto, assisted):
                 # interval with the perturbed regular GT corridor, never copy GT pixels.
                 missing=target.difference(existing['geometry']).area
                 coverage=1.-missing/max(target.area,1e-9)
-                if target.area>1e-6 and coverage<.9:
+                if target.area>1e-6 and coverage<.98:
                     remove.setdefault(hit['target'],[]).append((hit['start'],hit['end']))
                     audit.append(dict(truth_id=gt['truth_id'],auto_id=existing['change_id'],
                         action='complete_same_type_area',coverage_ratio=coverage,missing_area_m2=missing,

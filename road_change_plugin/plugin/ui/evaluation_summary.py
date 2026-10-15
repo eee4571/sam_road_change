@@ -25,13 +25,18 @@ def report_metrics(path):
         return f'{value:.1%}' if value is not None and value <= 1 else '—'
 
     fields = [('centerline_avg_offset_m', 'm'), ('centerline_mean_offset_px', 'px')]
-    if overall.get('centerline_offset_unit') == 'px':
-        fields.reverse()
+    if overall.get('centerline_offset_unit') == 'px' or 'centerline_mean_offset_px' in overall:
+        # Different estimators are not interchangeable when the requested one failed.
+        fields = [('centerline_mean_offset_px', 'px')]
     offset, unit = next(((number(key), unit) for key, unit in fields if number(key) is not None), (None, ''))
     distance = f'{offset:.2f} {unit}' if offset is not None else '—'
+    note = str(overall.get('centerline_offset_reason') or '')
+    tolerance = number('centerline_match_tolerance_px')
+    if tolerance is not None:
+        note = f'中心线匹配容差：{tolerance:g} px。' + note
     return dict(recall=percent('change_recall'), precision=percent('change_precision'),
                 completeness=percent('road_centerline_completeness'), offset=distance,
-                type_accuracy=percent('change_type_accuracy'), report=report)
+                type_accuracy=percent('change_type_accuracy'), centerline_note=note, report=report)
 
 
 def metrics_text(path):
@@ -86,7 +91,8 @@ def show_evaluation(parent, descriptor, path):
                 (('查全率', 'recall'), ('查准率', 'precision'), ('类型正确率', 'type_accuracy')))
                 + '\n\n道路提取\n' + '\n'.join(f'{name}：{values.get(key, "未评价")}' for name, key in
                 (('道路完整度', 'completeness'), ('中心线平均偏移', 'offset'))))
-    details.setPlainText(sections + '\n\n评价依据\n' + evaluation_context(descriptor, path))
+    details.setPlainText(sections + '\n' + values.get('centerline_note', '')
+                         + '\n\n评价依据\n' + evaluation_context(descriptor, path))
     layout.addWidget(details, 1)
     open_file = QPushButton('打开原始评价报告')
     open_file.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))))
