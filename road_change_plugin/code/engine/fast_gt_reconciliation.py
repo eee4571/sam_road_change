@@ -672,7 +672,22 @@ def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *,
     truth['_gt_type']=truth[truth_type_field]
     widths={side:FinalWidths(gpd.read_file(p['width_segments']).to_crs(metric)) for side,p in zip(('before','after'),payloads)}
     gt,perturbation=perturb_truth(truth,widths,before_period,after_period,profile)
-    corrected,correction=correct_changes(auto,gt)
+    from .evaluation_grid import period_evaluation_grid
+    from .truth_assistance import limit_truth_assistance
+    try:
+        image_crs, image_transform, image_shape = period_evaluation_grid([payloads[0]])
+        position_grid = (image_crs, image_transform)
+        grid_metadata = dict(gt_assisted_grid_crs=str(image_crs),
+            gt_assisted_grid_transform=list(image_transform)[:6], gt_assisted_grid_shape=list(image_shape))
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        position_grid, grid_metadata = None, {}
+        print(f'[Fast final] Truth supplementation deferred: {exc}', flush=True)
+    corrected,correction,assistance=limit_truth_assistance(auto,gt,truth,position_grid,
+        validation_area=gpd.read_file(validation_area) if validation_area else None,
+        evaluation_tolerance=evaluation_tolerance)
+    print(f"[Fast final] Pre-review assistance: {assistance['status']}; "
+          f"coverage {assistance['baseline_recall']} -> {assistance['candidate_recall']}", flush=True)
+    _write_json(output/'assistance_selection.json',assistance)
     audit_path=output/'correction_audit.gpkg'
     gt.to_file(audit_path,layer='perturbed_gt',driver='GPKG')
     corrected.to_file(audit_path,layer='corrected_intervals',driver='GPKG')
@@ -685,7 +700,9 @@ def augment_fast_changes_with_truth(automatic_result, truth_path, output_dir, *,
         'affected_auto_indices':affected,'ground_truth_used':True,'ground_truth_derived':True,
         'product_variant':'final','before_period':before_period,'after_period':after_period,
         'truth_path':str(Path(truth_path).resolve()),'truth_type_field':truth_type_field,
-        'ground_truth_usage':'posterior_local_road_correction','summary':str(output/'change_summary.json')}
+        'ground_truth_usage':'posterior_local_road_correction',
+        'assistance_selection':str(output/'assistance_selection.json'),
+        'assistance_coverage':assistance,'summary':str(output/'change_summary.json'),**grid_metadata}
     _write_json(result['summary'],result)
     if defer_finalization:return result
     periods=[{**p,'period':period,'grid':'pair'} for p,period in zip(payloads,(before_period,after_period))]

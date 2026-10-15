@@ -1343,6 +1343,24 @@ def _object_metric_values(
     }
 
 
+def _expand_by_pixels(geometry, metric_crs, position_grid, tolerance):
+    """Expand in the actual affine image grid, then return metric geometry."""
+    from shapely.affinity import affine_transform
+    image_crs, image_transform = position_grid
+    transform = Affine(*tuple(image_transform)[:6])
+    inverse = ~transform
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError('Position tolerance must be a finite nonnegative pixel distance')
+    if geometry.is_empty:
+        return geometry
+    image_geometry = gpd.GeoSeries([geometry], crs=metric_crs).to_crs(image_crs).iloc[0]
+    pixels = affine_transform(image_geometry, [inverse.a,inverse.b,inverse.d,inverse.e,inverse.c,inverse.f])
+    expanded_pixels = pixels.buffer(tolerance) if tolerance else pixels
+    world = affine_transform(expanded_pixels, [transform.a,transform.b,transform.d,transform.e,transform.c,transform.f])
+    return make_valid(gpd.GeoSeries([world], crs=image_crs).to_crs(metric_crs).iloc[0])
+
+
 def evaluate_changes(
     predicted: gpd.GeoDataFrame,
     truth: gpd.GeoDataFrame,
@@ -1421,27 +1439,12 @@ def evaluate_changes(
         result = _metric_row(name, predicted_support, truth_support, domain)
         if position_grid is None:
             return result
-        from shapely.affinity import affine_transform
-        image_crs, image_transform = position_grid
-        transform = Affine(*tuple(image_transform)[:6])
-        inverse = ~transform
         tolerance = float(position_tolerance_px)
-        if not math.isfinite(tolerance) or tolerance < 0:
-            raise ValueError('Position tolerance must be a finite nonnegative pixel distance')
-
-        def expanded(geometry):
-            if geometry.is_empty:
-                return geometry
-            image_geometry = gpd.GeoSeries([geometry], crs=metric_crs).to_crs(image_crs).iloc[0]
-            pixels = affine_transform(image_geometry, [inverse.a,inverse.b,inverse.d,inverse.e,inverse.c,inverse.f])
-            expanded_pixels = pixels.buffer(tolerance) if tolerance else pixels
-            world = affine_transform(expanded_pixels, [transform.a,transform.b,transform.d,transform.e,transform.c,transform.f])
-            return make_valid(gpd.GeoSeries([world], crs=image_crs).to_crs(metric_crs).iloc[0])
 
         # Each numerator has its own unchanged denominator. There is no single
         # tolerant TP area shared by precision and recall; strict TP/FP/FN stay intact.
-        covered = min(result['truth_support_m2'], float(truth_support.intersection(expanded(predicted_support)).area))
-        supported = min(result['predicted_support_m2'], float(predicted_support.intersection(expanded(truth_support)).area))
+        covered = min(result['truth_support_m2'], float(truth_support.intersection(_expand_by_pixels(predicted_support, metric_crs, position_grid, tolerance)).area))
+        supported = min(result['predicted_support_m2'], float(predicted_support.intersection(_expand_by_pixels(truth_support, metric_crs, position_grid, tolerance)).area))
         result.update(change_metric_method='area_with_pixel_tolerance_v1',
             change_match_tolerance_px=tolerance, position_covered_truth_m2=covered,
             position_supported_prediction_m2=supported,

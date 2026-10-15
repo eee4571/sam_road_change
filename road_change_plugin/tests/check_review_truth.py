@@ -72,6 +72,16 @@ class ReviewedTruthTests(unittest.TestCase):
         self.assertEqual(review['objects'][0]['review_ids'], ['0'])
         self.assertEqual(len(self.truth), 3)
 
+    def test_rejected_partial_assistance_keeps_unseen_truth_after_save(self):
+        self.audit['truth_object_complete'] = [False, True, True]
+        self.write_audit()
+        session = ReviewSession(self.fixture.manifest)
+        session.open_pair(0)
+        session.save({'0': 'reject', '1': 'keep', '2': 'pending'})
+        result = read_json(self.fixture.manifest)['change_results'][0]
+        self.assertEqual(result['manual_review']['truth_filter']['objects'], [])
+        self.assertEqual(len(gpd.read_file(self.truth_path)), 3)
+
     def test_fragment_retained_pending_or_unmapped_protects_whole_truth(self):
         self.audit.loc[2, 'truth_id'] = self.audit.loc[0, 'truth_id']
         self.write_audit()

@@ -32,6 +32,8 @@ def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes'
     groups = {key: group for key, group in linked.groupby('truth_id', sort=False)}
     for truth_id, generated_group in generated.groupby('truth_id', sort=False):
         group = groups[truth_id]
+        if 'truth_object_complete' in group and not group.truth_object_complete.fillna(False).astype(bool).all():
+            continue
         review_ids = set()
         fully_rejected = True
         for row in group.itertuples():
