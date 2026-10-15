@@ -64,6 +64,9 @@ class UpdatePage(ProjectPage):
         self.area.setMinimumWidth(0)
         self.area.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.form.addRow('区域', self.area)
+        self.all_changes_button = QPushButton('选择所有区域的全部变化对')
+        self.all_changes_button.clicked.connect(self._all_changes_selected)
+        self.form.addRow(self.all_changes_button)
         self.form.addRow(note('选择需要重新计算的期次或变化对。重跑道路期次时，与该期次相关的变化成果将自动重新计算。'))
         self.configuration_note = note()
         self.form.addRow(self.configuration_note)
@@ -81,6 +84,32 @@ class UpdatePage(ProjectPage):
         self.temporal_button.clicked.connect(self._temporal_selected)
         self.form.addRow(self.temporal_button)
         self.save_button.setEnabled(False)
+
+    def _all_changes_selected(self):
+        areas = []
+        for index in range(self.area.count()):
+            grid = self.area.itemText(index)
+            names = ProjectState.period_order(self.manifest, grid)
+            if len(names) >= 2:
+                areas.append(dict(grid=grid, selected_periods=[],
+                                  selected_pairs=[list(pair) for pair in zip(names, names[1:])]))
+        self.buttons.blockSignals(True)
+        for button in self.buttons.buttons():
+            button.setChecked(False)
+        self.buttons.blockSignals(False)
+        self.selection = dict(action='rerun-selection', selection_areas=areas)
+        self.scope = None
+        self.save_button.setEnabled(False)
+        try:
+            self.scope = self.store.local_scope('rerun-selection', self.selection)
+            total = sum(len(area['selected_pairs']) for area in areas)
+            details = [f"{area['grid']}：" + '、'.join(f'{a} → {b}' for a,b in area['selected_pairs'])
+                       for area in areas]
+            self.impact.setText(f'已选择全部 {len(areas)} 个区域，共 {total} 个变化对：\n' +
+                                '\n'.join(details) + '\n\n复用已有道路成果，更新变化检测、长时序及可用的精度评价。')
+            self.save_button.setEnabled(True)
+        except (OSError, ValueError, KeyError) as exc:
+            self.impact.setText(str(exc))
 
     def _temporal_selected(self):
         self.buttons.blockSignals(True)

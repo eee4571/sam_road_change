@@ -222,6 +222,8 @@ class ProjectState:
 
     @staticmethod
     def in_scope(product, scope):
+        if 'areas' in scope:
+            return any(ProjectState.in_scope(product, area) for area in scope['areas'])
         meta = product.get('metadata', {})
         kind = product['result_type']
         if kind == 'road_evaluation':
@@ -259,6 +261,11 @@ class ProjectState:
                 raise ValueError('该区域至少需要两个已处理期次')
             return dict(grid=grid, periods=[], changes=[], temporal_only=True)
         if action == 'rerun-selection':
+            if 'selection_areas' in data:
+                areas = data['selection_areas']
+                if not areas or len({a['grid'] for a in areas}) != len(areas):
+                    raise ValueError('请选择不重复的区域')
+                return dict(areas=[self.local_scope(action, a) for a in areas])
             scopes = [self.local_scope('rerun-period', dict(grid=data['grid'], period=p))
                       for p in data.get('selected_periods', [])]
             scopes += [self.local_scope('rerun-change', dict(grid=data['grid'], before_period=a, after_period=b))
@@ -296,21 +303,23 @@ class ProjectState:
                          configuration_signature=self.state().get('configuration_signature'))
             write_json(self.path, state)
             return state
-        grid, period, changes = scope['grid'], data.get('period', ''), scope['changes']
+        scopes = scope.get('areas', [scope])
         products = self.results()
         removed = [p for p in products if self.in_scope(p, scope)]
         targets = [path for p in removed for path in self.dataset_files(p['path'])]
         job = Path(manifest.get('job_root') or Path(descriptor['path']).parent).resolve()
         # Local updates replace publications, not the period inference/width
         # workspace. The backend validates and resumes individual stages there.
-        period_cache = job / 'grids' / safe_name(grid) / 'periods'
-        targets = [p for p in targets if not Path(p).resolve().is_relative_to(period_cache.resolve())]
+        period_caches = [(job / 'grids' / safe_name(s['grid']) / 'periods').resolve() for s in scopes]
+        targets = [p for p in targets if not any(Path(p).resolve().is_relative_to(cache) for cache in period_caches)]
         targets.append(Path(descriptor['path']).parent / 'local_rerun.json')
-        targets += [job / 'grids' / safe_name(grid) / 'changes' / safe_name(pair) for pair in changes]
-        # Exact published category directories include auxiliary files and previews.
-        targets += [self.output / safe_name(grid) / '01_单期道路' / safe_name(p) for p in scope['periods']]
-        targets += [self.output / safe_name(grid) / '02_变化检测' / safe_name(pair) for pair in changes]
-        targets.append(self.output / safe_name(grid) / '03_长时序')
+        for area_scope in scopes:
+            grid, changes = area_scope['grid'], area_scope['changes']
+            targets += [job / 'grids' / safe_name(grid) / 'changes' / safe_name(pair) for pair in changes]
+            # Exact published category directories include auxiliary files and previews.
+            targets += [self.output / safe_name(grid) / '01_单期道路' / safe_name(p) for p in area_scope['periods']]
+            targets += [self.output / safe_name(grid) / '02_变化检测' / safe_name(pair) for pair in changes]
+            targets.append(self.output / safe_name(grid) / '03_长时序')
         index_path = self.output / 'result_index.json'
         index = read_json(index_path) if index_path.is_file() else None
         if index:
@@ -321,12 +330,13 @@ class ProjectState:
                             self.output / safe_name(area) / '02_变化检测' / '精度评价']
         self._delete(targets, data)
         if index:
-            node = index.get('areas', {}).get(grid, {})
-            for p in scope['periods']:
-                node.get('periods', {}).pop(p, None)
-            for pair in scope['changes']:
-                node.get('changes', {}).pop(pair, None)
-            node['temporal'] = {}
+            for area_scope in scopes:
+                node = index.get('areas', {}).get(area_scope['grid'], {})
+                for p in area_scope['periods']:
+                    node.get('periods', {}).pop(p, None)
+                for pair in area_scope['changes']:
+                    node.get('changes', {}).pop(pair, None)
+                node['temporal'] = {}
             for area in index.get('areas', {}).values():
                 area['evaluation'] = {}
             write_json(index_path, index)

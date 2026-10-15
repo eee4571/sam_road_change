@@ -46,25 +46,35 @@ def run_selection(args, pipeline):
     """Persist each finished step; retry only the interrupted step on resume."""
     path = Path(args.pipeline_manifest).resolve()
     manifest = pipeline.read_json(path)
-    plan = selection_plan(manifest, str(args.grid), json.loads(args.selection), pipeline)
+    selection = json.loads(args.selection)
+    if 'areas' in selection:
+        areas = selection['areas']
+        if not areas or len({a['grid'] for a in areas}) != len(areas):
+            raise ValueError('请选择不重复的区域')
+        plan = dict(areas=[selection_plan(manifest, a['grid'], a, pipeline) for a in areas])
+    else:
+        plan = selection_plan(manifest, str(args.grid), selection, pipeline)
+    plans = plan.get('areas', [plan])
     checkpoint = path.parent / 'local_rerun.json'
     saved = pipeline.read_json(checkpoint) if checkpoint.is_file() else {}
     if saved and saved.get('plan') != plan:
         raise ValueError('当前重跑断点与所选范围不一致，请继续原范围或重新开始')
     pipeline._apply_fast2_task_settings(manifest, args)
-    steps = [('period', p) for p in plan['periods']]
-    steps += [('change', pair) for pair in plan['pairs']]
-    steps += [('downstream', None)]
+    steps = []
+    for area in plans:
+        steps += [(area['grid'], 'period', p) for p in area['periods']]
+        steps += [(area['grid'], 'change', pair) for pair in area['pairs']]
+        steps.append((area['grid'], 'downstream', None))
     completed = int(saved.get('completed', 0))
     if not 0 <= completed <= len(steps):raise ValueError('局部重跑断点无效')
     if not saved:
-        scoped_downstream(manifest, plan['grid'], pipeline, invalidate=True,pairs=plan['pairs'])
+        for area in plans:
+            scoped_downstream(manifest, area['grid'], pipeline, invalidate=True,pairs=area['pairs'])
         manifest['status'] = 'running'
         pipeline._persist_existing_pipeline(manifest, path)
         pipeline.write_json(checkpoint, dict(plan=plan, completed=0))
-    grid = plan['grid']
     for index in range(completed, len(steps)):
-        kind, value = steps[index]
+        grid, kind, value = steps[index]
         context = dict(grid=grid)
         if kind == 'period':context['period'] = value
         if kind == 'change':context.update(before_period=value[0], after_period=value[1])
@@ -92,6 +102,8 @@ def run_selection(args, pipeline):
         pipeline.emit('pipeline', stage=stage, status='complete', completed=index+1, total=len(steps), **context)
     manifest['status'] = 'completed'
     pipeline._persist_existing_pipeline(manifest, path)
-    pipeline.emit('complete', stage='rerun-selection', grid=grid,
-                  period_count=len(plan['periods']), change_count=len(plan['pairs']))
+    pipeline.emit('complete', stage='rerun-selection', grid=plans[0]['grid'] if len(plans) == 1 else '',
+                  grids=[a['grid'] for a in plans],
+                  period_count=sum(len(a['periods']) for a in plans),
+                  change_count=sum(len(a['pairs']) for a in plans))
     return plan

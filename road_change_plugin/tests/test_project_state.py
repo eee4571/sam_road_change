@@ -1,6 +1,7 @@
 """Project lifecycle acceptance using synthetic files; never run models."""
 import ast
 import copy
+import json
 import importlib.util
 import os
 from pathlib import Path
@@ -278,6 +279,45 @@ class ProjectLifecycleTests(unittest.TestCase):
         for year in range(2020,2025):
             self.assertTrue((self.store.current / f'grids/南区/periods/{year}/intermediate.dat').is_file())
         self.assertTrue((self.store.current / 'grids/南区/changes/2021_to_2022/intermediate.dat').is_file())
+        self.assert_cache()
+
+    def test_all_area_changes_preserve_period_caches_and_resume_batch(self):
+        self.existing()
+        original = self.store.results()
+        areas = [dict(grid=g, selected_periods=[],
+                      selected_pairs=[[str(y),str(y+1)] for y in range(2020,2024)])
+                 for g in ('北区','南区')]
+        data = {**self.data, 'selection_areas': areas}
+        scope = self.store.local_scope('rerun-selection', data)
+        self.assertEqual(len(scope['areas']), 2)
+        self.controller.run('rerun-selection', data)
+        self.assertFalse(self.errors)
+        command = self.controller.runner.commands[-1]
+        selection = json.loads(command[command.index('--selection')+1])
+        self.assertEqual(selection['areas'], areas)
+        self.assertNotIn('--grid', command)
+        for product in original:
+            self.assertEqual(Path(product['path']).exists(), not self.store.in_scope(product, scope))
+        for grid in ('北区','南区'):
+            for year in range(2020,2025):
+                self.assertTrue((self.store.current/f'grids/{grid}/periods/{year}/intermediate.dat').exists())
+        marker = Path(file(self.store.current/'local_rerun.json', 'completed-north'))
+        self.controller.cancel()
+        self.controller.run('all', {**self.data, 'resume': True})
+        self.assertFalse(self.errors)
+        self.assertEqual(self.controller.runner.commands[-1], command)
+        self.assertEqual(marker.read_text(), 'completed-north')
+        self.assert_cache()
+
+    def test_invalid_area_in_batch_keeps_all_existing_outputs(self):
+        self.existing()
+        original = self.store.results()
+        data = {**self.data, 'selection_areas': [
+            dict(grid='北区', selected_pairs=[['2020','2021']]),
+            dict(grid='不存在', selected_pairs=[['2020','2021']])]}
+        self.controller.run('rerun-selection', data)
+        self.assertTrue(self.errors)
+        self.assertTrue(all(Path(p['path']).exists() for p in original))
         self.assert_cache()
 
     def test_cancelled_local_rerun_can_start_new_selection_then_continue_it(self):

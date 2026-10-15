@@ -54,9 +54,13 @@ class Controller(TaskSignals):
                 store = ProjectState(data['project_root'], data['output'])
                 scope = store.local_scope(action, data)
                 check_existing_task(manifest)
-                selection = {k: data.get(k, []) for k in ('selected_periods', 'selected_pairs')}
-                return task_arguments([action, '--pipeline-manifest', manifest, '--grid', scope['grid'],
-                                       '--selection', json.dumps(selection, ensure_ascii=False)])
+                selection = (dict(areas=data['selection_areas']) if 'selection_areas' in data else
+                             {k: data.get(k, []) for k in ('selected_periods', 'selected_pairs')})
+                args = [action, '--pipeline-manifest', manifest,
+                        '--selection', json.dumps(selection, ensure_ascii=False)]
+                if 'grid' in scope:
+                    args += ['--grid', scope['grid']]
+                return task_arguments(args)
             if action == "evaluate-all-existing":
                 args = [action, "--pipeline-manifest", manifest]
                 for row in data.get("truths", []):

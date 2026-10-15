@@ -496,6 +496,52 @@ class ProcessingUiTests(unittest.TestCase):
         self.assertFalse(page.save_button.isEnabled())
         self.assertIsNone(page.selection)
 
+    def test_all_area_change_selection_reaches_backend_without_periods(self):
+        self.widget._show_update()
+        page = self.widget.update_page
+        page.buttons.buttons()[0].click()
+        page.all_changes_button.click()
+        self.assertTrue(page.save_button.isEnabled())
+        self.assertFalse(any(b.isChecked() for b in page.buttons.buttons()))
+        areas = page.selection['selection_areas']
+        self.assertEqual({a['grid'] for a in areas}, {'北区','南区'})
+        self.assertTrue(all(a['selected_periods'] == [] for a in areas))
+        self.assertEqual(sum(len(a['selected_pairs']) for a in areas), 4)
+        self.assertIn('共 4 个变化对', page.impact.text())
+        with patch.object(self.widget.controller, 'run') as run, \
+             patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes) as confirm:
+            page.save_button.click()
+            action, data = run.call_args.args
+            command = self.widget.controller.build_command(action, data)
+            self.assertEqual(json.loads(command[command.index('--selection')+1])['areas'], areas)
+            self.assertIn('0 个道路期次', confirm.call_args.args[2])
+            self.assertIn('4 个变化对', confirm.call_args.args[2])
+
+    def test_single_area_selection_replaces_all_area_selection(self):
+        self.widget._show_update()
+        page = self.widget.update_page
+        page.all_changes_button.click()
+        pair = next(b for b in page.buttons.buttons() if b.selection['action'] == 'rerun-change')
+        pair.click()
+        self.assertNotIn('selection_areas', page.selection)
+        self.assertEqual(page.selection['grid'], page.area.currentText())
+        self.assertEqual(len(page.selection['selected_pairs']), 1)
+
+    def test_resume_hint_lists_every_selected_area(self):
+        from plugin.project_state import ProjectState, write_json
+        self.widget._show_update()
+        page = self.widget.update_page
+        page.all_changes_button.click()
+        store = ProjectState(self.root)
+        state = store.state()
+        state.update(status='cancelled', action='rerun-selection', scope=page.scope,
+                     parameters={'selection_areas': page.selection['selection_areas']})
+        write_json(store.path, state)
+        self.widget._refresh_results()
+        self.assertEqual(self.widget.run_button.text(), '继续重跑')
+        self.assertIn('北区 /', self.widget.processing_hint.text())
+        self.assertIn('南区 /', self.widget.processing_hint.text())
+
     def test_summary_opens_local_output_without_reemitting_results(self):
         received = []
         self.plugin.result_ready.connect(received.append)

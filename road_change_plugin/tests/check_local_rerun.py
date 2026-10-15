@@ -132,6 +132,68 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(pipeline.parser().parse_args(['rerun-period','--pipeline-manifest',str(self.path),
             '--grid','north','--period','2021','--update-related']).period,'2021')
 
+    def multi_args(self):
+        return SimpleNamespace(pipeline_manifest=str(self.path), grid=None,
+            selection=json.dumps(dict(areas=[dict(grid=g, selected_periods=[],
+                selected_pairs=[['2020','2021'], ['2021','2022']]) for g in ('north','south')])))
+
+    def test_multi_area_resume_skips_completed_area_and_pairs(self):
+        args = self.multi_args()
+        calls = []
+        fail = True
+        def change(m, g, a, b):
+            calls.append((g, a, b))
+            if fail and (g,a) == ('south','2021'):
+                raise RuntimeError('interrupt')
+        def downstream(m):
+            grids = {r['grid'] for r in m['change_results']}
+            self.assertEqual(len(grids), 1)
+            calls.append((next(iter(grids)), 'downstream'))
+        with patch.object(pipeline, '_rerun_change_entry', side_effect=change), \
+             patch.object(pipeline, '_refresh_manifest_downstream', side_effect=downstream), \
+             patch.object(pipeline, '_rerun_period_entry', side_effect=AssertionError('no extraction or width')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupt'):
+                run_selection(args, pipeline)
+            self.assertEqual(calls[:3], [('north','2020','2021'), ('north','2021','2022'), ('north','downstream')])
+            calls.clear(); fail = False
+            run_selection(args, pipeline)
+            self.assertEqual(calls, [('south','2021','2022'), ('south','downstream')])
+        saved = pipeline.read_json(self.path)
+        self.assertEqual(saved['status'], 'completed')
+        self.assertEqual(sorted(saved['auto_period_results'], key=lambda p:(p['grid'],p['period'])),
+                         self.manifest['auto_period_results'])
+
+    def test_multi_area_downstream_retry_only_rebuilds_failed_area(self):
+        args = self.multi_args()
+        calls = []
+        fail = True
+        def downstream(m):
+            grid = m['change_results'][0]['grid']
+            calls.append(grid)
+            if fail and grid == 'south': raise RuntimeError('interrupt')
+        with patch.object(pipeline, '_refresh_manifest_downstream', side_effect=downstream):
+            with self.assertRaises(RuntimeError): run_selection(args, pipeline)
+            calls.clear(); self.calls.clear(); fail = False
+            run_selection(args, pipeline)
+        self.assertEqual(calls, ['south'])
+        self.assertFalse(self.calls)
+
+    def test_invalid_second_area_is_rejected_before_any_work(self):
+        args = self.multi_args()
+        value = json.loads(args.selection)
+        value['areas'][1]['selected_pairs'] = [['2020','2099']]
+        args.selection = json.dumps(value)
+        with self.assertRaises(ValueError): run_selection(args, pipeline)
+        self.assertFalse(self.calls)
+        self.assertEqual(pipeline.read_json(self.path), self.manifest)
+        self.assertFalse((self.path.parent/'local_rerun.json').exists())
+
+    def test_cli_accepts_multi_area_without_grid(self):
+        args = pipeline.parser().parse_args(['rerun-selection','--pipeline-manifest',str(self.path),
+            '--selection',self.multi_args().selection])
+        self.assertIsNone(args.grid)
+        self.assertEqual(len(json.loads(args.selection)['areas']), 2)
+
     def test_retry_evaluation_does_not_invalidate_completed_geometry(self):
         selected=dict(grid='north',before_period='2020',after_period='2021',
             fast_finalization_state='completed',evaluation_state='failed',output=self.tmp.name)

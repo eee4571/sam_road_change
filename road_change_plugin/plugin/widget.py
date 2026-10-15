@@ -411,8 +411,10 @@ class RoadChangeWidget(QWidget):
     def _start_update(self):
         if self.update_page.selection and not self.busy and self.checked and not self.browsing:
             scope = self.update_page.scope or {}
-            confirmation = (f"区域：{scope.get('grid', '')}\n重新处理 {len(scope.get('periods', []))} 个道路期次，"
-                            f"更新 {len(scope.get('changes', []))} 个变化对、长时序及可用的精度评价。\n\n"
+            scopes = scope.get('areas', [scope])
+            confirmation = (f"区域：{'、'.join(s.get('grid', '') for s in scopes)}\n"
+                            f"重新处理 {sum(len(s.get('periods', [])) for s in scopes)} 个道路期次，"
+                            f"更新 {sum(len(s.get('changes', [])) for s in scopes)} 个变化对、长时序及可用的精度评价。\n\n"
                             '程序会复用有效缓存，按需更新过期的单期正式成果。\n\n'
                             '完整范围已列于当前页面。对应正式成果将被替换，是否开始？')
             if scope.get('temporal_only'):
@@ -809,8 +811,10 @@ class RoadChangeWidget(QWidget):
             description = '上次重跑尚未完成' if local else '上次处理尚未完成'
             if local:
                 scope = self._resume_task.get('scope') or {}
-                target = (scope.get('periods') or scope.get('changes') or [])
-                description += '，继续完成上次选定范围\n' + scope.get('grid', '') + ' / ' + '、'.join(target).replace('_to_', ' → ')
+                scopes = scope.get('areas', [scope])
+                description += '，继续完成上次选定范围\n' + '\n'.join(
+                    s.get('grid', '') + ' / ' + '、'.join(s.get('periods', []) + s.get('changes', [])).replace('_to_', ' → ')
+                    for s in scopes)
             description += '\n也可选择“局部重跑”重新指定处理范围'
         elif not self.model['areas']:
             state, title, description = 'unconfigured', '配置数据', '项目尚未配置数据'
