@@ -27,12 +27,15 @@ def _cells(surface, coordinates):
     tree = STRtree(list(points.geoms))
     cells = voronoi_polygons(points, extend_to=surface.envelope)
     for cell in cells.geoms:
-        owners = tree.query(cell, predicate='covers')
-        if len(owners) != 1:
-            raise ValueError('Cannot uniquely associate a truth surface cell with its axis sample')
+        # A Voronoi cell belongs to the nearest generator at an interior point.
+        # Almost coincident endpoint/sample coordinates can both be covered by
+        # a cell after GEOS rounding, so containment is not a unique owner test.
+        # Resolve exact distance ties by input order for reproducible assignment.
+        owners = tree.query_nearest(cell.representative_point(), all_matches=True)
+        owner = min(int(indices[int(index)]) for index in owners)
         clipped = cell.intersection(surface)
         if not clipped.is_empty and clipped.area > 0:
-            yield int(indices[int(owners[0])]), clipped
+            yield owner, clipped
 
 
 def partition_surface(surface, axes):

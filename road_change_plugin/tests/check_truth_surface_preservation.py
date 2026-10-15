@@ -39,6 +39,33 @@ class TruthSurfaceTests(unittest.TestCase):
         self.assertNotIn('gt_width_profile', candidates)
         self.assertTrue(candidates.gt_surface_wkt.notna().all())
 
+    def test_real_near_coincident_interval_sample_preserves_clipped_face(self):
+        fixture = json.loads((ROOT/'tests/fixtures/truth_surface_near_sample.json').read_text())
+        face, axis, local = (shape(fixture[key]) for key in ('surface', 'reference', 'local'))
+        selected = surface_interval(face, axis, local)
+        self.assertTrue(selected.is_valid)
+        self.assertAlmostEqual(selected.area, 5.10832828, delta=1e-6)
+        self.assertLess(selected.difference(face).area, 1e-8)
+        self.assert_same_surface(surface_interval(face, axis, axis), face)
+
+    def test_nearly_coincident_branch_sites_preserve_all_surface(self):
+        from shapely.affinity import translate
+        # A second branch starts a few ULPs from a regular sample. No cell may
+        # disappear or be duplicated when nearest-generator distances tie.
+        for offset in (0., 260000.):
+            axes = [LineString([(0, 0), (4, 0)]),
+                    LineString([(2+3e-11, 0), (2+3e-11, 4)])]
+            axes = [translate(axis, xoff=offset, yoff=2600000.) for axis in axes]
+            face = union_all([axis.buffer(1, cap_style='flat') for axis in axes])
+            with self.subTest(offset=offset):
+                parts = partition_surface(face, axes)
+                self.assert_same_surface(union_all(parts), face)
+                self.assertAlmostEqual(sum(part.area for part in parts), face.area, delta=1e-7)
+                self.assertTrue(all(part.area > 0 for part in parts))
+                repeated = partition_surface(face, axes)
+                for actual, expected in zip(repeated, parts):
+                    self.assert_same_surface(actual, expected)
+
     def test_presence_and_width_change_keep_full_truth_polygon(self):
         geometry = Polygon([(0,0), (80,0), (80,7), (30,10), (30,60), (0,60)])
         for kind in ('2', '3', '4'):

@@ -118,7 +118,7 @@
   "code/engine/samroad/utils.py": "32769dad96450d95e2fb3f8021badd8301a9ead31fa89bcb78af87eb40105b44",
   "code/engine/samroad/vitdet.py": "fb669e9e6bb5715bce0ad33b00814b325d5ffa361a6b314909039ee5f4c730f0",
   "code/engine/truth_assistance.py": "e39574dafda15cf60e487b67d4fc39b149eb97f149c54871e1165c7c3a55b76a",
-  "code/engine/truth_surface.py": "f5ff867131cbf8a9d3f2c2d509e7f57f0e755b94f931f18545b611e0e13bfadc",
+  "code/engine/truth_surface.py": "0fd896b45629b2d1e97e0e9e2e6b6dc4efe71f0584beaff438d662a3944a2fcf",
   "code/engine/vector_evidence.py": "b6b026ac044f53c283c1b9ef9c654305c2d06e73b03b68c8f76840b6eecc61e4",
   "code/engine/width/chain_width_calculator.py": "2550abd018bf21112f82db32ad9a78c821e7f3b1f73284f003eb467e98d68cf6",
   "code/engine/width/final_width_calculator.py": "f00ef235aa4a72d25841886c36b9d682d2da532e445c6e6c5a52e6dc6bf15bf8",

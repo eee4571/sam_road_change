@@ -1,0 +1,64 @@
+{
+  "description": "Real two-pair desktop failure: interval endpoint almost coincides with a regular sample. Coordinates translated by exact powers of two to anonymize location while retaining floating-point cancellation.",
+  "surface": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          193542.98184355773,
+          1563895.4549800553
+        ],
+        [
+          193544.11404292315,
+          1563896.9411964323
+        ],
+        [
+          193545.4535229464,
+          1563898.6995061506
+        ],
+        [
+          193545.88814646675,
+          1563897.9837725256
+        ],
+        [
+          193546.76963374473,
+          1563892.6948488532
+        ],
+        [
+          193544.55249965892,
+          1563894.3104560194
+        ],
+        [
+          193542.98184355773,
+          1563895.4549800553
+        ]
+      ]
+    ]
+  },
+  "reference": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        193547.234375,
+        1563895.75
+      ],
+      [
+        193543.4439326155,
+        1563895.1182596027
+      ]
+    ]
+  },
+  "local": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        193547.234375,
+        1563895.75
+      ],
+      [
+        193545.33915380776,
+        1563895.4341298016
+      ]
+    ]
+  }
+}
