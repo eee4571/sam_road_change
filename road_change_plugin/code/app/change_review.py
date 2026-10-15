@@ -173,6 +173,9 @@ class ReviewSession:
                 statuses = draft['decisions']
                 if set(statuses) != valid_ids or any(s not in STATES for s in statuses.values()):
                     raise ValueError('自动保存的复核记录无效')
+                # This draft already belongs to the current candidates. Reopening
+                # it must not repeat migration or block the batch apply operation.
+                reconciled = False
             else:
                 draft_original = original if draft.get('source_signature') == record.get('source_signature') else None
                 snapshot = self.folder / 'draft_source.json'

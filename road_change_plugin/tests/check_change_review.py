@@ -391,10 +391,22 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(set(data['applied_decisions'].values()), {'pending'})
         self.assertTrue(session.review_states()[0]['modified'])
         self.assertEqual(read_json(record_path)['decisions'], decisions)
+        self.assertTrue(data['warning'])
+        expected['1'] = 'keep'
+        session.record(expected)
+        archives = set(session.folder.glob('draft_*.json'))
+        session = ReviewSession(self.manifest)
+        reopened = session.open_pair(0)
+        self.assertEqual(reopened['warning'], '')
+        self.assertEqual({f['id']: f['status'] for f in reopened['features']}, expected)
+        self.assertEqual(set(reopened['applied_decisions'].values()), {'pending'})
+        self.assertTrue(session.review_states()[0]['modified'])
+        self.assertEqual(set(session.folder.glob('draft_*.json')), archives)
+        self.assertEqual(read_json(record_path)['decisions'], decisions)
         session.save(expected)
         reopened = ReviewSession(self.manifest).open_pair(0)
         self.assertEqual(reopened['applied_decisions'], expected)
-        self.assertEqual(len(gpd.read_file(self.source)), 1)
+        self.assertEqual(len(gpd.read_file(self.source)), 2)
 
     def test_identical_rerun_preserves_decisions_but_marks_publication_pending(self):
         decisions = {'0': 'keep', '1': 'reject', '2': 'pending'}
