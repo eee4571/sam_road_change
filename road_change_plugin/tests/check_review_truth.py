@@ -72,33 +72,83 @@ class ReviewedTruthTests(unittest.TestCase):
         self.assertEqual(review['objects'][0]['review_ids'], ['0'])
         self.assertEqual(len(self.truth), 3)
 
-    def test_rejected_partial_assistance_keeps_unseen_truth_after_save(self):
+    def test_rejected_partial_assistance_excludes_only_reviewed_extent_after_save(self):
+        # The source truth extends beyond the part actually supplemented.
+        original_geometry = self.truth.geometry.iloc[0]
+        unseen = box(500028,3300100,500032,3300120)
+        self.truth.loc[0, 'geometry'] = original_geometry.union(unseen)
+        pyogrio.write_dataframe(self.truth, self.truth_path, encoding='UTF-8')
+        self.audit.loc[0, 'truth_id'] = _id(self.truth.geometry.iloc[0], 'GT')
         self.audit['truth_object_complete'] = [False, True, True]
         self.write_audit()
+        signature = source_signature(self.truth_path, {})
         session = ReviewSession(self.fixture.manifest)
         session.open_pair(0)
         session.save({'0': 'reject', '1': 'keep', '2': 'pending'})
         result = read_json(self.fixture.manifest)['change_results'][0]
-        self.assertEqual(result['manual_review']['truth_filter']['objects'], [])
-        self.assertEqual(len(gpd.read_file(self.truth_path)), 3)
+        review = result['manual_review']['truth_filter']
+        self.assertEqual(review['objects'][0]['scope'], 'partial')
+        effective, metadata = apply_truth_filter(self.truth, review, 'BHBM')
+        self.assertTrue(effective.geometry.iloc[0].equals(unseen))
+        self.assertEqual(metadata['partially_excluded_feature_count'], 1)
+        self.assertEqual(source_signature(self.truth_path, {}), signature)
+        # Re-evaluation upgrades an old saved empty filter from saved decisions.
+        manifest = read_json(self.fixture.manifest)
+        manifest['change_results'][0]['manual_review']['truth_filter'] = {'objects': []}
+        write_json(self.fixture.manifest, manifest)
+        from user_pipeline import _evaluate_existing_changes_impl
+        _evaluate_existing_changes_impl(argparse.Namespace(
+            pipeline_manifest=str(self.fixture.manifest), grid='北区', before_period='before', after_period='after',
+            truth=str(self.truth_path), validation_area='', truth_type_field='BHBM', evaluation_tolerance=5.,
+            defer_publish=True, defer_aggregate=True))
+        evaluation = read_json(result['summary'])['evaluation']
+        self.assertEqual(evaluation['metadata']['manual_review_truth']['partially_excluded_feature_count'], 1)
+        # Undoing the rejection restores the original evaluation truth.
+        reopened = ReviewSession(self.fixture.manifest); reopened.open_pair(0)
+        reopened.save({'0': 'keep', '1': 'keep', '2': 'keep'})
+        result = read_json(self.fixture.manifest)['change_results'][0]
+        self.assertIsNone(result['manual_review'].get('truth_filter'))
 
-    def test_fragment_retained_pending_or_unmapped_protects_whole_truth(self):
-        self.audit.loc[2, 'truth_id'] = self.audit.loc[0, 'truth_id']
+    def shared_truth(self, other):
+        geometry = self.audit.geometry.iloc[0].union(self.audit.geometry.iloc[other])
+        truth = gpd.GeoDataFrame({'BHBM': [2]}, geometry=[geometry], crs=self.truth.crs)
+        self.audit.loc[[0, other], 'truth_id'] = _id(geometry, 'GT')
         self.write_audit()
+        return truth
+
+    def test_partial_rejection_preserves_pending_kept_and_unmapped_parts(self):
+        truth = self.shared_truth(2)
+        kept_geometry = self.audit.geometry.iloc[2]
         for status in ('pending', 'keep'):
             review = self.exclusions({'0': 'reject', '1': 'reject', '2': status})
-            self.assertEqual(review['objects'], [])
+            effective, metadata = apply_truth_filter(truth, review, 'BHBM')
+            self.assertTrue(effective.geometry.iloc[0].equals(kept_geometry))
+            self.assertEqual(metadata['partially_excluded_feature_count'], 1)
         review = self.exclusions({'0': 'reject', '1': 'reject', '2': 'reject'})
-        self.assertEqual(review['objects'][0]['review_ids'], ['0', '2'])
-        self.audit.loc[2, 'geometry'] = box(600000, 3400000, 600010, 3400010)
-        self.write_audit()
-        self.assertEqual(self.exclusions({'0': 'reject', '1': 'reject', '2': 'reject'})['objects'], [])
+        self.assertTrue(apply_truth_filter(truth, review, 'BHBM')[0].empty)
+        self.original.loc[2, 'geometry'] = box(600000, 3400000, 600010, 3400010)
+        review = self.exclusions({'0': 'reject', '1': 'reject', '2': 'reject'})
+        self.assertTrue(apply_truth_filter(truth, review, 'BHBM')[0].geometry.iloc[0].equals(kept_geometry))
 
-    def test_retained_auto_support_protects_a_shared_truth(self):
-        self.audit.loc[1, 'truth_id'] = self.audit.loc[0, 'truth_id']
-        self.write_audit()
+    def test_retained_auto_support_protects_its_part_of_shared_truth(self):
+        truth = self.shared_truth(1)
         review = self.exclusions({'0': 'reject', '1': 'keep', '2': 'pending'})
-        self.assertEqual(review['objects'], [])
+        effective, _ = apply_truth_filter(truth, review, 'BHBM')
+        self.assertTrue(effective.geometry.iloc[0].equals(self.audit.geometry.iloc[1]))
+
+    def test_shared_pixel_tolerance_removes_offset_slivers_only_for_identified_truth(self):
+        from affine import Affine
+        from shapely.affinity import translate
+        self.audit['truth_object_complete'] = False
+        truth = self.truth.copy()
+        truth.loc[0, 'geometry'] = translate(truth.geometry.iloc[0], xoff=1.5)
+        self.audit.loc[0, 'truth_id'] = _id(truth.geometry.iloc[0], 'GT')
+        self.write_audit()
+        review = build_truth_filter(self.original, {'0':'reject','1':'keep','2':'keep'}, self.audit_path,
+                                   position_grid=(truth.crs, Affine(.5,0,500000,0,-.5,3300200)))
+        effective, metadata = apply_truth_filter(truth, review, 'BHBM')
+        self.assertEqual(list(effective.index), [1,2])
+        self.assertEqual(metadata['excluded_feature_count'], 1)
 
     def test_dissolved_public_polygon_preserves_explicit_truth_associations(self):
         from engine.continuous_road_geometry import change_surfaces

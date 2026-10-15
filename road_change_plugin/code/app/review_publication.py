@@ -192,13 +192,7 @@ def publish_review(session, version, record, progress):
         progress('正在根据真值数据重新计算精度…')
         if record['counts']['reject']:
             audit_path = Path(entry.get('output') or '') / 'gt_assisted_audit.gpkg'
-            if audit_path.is_file():
-                from engine.reviewed_truth import build_truth_filter
-                review_filter = build_truth_filter(session.frame, record['decisions'], audit_path,
-                    audit_layer=entry.get('review_audit_layer','changes'))
-                entry['manual_review']['truth_filter'] = review_filter
-                record['truth_filter'] = review_filter
-            elif entry.get('ground_truth_used'):
+            if not audit_path.is_file() and entry.get('ground_truth_used'):
                 raise ValueError('缺少变化来源记录，无法更新复核评价，请检查处理成果')
         values = entry.get('truth_value_map') or manifest.get('truth_value_map') or {}
         pipeline._evaluate_existing_changes_impl(argparse.Namespace(
@@ -208,6 +202,7 @@ def publish_review(session, version, record, progress):
             truth_added_value=values.get('added', ''), truth_width_changed_value=values.get('width_changed', ''),
             truth_removed_value=values.get('removed', ''),
             evaluation_tolerance=float(spec.get('evaluation_tolerance') or 5)))
+        record['truth_filter'] = entry['manual_review'].get('truth_filter')
     else:
         entry['evaluation_state'] = 'skipped_no_truth'
         entry.pop('evaluation_stale', None)

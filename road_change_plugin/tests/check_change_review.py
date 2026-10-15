@@ -45,7 +45,7 @@ class ReviewTests(unittest.TestCase):
             (self.root / (name + ".txt")).write_text(image.name + "\n", encoding="utf-8")
             roads = self.root / (name + '_roads.shp')
             pyogrio.write_dataframe(self.frame, roads, encoding='UTF-8')
-            periods.append(dict(grid='北区', period=name, centerlines=str(roads)))
+            periods.append(dict(grid='北区', period=name, centerlines=str(roads), road_probability=str(image)))
         self.manifest = self.root / "pipeline_result.json"
         self.manifest.write_text(json.dumps({'project_root': str(self.root), 'output_root': str(self.output),
             'execution_profile': 'fast', 'status': 'completed', 'period_results': periods,
@@ -196,7 +196,11 @@ class ReviewTests(unittest.TestCase):
                      evaluation_state='completed')
         write_json(other['summary'], {'evaluation': {'metrics': [
             {'class': 'all', 'tp_m2': 120, 'fp_m2': 0, 'fn_m2': 0, 'tn_m2': 0,
-             'correctly_classified_m2': 120, 'detected_truth_m2': 120}]}})
+             'correctly_classified_m2': 120, 'detected_truth_m2': 120,
+             'truth_support_m2': 120, 'predicted_support_m2': 120,
+             'position_covered_truth_m2': 120, 'position_supported_prediction_m2': 120,
+             'change_metric_method': 'area_with_pixel_tolerance_v1', 'change_match_tolerance_px': 4,
+             'change_recall': 1., 'change_precision': 1.}]}})
         manifest['change_results'].append(other)
         manifest['temporal_results'] = [{'grid': '南区', 'event_count': 7, 'sentinel': 'unchanged'}]
         write_json(self.manifest, manifest)

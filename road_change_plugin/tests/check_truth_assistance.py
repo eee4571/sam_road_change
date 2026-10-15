@@ -104,7 +104,10 @@ class AssistanceTests(unittest.TestCase):
 
     def test_partial_source_network_cannot_remove_unseen_truth_on_review(self):
         gt, truth = roads()
-        gt['truth_id'] = 'source_network'
+        from engine.fast_gt_reconciliation import _id
+        source_geometry = truth.geometry.union_all()
+        truth = gpd.GeoDataFrame({'BHBM':[2]}, geometry=[source_geometry], crs=truth.crs)
+        gt['truth_id'] = _id(source_geometry, 'GT')
         result, _, audit = limit_truth_assistance(automatic(gt.iloc[:0]), gt, truth, GRID)
         self.assertEqual(len(result), 19)
         self.assertFalse(result.truth_object_complete.any())
@@ -116,7 +119,9 @@ class AssistanceTests(unittest.TestCase):
             path = Path(raw)/'audit.gpkg'
             result.to_file(path, layer='changes', driver='GPKG')
             filtered = build_truth_filter(public, {str(i): 'reject' for i in range(len(public))}, path)
-        self.assertEqual(filtered['objects'], [])
+        from engine.reviewed_truth import apply_truth_filter
+        effective, _ = apply_truth_filter(truth, filtered, 'BHBM')
+        self.assertAlmostEqual(effective.geometry.area.sum()/truth.geometry.area.sum(), .05)
 
     def test_curved_supplement_keeps_original_axis_and_audits_missing_range(self):
         gt, _ = roads(1)

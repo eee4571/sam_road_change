@@ -3214,10 +3214,26 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         truth, evaluation_truth_type_field = apply_truth_value_mapping(
             truth, original_truth_type_field, truth_value_map,
         )
-    from engine.reviewed_truth import apply_truth_filter
+    is_fast_result = str(entry.get('execution_profile') or manifest.get('execution_profile')
+                         or summary.get('execution_profile') or '') == 'fast'
+    pixel_grid = None
+    grid_error = ''
+    if is_fast_result:
+        from rasterio.errors import RasterioIOError
+        try:
+            pixel_grid = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        except (FileNotFoundError, RasterioIOError) as error:
+            grid_error = str(error)
+    from engine.reviewed_truth import apply_truth_filter, saved_truth_filter
+    review = entry.get('manual_review') or {}
+    if review:
+        review['truth_filter'] = saved_truth_filter(review,
+            Path(entry.get('output') or '')/'gt_assisted_audit.gpkg',
+            audit_layer=entry.get('review_audit_layer', 'changes'),
+            position_grid=pixel_grid[:2] if pixel_grid else None)
     original_evaluation_truth = truth
     truth, review_truth_metadata = apply_truth_filter(
-        truth, (entry.get('manual_review') or {}).get('truth_filter'), evaluation_truth_type_field,
+        truth, review.get('truth_filter'), evaluation_truth_type_field,
     )
     if changes_path.is_file():
         predicted = gpd.read_file(changes_path)
@@ -3240,16 +3256,6 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         )
     validation_value = str(args.validation_area or entry.get("validation_area") or manifest.get("validation_area") or "").strip()
     validation = gpd.read_file(validation_value) if validation_value else None
-    is_fast_result = str(entry.get('execution_profile') or manifest.get('execution_profile')
-                         or summary.get('execution_profile') or '') == 'fast'
-    pixel_grid = None
-    grid_error = ''
-    if is_fast_result:
-        from rasterio.errors import RasterioIOError
-        try:
-            pixel_grid = _fast_assisted_evaluation_grid(manifest, entry, summary)
-        except (FileNotFoundError, RasterioIOError) as error:
-            grid_error = str(error)
     rows, metadata = evaluate_changes(
         predicted,
         truth,

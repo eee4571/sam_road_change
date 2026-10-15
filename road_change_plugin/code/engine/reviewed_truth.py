@@ -1,21 +1,23 @@
-"""Use explicit generation identities to apply human corrections to evaluation truth.
+"""Apply human rejection of truth-assisted changes to evaluation truth.
 
-Public polygons dissolve several intervals. A truth object can be excluded only
-when every linked interval maps to rejected public polygons. Retained, pending,
-unmapped, and Auto-supported intervals protect the original object.
+Complete rejected sources are excluded; partial rejections exclude only their
+associated spatial support. Original truth files and unrelated roads stay intact.
 """
+import json
 from pathlib import Path
 
 import geopandas as gpd
-from shapely import make_valid
+from shapely import from_wkt, make_valid, union_all
 
 
-def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes'):
+def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes',
+                       position_grid=None, position_tolerance_px=4.):
     audit_path = Path(audit_path)
     audit = gpd.read_file(audit_path, layer=audit_layer)
     if audit.crs is None:
         raise ValueError('变化来源记录缺少坐标系，无法更新复核评价')
-    result = {'audit': str(audit_path), 'crs': audit.crs.to_wkt(), 'objects': []}
+    result = {'version': 2, 'audit': str(audit_path), 'crs': audit.crs.to_wkt(), 'objects': [],
+              'position_tolerance_px': float(position_tolerance_px) if position_grid else None}
     if audit.empty:
         return result
     required = {'change_src', 'truth_id', 'change_typ'}
@@ -29,63 +31,113 @@ def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes'
         raise ValueError('变化来源记录缺少类型，无法更新复核评价')
     public = original.to_crs(audit.crs)
     spatial_index = public.sindex
+
+    def expanded(geometry):
+        if position_grid is None:
+            return geometry
+        from road_change_detection import _expand_by_pixels
+        return _expand_by_pixels(geometry, audit.crs, position_grid, position_tolerance_px)
+
     groups = {key: group for key, group in linked.groupby('truth_id', sort=False)}
     for truth_id, generated_group in generated.groupby('truth_id', sort=False):
         group = groups[truth_id]
-        if 'truth_object_complete' in group and not group.truth_object_complete.fillna(False).astype(bool).all():
-            continue
-        review_ids = set()
-        fully_rejected = True
+        complete = ('truth_object_complete' not in group or
+                    group.truth_object_complete.fillna(False).astype(bool).all())
+        fully_rejected = bool(complete)
+        review_ids, rejected, protected = set(), [], []
         for row in group.itertuples():
             if row.geometry is None or row.geometry.is_empty:
                 fully_rejected = False
-                break
+                continue
             geometry = make_valid(row.geometry)
             hits = []
             for position in spatial_index.query(geometry, predicate='intersects'):
                 feature = public.iloc[int(position)]
                 if feature.change_typ != row.change_typ:
                     continue
-                # Boundary contact and numerical slivers do not establish origin.
-                overlap = geometry.intersection(make_valid(feature.geometry)).area
-                if overlap > max(1e-8, geometry.area * 1e-10):
-                    hits.append(str(int(position)))
+                overlap = geometry.intersection(make_valid(feature.geometry))
+                if overlap.area <= max(1e-8, geometry.area * 1e-10):
+                    continue
+                index = str(int(position))
+                hits.append(index)
+                if decisions[index] != 'reject':
+                    protected.append(overlap)
+                elif row.change_src == 'GT_ASSISTED':
+                    rejected.append(overlap)
+                    review_ids.add(index)
+            if not hits:
+                protected.append(geometry)
             if not hits or any(decisions[index] != 'reject' for index in hits):
                 fully_rejected = False
-                break
-            review_ids.update(hits)
-        if fully_rejected:
-            kinds = {str(value) for value in generated_group.gt_type
-                     if str(value) in {'added', 'removed', 'widened', 'narrowed', 'width_changed'}}
-            kinds = {'width_changed' if kind in {'widened', 'narrowed'} else kind for kind in kinds}
-            if kinds:
-                result['objects'].append({'truth_id': str(truth_id), 'types': sorted(kinds),
-                                          'review_ids': sorted(review_ids, key=int)})
+        if not rejected:
+            continue
+        kinds = {str(value) for value in generated_group.gt_type
+                 if str(value) in {'added', 'removed', 'widened', 'narrowed', 'width_changed'}}
+        kinds = {'width_changed' if kind in {'widened', 'narrowed'} else kind for kind in kinds}
+        if not kinds:
+            continue
+        item = dict(truth_id=str(truth_id), types=sorted(kinds),
+                    review_ids=sorted(review_ids, key=int), scope='whole' if fully_rejected else 'partial')
+        if not fully_rejected:
+            mask = expanded(union_all(rejected)).difference(expanded(union_all(protected)))
+            if mask.is_empty:
+                continue
+            item['excluded_geometry_wkt'] = make_valid(mask).wkt
+        result['objects'].append(item)
     return result
 
 
+def saved_truth_filter(review, audit_path, *, audit_layer='changes', position_grid=None):
+    """Rebuild from saved decisions, including projects saved before partial support."""
+    record_path = Path(review.get('record') or '')
+    original_path = Path(review.get('original') or '')
+    if not record_path.is_file() or not original_path.is_file():
+        return review.get('truth_filter')
+    record = json.loads(record_path.read_text(encoding='utf-8-sig'))
+    decisions = record['decisions']
+    if not any(value == 'reject' for value in decisions.values()):
+        return None
+    if not Path(audit_path).is_file():
+        # Older unassisted outputs may have no origin audit at all.
+        return review.get('truth_filter')
+    return build_truth_filter(gpd.read_file(original_path), decisions, audit_path,
+                              audit_layer=audit_layer, position_grid=position_grid)
+
+
 def apply_truth_filter(truth, review_filter, truth_type_field):
-    """Filter in memory; original files and the evaluation formula stay intact."""
+    """Exclude identified reviewed support in memory without changing source files."""
     if not review_filter or not review_filter['objects']:
         return truth, {}
     from .fast_gt_reconciliation import _id
     from road_change_detection import _truth_type_field, _normalized_truth_change_type
 
     field = _truth_type_field(truth, truth_type_field)
-    identities = {(item['truth_id'], kind) for item in review_filter['objects'] for kind in item['types']}
+    identities = {(item['truth_id'], kind): item for item in review_filter['objects'] for kind in item['types']}
     projected = truth.to_crs(review_filter['crs'])
-    excluded, applied = [], []
-    for _, row in projected.iterrows():
+    filtered = truth.copy()
+    retained, excluded, partial = [], [], []
+    for position, (_, row) in enumerate(projected.iterrows()):
         geometry = row.geometry
         kind = _normalized_truth_change_type(row[field], field, 'three') if field else None
         identity = _id(geometry, 'GT') if geometry is not None and not geometry.is_empty else ''
-        remove = (identity, kind) in identities
-        excluded.append(remove)
-        if remove:
-            applied.append(identity)
-    # Recomputed from the original truth on every evaluation. A changed source
-    # geometry or class cannot silently inherit an old exclusion.
-    filtered = truth.iloc[[i for i, remove in enumerate(excluded) if not remove]].copy()
+        item = identities.get((identity, kind))
+        remaining = geometry
+        if item is not None:
+            if item.get('scope', 'whole') == 'whole':
+                excluded.append(identity)
+                continue
+            remaining = make_valid(geometry).difference(from_wkt(item['excluded_geometry_wkt']))
+            if remaining.is_empty:
+                excluded.append(identity)
+                continue
+            if not remaining.equals(geometry):
+                partial.append(identity)
+                filtered.iat[position, filtered.columns.get_loc(filtered.geometry.name)] = gpd.GeoSeries(
+                    [remaining], crs=projected.crs).to_crs(truth.crs).iloc[0]
+        retained.append(position)
+    filtered = filtered.iloc[retained].copy()
     metadata = {'original_feature_count': len(truth), 'effective_feature_count': len(filtered),
-                'excluded_feature_count': len(applied), 'excluded_truth_ids': sorted(set(applied))}
+                'excluded_feature_count': len(excluded), 'excluded_truth_ids': sorted(set(excluded)),
+                'partially_excluded_feature_count': len(partial), 'partially_excluded_truth_ids': sorted(set(partial)),
+                'truth_filter_version': review_filter.get('version', 1)}
     return filtered, metadata
