@@ -60,12 +60,11 @@ class AccuracyTests(unittest.TestCase):
         self.assertGreater(result['road_centerline_completeness'],.98)
         self.assertGreater(result['truth_centerline_length_px'],350)
 
-    def test_partial_correction_identities_cannot_erase_actual_road_coverage(self):
+    def test_all_published_roads_contribute_to_coverage(self):
         truth=frame([dict(BHBM=2,geometry=box(100,y,200,y+8)) for y in (100,200)])
         predicted=truth.rename(columns={'BHBM':'change_typ'});predicted['change_typ']='added'
         result=evaluate_fast_assisted_centerline_metrics(predicted,truth,truth_type_field='BHBM',
-            image_crs=3857,image_transform=from_origin(0,500,.5,.5),image_shape=(1000,1000),
-            offset_predicted=predicted.iloc[:1])
+            image_crs=3857,image_transform=from_origin(0,500,.5,.5),image_shape=(1000,1000))
         self.assertEqual(result['road_centerline_completeness'],1.)
         self.assertEqual(result['centerline_mean_offset_px'],0.)
 
@@ -187,7 +186,7 @@ class RegionalEvaluationTests(unittest.TestCase):
                 row=pipeline.read_json(summary)['evaluation']['metrics'][0]
                 if name=='north':
                     self.assertEqual(pipeline.read_json(summary)['evaluation']['metadata']['centerline_association'],
-                                     'final_road_intervals_from_correction_identity')
+                                     'reciprocal_road_segments_all_published')
                 self.assertAlmostEqual(row['recall'],.875,places=5)
                 self.assertAlmostEqual(row['change_recall'],1.,places=5)
                 self.assertAlmostEqual(row['centerline_mean_offset_px'],2.,delta=.15)

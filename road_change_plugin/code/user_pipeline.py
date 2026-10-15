@@ -2940,6 +2940,8 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 for source in source_rows for key in pixel_keys)
             tolerances = {source.get("centerline_match_tolerance_px", 4.0) for source in source_rows}
             comparable_completeness = pixel_totals_valid and len(tolerances) == 1
+            offset_methods = {source.get('centerline_offset_method', 'nearest_skeleton_v0') for source in source_rows}
+            comparable_offset = pixel_totals_valid and len(offset_methods) == 1
             row.update({
                 "centerline_match_tolerance_px": next(iter(tolerances)) if len(tolerances) == 1 else None,
                 "change_precision": precision,
@@ -2952,7 +2954,7 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 "centerline_mean_offset_px": (
                     sums["centerline_offset_integral_px2"]
                     / sums["predicted_centerline_length_px"]
-                    if pixel_totals_valid and sums["predicted_centerline_length_px"] else None
+                    if comparable_offset and sums["predicted_centerline_length_px"] else None
                 ),
                 "change_type_accuracy": (
                     sums["type_correct_tp_count"] / sums["type_matched_tp_count"]
@@ -2984,12 +2986,21 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
             row['centerline_offset_status'] = ('computed' if row['centerline_mean_offset_px'] is not None
                                               else 'unavailable')
             row['centerline_offset_reason'] = (
-                '原始影像像素坐标；新增与灭失；按预测骨架像素数量加权'
+                '原始影像像素坐标；新增与灭失；按参与评价的中心线长度加权'
                 if pixel_totals_valid else '部分变化对缺少像素评价统计，未以零值或米制结果替代')
             if not pixel_totals_valid:
                 reasons = dict.fromkeys(str(source.get('centerline_offset_reason') or '') for source in source_rows
                                         if source.get('centerline_mean_offset_px') is None)
                 row['centerline_offset_reason'] += ': ' + '; '.join(reason for reason in reasons if reason)
+            row['centerline_offset_method'] = next(iter(offset_methods)) if len(offset_methods) == 1 else None
+            if not comparable_offset:
+                row['centerline_offset_reason'] += '；中心线偏移口径不同或统计缺失，请重新评价相关变化对'
+            if comparable_offset and row['centerline_offset_method'] == 'reciprocal_road_segments_v1':
+                total = sum(source.get('centerline_total_prediction_length_px', 0.) for source in source_rows)
+                matched = sums['predicted_centerline_length_px']
+                row.update(centerline_total_prediction_length_px=total,
+                    centerline_unmatched_prediction_length_px=max(0., total-matched),
+                    centerline_matched_prediction_fraction=matched/total if total else None)
             if pixel_totals_valid and not comparable_completeness:
                 row["centerline_offset_reason"] += "；完整度匹配容差不一致，请重新评价相关变化对"
         if any(source.get('change_metric_method') == 'area_with_pixel_tolerance_v1' for source in source_rows):
@@ -3323,16 +3334,9 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
                     position_supported_prediction_m2=None, change_metric_reason=grid_error)
         else:
             image_crs, image_transform, image_shape = pixel_grid
-            centerline_predicted=predicted
-            final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
-            if final_audit.is_file():
-                from engine.gt_road_geometry import matched_final_roads
-                centerline_predicted=matched_final_roads(predicted,final_audit)
-                metadata['centerline_association']='final_road_intervals_from_correction_identity'
-                metadata['centerline_matched_object_count']=len(centerline_predicted)
+            metadata['centerline_association']='reciprocal_road_segments_all_published'
             rows[0].update(evaluate_fast_assisted_centerline_metrics(
                 predicted, truth, truth_type_field=evaluation_truth_type_field,
-                offset_predicted=centerline_predicted,
                 image_crs=image_crs, image_transform=image_transform, image_shape=image_shape,
                 validation_area=validation,
             ))

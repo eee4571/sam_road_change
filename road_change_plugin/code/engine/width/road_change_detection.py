@@ -1716,7 +1716,6 @@ def evaluate_fast_assisted_centerline_metrics(
     image_transform,
     image_shape: tuple[int, int],
     validation_area: gpd.GeoDataFrame | None = None,
-    offset_predicted: gpd.GeoDataFrame | None = None,
     centerline_match_tolerance_px: float = 4.0,
 ) -> dict:
     """Measure Final added/removed axes directly on the source image grid."""
@@ -1786,22 +1785,13 @@ def evaluate_fast_assisted_centerline_metrics(
 
     truth = components(truth)
     predicted = components(predicted)
-    # Coverage uses all published roads. Optional correction identities only
-    # select the roads used for displacement; they must never erase coverage.
-    offset_roads = predicted
-    if offset_predicted is not None:
-        offset_roads = _clean_geometries(offset_predicted).to_crs(image_crs)
-        if validation is not None:
-            offset_roads = _clip_frame(offset_roads, validation)
-        offset_roads['_fast_type'] = normalized_change_series(offset_roads, 'change_typ', 'three')
-        offset_roads.geometry = offset_roads.geometry.map(
-            lambda geometry: make_valid(to_pixel_geometry(geometry).intersection(image_extent)))
-        offset_roads = components(offset_roads)
+    # All published geometry participates, regardless of correction identities.
+    from engine.centerline_correspondence import axis_samples, corresponding_distances, METHOD, SEARCH_PX
 
     tolerance = float(centerline_match_tolerance_px)
     search_radius = max(32.0, 8.0 * tolerance)
 
-    def raster_axes(primary_geometry, reference_geometries) -> tuple[np.ndarray, np.ndarray]:
+    def raster_axes(primary_geometry, reference_geometries):
         reference_geometry = (
             union_all(np.asarray(reference_geometries, dtype=object))
             if reference_geometries else None
@@ -1821,7 +1811,7 @@ def evaluate_fast_assisted_centerline_metrics(
         check_grid(local_shape)
         if local_shape[0] <= 0 or local_shape[1] <= 0:
             empty = np.zeros((0, 0), dtype=bool)
-            return empty, empty
+            return empty, empty, (column_start, row_start)
         local_transform = Affine.translation(column_start, row_start)
         primary_mask = rasterize(
             [(primary_geometry, 1)], out_shape=local_shape,
@@ -1835,16 +1825,16 @@ def evaluate_fast_assisted_centerline_metrics(
             if reference_geometry is not None and not reference_geometry.is_empty
             else np.zeros(local_shape, dtype=bool)
         )
-        return skeletonize(primary_mask), skeletonize(reference_mask)
+        return skeletonize(primary_mask), skeletonize(reference_mask), (column_start, row_start)
 
     truth_length_px = covered_truth_length_px = 0.0
     predicted_length_px = offset_integral_px2 = 0.0
+    all_predicted_length_px = 0.0
 
     for change_type in ("added", "removed"):
         truth_part = truth.loc[truth["_fast_type"] == change_type].copy()
         predicted_part = predicted.loc[predicted["_fast_type"] == change_type].copy()
         predicted_index = predicted_part.sindex if not predicted_part.empty else None
-        truth_index = truth_part.sindex if not truth_part.empty else None
 
         for truth_geometry in truth_part.geometry:
             candidate_geometries = []
@@ -1858,7 +1848,7 @@ def evaluate_fast_assisted_centerline_metrics(
                 candidate_geometries = predicted_part.iloc[
                     positions.tolist()
                 ].geometry.tolist()
-            truth_axis, predicted_axis = raster_axes(
+            truth_axis, predicted_axis, _ = raster_axes(
                 truth_geometry, candidate_geometries,
             )
             truth_count = int(truth_axis.sum())
@@ -1871,31 +1861,18 @@ def evaluate_fast_assisted_centerline_metrics(
                     distance_to_predicted[truth_axis] <= tolerance
                 ))
 
-        for predicted_geometry in offset_roads.loc[offset_roads['_fast_type'] == change_type].geometry:
-            candidate_geometries = []
-            if truth_index is not None:
-                positions = np.asarray(
-                    truth_index.query(
-                        predicted_geometry.buffer(search_radius), predicate="intersects",
-                    ),
-                    dtype=int,
-                ).reshape(-1)
-                candidate_geometries = truth_part.iloc[
-                    positions.tolist()
-                ].geometry.tolist()
-            if not candidate_geometries:
-                continue
-            predicted_axis, truth_axis = raster_axes(
-                predicted_geometry, candidate_geometries,
-            )
-            predicted_count = int(predicted_axis.sum())
-            if predicted_count == 0 or not truth_axis.any():
-                continue
-            distance_to_truth = distance_transform_edt(~truth_axis)
-            predicted_length_px += float(predicted_count)
-            offset_integral_px2 += float(
-                distance_to_truth[predicted_axis].sum()
-            )
+        def samples(frame):
+            parts = []
+            for geometry in frame.geometry:
+                axis, _, origin = raster_axes(geometry, [])
+                parts.append(axis_samples(axis, origin))
+            return np.concatenate(parts) if parts else np.empty((0, 5))
+
+        predicted_samples, truth_samples = samples(predicted_part), samples(truth_part)
+        distances, weights = corresponding_distances(predicted_samples, truth_samples)
+        all_predicted_length_px += float(predicted_samples[:, 4].sum())
+        predicted_length_px += float(weights.sum())
+        offset_integral_px2 += float(distances @ weights)
 
     return {
         "road_centerline_completeness": (
@@ -1908,8 +1885,13 @@ def evaluate_fast_assisted_centerline_metrics(
         ),
         "centerline_offset_status": "computed" if predicted_length_px > 0 else "unavailable",
         "centerline_offset_reason": (
-            "原始影像像素坐标；新增与灭失；预测骨架到同类真值骨架的平均距离"
+            "原始影像像素坐标；同类道路双向对应段按弧长加权；超出4px的已匹配距离仍计入"
             if predicted_length_px > 0 else "没有可比较的预测与真值骨架，未使用米制结果替代"),
+        "centerline_offset_method": METHOD,
+        "centerline_association_radius_px": SEARCH_PX,
+        "centerline_total_prediction_length_px": all_predicted_length_px,
+        "centerline_unmatched_prediction_length_px": max(0., all_predicted_length_px - predicted_length_px),
+        "centerline_matched_prediction_fraction": predicted_length_px / all_predicted_length_px if all_predicted_length_px else None,
         "centerline_match_tolerance_px": tolerance,
         "truth_centerline_length_px": float(truth_length_px),
         "covered_truth_centerline_length_px": float(covered_truth_length_px),
