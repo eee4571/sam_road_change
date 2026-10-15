@@ -38,6 +38,19 @@ def automatic(frame):
 
 
 class AssistanceTests(unittest.TestCase):
+    def test_changed_assistance_budget_keeps_unaffected_auto_geometry_and_type(self):
+        gt, truth = roads(10)
+        auto = automatic(gt.iloc[:5])
+        baseline = auto.copy(deep=True)
+        first, _, _ = limit_truth_assistance(auto, gt, truth, GRID, target=.8)
+        second, _, _ = limit_truth_assistance(auto, gt, truth, GRID, target=.95)
+        for result in (first, second):
+            retained = result.loc[result.change_src.eq('AUTO')]
+            self.assertEqual(list(retained.geometry.to_wkb()), list(baseline.geometry.to_wkb()))
+            self.assertEqual(list(retained.change_typ), list(baseline.change_typ))
+        self.assertTrue(auto.equals(baseline))
+        self.assertFalse(first.geometry.union_all().equals(second.geometry.union_all()))
+
     def assert_actual_score(self, result, truth, audit, **kwargs):
         metrics, _ = evaluate_changes(change_surfaces(result), truth, truth_type_field='BHBM',
                                       position_grid=GRID, **kwargs)

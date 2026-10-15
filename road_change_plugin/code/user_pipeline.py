@@ -4736,6 +4736,10 @@ def _refresh_fast_period_entries(manifest: dict, grid: str, names=None) -> None:
 
 
 def _rerun_change_entry(manifest: dict, grid: str, before: str, after: str) -> dict:
+    from app.review_history import snapshot_review_source
+    for previous in manifest.get('change_results', []):
+        if (str(previous.get('grid')), str(previous.get('before_period')), str(previous.get('after_period'))) == (grid, before, after):
+            snapshot_review_source(manifest, previous)
     from engine.fast_multitemporal import dependency_periods
     _refresh_fast_period_entries(manifest,grid,dependency_periods(_manifest_period_plan(manifest).get(grid,[]),before,after))
     periods = {

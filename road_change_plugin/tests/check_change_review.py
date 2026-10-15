@@ -92,7 +92,7 @@ class ReviewTests(unittest.TestCase):
         pyogrio.write_dataframe(changed,candidates,encoding='UTF-8')
         with self.assertRaisesRegex(ValueError,'已改变'):session.save(decisions)
         with self.assertRaisesRegex(ValueError,'已改变'):reopened.save(decisions)
-        self.assertTrue(all(f['status']=='pending' for f in ReviewSession(self.manifest).open_pair(0)['features']))
+        self.assertEqual({f['id']:f['status'] for f in ReviewSession(self.manifest).open_pair(0)['features']}, decisions)
 
     def test_save_resume_preserves_original_and_attributes(self):
         before = source_signature(self.source, self.session.inputs)
@@ -120,6 +120,9 @@ class ReviewTests(unittest.TestCase):
         saved = self.session.save({str(i): "reject" for i in range(3)})
         self.assertEqual(len(gpd.read_file(saved["path"])), 0)
         pyogrio.write_dataframe(self.frame.iloc[:0], self.source, geometry_type="LineString")
+        manifest = read_json(self.manifest)
+        manifest['change_results'][0].pop('manual_review', None)
+        write_json(self.manifest, manifest)
         empty = ReviewSession(self.manifest)
         self.assertEqual(empty.open_pair(0)["features"], [])
         saved = empty.save({})
@@ -128,7 +131,7 @@ class ReviewTests(unittest.TestCase):
     def test_changed_source_does_not_reuse_review(self):
         self.session.save({str(i): "reject" for i in range(3)})
         altered = self.frame.copy()
-        altered.loc[0, "road_id"] = 999
+        altered["width_m"] = 999
         pyogrio.write_dataframe(altered, self.source, encoding="UTF-8")
         with self.assertRaisesRegex(ValueError, "已改变"):
             self.session.save({str(i): "keep" for i in range(3)})
@@ -358,11 +361,65 @@ class ReviewTests(unittest.TestCase):
     def test_changed_detection_does_not_load_autosaved_judgements(self):
         self.session.record({str(i): 'reject' for i in range(3)})
         changed = self.frame.copy()
-        changed.loc[0, 'road_id'] = 999
+        changed['width_m'] = 999
         pyogrio.write_dataframe(changed, self.source, encoding='UTF-8')
         data = ReviewSession(self.manifest).open_pair(0)
         self.assertTrue(data['warning'])
         self.assertTrue(all(f['status'] == 'pending' for f in data['features']))
+
+    def test_reordered_legacy_review_restores_unchanged_only_and_requires_apply(self):
+        decisions = {'0': 'keep', '1': 'reject', '2': 'keep'}
+        self.session.save(decisions)
+        # Simulate an old program's records without per-feature fingerprints.
+        pointer = read_json(self.session.folder / 'current.json')
+        record_path = self.session.folder / pointer['version'] / 'review.json'
+        for path in (record_path, self.session.folder / 'draft.json'):
+            record = read_json(path); record.pop('feature_keys', None); write_json(path, record)
+        candidates = self.root / 'new_candidates.shp'
+        frame = self.frame.iloc[[1, 2, 0]].reset_index(drop=True)
+        frame.loc[1, 'width_m'] = 12.
+        pyogrio.write_dataframe(frame, candidates, encoding='UTF-8')
+        manifest = read_json(self.manifest)
+        entry = manifest['change_results'][0]
+        entry.pop('manual_review', None)
+        entry['review_candidates'] = str(candidates)
+        write_json(self.manifest, manifest)
+        session = ReviewSession(self.manifest)
+        data = session.open_pair(0)
+        expected = {'0': 'reject', '1': 'pending', '2': 'keep'}
+        self.assertEqual({f['id']:f['status'] for f in data['features']}, expected)
+        self.assertEqual(set(data['applied_decisions'].values()), {'pending'})
+        self.assertTrue(session.review_states()[0]['modified'])
+        self.assertEqual(read_json(record_path)['decisions'], decisions)
+        session.save(expected)
+        reopened = ReviewSession(self.manifest).open_pair(0)
+        self.assertEqual(reopened['applied_decisions'], expected)
+        self.assertEqual(len(gpd.read_file(self.source)), 1)
+
+    def test_identical_rerun_preserves_decisions_but_marks_publication_pending(self):
+        decisions = {'0': 'keep', '1': 'reject', '2': 'pending'}
+        self.session.save(decisions)
+        manifest = read_json(self.manifest)
+        entry = manifest['change_results'][0]
+        original = entry.pop('manual_review')['original']
+        entry['review_candidates'] = original
+        write_json(self.manifest, manifest)
+        session = ReviewSession(self.manifest)
+        data = session.open_pair(0)
+        self.assertEqual({f['id']:f['status'] for f in data['features']}, decisions)
+        self.assertEqual(set(data['applied_decisions'].values()), {'pending'})
+        self.assertTrue(session.review_states()[0]['modified'])
+
+    def test_relocated_legacy_inputs_do_not_hide_rejected_objects(self):
+        decisions = {'0': 'keep', '1': 'reject', '2': 'reject'}
+        self.session.save(decisions)
+        manifest = read_json(self.manifest)
+        for name, info in manifest['input_spec']['grids']['北区'].items():
+            info['path'] = str(self.root / (name + '.txt'))
+        write_json(self.manifest, manifest)
+        data = ReviewSession(self.manifest).open_pair(0)
+        self.assertEqual(len(data['features']), 3)
+        self.assertEqual({f['id']: f['status'] for f in data['features']}, decisions)
 
 
 if __name__ == "__main__":

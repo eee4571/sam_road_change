@@ -6,7 +6,7 @@ line. Publication uses immutable versions and an atomic current.json pointer.
 from __future__ import annotations
 
 import base64
-import hashlib
+from collections import Counter
 import io
 import json
 import os
@@ -29,6 +29,7 @@ from shapely.geometry import box, mapping
 from shapely.ops import transform
 
 from input_catalog import read_path_list
+from .review_history import source_signature, feature_keys, match_decisions
 
 PREFIX = "__ROAD_REVIEW__"
 STATES = {"pending", "keep", "reject"}
@@ -49,21 +50,6 @@ def atomic_json(path, data):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def source_signature(path, inputs):
-    digest = hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
-    for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
-        part = path.with_suffix(suffix)
-        digest.update(suffix.encode("ascii"))
-        if not part.is_file():
-            if suffix in {".shp", ".shx", ".dbf", ".prj"}:
-                raise ValueError(f"变化数据缺少文件：{part}")
-            continue
-        with part.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    return digest.hexdigest()
 
 
 class ReviewSession:
@@ -107,7 +93,10 @@ class ReviewSession:
                 applied = read_json(folder / version / 'review.json')
             draft = read_json(folder / 'draft.json') if (folder / 'draft.json').is_file() else applied
             decisions = draft.get('decisions', {})
-            baseline = applied.get('decisions', {}) if draft.get('source_signature') == applied.get('source_signature') else {}
+            entry = next((e for e in self.manifest.get('change_results', [])
+                          if all(e.get(k) == pair.get(k) for k in ('grid', 'before_period', 'after_period'))), {})
+            baseline = (applied.get('decisions', {}) if entry.get('manual_review') and
+                        draft.get('source_signature') == applied.get('source_signature') else {})
             baseline = {key: baseline.get(key, 'pending') for key in decisions}
             states.append({'known': bool(draft), 'modified': decisions != baseline,
                            'counts': {s: sum(v == s for v in decisions.values()) for s in STATES}})
@@ -129,11 +118,24 @@ class ReviewSession:
         if entry.get('review_candidates'):
             source=self.resolve(entry['review_candidates'])
             signature=source_signature(source,inputs)
-        elif review.get('published_signature') == signature:
-            source = Path(review['original'])
-            signature = source_signature(source, inputs)
-            if signature != review['source_signature']:
-                raise ValueError('原始变化备份已改变，无法继续复核')
+        elif review.get('original'):
+            original = Path(review['original'])
+            approved = original.with_name('road_changes_reviewed.shp')
+            same_context = review.get('published_signature') == signature
+            # Copying a project changes image-list paths in the signature. The
+            # immutable published snapshot proves this is still the same result;
+            # open the full original, including rejected roads, not just the kept subset.
+            same_data = False
+            if not same_context and approved.is_file():
+                # Publishing drops non-product columns; compare the semantic
+                # contents, not DBF bytes or a regenerated feature numbering.
+                same_data = (Counter(feature_keys(gpd.read_file(source, engine='pyogrio')).values()) ==
+                             Counter(feature_keys(gpd.read_file(approved, engine='pyogrio')).values()))
+            if same_context or same_data:
+                source = original
+                signature = source_signature(source, inputs)
+                if same_context and signature != review['source_signature']:
+                    raise ValueError('原始变化备份已改变，无法继续复核')
         frame = gpd.read_file(source, engine="pyogrio")
         if frame.crs is None:
             raise ValueError("变化成果缺少坐标系，无法与影像叠加")
@@ -142,6 +144,7 @@ class ReviewSession:
         self.pair, self.source, self.inputs, self.signature = pair, source, inputs, signature
         self.folder = self.published_source.parent / "人工复核" / self.published_source.stem
         statuses, warning, saved_path = {}, "", ""
+        record, original, reconciled = {}, None, False
         pointer = self.folder / "current.json"
         if pointer.is_file():
             current = read_json(pointer)
@@ -149,17 +152,20 @@ class ReviewSession:
             if Path(version).name != version or version in {".", ".."}:
                 raise ValueError("复核记录版本路径无效")
             record = read_json(self.folder / version / "review.json")
+            original = self.folder / version / "original_changes.shp"
             if record["source_signature"] == signature:
                 statuses = record["decisions"]
                 saved_path = str(self.folder / version / "road_changes_reviewed.shp")
                 if review.get('published_signature') == self.published_signature:
                     saved_path = str(self.published_source)
             else:
-                warning = "检测结果或处理输入已改变，本次从待复核开始；旧复核版本仍保留。"
+                statuses = match_decisions(frame, record, original)
+                reconciled = True
         valid_ids = {str(i) for i in range(len(frame))}
         if not isinstance(statuses, dict) or not set(statuses) <= valid_ids or any(s not in STATES for s in statuses.values()):
             raise ValueError("复核记录中的条目或状态无效")
-        applied_decisions = {key: statuses.get(key, 'pending') for key in valid_ids}
+        is_applied = not reconciled and review.get('published_signature') == self.published_signature
+        applied_decisions = {key: statuses.get(key, 'pending') if is_applied else 'pending' for key in valid_ids}
         draft_path = self.folder / 'draft.json'
         if draft_path.is_file():
             draft = read_json(draft_path)
@@ -168,7 +174,21 @@ class ReviewSession:
                 if set(statuses) != valid_ids or any(s not in STATES for s in statuses.values()):
                     raise ValueError('自动保存的复核记录无效')
             else:
-                warning = '检测结果已改变，原复核记录未套用，请重新复核。'
+                draft_original = original if draft.get('source_signature') == record.get('source_signature') else None
+                snapshot = self.folder / 'draft_source.json'
+                if snapshot.is_file():
+                    name = str(read_json(snapshot)['version'])
+                    if Path(name).name != name or name in {'.', '..'}:
+                        raise ValueError('复核记录版本路径无效')
+                    evidence = self.folder / name
+                    if read_json(evidence / 'review.json').get('source_signature') == draft.get('source_signature'):
+                        draft_original = evidence / 'original_changes.shp'
+                statuses = match_decisions(frame, draft, draft_original)
+                reconciled = True
+        if reconciled:
+            count = sum(value in {'keep', 'reject'} for value in statuses.values())
+            warning = f'已恢复 {count} 条未变化对象的复核判断，另有 {len(frame)-count} 条待复核；旧版本仍保留。请完成复核并更新成果。'
+
         # The view uses metres; stored/exported geometry keeps the original CRS.
         valid = frame.geometry.notna() & ~frame.geometry.is_empty
         view_crs = frame.loc[valid].estimate_utm_crs() if valid.any() else frame.crs
@@ -199,6 +219,12 @@ class ReviewSession:
                 self.image_warnings.append(f"{period}：{exc}")
             self.rasters.append(tiles)
         self.frame = frame
+        self.feature_keys = feature_keys(frame)
+        if reconciled:
+            # Persist the new ID mapping immediately, but do not publish drafts.
+            if draft_path.is_file():
+                atomic_json(self.folder / ('draft_' + uuid.uuid4().hex[:12] + '.json'), read_json(draft_path))
+            self.record({str(i): statuses.get(str(i), 'pending') for i in range(len(frame))})
         ordered=frame.sort_values('confidence',ascending=False,kind='stable') if 'confidence' in frame else frame
         return {"pair": pair, "features": [
             {"id": str(i), "change_type": str(row.get("change_typ", "未分类")),
@@ -219,6 +245,7 @@ class ReviewSession:
         self.folder.mkdir(parents=True, exist_ok=True)
         atomic_json(self.folder / 'draft.json', {
             'source_signature': self.signature, 'decisions': decisions,
+            'feature_keys': self.feature_keys,
             'recorded_at': datetime.now(timezone.utc).isoformat()})
         return {'recorded': True}
 
@@ -309,6 +336,7 @@ class ReviewSession:
         counts = {state: sum(s == state for s in decisions.values()) for state in sorted(STATES)}
         record = {"version": 1, "source": str(self.source), "source_signature": self.signature,
                   "pair": self.pair, "decisions": decisions, "counts": counts,
+                  "feature_keys": self.feature_keys,
                   "saved_at": datetime.now(timezone.utc).isoformat(),
                   "retained_pending": False, "evaluation": "not_recomputed"}
         atomic_json(target / "review.json", record)

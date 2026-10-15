@@ -241,7 +241,7 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertEqual(scope, preview)
         self.assertEqual(scope['changes'], ['2020_to_2021', '2021_to_2022'])
         for p in original:
-            self.assertEqual(Path(p['path']).exists(), not self.store.in_scope(p, scope), p['path'])
+            self.assertEqual(Path(p['path']).exists(), p['result_type'] == 'road_change' or not self.store.in_scope(p, scope), p['path'])
         self.assertTrue((self.store.current / 'grids/南区/periods/2021/intermediate.dat').exists())
         self.assertTrue((self.store.current / 'grids/南区/periods/2020/intermediate.dat').exists())
         self.assertTrue((self.store.current / 'grids/南区/changes/2022_to_2023/intermediate.dat').exists())
@@ -259,7 +259,7 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertEqual(scope['periods'], ['2020', '2021'])
         self.assertEqual(scope['changes'], ['2020_to_2021','2021_to_2022','2022_to_2023','2023_to_2024'])
         for product in original:
-            self.assertEqual(Path(product['path']).exists(), not self.store.in_scope(product, scope))
+            self.assertEqual(Path(product['path']).exists(), product['result_type'] == 'road_change' or not self.store.in_scope(product, scope))
         command = self.controller.runner.commands[-1]
         marker = Path(file(self.store.current / 'local_rerun.json', 'saved-step'))
         self.controller.cancel()
@@ -281,6 +281,21 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertTrue((self.store.current / 'grids/南区/changes/2021_to_2022/intermediate.dat').is_file())
         self.assert_cache()
 
+    def test_rerun_and_cancel_preserve_review_versions_drafts_and_previous_changes(self):
+        self.existing()
+        pair = self.output / '南区/02_变化检测/2020_to_2021'
+        records = [Path(file(pair / '人工复核/road_changes' / name, 'human-decisions'))
+                   for name in ('draft.json', 'current.json', 'v1/review.json', 'v1/original_changes.shp')]
+        previous = (pair / 'changes.shp').read_bytes()
+        self.controller.run('rerun-change', self.data)
+        self.assertFalse(self.errors)
+        self.controller.cancel()
+        self.assertEqual((pair / 'changes.shp').read_bytes(), previous)
+        self.assertTrue(all(p.read_text() == 'human-decisions' for p in records))
+        self.controller.run('rerun-change', self.data)
+        self.assertFalse(self.errors)
+        self.assertTrue(all(p.read_text() == 'human-decisions' for p in records))
+
     def test_all_area_changes_preserve_period_caches_and_resume_batch(self):
         self.existing()
         original = self.store.results()
@@ -297,7 +312,7 @@ class ProjectLifecycleTests(unittest.TestCase):
         self.assertEqual(selection['areas'], areas)
         self.assertNotIn('--grid', command)
         for product in original:
-            self.assertEqual(Path(product['path']).exists(), not self.store.in_scope(product, scope))
+            self.assertEqual(Path(product['path']).exists(), product['result_type'] == 'road_change' or not self.store.in_scope(product, scope))
         for grid in ('北区','南区'):
             for year in range(2020,2025):
                 self.assertTrue((self.store.current/f'grids/{grid}/periods/{year}/intermediate.dat').exists())

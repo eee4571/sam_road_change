@@ -51,6 +51,24 @@ class RefreshTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError,'north/2020.*重跑该道路期次'):
             pipeline._refresh_fast_period_entries(self.manifest,'north')
 
+    def test_compatible_program_update_does_not_regenerate_completed_period(self):
+        pipeline._refresh_fast_period_entries(self.manifest,'north')
+        marker = self.f.output/'fast_export_cache.json'
+        saved = pipeline.read_json(marker)
+        # A 1015 installation has different code paths/timestamps, but the same
+        # formal revision. Keep actual source/output signatures unchanged.
+        old_implementation = [['C:/previous_program/formal_road_products.py', 123, 1], 2]
+        saved['inputs'][1] = [['C:/previous_program/fast_pipeline.py', 123, 1]]
+        saved['inputs'][2] = old_implementation
+        saved['result']['formal_road_implementation'] = old_implementation
+        pipeline.write_json(marker, saved)
+        payload = pipeline.read_json(self.path)
+        payload['formal_road_implementation'] = old_implementation
+        pipeline.write_json(self.path, payload)
+        with patch('engine.fast_pipeline.export_fast_products', side_effect=AssertionError('unnecessary upgrade')):
+            pipeline._refresh_fast_period_entries(self.manifest, 'north', {'2020'})
+        self.assertEqual(self.manifest['auto_period_results'][0]['formal_road_implementation'], old_implementation)
+
     def test_unselected_area_or_period_does_not_touch_missing_inputs(self):
         with patch('engine.fast_pipeline.export_fast_products',side_effect=AssertionError('outside scope')):
             pipeline._refresh_fast_period_entries(self.manifest,'south')

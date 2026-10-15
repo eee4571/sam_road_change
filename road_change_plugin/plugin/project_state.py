@@ -318,7 +318,8 @@ class ProjectState:
             targets += [job / 'grids' / safe_name(grid) / 'changes' / safe_name(pair) for pair in changes]
             # Exact published category directories include auxiliary files and previews.
             targets += [self.output / safe_name(grid) / '01_单期道路' / safe_name(p) for p in area_scope['periods']]
-            targets += [self.output / safe_name(grid) / '02_变化检测' / safe_name(pair) for pair in changes]
+            # Keep the previous changes and their immutable review versions until
+            # publication replaces the datasets. Rerunning is not deleting review.
             targets.append(self.output / safe_name(grid) / '03_长时序')
         index_path = self.output / 'result_index.json'
         index = read_json(index_path) if index_path.is_file() else None
@@ -328,6 +329,10 @@ class ProjectState:
             for area in index.get('areas', {}):
                 targets += [self.output / safe_name(area) / '04_精度评价',
                             self.output / safe_name(area) / '02_变化检测' / '精度评价']
+        preserved_changes = [(self.output / safe_name(s['grid']) / '02_变化检测' / safe_name(pair)).resolve()
+                             for s in scopes for pair in s['changes']]
+        targets = [p for p in targets if not any(Path(p).resolve().is_relative_to(folder)
+                                               for folder in preserved_changes)]
         self._delete(targets, data)
         if index:
             for area_scope in scopes:
