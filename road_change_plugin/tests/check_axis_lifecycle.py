@@ -42,7 +42,11 @@ class AxisTests(unittest.TestCase):
         self.assertEqual(fixed.coords[0],axis.coords[0]);self.assertEqual(fixed.coords[-1],axis.coords[-1])
         surface=corridor(fixed,np.array([0.,fixed.length]),np.array([8.,12.]))
         self.assertTrue(surface.is_valid);self.assertEqual(len(surface.interiors),0)
-        with self.assertRaises(AxisQualityError):corridor(axis,[0.,axis.length],[8.,12.])
+        original = axis.wkb
+        folded = corridor(axis, [0., axis.length], [8., 12.])
+        self.assertTrue(folded.is_valid)
+        self.assertLess(axis.difference(folded.buffer(1e-5)).length, 1e-5)
+        self.assertEqual(axis.wkb, original)
 
     def test_degree_two_fragments_repair_as_one_chain(self):
         axis=staircase();xy=list(axis.coords)

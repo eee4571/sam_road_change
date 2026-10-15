@@ -28,8 +28,7 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None):
     profiles=[(profiles[i][0],np.clip(np.asarray(profiles[i][1],float),0.,profiles[i][0].length),
                np.asarray(profiles[i][2],float)) for i in selected]
     if not profiles:return Polygon()
-    from .road_axis_quality import require_safe_axis, axis_quality
-    for axis,_,widths in profiles:require_safe_axis(axis,float(np.median(widths)))
+    from .road_axis_quality import axis_quality
     points=[Point(a.coords[e]) for a,_,_ in profiles for e in (0,-1)]
     tree=STRtree(points);parent=list(range(len(points)))
     def root(i):
@@ -154,7 +153,6 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None):
         sampling=np.linspace(0,axis.length,max(2,int(np.ceil(axis.length/2))+1))
         ww=np.interp(sampling,ss,values)
         if len(ww)>3:ww=gaussian_filter1d(ww,1.,mode='nearest')
-        require_safe_axis(axis,float(np.median(ww)))
         polygons.append(corridor(axis,sampling,ww))
     starts=[i for i in range(len(points)) if i not in pair]+list(range(len(points)))
     for start in starts:

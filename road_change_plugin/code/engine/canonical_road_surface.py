@@ -754,7 +754,7 @@ def _junction(portals, center, required_axes):
     No cyclic portal polygon is clipped against independently buffered stubs.
     That mismatch made valid polygons with rectangular gaps at their seams.
     """
-    from .road_axis_quality import require_safe_axis
+    from .road_axis_quality import note_axis_quality
     stubs=required_axes[-len(portals):];minimum=min(p['width'] for p in portals)/2
     envelopes=[];collars=[];roots={}
     for axis,p in zip(stubs,portals):
@@ -762,7 +762,7 @@ def _junction(portals, center, required_axes):
         if np.linalg.norm(np.asarray(xy[0])-p['point'])<np.linalg.norm(np.asarray(xy[-1])-p['point']):xy.reverse()
         axis=LineString(xy)
         root_width=p.get('root_width',p['width'])
-        require_safe_axis(axis,max(root_width,p['width']))
+        note_axis_quality(axis,max(root_width,p['width']))
         envelopes.append(_chain_surface(axis,[0.,axis.length],[root_width,p['width']],
             end_direction=p['direction'],check_axis=False))
         key=tuple(np.round(xy[0],6));roots[key]=max(roots.get(key,0),root_width/2)
@@ -772,7 +772,7 @@ def _junction(portals, center, required_axes):
         collars.append(Polygon([p['right']-eps,p['left']-eps,p['left']+eps,p['right']+eps]))
     envelopes.extend(Point(xy).buffer(radius) for xy,radius in roots.items())
     for axis in required_axes[:-len(portals)]:
-        require_safe_axis(axis,minimum*2)
+        note_axis_quality(axis,minimum*2)
         envelopes.append(axis.buffer(minimum,cap_style='round'))
     footprint=polygonal(union_all(envelopes))
     # Local concave corner fillets, independently on each connected footprint.
@@ -859,8 +859,8 @@ def _chain_surface(axis, stations, widths, *, start_direction=None, end_directio
     the occupied envelope before any overlay instead. These are sampling cells
     of one stable width function, never the original fragment corridors.
     """
-    from .road_axis_quality import require_safe_axis
-    if check_axis:require_safe_axis(axis,float(np.max(widths)))
+    from .road_axis_quality import note_axis_quality
+    if check_axis:note_axis_quality(axis,float(np.max(widths)))
     xy=np.asarray(axis.coords)
     vertex=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(xy,axis=0),axis=1))]
     ss=np.unique(np.r_[stations,vertex])
@@ -1185,8 +1185,6 @@ def _build_road_geometry(profiles, quality, *, metadata=None, evidence=None, obs
                 bodies.append(body)
             published.add(i)
         with geometry_item("chain_surface",c.sources,on_error=retain_surface_axis,status='fallback',road_local=True):
-            from .road_axis_quality import require_safe_axis
-            require_safe_axis(c.axis,float(np.max(c.widths)))
             a,b=trim[i,0],c.axis.length-trim[i,1]
             axis=substring(c.axis,a,b)
             ss=np.unique(np.r_[a,c.stations[(c.stations>a)&(c.stations<b)],b])

@@ -562,6 +562,30 @@ def conservative_axis_parts(axis,width,neighbours,error):
                         exception_type=type(local).__name__,reason=str(local))]
 
 
+def note_axis_quality(axis, width):
+    """Rendering accepts folds; QA must never veto an otherwise usable road."""
+    from hashlib import sha1
+    from .geometry_recovery import Recovery, current_recovery
+    from .width.width_reliability import require_road_local
+    try:
+        qa = axis_quality(axis, width)
+        if not qa['abnormal']:
+            return
+        error = AxisQualityError('道路轴线存在连续折返或自交，保留原轴线继续生成道路面')
+    except GEOMETRY_ERRORS as failure:
+        require_road_local(failure)
+        qa = {'reasons': [str(failure)]}
+        error = failure
+    recovery = current_recovery() or Recovery()
+    key = sha1(axis.wkb).hexdigest()[:16]
+    if any(r['stage'] == 'axis_quality_notice' and r['source_ids'] == [key]
+           for r in recovery.failures):
+        return
+    row = recovery.record('axis_quality_notice', [key], error, status='warning',
+                          final_action='retain_valid_geometry')
+    row['quality_reasons'] = qa['reasons']
+
+
 def require_safe_axis(axis,width):
     if axis_quality(axis,width)['abnormal']:
         raise AxisQualityError('道路轴线仍存在连续折返，必须在 corridor 前修复')

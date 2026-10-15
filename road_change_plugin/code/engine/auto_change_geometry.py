@@ -109,8 +109,31 @@ def corridor(axis, stations, widths):
     """
     if axis.geom_type != 'LineString' or axis.length <= 0:
         raise ValueError('Published change has no usable longitudinal axis')
-    from .road_axis_quality import require_safe_axis
-    require_safe_axis(axis,float(np.max(widths)))
+    from .road_axis_quality import note_axis_quality
+    from .geometry_recovery import GEOMETRY_ERRORS, Recovery, current_recovery
+    from .width.width_reliability import require_road_local
+    note_axis_quality(axis, float(np.max(widths)))
+    try:
+        surface = _swept_corridor(axis, stations, widths)
+        if surface.is_empty or not surface.is_valid:
+            raise ValueError('Empty or invalid swept road surface')
+        return surface
+    except GEOMETRY_ERRORS as error:
+        require_road_local(error)
+        # A failed variable-width overlay concerns this road only. Preserve its
+        # complete axis, including folds, with a constant-width occupied area.
+        surface = polygonal(axis.buffer(float(np.median(widths))/2,
+                                        cap_style='flat', join_style='round'))
+        if surface.is_empty or not surface.is_valid:
+            raise ValueError('No usable fallback road surface') from error
+        from hashlib import sha1
+        (current_recovery() or Recovery()).record(
+            'corridor_buffer', [sha1(axis.wkb).hexdigest()[:16]], error,
+            status='fallback', final_action='retain_valid_geometry')
+        return surface
+
+
+def _swept_corridor(axis, stations, widths):
     if np.ptp(widths) < 1e-8:
         return polygonal(axis.buffer(float(widths[0])/2, cap_style='flat', join_style='round'))
     original = np.asarray(axis.coords)[:, :2]
