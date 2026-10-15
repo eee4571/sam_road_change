@@ -64,6 +64,13 @@ def road_profile(row, axis, width):
 
 
 def record_polygon(row, axis=None):
+    footprint = row.get('gt_surface_wkt')
+    if isinstance(footprint, str) and footprint:
+        surface = from_wkt(footprint)
+        if axis is None:
+            return surface
+        from .truth_surface import surface_interval
+        return surface_interval(surface, from_wkt(row['axis_wkt']), axis)
     axis=from_wkt(row['axis_wkt']) if axis is None else axis
     b,a=float(row['width_bef']),float(row['width_aft'])
     kind=row['change_typ']
@@ -74,6 +81,17 @@ def record_polygon(row, axis=None):
     if kind=='removed':return surface(b)
     if row.get('gt_geometry_role')=='full_road_change':return surface(max(a,b))
     return surface(a).difference(surface(b)) if a>b else surface(b).difference(surface(a))
+
+
+def slice_record(row, axis, match=None, **attributes):
+    """Move interval metadata and its authoritative footprint together."""
+    geometry = record_polygon(row, axis)
+    result = dict(row, **attributes)
+    result.update(axis_wkt=axis.wkt, match_axis_wkt=(axis if match is None else match).wkt,
+                  length_m=axis.length, geometry=geometry)
+    if isinstance(row.get('gt_surface_wkt'), str) and row['gt_surface_wkt']:
+        result['gt_surface_wkt'] = geometry.wkt
+    return result
 
 def matched_final_roads(predicted, audit_path):
     """Select associated final road intervals before the unchanged metric formula.

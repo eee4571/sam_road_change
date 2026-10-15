@@ -15,17 +15,17 @@ from .continuous_road_geometry import change_surfaces
 
 def _shortened_proposal(group, fraction):
     """Shorten only proposed assistance along its original axis/width profile."""
-    from .gt_road_geometry import record_polygon
+    from .gt_road_geometry import slice_record
     shortened = group.copy()
     for index, row in shortened.iterrows():
         axis = from_wkt(row.axis_wkt)
         reference = from_wkt(row.match_axis_wkt)
         local = substring(axis, 0., axis.length*fraction)
         match = substring(reference, 0., reference.length*fraction)
-        shortened.at[index, 'axis_wkt'] = local.wkt
-        shortened.at[index, 'match_axis_wkt'] = match.wkt
-        shortened.at[index, 'length_m'] = local.length
-        shortened.at[index, 'geometry'] = record_polygon(row, local)
+        updated = slice_record(row.to_dict(), local, match)
+        for field in ('axis_wkt', 'match_axis_wkt', 'length_m', 'geometry', 'gt_surface_wkt'):
+            if field in updated:
+                shortened.at[index, field] = updated[field]
     return shortened
 
 

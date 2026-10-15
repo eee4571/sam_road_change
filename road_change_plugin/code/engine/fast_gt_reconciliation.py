@@ -21,7 +21,7 @@ from shapely.strtree import STRtree
 
 from .auto_change_geometry import FinalWidths, corridor, _direction, _stations, _clean_overlay
 from .auto_change_assembly import polygonal
-from .gt_road_geometry import record_polygon, road_profile
+from .gt_road_geometry import record_polygon, road_profile, slice_record
 from .formal_road_products import export_polygons as _export_polygons
 
 
@@ -213,7 +213,30 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
         if rng.random()<profile.omission_probability:
             audit.append(dict(truth_id=truth_id,action='omitted_object',seed=str(seed)));continue
         declared_width=_number(row,('DLKD','width_m'),6.)
-        axes=_gt_axes(row.geometry,declared_width)
+        # Polygon evidence is authoritative. Associate each disconnected face
+        # with its own axes, partitioning branches without changing its boundary.
+        from .truth_surface import partition_surface
+        faces = polygonal(make_valid(row.geometry))
+        parts = [faces] if faces.geom_type == 'Polygon' else list(faces.geoms)
+        axes = []
+        for face in parts:
+            if face.is_empty:
+                continue
+            descriptions = _gt_axes(face, declared_width)
+            if not descriptions:
+                # A tiny face may have no raster skeleton. Its rectangle's axis
+                # provides association metadata only; keep the complete face.
+                corners = np.asarray(face.minimum_rotated_rectangle.exterior.coords)[:4]
+                edges = np.roll(corners, -1, axis=0) - corners
+                k = int(np.argmax(np.linalg.norm(edges, axis=1)))
+                start = (corners[k] + corners[(k+3)%4]) / 2
+                end = (corners[(k+1)%4] + corners[(k+2)%4]) / 2
+                descriptions = [dict(axis=LineString([start, end]), start_external=True, end_external=True)]
+            footprints = partition_surface(face, [d['axis'] for d in descriptions])
+            axes.extend(dict(d, footprint=footprint) for d, footprint in zip(descriptions, footprints)
+                        if not footprint.is_empty and footprint.area > 0)
+        for line in _parts(row.geometry):
+            axes.extend(_gt_axes(line, declared_width))
         if not axes:
             audit.append(dict(truth_id=truth_id,action='review_no_road_axis',seed=str(seed)));continue
         type_error=rng.random()<profile.type_error_probability
@@ -221,7 +244,10 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
         factor=1.+float(rng.uniform(-profile.width_fraction,profile.width_fraction))
         for part,description in enumerate(axes):
             original=description['axis']
+            footprint = description.get('footprint')
             fitted_width=float(np.median(description.get('fitted_widths',[declared_width])))
+            if footprint is not None:
+                fitted_width = _number(row, ('DLKD', 'width_m'), fitted_width)
             loss=min(profile.maximum_end_loss_m,original.length*profile.end_loss_fraction)*rng.random()
             start_loss=loss if description['start_external'] else 0.
             end_loss=loss if description['end_external'] else 0.
@@ -260,7 +286,9 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
                 length_m=axis.length,before_per=before_period,after_per=after_period,
                 geometry=_change_polygon(axis,resolved_kind,wb,wa)))
             records[-1]['gt_geometry_role']='full_road_change' if kind=='width_changed' else 'road_presence'
-            if 'fitted_widths' in description:
+            if footprint is not None:
+                records[-1]['gt_surface_wkt'] = footprint.wkt
+            elif 'fitted_widths' in description:
                 records[-1]['gt_width_profile']=json.dumps(dict(axis=original.wkt,stations=description['fitted_stations'],
                     widths=description['fitted_widths'],reference_width=fitted_width))
             records[-1]['geometry']=record_polygon(records[-1])
@@ -334,18 +362,14 @@ def correct_changes(auto, assisted):
             old_axis=current[i]
             for part,(start,end) in enumerate(_remaining(old_axis.length,remove[i])):
                 local=substring(old_axis,start,end)
-                revised.append({**row,'change_id':f"{row['change_id']}_rest{part}",'axis_wkt':local.wkt,
-                    'match_axis_wkt':local.wkt,'length_m':local.length,
-                    'geometry':record_polygon(row,local)})
+                revised.append(slice_record(row, local, change_id=f"{row['change_id']}_rest{part}"))
         records=revised
         for part,(start,end) in enumerate(_remaining(axis.length,covered)):
             if end-start<.25:continue
             local=substring(axis,start,end)
             # Match against the corresponding unperturbed longitudinal range.
             match=substring(reference,start/axis.length*reference.length,end/axis.length*reference.length)
-            records.append({**gt,'change_id':f"{gt['change_id']}_fill{part}",'axis_wkt':local.wkt,
-                'match_axis_wkt':match.wkt,'length_m':local.length,
-                'geometry':record_polygon(gt,local)})
+            records.append(slice_record(gt, local, match, change_id=f"{gt['change_id']}_fill{part}"))
             audit.append(dict(truth_id=gt['truth_id'],action='supplement_missed_interval',length_m=local.length))
     return _changes(records,auto.crs),audit
 
@@ -387,9 +411,8 @@ def _atomize_adjacent_changes(changes):
             u,v=(s1-f1*(s1-s0),s1-f0*(s1-s0)) if reverse else (s0+f0*(s1-s0),s0+f1*(s1-s0))
             local=substring(actual,u/source_axis.length*actual.length,v/source_axis.length*actual.length)
             match=substring(ref['axis'],a,b);track_id=_id(match,'RC')
-            records[pair_id].append({**row,'change_id':f"{row['change_id']}_{track_id[2:10]}",
-                'atomic_track':track_id,'axis_wkt':local.wkt,'match_axis_wkt':match.wkt,'length_m':local.length,
-                'geometry':record_polygon(row,local)})
+            records[pair_id].append(slice_record(row, local, match,
+                change_id=f"{row['change_id']}_{track_id[2:10]}", atomic_track=track_id))
     for pair_id,pair in enumerate(changes):pair['frame']=_changes(list(records[pair_id]),pair['frame'].crs)
 
 

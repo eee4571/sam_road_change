@@ -207,8 +207,12 @@ def change_surfaces(frame):
     work=frame.copy()
     work['_full_road']=work.get('gt_geometry_role',pd.Series(index=work.index,dtype=str)).eq('full_road_change')
     for (kind,full_road),group in work.groupby(['change_typ','_full_road'],sort=False):
-        before=[];after=[]
+        before=[];after=[];authoritative=[]
         for row in group.itertuples():
+            footprint = getattr(row, 'gt_surface_wkt', None)
+            if isinstance(footprint, str) and footprint:
+                authoritative.append(from_wkt(footprint))
+                continue
             geometry=from_wkt(row.axis_wkt)
             axes=[geometry] if geometry.geom_type=='LineString' else list(geometry.geoms)
             for axis in axes:
@@ -218,7 +222,7 @@ def change_surfaces(frame):
         b=network_surface(before);a=network_surface(after)
         geometry=a if kind=='added' or (full_road and kind=='widened') else b if kind=='removed' or (full_road and kind=='narrowed') else a.difference(b) if kind=='widened' else b.difference(a)
         from .auto_change_assembly import polygonal
-        geometry=polygonal(geometry)
+        geometry=polygonal(union_all([geometry, *authoritative]))
         parts=[geometry] if geometry.geom_type=='Polygon' else list(geometry.geoms)
         for part in parts:
             if part.is_empty:continue
