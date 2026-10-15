@@ -43,6 +43,34 @@ class Controller(TaskSignals):
             raise ValueError(f"请选择存在的 {suffix or ''} 文件：{path}")
         return str(path)
 
+    def prepare_project_paths(self, directory):
+        """Migrate copied project metadata in an isolated, standard-library process."""
+        import subprocess
+        import sys
+        import os
+        root = Path(directory).resolve()
+        config = root / 'project_config.json'
+        if not config.is_file():
+            return
+        recorded = json.loads(config.read_text(encoding='utf-8-sig')).get('project_root')
+        if not recorded or not Path(recorded).is_absolute() or Path(recorded).resolve() == root:
+            return
+        work = root / '_work'
+        work.mkdir(exist_ok=True)
+        lock = QLockFile(str(work / 'current.lock'))
+        lock.setStaleLockTime(0)
+        if not lock.tryLock(0):
+            raise ValueError('当前项目正在处理中，暂时无法更新移动后的项目路径')
+        try:
+            process = subprocess.run([sys.executable, str(ROOT / 'code/app/project_relocation.py'),
+                '--plugin-project', str(root)], capture_output=True, text=True, encoding='utf-8',
+                errors='replace', env={**os.environ, 'PYTHONUTF8': '1'},
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if process.returncode:
+                raise ValueError('旧工程路径更新失败：' + (process.stderr or process.stdout)[-2000:])
+        finally:
+            lock.unlock()
+
     def build_command(self, action, data):
         if action != "all":
             manifest = self.input_file(data.get("manifest", ""), ".json")

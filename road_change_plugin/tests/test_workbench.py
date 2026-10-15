@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QScrollArea, QMessageBox, QPlainTextEdit, QPushBut
 from plugin.runner import Runner
 from plugin.diagnostics import failure_summary
 from plugin.ui.run_log import log_entry
-from plugin.ui.task_overview import stage_states
+from plugin.ui.task_overview import stage_states, product_inventory
 from plugin.ui.evaluation_summary import evaluation_context
 
 APP = helpers.APP
@@ -218,6 +218,20 @@ class WorkbenchTests(unittest.TestCase):
         data['period_orders'] = {'北区': ['2020', '2022', '20250118'], '南区': ['2020', '2022', '20250118']}
         incomplete = stage_states({**descriptor, 'data': data}, {'status': 'completed'})
         self.assertEqual(incomplete[2], '已有 1/4')
+
+    def test_saved_order_metadata_and_internal_width_products(self):
+        descriptor = self.w._current
+        data = json.loads(json.dumps(descriptor['data']))
+        data['period_results'] = data['period_results'][:2]
+        data['period_orders'] = {'北区': {
+            'period_order': ['2020', '2022'], 'change_pairs': [['2020', '2022']],
+            'periods': [{'value': '2020'}, {'value': '2022'}], 'custom_order_warning': False,
+        }}
+        for entry in data['period_results']:
+            entry['width_segments'] = entry['published'].pop('width_segments')
+        descriptor = {**descriptor, 'data': data}
+        self.assertEqual(product_inventory(descriptor), ([2, 2, 1], [2, 2, 1], [False]*3))
+        self.assertEqual(stage_states(descriptor, {'status': 'completed'}), ['已完成']*3)
 
 
 class DiagnosticTests(unittest.TestCase):

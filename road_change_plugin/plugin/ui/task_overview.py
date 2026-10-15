@@ -40,14 +40,23 @@ def product_inventory(descriptor):
         return (path if path.is_absolute() else base / path).is_file()
     periods = manifest.get('final_period_results', manifest.get('period_results', []))
     changes = manifest.get('change_results', [])
-    groups = [[[(e.get('published') or e).get(key) for key in keys] for e in periods]
+    def product(entry, key):
+        published = entry.get('published') or entry.get('layers') or {}
+        return published.get(key, entry.get(key))
+    groups = [[[product(e, key) for key in keys] for e in periods]
               for keys in (('centerlines',), ('surfaces', 'width_segments'))]
-    groups.append([[(e.get('published') or e.get('layers') or e).get('changes')] for e in changes])
+    groups.append([[product(e, 'changes')] for e in changes])
     counts = [sum(all(exists(path) for path in paths) for paths in group) for group in groups]
     missing = [any(path and not exists(path) for paths in group for path in paths) for group in groups]
-    orders = manifest.get('period_orders') or manifest.get('input_spec', {}).get('grids', {})
-    expected_periods = sum(len(values) for values in orders.values())
-    expected_changes = sum(max(0, len(values) - 1) for values in orders.values())
+    orders = manifest.get('period_orders')
+    if orders:
+        plans = [(value.get('period_order', []), value.get('change_pairs'))
+                 if isinstance(value, dict) else (value, None) for value in orders.values()]
+    else:
+        plans = [(list(value), None) for value in manifest.get('input_spec', {}).get('grids', {}).values()]
+    expected_periods = sum(len(order) for order, _ in plans)
+    expected_changes = sum(len(pairs) if pairs is not None else max(0, len(order)-1)
+                           for order, pairs in plans)
     totals = [max(len(periods), expected_periods)] * 2 + [max(len(changes), expected_changes)]
     return counts, totals, missing
 

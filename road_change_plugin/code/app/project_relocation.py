@@ -36,7 +36,20 @@ def _inside(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(_relative_to(path, root) is not None for root in roots)
 
 
+def _io_path(path: Path) -> Path:
+    """Use Windows extended paths for I/O without storing them in manifests."""
+    if os.name != 'nt':
+        return path
+    text = os.path.abspath(path)
+    if text.startswith('\\\\?\\'):
+        return Path(text)
+    if text.startswith('\\\\'):
+        return Path('\\\\?\\UNC\\' + text[2:])
+    return Path('\\\\?\\' + text)
+
+
 def _atomic_write_json(path: Path, value: dict) -> None:
+    path = _io_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -50,11 +63,12 @@ def _atomic_write_json(path: Path, value: dict) -> None:
 
 def _backup_once(path: Path) -> Path:
     backup = path.with_name(path.name + BACKUP_SUFFIX)
-    if not backup.exists():
-        temporary = backup.with_name(f".{backup.name}.{os.getpid()}.tmp")
+    target = _io_path(backup)
+    if not target.exists():
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
         try:
-            temporary.write_bytes(path.read_bytes())
-            os.replace(temporary, backup)
+            temporary.write_bytes(_io_path(path).read_bytes())
+            os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
     return backup
@@ -312,18 +326,16 @@ def active_old_path_references(value, old_roots: tuple[Path, ...]) -> list[str]:
 
 def rebase_project_owned_tree(value, old_root: Path | str, new_root: Path | str):
     """Return a read-only, boundary-safe rebase for project discovery views."""
+    return _project_rebaser(old_root, new_root)(value)
+
+
+def _project_rebaser(old_root, new_root):
+    from functools import lru_cache
     old = _resolved(old_root)
     new = _resolved(new_root)
 
-    def visit(item, key=""):
-        if key in _HISTORICAL_KEYS:
-            return copy.deepcopy(item)
-        if isinstance(item, dict):
-            return {child_key: visit(child, str(child_key)) for child_key, child in item.items()}
-        if isinstance(item, list):
-            return [visit(child, key) for child in item]
-        if not isinstance(item, str) or not item.strip():
-            return copy.deepcopy(item)
+    @lru_cache(maxsize=8192)
+    def mapped_path(item):
         path = Path(item).expanduser()
         if not path.is_absolute():
             return item
@@ -335,7 +347,120 @@ def rebase_project_owned_tree(value, old_root: Path | str, new_root: Path | str)
             raise ValueError(f"项目浏览路径重定位逃出当前项目目录：{path} -> {target}")
         return str(target)
 
-    return visit(value)
+    def visit(item, key=""):
+        if key in _HISTORICAL_KEYS:
+            return copy.deepcopy(item)
+        if isinstance(item, dict):
+            return {child_key: visit(child, str(child_key)) for child_key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child, key) for child in item]
+        if not isinstance(item, str) or not item.strip():
+            return copy.deepcopy(item)
+        return mapped_path(item)
+
+    return visit
+
+
+def relocate_plugin_project(project_root: Path | str) -> dict:
+    """Repair copied plugin metadata before opening its saved operation.
+
+    Only project-owned JSON and internal path lists change. Source images,
+    algorithm revisions, cache keys, and all binary products remain untouched.
+    The config is committed last so an interrupted repair can be repeated.
+    """
+    root = _resolved(project_root)
+    config_path = root / 'project_config.json'
+    if not config_path.is_file():
+        return {'modified_files': 0}
+    config = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    recorded = config.get('project_root')
+    if not recorded or not Path(recorded).is_absolute() or _resolved(recorded) == root:
+        return {'modified_files': 0}
+    old = _resolved(recorded)
+    rebase = _project_rebaser(old, root)
+    output = Path(config.get('output_root') or '成果输出')
+    if output.is_absolute():
+        relative = _relative_to(output, old)
+        if relative is None:
+            raise ValueError('旧工程成果目录在项目之外，请将成果一并复制到当前项目并更新成果目录配置')
+        output = root / relative
+    else:
+        output = root / output
+    if not _inside(output.resolve(), (root,)):
+        raise ValueError('项目成果目录超出当前项目，不能自动迁移')
+    candidates = {config_path}
+    text_paths = set()
+    for base in (root / '_work', output):
+        if base.is_dir():
+            # Resolve each directory once. Resolving every deep station record
+            # separately performs millions of Windows filesystem lookups.
+            for folder, directories, files in os.walk(base):
+                directory = Path(folder)
+                if not _inside(directory.resolve(), (root,)):
+                    raise ValueError(f'项目目录链接到其他目录，不能迁移：{directory}')
+                for name in directories:
+                    child = directory / name
+                    if child.is_symlink() or (hasattr(child, 'is_junction') and child.is_junction()):
+                        raise ValueError(f'项目目录包含链接，不能迁移：{child}')
+                for name in files:
+                    path = directory / name
+                    if path.suffix.lower() not in {'.json', '.txt'}:
+                        continue
+                    if path.is_symlink():
+                        raise ValueError(f'项目文件包含链接，不能迁移：{path}')
+                    if path.suffix.lower() == '.json':
+                        candidates.add(path)
+                    elif base == root / '_work':
+                        text_paths.add(path)
+    replacements = []
+    prefixes = {prefix.casefold() for prefix in (
+        json.dumps(str(old))[1:-1], json.dumps(str(old), ensure_ascii=False)[1:-1],
+        old.as_posix(), str(old),
+    )}
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import islice
+    def read_metadata(path):
+        text = _io_path(path).read_text(encoding='utf-8-sig')
+        lowered = text.casefold()
+        return path, text if any(prefix in lowered for prefix in prefixes) else None
+    paths = iter(sorted(candidates, key=lambda p: (p == config_path, str(p))))
+    # Bound queued reads: old width caches can contain hundreds of thousands of
+    # small records. Mapping and all writes remain sequential and preflighted.
+    with ThreadPoolExecutor(max_workers=8) as readers:
+        while batch := list(islice(paths, 256)):
+            for path, text in readers.map(read_metadata, batch):
+                if text is None:
+                    continue
+                payload = json.loads(text)
+                mapped = rebase(payload)
+                if mapped != payload:
+                    replacements.append((path, mapped))
+    lists = []
+    for path in sorted(text_paths):
+        text = path.read_text(encoding='utf-8-sig')
+        lines = text.splitlines()
+        mapped = [rebase(line) for line in lines]
+        if mapped != lines:
+            lists.append((path, '\n'.join(mapped) + ('\n' if text.endswith('\n') else '')))
+    # Validate all metadata before writing any file, and preserve recoverable
+    # originals beside changed files. No source-tree path is ever opened to write.
+    for path, mapped in replacements:
+        if path == config_path:
+            continue
+        _backup_once(path)
+        _atomic_write_json(path, mapped)
+    for path, text in lists:
+        _backup_once(path)
+        target = _io_path(path)
+        temporary = target.with_name(f'.{target.name}.{os.getpid()}.tmp')
+        try:
+            temporary.write_text(text, encoding='utf-8-sig')
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    _backup_once(config_path)
+    _atomic_write_json(config_path, rebase(config))
+    return dict(modified_files=len(replacements) + len(lists), old_root=str(old), new_root=str(root))
 
 
 @dataclass(frozen=True)
@@ -475,3 +600,11 @@ def repair_task_batch_lists(job_root: Path | str) -> BatchListRepairResult:
         checked_lists=len(plans), modified_lists=modified_lists,
         modified_paths=modified_paths, checked_json=checked_json,
     )
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plugin-project", required=True)
+    args = parser.parse_args()
+    print(json.dumps(relocate_plugin_project(args.plugin_project), ensure_ascii=False))

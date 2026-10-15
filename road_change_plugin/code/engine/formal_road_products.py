@@ -138,7 +138,10 @@ def _reconstruct_frames(centers, widths, *, evidence=None, observations=(), dire
     repaired, axis_audit = repair_network_axes(axes, fallback, evidence)
     print('[正式道路] 轴线质量检查完成，开始映射已有测宽观测',flush=True)
     for issue in current_recovery().failures[first_issue:]:
-        issue['source_ids']=[rows[k]['source_feature'] for k in issue['source_ids']]
+        # Repair failures reference positions in this filtered network. Quality
+        # notices emitted by corridor rendering use geometry fingerprints.
+        if issue['stage']=='axis_repair':
+            issue['source_ids']=[rows[k]['source_feature'] for k in issue['source_ids']]
     for report in axis_audit:
         report['source_ids']=[rows[report['feature']]['source_feature']]
     repairs = {r['feature']: r for r in axis_audit}

@@ -23,6 +23,24 @@ class RecoveryExportTests(unittest.TestCase):
         return [json.loads(Path(result[key]).read_text(encoding='utf8')) for key in
                 ('axis_quality_audit','surface_quality_audit')]
 
+    def test_axis_quality_fingerprint_does_not_become_a_row_index(self):
+        from engine.geometry_recovery import current_recovery
+        self.regional([line(0,100),line(0,100,100)])
+        def repaired(axes, widths, evidence):
+            recovery=current_recovery()
+            recovery.record('axis_quality_notice',['geometry-fingerprint'],
+                ValueError('folded but renderable'),status='warning',final_action='retain_valid_geometry')
+            recovery.record('axis_repair',[1],ValueError('local repair'),status='fallback')
+            return axes,[]
+        with patch('engine.road_axis_quality.repair_network_axes',side_effect=repaired):
+            result=self.export()
+        self.assertEqual(len(gpd.read_file(result['centerlines'])),2)
+        axis,surf=self.audits(result)
+        self.assertEqual(axis['failures'][0]['source_ids'],[1])
+        notice=next(r for r in surf['failures'] if r['stage']=='axis_quality_notice')
+        self.assertEqual(notice['source_ids'],['geometry-fingerprint'])
+        self.assertEqual(notice['final_action'],'retain_valid_geometry')
+
     def test_all_axis_repairs_fail_period_still_exports(self):
         healthy=line(0,120,200);bad=teeth()
         self.regional([healthy,bad])

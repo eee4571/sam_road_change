@@ -611,7 +611,12 @@ class RoadChangeWidget(QWidget):
         self._project_revision += 1
         self.checked = False
         self._return_after_check = False
-        self._background(scan_project, (self._project_directory,), self._scanned)
+        self.check_note.setText('正在打开项目并检查已有成果…')
+        self._background(self._scan_project, (self._project_directory,), self._scanned)
+
+    def _scan_project(self, directory):
+        self.controller.prepare_project_paths(directory)
+        return scan_project(directory)
 
     def _scanned(self, model):
         self.open_timer.stop()
