@@ -66,6 +66,48 @@ class TruthSurfaceTests(unittest.TestCase):
                 for actual, expected in zip(repeated, parts):
                     self.assert_same_surface(actual, expected)
 
+    def test_degenerate_voronoi_sites_preserve_valid_source_surface(self):
+        fixture = json.loads((ROOT/'tests/fixtures/truth_surface_degenerate_sites.json').read_text())
+        from shapely.ops import substring
+        for case in fixture:
+            axis, other = shape(case['axis']), shape(case['other'])
+            face = axis.buffer(case['buffer_width'])
+            with self.subTest(case=case['case']):
+                parts = partition_surface(face, [axis, other])
+                self.assertTrue(all(part.is_valid for part in parts))
+                self.assert_same_surface(union_all(parts), face)
+                self.assertAlmostEqual(sum(part.area for part in parts), face.area, delta=1e-6)
+                for fraction in (1e-8, .125, .5, .99999999):
+                    selected = surface_interval(face, axis, substring(axis, 0, axis.length*fraction))
+                    self.assertTrue(selected.is_valid)
+                    self.assertLess(selected.difference(face).area, 1e-7)
+
+    def test_exact_cut_survives_numerically_coincident_sample(self):
+        from shapely.ops import substring
+        axis = LineString([(38000000., 2600000.), (38000100., 2600000.)])
+        face = box(38000000., 2599996., 38000100., 2600004.)
+        for start, end in ((0., 50.+3e-8), (50.-3e-8, 100.), (0., 3e-8)):
+            selected = surface_interval(face, axis, substring(axis, start, end))
+            self.assertAlmostEqual(selected.area, (end-start)*8, delta=1e-6)
+
+    def test_empty_and_collapsed_truth_do_not_abort_valid_roads(self):
+        line = LineString([(0., 20.), (30., 20.)])
+        collapsed = LineString([(0., 0.), (0., 0.)])
+        mixed = GeometryCollection([collapsed, line, Point(1000., 1000.)])
+        truth = _frame([dict(_gt_type='2', geometry=g) for g in (None, Polygon(), collapsed, mixed)], 3857)
+        roads = _frame([dict(width_m=8., geometry=line)], 3857)
+        candidates, audit = perturb_truth(truth, {p: FinalWidths(roads) for p in ('before', 'after')}, '1', '2')
+        self.assert_same_surface(candidates.geometry.union_all(), line.buffer(3., cap_style='flat'))
+        self.assertEqual(sum(r['action']=='review_no_geometry' for r in audit), 2)
+        self.assertTrue(any(r['action']=='ignored_zero_length_parts' for r in audit))
+        self.assertTrue(any(r['action']=='review_no_road_axis' for r in audit))
+
+    def test_collapsed_polygon_does_not_become_a_buffered_road(self):
+        flat = Polygon([(0., 0.), (10., 0.), (20., 0.), (0., 0.)])
+        valid = box(0., 20., 40., 28.)
+        _, candidates = generated(GeometryCollection([flat, valid]))
+        self.assert_same_surface(candidates.geometry.union_all(), valid)
+
     def test_presence_and_width_change_keep_full_truth_polygon(self):
         geometry = Polygon([(0,0), (80,0), (80,7), (30,10), (30,60), (0,60)])
         for kind in ('2', '3', '4'):

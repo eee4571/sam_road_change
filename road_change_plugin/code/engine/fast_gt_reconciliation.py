@@ -202,7 +202,10 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
              '新增':'added','灭失':'removed','宽度变化':'width_changed'}
     from .gt_road_geometry import record_polygon
     records=[];audit=[]
-    for _,row in truth.iterrows():
+    for source_index,row in truth.iterrows():
+        if row.geometry is None or row.geometry.is_empty:
+            audit.append(dict(source_index=str(source_index), action='review_no_geometry'))
+            continue
         token=str(row['_gt_type']).strip().lower()
         if token in ('2.0','3.0','4.0'):token=token[:-2]
         kind=aliases.get(token)
@@ -216,7 +219,11 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
         # Polygon evidence is authoritative. Associate each disconnected face
         # with its own axes, partitioning branches without changing its boundary.
         from .truth_surface import partition_surface
-        faces = polygonal(make_valid(row.geometry))
+        geometry = make_valid(row.geometry)
+        collapsed = sum(line.length == 0 for line in _parts(row.geometry))
+        if collapsed:
+            audit.append(dict(truth_id=truth_id, action='ignored_zero_length_parts', count=collapsed))
+        faces = polygonal(geometry)
         parts = [faces] if faces.geom_type == 'Polygon' else list(faces.geoms)
         axes = []
         for face in parts:
@@ -235,8 +242,11 @@ def perturb_truth(truth, widths, before_period, after_period, profile=GTProfile(
             footprints = partition_surface(face, [d['axis'] for d in descriptions])
             axes.extend(dict(d, footprint=footprint) for d, footprint in zip(descriptions, footprints)
                         if not footprint.is_empty and footprint.area > 0)
+        # Only explicit line evidence may create a width-based footprint.
+        # Collapsed polygon boundaries returned by make_valid are not roads.
         for line in _parts(row.geometry):
-            axes.extend(_gt_axes(line, declared_width))
+            if line.length > 0:
+                axes.extend(_gt_axes(line, declared_width))
         if not axes:
             audit.append(dict(truth_id=truth_id,action='review_no_road_axis',seed=str(seed)));continue
         type_error=rng.random()<profile.type_error_probability

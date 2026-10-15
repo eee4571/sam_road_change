@@ -5,16 +5,27 @@ road area. Every result is an intersection with the supplied footprint. Axes
 are association metadata, not instructions to regenerate polygon boundaries.
 """
 import numpy as np
-from shapely import union_all, voronoi_polygons
+from scipy.spatial import cKDTree
+from shapely import make_valid, union_all, voronoi_polygons
+from shapely.affinity import translate
 from shapely.geometry import MultiPoint, Point, Polygon
 from shapely.strtree import STRtree
+
+
+def _coordinate_epsilon(coordinates):
+    return 8 * np.spacing(max(1., float(np.max(np.abs(coordinates)))))
 
 
 def _sites(axis, extra=()):
     # Sampling controls association only. Original boundary vertices and holes
     # are preserved even for very long roads; no raster is allocated.
     count = min(100_000, max(2, int(np.ceil(axis.length / 2.)) + 1))
-    distances = np.unique(np.r_[np.linspace(0., axis.length, count), extra])
+    distances = np.linspace(0., axis.length, count)
+    # Keep exact requested cuts when they coincide numerically with a sample.
+    epsilon = max(_coordinate_epsilon(axis.coords), _coordinate_epsilon([axis.length]))
+    for station in extra:
+        distances = distances[np.abs(distances-station) > epsilon]
+    distances = np.unique(np.r_[distances, extra])
     return distances, np.array([axis.interpolate(s).coords[0][:2] for s in distances])
 
 
@@ -23,9 +34,30 @@ def _cells(surface, coordinates):
     if len(unique) == 1:
         yield int(indices[0]), surface
         return
-    points = MultiPoint(unique)
+    # Collapse only numerical duplicates in the association sites, never in the
+    # authoritative road footprint. Large projected coordinates otherwise make
+    # GEOS create zero-width/invalid Voronoi rings between nearly equal points.
+    epsilon = _coordinate_epsilon(unique)
+    neighbors = cKDTree(unique)
+    assigned = np.zeros(len(unique), dtype=bool)
+    keep = []
+    for index in np.argsort(indices):
+        if assigned[index]:
+            continue
+        keep.append(index)
+        assigned[neighbors.query_ball_point(unique[index], epsilon)] = True
+    unique, indices = unique[keep], indices[keep]
+    if len(unique) == 1:
+        yield int(indices[0]), surface
+        return
+    # Build the diagram near the origin to avoid subtracting million-metre
+    # eastings/northings inside the triangulation. Clip the translated cells
+    # against the original face so its boundary vertices remain authoritative.
+    origin = unique[0]
+    points = MultiPoint(unique-origin)
     tree = STRtree(list(points.geoms))
-    cells = voronoi_polygons(points, extend_to=surface.envelope)
+    extent = translate(surface.envelope, xoff=-origin[0], yoff=-origin[1])
+    cells = voronoi_polygons(points, extend_to=extent)
     for cell in cells.geoms:
         # A Voronoi cell belongs to the nearest generator at an interior point.
         # Almost coincident endpoint/sample coordinates can both be covered by
@@ -33,7 +65,8 @@ def _cells(surface, coordinates):
         # Resolve exact distance ties by input order for reproducible assignment.
         owners = tree.query_nearest(cell.representative_point(), all_matches=True)
         owner = min(int(indices[int(index)]) for index in owners)
-        clipped = cell.intersection(surface)
+        cell = translate(cell, xoff=origin[0], yoff=origin[1])
+        clipped = make_valid(cell).intersection(surface)
         if not clipped.is_empty and clipped.area > 0:
             yield owner, clipped
 
@@ -68,6 +101,8 @@ def surface_interval(surface, reference, local):
     if start <= 1e-8 and end >= reference.length - 1e-8:
         return surface
     stations, coordinates = _sites(reference, (start, end))
+    station_epsilon = max(1e-9, _coordinate_epsilon(coordinates),
+                          _coordinate_epsilon([reference.length]))
     span = max(np.ptp(np.asarray(surface.bounds).reshape(2, 2), axis=0).max(), reference.length, 1.) * 4
 
     def half_plane(station, forward):
@@ -93,11 +128,11 @@ def surface_interval(surface, reference, local):
     selected = []
     for site, cell in _cells(surface, coordinates):
         station = stations[site]
-        if not start-1e-9 <= station <= end+1e-9:
+        if not start-station_epsilon <= station <= end+station_epsilon:
             continue
-        if abs(station-start) < 1e-9 and start > 1e-8:
+        if abs(station-start) <= station_epsilon and start > 1e-8:
             cell = cell.intersection(half_plane(start, True))
-        if abs(station-end) < 1e-9 and end < reference.length-1e-8:
+        if abs(station-end) <= station_epsilon and end < reference.length-1e-8:
             cell = cell.intersection(half_plane(end, False))
         selected.append(cell)
     return union_all(selected)
