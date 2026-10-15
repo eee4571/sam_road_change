@@ -1353,6 +1353,8 @@ def evaluate_changes(
     object_iou_threshold: float = 0.1,
     *,
     truth_extent: gpd.GeoDataFrame | None = None,
+    position_grid: tuple | None = None,
+    position_tolerance_px: float = 4.0,
 ) -> tuple[list[dict], dict]:
     evaluation_started = time.perf_counter()
     if predicted.crs is None or truth.crs is None:
@@ -1415,7 +1417,39 @@ def evaluate_changes(
         pairs = _matched_object_pairs(left, right, evaluation_tolerance, object_iou_threshold)
         matching_seconds += time.perf_counter()-started
         return pairs
-    overall = _metric_row(
+    def area_row(name, predicted_support, truth_support, domain):
+        result = _metric_row(name, predicted_support, truth_support, domain)
+        if position_grid is None:
+            return result
+        from shapely.affinity import affine_transform
+        image_crs, image_transform = position_grid
+        transform = Affine(*tuple(image_transform)[:6])
+        inverse = ~transform
+        tolerance = float(position_tolerance_px)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError('Position tolerance must be a finite nonnegative pixel distance')
+
+        def expanded(geometry):
+            if geometry.is_empty:
+                return geometry
+            image_geometry = gpd.GeoSeries([geometry], crs=metric_crs).to_crs(image_crs).iloc[0]
+            pixels = affine_transform(image_geometry, [inverse.a,inverse.b,inverse.d,inverse.e,inverse.c,inverse.f])
+            expanded_pixels = pixels.buffer(tolerance) if tolerance else pixels
+            world = affine_transform(expanded_pixels, [transform.a,transform.b,transform.d,transform.e,transform.c,transform.f])
+            return make_valid(gpd.GeoSeries([world], crs=image_crs).to_crs(metric_crs).iloc[0])
+
+        # Each numerator has its own unchanged denominator. There is no single
+        # tolerant TP area shared by precision and recall; strict TP/FP/FN stay intact.
+        covered = min(result['truth_support_m2'], float(truth_support.intersection(expanded(predicted_support)).area))
+        supported = min(result['predicted_support_m2'], float(predicted_support.intersection(expanded(truth_support)).area))
+        result.update(change_metric_method='area_with_pixel_tolerance_v1',
+            change_match_tolerance_px=tolerance, position_covered_truth_m2=covered,
+            position_supported_prediction_m2=supported,
+            change_recall=covered/result['truth_support_m2'] if result['truth_support_m2'] else float(not result['predicted_support_m2']),
+            change_precision=supported/result['predicted_support_m2'] if result['predicted_support_m2'] else float(not result['truth_support_m2']))
+        return result
+
+    overall = area_row(
             "all",
             _support_geometry(predicted, evaluation_tolerance).intersection(validation),
             _support_geometry(truth, evaluation_tolerance).intersection(validation),
@@ -1430,7 +1464,7 @@ def evaluate_changes(
         for change_type in evaluation_types:
             pred_part = predicted.loc[predicted["_eval_type"] == change_type]
             truth_part = truth.loc[truth["_eval_type"] == change_type]
-            row = _metric_row(
+            row = area_row(
                     change_type,
                     _support_geometry(pred_part, evaluation_tolerance).intersection(validation),
                     _support_geometry(truth_part, evaluation_tolerance).intersection(validation),
@@ -1530,6 +1564,12 @@ def evaluate_changes(
             "type_judgment_accuracy": "Correctly classified detected truth area / truth change area covered by any prediction.",
         },
     }
+    if position_grid is not None:
+        metadata['change_metric_method'] = 'area_with_pixel_tolerance_v1'
+        metadata['change_match_tolerance_px'] = float(position_tolerance_px)
+        metadata['headline_metric_definition'].update(
+            change_recall='Truth area within the pixel tolerance of any prediction / unchanged truth area.',
+            change_precision='Prediction area within the pixel tolerance of any truth / unchanged prediction area.')
     metadata['evaluation_clipping_seconds'] = clipping_seconds
     metadata['evaluation_matching_seconds'] = matching_seconds
     metadata['evaluation_total_seconds'] = time.perf_counter()-evaluation_started

@@ -188,7 +188,8 @@ class RegionalEvaluationTests(unittest.TestCase):
                 if name=='north':
                     self.assertEqual(pipeline.read_json(summary)['evaluation']['metadata']['centerline_association'],
                                      'final_road_intervals_from_correction_identity')
-                self.assertAlmostEqual(row['change_recall'],.875,places=5)
+                self.assertAlmostEqual(row['recall'],.875,places=5)
+                self.assertAlmostEqual(row['change_recall'],1.,places=5)
                 self.assertAlmostEqual(row['centerline_mean_offset_px'],2.,delta=.15)
                 self.assertGreater(row['road_centerline_completeness'],.98)
                 self.assertEqual(row['centerline_match_tolerance_px'],4.)
@@ -198,7 +199,8 @@ class RegionalEvaluationTests(unittest.TestCase):
             summary.write_text('{}')
             pipeline._evaluate_existing_changes_impl(args)
             row=pipeline.read_json(summary)['evaluation']['metrics'][0]
-            self.assertAlmostEqual(row['change_recall'],.875,places=5)
+            self.assertAlmostEqual(row['recall'],.875,places=5)
+            self.assertIsNone(row['change_recall'])
             self.assertIsNone(row['road_centerline_completeness'])
             self.assertIsNone(row['centerline_mean_offset_px'])
             self.assertEqual(row['centerline_offset_status'],'unavailable_image_grid')

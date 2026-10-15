@@ -2992,6 +2992,24 @@ def aggregate_change_evaluations(manifest: dict, job_root: Path) -> dict:
                 row['centerline_offset_reason'] += ': ' + '; '.join(reason for reason in reasons if reason)
             if pixel_totals_valid and not comparable_completeness:
                 row["centerline_offset_reason"] += "；完整度匹配容差不一致，请重新评价相关变化对"
+        if any(source.get('change_metric_method') == 'area_with_pixel_tolerance_v1' for source in source_rows):
+            area_keys = ('position_covered_truth_m2', 'position_supported_prediction_m2',
+                         'truth_support_m2', 'predicted_support_m2')
+            area_tolerances = {source.get('change_match_tolerance_px') for source in source_rows}
+            comparable = len(area_tolerances) == 1 and None not in area_tolerances and all(
+                source.get('change_metric_method') == 'area_with_pixel_tolerance_v1'
+                and all(isinstance(source.get(key), (int, float)) and not isinstance(source.get(key), bool)
+                        and math.isfinite(source[key]) and source[key] >= 0 for key in area_keys)
+                for source in source_rows)
+            covered = sum(source['position_covered_truth_m2'] for source in source_rows) if comparable else None
+            supported = sum(source['position_supported_prediction_m2'] for source in source_rows) if comparable else None
+            row.update(change_metric_method='area_with_pixel_tolerance_v1',
+                change_match_tolerance_px=next(iter(area_tolerances)) if len(area_tolerances) == 1 else None,
+                position_covered_truth_m2=covered, position_supported_prediction_m2=supported,
+                change_recall=(covered/sums['truth_support_m2'] if sums['truth_support_m2'] else float(not sums['predicted_support_m2'])) if comparable else None,
+                change_precision=(supported/sums['predicted_support_m2'] if sums['predicted_support_m2'] else float(not sums['truth_support_m2'])) if comparable else None,
+                change_metric_reason='原道路面积不变；按各区域原始影像像素容差匹配后按面积汇总' if comparable
+                    else '部分变化对缺少容差评价或口径不同，请重新评价；未与旧的严格重合率混算')
         aggregate_rows.append(row)
 
     job_root.mkdir(parents=True, exist_ok=True)
@@ -3257,6 +3275,16 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         )
     validation_value = str(args.validation_area or entry.get("validation_area") or manifest.get("validation_area") or "").strip()
     validation = gpd.read_file(validation_value) if validation_value else None
+    is_fast_result = str(entry.get('execution_profile') or manifest.get('execution_profile')
+                         or summary.get('execution_profile') or '') == 'fast'
+    pixel_grid = None
+    grid_error = ''
+    if is_fast_result:
+        from rasterio.errors import RasterioIOError
+        try:
+            pixel_grid = _fast_assisted_evaluation_grid(manifest, entry, summary)
+        except (FileNotFoundError, RasterioIOError) as error:
+            grid_error = str(error)
     rows, metadata = evaluate_changes(
         predicted,
         truth,
@@ -3265,6 +3293,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         float(args.evaluation_tolerance),
         class_mode="three",
         truth_extent=original_evaluation_truth if review_truth_metadata else None,
+        position_grid=pixel_grid[:2] if pixel_grid else None,
     )
     auto_rows = None
     auto_metadata = None
@@ -3288,6 +3317,7 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
                 float(args.evaluation_tolerance),
                 class_mode="three",
                 truth_extent=original_evaluation_truth if review_truth_metadata else None,
+                position_grid=pixel_grid[:2] if pixel_grid else None,
             )
         else:
             stored_evaluation = (
@@ -3308,20 +3338,20 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
         metadata['geometry_source']='regular_axis_width_corridors'
         metadata['centerline_offset_unit']='m'
 
-    # Pixel metrics depend on the image grid, not optional GT provenance flags.
-    if str(entry.get('execution_profile') or manifest.get('execution_profile')
-           or summary.get('execution_profile') or '') == 'fast':
-        from rasterio.errors import RasterioIOError
-        try:
-            image_crs, image_transform, image_shape = _fast_assisted_evaluation_grid(manifest, entry, summary)
-        except (FileNotFoundError, RasterioIOError) as error:
+    if is_fast_result:
+        if pixel_grid is None:
             rows[0].update(dict.fromkeys(('road_centerline_completeness', 'centerline_mean_offset_px',
                 'truth_centerline_length_px', 'covered_truth_centerline_length_px',
                 'predicted_centerline_length_px', 'centerline_offset_integral_px2')))
             rows[0].update(centerline_offset_status='unavailable_image_grid',
-                centerline_offset_reason=str(error), centerline_offset_unit='px')
+                centerline_offset_reason=grid_error, centerline_offset_unit='px')
             metadata['centerline_offset_unit']='px'
+            for row in rows:
+                row.update(change_metric_method='area_with_pixel_tolerance_v1', change_match_tolerance_px=4.,
+                    change_recall=None, change_precision=None, position_covered_truth_m2=None,
+                    position_supported_prediction_m2=None, change_metric_reason=grid_error)
         else:
+            image_crs, image_transform, image_shape = pixel_grid
             centerline_predicted=predicted
             final_audit=Path(str(entry.get('output') or ''))/'gt_assisted_audit.gpkg'
             if final_audit.is_file():
@@ -3343,17 +3373,13 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
 
     for row in rows:
         if row.get("class") == "all":
-            row["change_recall"] = row.get(
-                "change_area_recall", row.get("recall")
-            )
-            row["change_precision"] = row.get("precision")
+            row.setdefault("change_recall", row.get("change_area_recall", row.get("recall")))
+            row.setdefault("change_precision", row.get("precision"))
             row["change_type_accuracy"] = row.get("type_judgment_accuracy")
     for row in auto_rows or []:
         if row.get("class") == "all":
-            row["change_recall"] = row.get(
-                "change_area_recall", row.get("recall")
-            )
-            row["change_precision"] = row.get("precision")
+            row.setdefault("change_recall", row.get("change_area_recall", row.get("recall")))
+            row.setdefault("change_precision", row.get("precision"))
             row["change_type_accuracy"] = row.get("type_judgment_accuracy")
     is_fast_truth = bool(
         entry.get("ground_truth_derived")
@@ -3394,8 +3420,6 @@ def _evaluate_existing_changes_impl(args: argparse.Namespace) -> dict:
                 validation_area=validation,
             )
             rows[0].update(fast_metrics)
-            rows[0]["change_precision"] = rows[0]["precision"]
-            rows[0]["change_recall"] = rows[0]["recall"]
             metadata["fast_truth_metrics"] = True
             metadata["centerline_offset_unit"] = "px"
     if entry.get('manual_review'):

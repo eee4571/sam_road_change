@@ -34,9 +34,18 @@ def report_metrics(path):
     tolerance = number('centerline_match_tolerance_px')
     if tolerance is not None:
         note = f'中心线匹配容差：{tolerance:g} px。' + note
+    position_note = ''
+    if overall.get('change_metric_method') == 'area_with_pixel_tolerance_v1':
+        match_tolerance = number('change_match_tolerance_px')
+        position_note = (f'查全率/准确率允许 {match_tolerance:g} px 位置误差；按原道路面积统计。'
+                         if match_tolerance is not None else '查全率/准确率的位置容差不一致。')
+        position_note += str(overall.get('change_metric_reason') or '')
+    elif overall:
+        position_note = '查全率/准确率按严格面积重合统计（旧口径）。'
     return dict(recall=percent('change_recall'), precision=percent('change_precision'),
                 completeness=percent('road_centerline_completeness'), offset=distance,
-                type_accuracy=percent('change_type_accuracy'), centerline_note=note, report=report)
+                type_accuracy=percent('change_type_accuracy'), centerline_note=note,
+                position_note=position_note, report=report)
 
 
 def metrics_text(path):
@@ -91,7 +100,8 @@ def show_evaluation(parent, descriptor, path):
                 (('查全率', 'recall'), ('查准率', 'precision'), ('类型正确率', 'type_accuracy')))
                 + '\n\n道路提取\n' + '\n'.join(f'{name}：{values.get(key, "未评价")}' for name, key in
                 (('道路完整度', 'completeness'), ('中心线平均偏移', 'offset'))))
-    details.setPlainText(sections + '\n' + values.get('centerline_note', '')
+    details.setPlainText(sections + '\n' + values.get('position_note', '')
+                         + '\n' + values.get('centerline_note', '')
                          + '\n\n评价依据\n' + evaluation_context(descriptor, path))
     layout.addWidget(details, 1)
     open_file = QPushButton('打开原始评价报告')

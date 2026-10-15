@@ -64,3 +64,13 @@ class EvaluationSummaryTests(unittest.TestCase):
             note=report_metrics(path)['centerline_note']
             self.assertIn('4 px',note)
             self.assertIn('未找到对应区域影像',note)
+
+    def test_report_labels_tolerant_and_old_area_definitions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'report.json'
+            path.write_text(json.dumps({'metrics':[dict(**{'class':'all'},change_recall=.875)]}),encoding='utf8')
+            self.assertIn('严格面积重合',report_metrics(path)['position_note'])
+            path.write_text(json.dumps({'metrics':[dict(**{'class':'all'},change_recall=1.,
+                change_metric_method='area_with_pixel_tolerance_v1',change_match_tolerance_px=4.)]}),encoding='utf8')
+            self.assertIn('允许 4 px',report_metrics(path)['position_note'])
+            self.assertEqual(report_metrics(path)['recall'],'100.0%')
