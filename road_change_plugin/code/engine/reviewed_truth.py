@@ -55,6 +55,14 @@ def build_truth_filter(original, decisions, audit_path, *, audit_layer='changes'
                 feature = public.iloc[int(position)]
                 if feature.change_typ != row.change_typ:
                     continue
+                # New candidates carry explicit provenance. Spatial overlap
+                # alone must not transfer an Auto decision to a GT object (or
+                # to a different GT source). Old projects lack these fields.
+                source = feature.get('change_src')
+                if source in ('AUTO', 'GT_ASSISTED') and source != row.change_src:
+                    continue
+                if source == 'GT_ASSISTED' and feature.get('truth_id') != row.truth_id:
+                    continue
                 overlap = geometry.intersection(make_valid(feature.geometry))
                 if overlap.area <= max(1e-8, geometry.area * 1e-10):
                     continue

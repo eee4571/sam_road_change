@@ -62,6 +62,36 @@ class TruthSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(sum(part.area for part in parts), surface.area, places=6)
         self.assertTrue(all(part.area > 0 for part in parts))
 
+    def test_touching_auto_branch_does_not_join_assisted_review_object(self):
+        truth, gt = generated(box(0,-4,100,4), width=8.)
+        axis = LineString([(50,0),(50,80)])
+        auto = dict(change_id='AUTO', change_typ='added', change_src='AUTO', truth_id='',
+                    width_bef=0., width_aft=8., axis_wkt=axis.wkt, geometry=axis.buffer(4,cap_style='flat'))
+        frame = _frame([auto, *gt.to_dict('records')], gt.crs)
+        public = change_surfaces(frame)
+        self.assertEqual(len(public), 2)
+        retained = public.loc[public.change_src.eq('GT_ASSISTED')]
+        self.assert_same_surface(retained.geometry.union_all(), gt.geometry.union_all())
+        self.assertLess(retained.geometry.union_all().intersection(box(45,10,55,80)).area, 1e-8)
+        self.assert_same_surface(public.loc[public.change_src.eq('AUTO')].geometry.union_all(), auto['geometry'])
+        from road_change_detection import evaluate_changes
+        grid = (gt.crs, Affine(.5,0,-10,0,-.5,100))
+        validation = _frame([dict(geometry=box(-10,-10,110,90))], gt.crs)
+        kept_metrics, _ = evaluate_changes(retained, truth, validation, 'BHBM', 5., class_mode='three', position_grid=grid)
+        all_metrics, _ = evaluate_changes(public, truth, validation, 'BHBM', 5., class_mode='three', position_grid=grid)
+        self.assertAlmostEqual(kept_metrics[0]['change_precision'], 1.)
+        self.assertLess(all_metrics[0]['change_precision'], .8)
+
+    def test_touching_truth_objects_remain_independently_reviewable(self):
+        _, first = generated(box(0,-4,100,4), width=8.)
+        _, second = generated(box(100,-4,200,4), width=8.)
+        public = change_surfaces(_frame([*first.to_dict('records'), *second.to_dict('records')], first.crs))
+        self.assertEqual(len(public), 2)
+        self.assertEqual(public.truth_id.nunique(), 2)
+        for gt in (first, second):
+            selected = public.loc[public.truth_id.eq(gt.iloc[0].truth_id)]
+            self.assert_same_surface(selected.geometry.union_all(), gt.geometry.union_all())
+
     def test_partial_interval_and_repeated_shortening_never_restore_full_face(self):
         axis = LineString([(0,0),(100,0)])
         face = Polygon([(0,-2),(100,-6),(100,6),(0,2)])

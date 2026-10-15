@@ -198,7 +198,7 @@ def network_surface(profiles, node_tolerance=.5, _junctions=None):
 
 
 def change_surfaces(frame):
-    """Render/dissolve each change class; preserve interval metadata in audit."""
+    """Render review objects without merging different evidence sources."""
     import geopandas as gpd
     import pandas as pd
     from shapely import from_wkt
@@ -206,7 +206,12 @@ def change_surfaces(frame):
     from .gt_road_geometry import road_profile
     work=frame.copy()
     work['_full_road']=work.get('gt_geometry_role',pd.Series(index=work.index,dtype=str)).eq('full_road_change')
-    for (kind,full_road),group in work.groupby(['change_typ','_full_road'],sort=False):
+    work['_source']=work.get('change_src',pd.Series('AUTO',index=work.index)).fillna('AUTO')
+    # Each truth object is independently reviewable, including where its face
+    # touches another truth road or an automatic detection. Keep Auto roads as
+    # their own objects; an overlap is not permission to accept either source.
+    work['_truth']=work.get('truth_id',pd.Series('',index=work.index)).fillna('').where(work['_source'].eq('GT_ASSISTED'),'')
+    for (kind,full_road,source,truth_id),group in work.groupby(['change_typ','_full_road','_source','_truth'],sort=False):
         before=[];after=[];authoritative=[]
         for row in group.itertuples():
             footprint = getattr(row, 'gt_surface_wkt', None)
@@ -229,6 +234,7 @@ def change_surfaces(frame):
             local=group.loc[group.geometry.intersects(part)]
             if local.empty:local=group
             rows.append(dict(change_id=f'CH{len(rows)+1:06d}',change_typ=kind,
+                change_src=source,truth_id=truth_id,
                 confidence=float(local.confidence.min()) if 'confidence' in local else 0.,
                 qa_state='pending',
                 width_bef=float(local.width_bef.median()),width_aft=float(local.width_aft.median()),

@@ -72,6 +72,21 @@ class ReviewedTruthTests(unittest.TestCase):
         self.assertEqual(review['objects'][0]['review_ids'], ['0'])
         self.assertEqual(len(self.truth), 3)
 
+    def test_overlapping_auto_decision_does_not_decide_assisted_object(self):
+        self.audit = self.audit.iloc[[0]].copy()
+        self.write_audit()
+        assisted = self.original.iloc[[0]].copy()
+        assisted['change_src'] = 'GT_ASSISTED'
+        assisted['truth_id'] = self.audit.iloc[0].truth_id
+        auto = assisted.copy(); auto['change_src'] = 'AUTO'; auto['truth_id'] = ''
+        import pandas as pd
+        self.original = gpd.GeoDataFrame(pd.concat([assisted,auto],ignore_index=True),crs=assisted.crs)
+        self.assertEqual(self.exclusions({'0':'keep','1':'reject'})['objects'], [])
+        rejected = self.exclusions({'0':'reject','1':'keep'})['objects']
+        self.assertEqual(len(rejected),1)
+        self.assertEqual(rejected[0]['review_ids'],['0'])
+        self.assertEqual(rejected[0]['scope'],'whole')
+
     def test_rejected_partial_assistance_excludes_only_reviewed_extent_after_save(self):
         # The source truth extends beyond the part actually supplemented.
         original_geometry = self.truth.geometry.iloc[0]
@@ -150,7 +165,7 @@ class ReviewedTruthTests(unittest.TestCase):
         self.assertEqual(list(effective.index), [1,2])
         self.assertEqual(metadata['excluded_feature_count'], 1)
 
-    def test_dissolved_public_polygon_preserves_explicit_truth_associations(self):
+    def test_touching_public_polygons_preserve_separate_truth_associations(self):
         from engine.continuous_road_geometry import change_surfaces
         axes = [LineString([(500030, 3300030), (500030, 3300060)]),
                 LineString([(500080, 3300030), (500080, 3300060)]),
@@ -160,7 +175,8 @@ class ReviewedTruthTests(unittest.TestCase):
         self.audit['truth_id'] = self.audit.geometry.map(lambda geometry: _id(geometry, 'GT'))
         self.write_audit()
         self.original = change_surfaces(self.audit)
-        self.assertEqual(len(self.original), 2)
+        self.assertEqual(len(self.original), 3)
+        self.assertEqual(self.original.change_src.tolist().count('GT_ASSISTED'), 2)
         decisions = {str(i): 'reject' if row.geometry.centroid.x < 500050 else 'keep'
                      for i, row in self.original.iterrows()}
         review = self.exclusions(decisions)
